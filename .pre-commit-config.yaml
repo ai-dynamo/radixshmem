@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+default_install_hook_types: [pre-commit, commit-msg]
+default_stages: [pre-commit]
+repos:
+  - repo: local
+    hooks:
+      - id: spdx-header
+        name: SPDX header
+        entry: tools/check_spdx.sh
+        language: script
+        files: (\.(c|cc|cpp|h|hpp|cu|cuh|py|sh|go|toml|ya?ml|in)|CMakeLists\.txt)$
+        exclude: ^third_party/
+      - id: uv-lock
+        name: uv.lock up to date
+        entry: bash -c 'cd python && uv lock --check'
+        language: system
+        files: ^python/(pyproject\.toml|uv\.lock)$
+        pass_filenames: false
+      - id: dco-signoff
+        name: DCO sign-off
+        entry: tools/check_signoff.sh
+        language: script
+        stages: [commit-msg]

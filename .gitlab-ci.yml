@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
+variables:
+  GIT_DEPTH: "0"
+
+compliance:
+  image: python:3.12
+  before_script:
+    - pip install -q pre-commit uv
+  script:
+    - pre-commit run --all-files --show-diff-on-failure
+    - |
+      if [ -n "$CI_MERGE_REQUEST_DIFF_BASE_SHA" ]; then
+        range="$CI_MERGE_REQUEST_DIFF_BASE_SHA..$CI_COMMIT_SHA"
+      elif [ -n "$CI_COMMIT_BEFORE_SHA" ] && [ "$CI_COMMIT_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+        range="$CI_COMMIT_BEFORE_SHA..$CI_COMMIT_SHA"
+      else
+        range="-1 $CI_COMMIT_SHA"
+      fi
+      status=0
+      for c in $(git rev-list --no-merges $range); do
+        git log -1 --format=%B "$c" > /tmp/msg
+        tools/check_signoff.sh /tmp/msg || { echo "  in $(git log -1 --format='%h %s' "$c")"; status=1; }
+      done
+      exit $status

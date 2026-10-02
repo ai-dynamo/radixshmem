@@ -1,0 +1,8 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+# Source-free packaging: only setuptools/wheel, NO cmake/pybind11 — this wheel
+# bundles a pre-compiled _core.so and compiles nothing.
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
