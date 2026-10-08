@@ -44,7 +44,8 @@ radix-server --name /my_kv_cache --data-bytes 1024G
 # Same command on every node except --rpc-address
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
 Enable the SWA pool:
@@ -52,7 +53,8 @@ Enable the SWA pool:
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G --swa-ratio 0.2 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
 Enable the Mamba pool:
@@ -60,7 +62,8 @@ Enable the Mamba pool:
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G --mamba-ratio 0.2 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
 ### Client API
