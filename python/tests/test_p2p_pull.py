@@ -150,8 +150,10 @@ def check(cond, msg):
 def orchestrate(a) -> int:
     import shmradix
 
-    if not shutil.which("etcd") or not os.path.isdir("/sys/class/infiniband") or not hasattr(shmradix, "_data"):
-        print("SKIP: needs etcd, an RDMA device and shmradix._data")
+    if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{a.index_dev}")
+            or not hasattr(shmradix, "_data") or "mooncake" not in shmradix._data.TRANSFER_BACKENDS
+            or not hasattr(shmradix._core, "EtcdKv")):
+        print(f"SKIP: needs etcd, RDMA device {a.index_dev!r} and shmradix built with etcd + Mooncake")
         return 77
     workdir = tempfile.mkdtemp(prefix="shmradix-p2p-")
     cluster_id = f"p2p{os.getpid()}"

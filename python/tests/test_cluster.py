@@ -363,6 +363,12 @@ def check(cond, msg):
 
 
 def orchestrate(args) -> int:
+    import shmradix
+
+    if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{args.index_dev}")
+            or not hasattr(shmradix._core, "EtcdKv")):
+        print(f"SKIP: needs etcd, RDMA device {args.index_dev!r} and shmradix built with etcd")
+        return 77
     workdir = tempfile.mkdtemp(prefix="shmradix-cluster-")
     cluster_id = f"pytest{os.getpid()}"
     etcd_proc = servers = None

@@ -30,6 +30,7 @@ import json
 import os
 import queue
 import random
+import shutil
 import signal
 import socket
 import struct
@@ -1071,6 +1072,16 @@ def cleanup(procs, etcd, cfg: Config):
 
 
 def run_launcher(cfg: Config) -> int:
+    if cfg.nodes > 1:
+        backends = getattr(getattr(shmradix, "_data", None), "TRANSFER_BACKENDS", [])
+        missing = [what for what, ok in (
+            ("etcd", shutil.which("etcd")),
+            ("an RDMA device", rdma_devices(cfg)),
+            ("shmradix built with etcd", hasattr(shmradix._core, "EtcdKv")),
+            ("shmradix built with Mooncake", cfg.index_only or "mooncake" in backends)) if not ok]
+        if missing:
+            print(f"SKIP: --nodes {cfg.nodes} needs {', '.join(missing)}")
+            return 77
     cfg.run_id = f"{os.getpid():x}{int(time.time()) & 0xffff:x}"
     workdir = cfg.workdir or f"/tmp/agentic_stress_{os.getpid()}"
     os.makedirs(workdir, exist_ok=True)
