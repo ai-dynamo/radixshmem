@@ -44,11 +44,11 @@ from typing import Dict, List, Optional
 import numpy as np
 
 try:
-    import shmradix
+    import radixshmem
 except ImportError:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                     "..", "python"))
-    import shmradix
+    import radixshmem
 
 MSG_REQ, MSG_DONE, MSG_STOP, MSG_STATS = 1, 2, 3, 4
 
@@ -169,15 +169,15 @@ def parse_args():
 
 
 def query_mask(cfg: Config) -> int:
-    m = shmradix.COMPONENT_MASK_FULL
+    m = radixshmem.COMPONENT_MASK_FULL
     if cfg.aux == "swa":
-        m |= shmradix.COMPONENT_MASK_SWA
+        m |= radixshmem.COMPONENT_MASK_SWA
     elif cfg.aux == "mamba":
-        m |= shmradix.COMPONENT_MASK_MAMBA
+        m |= radixshmem.COMPONENT_MASK_MAMBA
     return m
 
 
-def server_config(cfg: Config, rank: int) -> shmradix.ServerConfig:
+def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
     """One node; a cluster when nodes > 1. Per-rank names keep the shm regions
     and the gRPC sockets of one host apart. Data mode: the budget is exactly
     the index pools' bytes and the ratios hand the aux pools their share, so
@@ -189,16 +189,16 @@ def server_config(cfg: Config, rank: int) -> shmradix.ServerConfig:
     data_bytes = 0 if cfg.index_only else cfg.max_blocks * cfg.full_slot_bytes + swa_bytes + mamba_bytes
     devs = rdma_devices(cfg)
     dev = [devs[rank % len(devs)]] if devs else []
-    cluster = shmradix.ClusterConfig()
+    cluster = radixshmem.ClusterConfig()
     if cfg.nodes > 1:
-        cluster = shmradix.ClusterConfig(
+        cluster = radixshmem.ClusterConfig(
             expected_min_nodes=cfg.nodes, registry=f"etcd://127.0.0.1:{cfg.etcd_port}",
             cluster_id=f"agentic_{cfg.run_id}", node_name=f"node{rank}", rpc_address="0.0.0.0",
             num_rht_shards=cfg.nodes, rht_shard_holders=list(range(cfg.nodes)),
             index_dev=dev[0] if dev else "", gid_idx=cfg.gid_idx,
             bootstrap_timeout_sec=cfg.bootstrap_timeout, rht_slots_per_bucket=cfg.rht_slots,
             enable_remote_query=cfg.diag_misses)
-    return shmradix.ServerConfig(
+    return radixshmem.ServerConfig(
         name=f"/agentic_{cfg.run_id}_r{rank}", data_bytes=data_bytes,
         swa_ratio=swa_bytes / data_bytes if data_bytes else 0.0,
         mamba_ratio=mamba_bytes / data_bytes if data_bytes else 0.0,
@@ -206,24 +206,24 @@ def server_config(cfg: Config, rank: int) -> shmradix.ServerConfig:
         data_pool_ratio=cfg.data_pool_ratio, cluster=cluster)
 
 
-def geometry(cfg: Config) -> shmradix.Geometry:
+def geometry(cfg: Config) -> radixshmem.Geometry:
     """What the engine would send: bytes per slot in data mode, slot counts
     in index-only mode (there the slots are the caller's own storage)."""
     swa, mamba = cfg.aux == "swa", cfg.aux == "mamba"
     if cfg.index_only:
-        return shmradix.Geometry(
+        return radixshmem.Geometry(
             block_size=cfg.block_size, full_slots=cfg.max_blocks,
             swa_slots=cfg.swa_max_blocks if swa else 0, swa_window_blocks=cfg.swa_window if swa else 0,
             mamba_slots=cfg.mamba_max_slots if mamba else 0,
             register_chunk_tokens=cfg.register_chunk_size * cfg.block_size)
-    return shmradix.Geometry(
+    return radixshmem.Geometry(
         block_size=cfg.block_size, full_slot_bytes=cfg.full_slot_bytes,
         swa_slot_bytes=cfg.swa_slot_bytes if swa else 0, swa_window_blocks=cfg.swa_window if swa else 0,
         mamba_slot_bytes=cfg.mamba_slot_bytes if mamba else 0, slot_align=64,
         register_chunk_tokens=cfg.register_chunk_size * cfg.block_size)
 
 
-FULL, SWA, MAMBA = shmradix.ComponentType.FULL, shmradix.ComponentType.SWA, shmradix.ComponentType.MAMBA
+FULL, SWA, MAMBA = radixshmem.ComponentType.FULL, radixshmem.ComponentType.SWA, radixshmem.ComponentType.MAMBA
 
 
 def kv_pattern(kind, hashes: np.ndarray, words: int) -> np.ndarray:
@@ -286,8 +286,8 @@ def create_node(cfg: Config, rank: int):
     """The engine's bootstrap: start the node's server, build the client with
     the geometry (handed to the server at once), wait for the cluster."""
     sc = server_config(cfg, rank)
-    server = shmradix.RadixServer(sc).start()
-    client = shmradix.RadixClient(sc.name, geometry(cfg))
+    server = radixshmem.RadixServer(sc).start()
+    client = radixshmem.RadixClient(sc.name, geometry(cfg))
     client.wait_ready(cfg.bootstrap_timeout + 120)
     return server, client
 
@@ -319,7 +319,7 @@ class Worker:
                         int(p.num_slots), int(p.slot_bytes) // 8)
 
     def local_full_hit(self, hashes: np.ndarray) -> int:
-        return int(self.client.query(hashes, mask=shmradix.COMPONENT_MASK_FULL, local_only=True,
+        return int(self.client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL, local_only=True,
                                      lock=False, update_meta=False).common_hit)
 
     def verify(self, r, inp: np.ndarray) -> int:
@@ -389,7 +389,7 @@ class Worker:
                          update_meta=False)
             time.sleep(0.002)
             rq = c.query(inp, mask=self.mask, lock=False, update_meta=False)
-            fo = c.query(inp, mask=shmradix.COMPONENT_MASK_FULL, lock=False,
+            fo = c.query(inp, mask=radixshmem.COMPONENT_MASK_FULL, lock=False,
                          update_meta=False)
             peer_hits = {}
             if c.is_distributed():
@@ -430,7 +430,7 @@ class Worker:
                             else kv_pattern(FULL, hashes[have:n], self.words[FULL]))
                     self.pools[FULL][slots, :self.words[FULL]] = rows
                 r = c.insert(hashes[:n], slots, start=have)
-                if r.error != shmradix.InsertError.OK:
+                if r.error != radixshmem.InsertError.OK:
                     err = err or r.error.name
         insert_full_us = (time.perf_counter() - t1) * 1e6
 
@@ -442,7 +442,7 @@ class Worker:
                     self.pools[SWA][s, :self.words[SWA]] = (
                         gen[SWA] if n == n0 else kv_pattern(SWA, hashes[n - k:n], self.words[SWA]))
                 r = c.insert(hashes[:n], s, start=0, component=SWA)
-                if r.error != shmradix.InsertError.OK:
+                if r.error != radixshmem.InsertError.OK:
                     err = err or "SWA_" + r.error.name
             else:
                 err = err or "SWA_POOL"
@@ -453,7 +453,7 @@ class Worker:
                     self.pools[MAMBA][s, :self.words[MAMBA]] = (
                         gen[MAMBA] if n == n0 else kv_pattern(MAMBA, hashes[n - 1:n], self.words[MAMBA]))
                 r = c.insert(hashes[:n], s, component=MAMBA)
-                if r.error != shmradix.InsertError.OK:
+                if r.error != radixshmem.InsertError.OK:
                     err = err or "MAMBA_" + r.error.name
             else:
                 err = err or "MAMBA_POOL"
@@ -1073,12 +1073,12 @@ def cleanup(procs, etcd, cfg: Config):
 
 def run_launcher(cfg: Config) -> int:
     if cfg.nodes > 1:
-        backends = getattr(getattr(shmradix, "_data", None), "TRANSFER_BACKENDS", [])
+        backends = getattr(getattr(radixshmem, "_data", None), "TRANSFER_BACKENDS", [])
         missing = [what for what, ok in (
             ("etcd", shutil.which("etcd")),
             ("an RDMA device", rdma_devices(cfg)),
-            ("shmradix built with etcd", hasattr(shmradix._core, "EtcdKv")),
-            ("shmradix built with Mooncake", cfg.index_only or "mooncake" in backends)) if not ok]
+            ("radixshmem built with etcd", hasattr(radixshmem._core, "EtcdKv")),
+            ("radixshmem built with Mooncake", cfg.index_only or "mooncake" in backends)) if not ok]
         if missing:
             print(f"SKIP: --nodes {cfg.nodes} needs {', '.join(missing)}")
             return 77

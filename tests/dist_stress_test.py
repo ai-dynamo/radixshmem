@@ -39,7 +39,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-import shmradix
+import radixshmem
 
 
 # ======================================================================
@@ -402,7 +402,7 @@ def _insert_full(node, full_hashes, is_standalone):
     the local allocation) without perturbing LRU, allocate just the shortfall,
     insert, and recycle any unused tail. Call under the writer lock, if any."""
     matched = int(
-        node.query(full_hashes, mask=shmradix.COMPONENT_MASK_FULL,
+        node.query(full_hashes, mask=radixshmem.COMPONENT_MASK_FULL,
                    local_only=not is_standalone,
                    lock=False, update_meta=False).common_hit
     )
@@ -432,10 +432,10 @@ def execute_request(node, req: Request,
             rdma_reads=0, rdma_atomics=0, error="",
         )
 
-    input_hashes = shmradix.compute_hashes(req.input_tokens, cfg.block_size)
+    input_hashes = radixshmem.compute_hashes(req.input_tokens, cfg.block_size)
 
     t0 = time.perf_counter()
-    qr = node.query(input_hashes, mask=shmradix.COMPONENT_MASK_FULL)
+    qr = node.query(input_hashes, mask=radixshmem.COMPONENT_MASK_FULL)
     t1 = time.perf_counter()
     query_us = (t1 - t0) * 1e6
     if query_us > 500000:
@@ -467,7 +467,7 @@ def execute_request(node, req: Request,
     insert_us = 0.0
 
     if full_num_hashes > 0:
-        full_hashes = shmradix.compute_hashes(full_tokens, cfg.block_size)
+        full_hashes = radixshmem.compute_hashes(full_tokens, cfg.block_size)
         t_ins = time.perf_counter()
         if insert_lock:
             with insert_lock:
@@ -485,7 +485,7 @@ def execute_request(node, req: Request,
             if us > 0:
                 time.sleep(us * 1e-6)
 
-        if ins_result.error != shmradix.InsertError.OK:
+        if ins_result.error != radixshmem.InsertError.OK:
             ins_error = ins_result.error.name
 
     return Completion(
@@ -1175,12 +1175,12 @@ def run_worker(cfg: StressConfig, node,
 
 def _create_cluster_node(rank: int, cfg: StressConfig):
     """Create RadixServerConfig + RadixServer and bootstrap (distributed)."""
-    shm_cfg = shmradix._core.ShmConfig(
+    shm_cfg = radixshmem._core.ShmConfig(
         max_nodes=cfg.max_nodes, max_blocks=cfg.max_blocks,
         block_size=cfg.block_size, register_chunk_tokens=cfg.register_chunk_size * cfg.block_size,
         background_evict_ratio=cfg.background_evict_ratio,
     )
-    rscfg = shmradix._core.RadixServerConfig()
+    rscfg = radixshmem._core.RadixServerConfig()
     rscfg.shm = shm_cfg
     rscfg.rank = rank
     rscfg.world_size = cfg.world_size
@@ -1193,12 +1193,12 @@ def _create_cluster_node(rank: int, cfg: StressConfig):
     rscfg.register_chunk_tokens = cfg.register_chunk_size * cfg.block_size
 
     print(f"[R{rank}] Creating RadixServer (distributed)...")
-    server = shmradix._core.RadixServer(rscfg)
+    server = radixshmem._core.RadixServer(rscfg)
     print(f"[R{rank}] Bootstrapping cluster...")
     if not server.bootstrap():
         print(f"[R{rank}] ERROR: Bootstrap failed!", file=sys.stderr)
         sys.exit(1)
-    client = shmradix._core.RadixClient(server)
+    client = radixshmem._core.RadixClient(server)
     print(f"[R{rank}] Cluster ready. shm={server.shm_name()}\n")
     return server, client
 
@@ -1218,17 +1218,17 @@ def run_rank(rank: int, cfg: StressConfig):
 
     if cfg.world_size == 1:
         # Standalone mode
-        shm_cfg = shmradix._core.ShmConfig(
+        shm_cfg = radixshmem._core.ShmConfig(
             max_nodes=cfg.max_nodes, max_blocks=cfg.max_blocks,
             block_size=cfg.block_size, register_chunk_tokens=cfg.register_chunk_size * cfg.block_size,
             background_evict_ratio=cfg.background_evict_ratio,
         )
-        shm_name = f"/shmradix_stress_0"
+        shm_name = f"/radixshmem_stress_0"
         if cfg.max_nodes == 0:
             shm_cfg.max_nodes = cfg.max_blocks
         print(f"[R0] Creating RadixServer (standalone mode)...")
-        server = shmradix._core.RadixServer(shm_name, shm_cfg)
-        client = shmradix._core.RadixClient(server)
+        server = radixshmem._core.RadixServer(shm_name, shm_cfg)
+        client = radixshmem._core.RadixClient(server)
         print(f"[R0] Ready. shm={shm_name}\n")
         errors = run_scheduler(cfg, client)
     elif rank == 0:

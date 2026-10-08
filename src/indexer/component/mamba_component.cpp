@@ -2,16 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "component_set.hpp"
-#include "shmradix/radix_tree.h"
+#include "radix_tree.h"
 
 #include <cassert>
 #include <cstdio>
 
-namespace shmradix {
+namespace radixshmem {
 
 // Deliberate sglang divergence (design §6.3): no checkpoint materialization
 // at deeper Full hits — checkpoint density is entirely the publisher's choice.
-InsertResult ShmRadixTree::insert_mamba(const uint64_t* hashes, int n,
+InsertResult RadixShmemTree::insert_mamba(const uint64_t* hashes, int n,
                                         const int32_t* slots, int num_slots,
                                         bool auto_recycle) {
     set_write_op("insert_mamba");
@@ -74,7 +74,7 @@ InsertResult ShmRadixTree::insert_mamba(const uint64_t* hashes, int n,
     return finish();
 }
 
-void ShmRadixTree::retire_mamba(uint32_t id, std::vector<int32_t>& out) {
+void RadixShmemTree::retire_mamba(uint32_t id, std::vector<int32_t>& out) {
     if (!has_mamba_) return;
     TreeNode* node = nodes_.get(id);
     if (node->mamba_checkpoint_slot == INVALID_COMPONENT_SLOT) return;
@@ -85,7 +85,7 @@ void ShmRadixTree::retire_mamba(uint32_t id, std::vector<int32_t>& out) {
 
 // Merge is gated on the parent END carrying no checkpoint; a leaf END
 // checkpoint moves onto the merged node.
-void ShmRadixTree::aux_on_merge(uint32_t parent_id, uint32_t leaf_id) {
+void RadixShmemTree::aux_on_merge(uint32_t parent_id, uint32_t leaf_id) {
     if (!has_mamba_) return;
     assert(nodes_.get(parent_id)->mamba_checkpoint_slot ==
            INVALID_COMPONENT_SLOT);
@@ -97,7 +97,7 @@ void ShmRadixTree::aux_on_merge(uint32_t parent_id, uint32_t leaf_id) {
     leaf->mamba_checkpoint_slot = INVALID_COMPONENT_SLOT;
 }
 
-int ShmRadixTree::evict_mamba_walk(int need_slots) {
+int RadixShmemTree::evict_mamba_walk(int need_slots) {
     if (!has_mamba_) return 0;
     std::vector<int32_t> tmp;
     uint32_t cur = mamba_lru_.head();
@@ -114,9 +114,9 @@ int ShmRadixTree::evict_mamba_walk(int need_slots) {
     }
     int got = mamba_mempool_.recycle(tmp.data(), (int)tmp.size());
     if (got != (int)tmp.size())
-        fprintf(stderr, "[shmradix] WARNING: Mamba evict recycled %d/%d slots "
+        fprintf(stderr, "[radixshmem] WARNING: Mamba evict recycled %d/%d slots "
                 "(duplicate or foreign slot id)\n", got, (int)tmp.size());
     return got;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

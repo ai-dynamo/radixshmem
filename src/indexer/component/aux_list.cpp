@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "component_set.hpp"
-#include "shmradix/radix_tree.h"
+#include "radix_tree.h"
 
 #include <algorithm>
 
-namespace shmradix {
+namespace radixshmem {
 
-void ShmRadixTree::aux_touch(const std::vector<MatchedNodeSpanView>& spans,
+void RadixShmemTree::aux_touch(const std::vector<MatchedNodeSpanView>& spans,
                              uint32_t mask, uint32_t common_hit,
                              uint32_t swa_start, uint64_t ts) {
     if (common_hit == 0 ||
@@ -31,4 +31,4 @@ void ShmRadixTree::aux_touch(const std::vector<MatchedNodeSpanView>& spans,
     lru_unlock();
 }
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -16,13 +16,13 @@
 //   - repeat recycle of an already-free slot is a silent no-op (dedup)
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
 #include <cassert>
 #include <set>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // ==================================================================
 static void test_allocate_basic() {

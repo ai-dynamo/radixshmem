@@ -7,8 +7,8 @@
 // coverage lives in test_tree_basic; eviction in test_tree_evict.
 
 #include "test_utils.h"
-#include "shmradix/hash.h"
-#include "shmradix/radix_client.h"
+#include "hash.h"
+#include "radix_client.h"
 
 #include <cassert>
 #include <cstring>
@@ -16,7 +16,7 @@
 #include <set>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // Build a hash sequence [base+0 .. base+n) so distinct tests don't collide.
 static std::vector<uint64_t> seq(int64_t base, int n) {

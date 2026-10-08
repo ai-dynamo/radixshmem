@@ -5,7 +5,7 @@
 
 #pragma once
 
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
 #include <algorithm>
 #include <chrono>
@@ -76,7 +76,7 @@ public:
             scratch_tokens_[i] = (int64_t)(base * 1315423911u + (uint64_t)i);
         tail_counters_[s]++;
 
-        auto h = shmradix::RadixClient::compute_hashes(
+        auto h = radixshmem::RadixClient::compute_hashes(
             scratch_tokens_.data(), total, 1);
         scratch_hashes_ = std::move(h);
         return scratch_hashes_;
@@ -94,7 +94,7 @@ public:
         uint64_t base = ((uint64_t)s << 32) ^ counter;
         for (int i = shared; i < total; i++)
             scratch_tokens_[i] = (int64_t)(base * 1315423911u + (uint64_t)i);
-        scratch_hashes_ = shmradix::RadixClient::compute_hashes(
+        scratch_hashes_ = radixshmem::RadixClient::compute_hashes(
             scratch_tokens_.data(), total, 1);
         return scratch_hashes_;
     }

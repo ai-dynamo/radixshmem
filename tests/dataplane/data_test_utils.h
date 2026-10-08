@@ -4,8 +4,8 @@
 #pragma once
 
 // Tiny self-contained runner for the data-plane tests. Mirrors
-// tests/indexer/test_utils.h, minus every shmradix indexer include — these
-// binaries link shmradix_data ONLY, which is what proves the data plane carries
+// tests/indexer/test_utils.h, minus every radixshmem indexer include — these
+// binaries link radixshmem_data ONLY, which is what proves the data plane carries
 // no dependency on the indexer.
 
 #include <cassert>
@@ -17,29 +17,29 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace shmradix_test {
+namespace radixshmem_test {
 inline int& tests_run()    { static int v = 0; return v; }
 inline int& tests_passed() { static int v = 0; return v; }
-} // namespace shmradix_test
+} // namespace radixshmem_test
 
 #define TEST_BEGIN(name)                                                       \
     do {                                                                       \
-        shmradix_test::tests_run()++;                                          \
+        radixshmem_test::tests_run()++;                                          \
         printf("  [%d] %-58s",                                                 \
-               shmradix_test::tests_run(), name);                              \
+               radixshmem_test::tests_run(), name);                              \
         fflush(stdout);                                                        \
     } while (0)
 
 #define TEST_PASS()                                                            \
     do {                                                                       \
-        shmradix_test::tests_passed()++;                                       \
+        radixshmem_test::tests_passed()++;                                       \
         printf("PASS\n");                                                      \
     } while (0)
 
 inline int tests_report() {
     printf("\n%d/%d tests passed.\n",
-           shmradix_test::tests_passed(), shmradix_test::tests_run());
-    return (shmradix_test::tests_passed() == shmradix_test::tests_run()) ? 0 : 1;
+           radixshmem_test::tests_passed(), radixshmem_test::tests_run());
+    return (radixshmem_test::tests_passed() == radixshmem_test::tests_run()) ? 0 : 1;
 }
 
 // Run `body` in a forked child and assert it exited cleanly. An assert() firing
@@ -85,7 +85,7 @@ inline bool child_succeeds(const std::function<void()>& body) {
 
 #define TEST_SKIP(why)                                                         \
     do {                                                                       \
-        shmradix_test::tests_passed()++;                                       \
+        radixshmem_test::tests_passed()++;                                       \
         printf("SKIP (%s)\n", why);                                            \
     } while (0)
 

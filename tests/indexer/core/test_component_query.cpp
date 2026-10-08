@@ -5,15 +5,15 @@
 // semantics, joint
 // common_hit, trust-model pin/release, the client facade, and the remote walk.
 
-#include "shmradix/config.h"
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_tree.h"
+#include "radixshmem_config.h"
+#include "radix_client.h"
+#include "radix_tree.h"
 #include "test_utils.h"
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 #include "fake_rdma_endpoint.hpp"
-#include "shmradix/cluster_manifest.h"
-#include "shmradix/rdma_remote_walker.h"
+#include "cluster_manifest.h"
+#include "rdma_remote_walker.h"
 #endif
 
 #include <algorithm>
@@ -24,7 +24,7 @@
 #include <utility>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 static_assert(std::is_aggregate_v<PinRecord>);
 static_assert(std::is_default_constructible_v<PinRecord>);
@@ -56,7 +56,7 @@ static ShmConfig cfg(uint32_t w, int cs, uint32_t max_blocks) {
     return c;
 }
 
-static std::vector<int32_t> insert_fresh(ShmRadixTree& t, const uint64_t* h,
+static std::vector<int32_t> insert_fresh(RadixShmemTree& t, const uint64_t* h,
                                          int n, int start = 0) {
     std::vector<int32_t> slots;
     int got = t.allocate_slots(n - start, slots);
@@ -66,7 +66,7 @@ static std::vector<int32_t> insert_fresh(ShmRadixTree& t, const uint64_t* h,
     return slots;
 }
 
-static void publish_at(ShmRadixTree& t, const uint64_t* h, int n, int W,
+static void publish_at(RadixShmemTree& t, const uint64_t* h, int n, int W,
                        std::vector<int32_t>* pos = nullptr) {
     const int start = n > W ? n - W : 0;
     std::vector<int32_t> s;
@@ -87,21 +87,21 @@ static void publish_at(ShmRadixTree& t, const uint64_t* h, int n, int W,
                     ComponentType::SWA);
 }
 
-static int32_t alloc_mamba(ShmRadixTree& t) {
+static int32_t alloc_mamba(RadixShmemTree& t) {
     std::vector<int32_t> s;
     int got = t.allocate_slots(1, s, ComponentType::MAMBA);
     assert(got == 1);
     return s[0];
 }
 
-static int32_t mamba_ok(ShmRadixTree& t, const uint64_t* h, int n) {
+static int32_t mamba_ok(RadixShmemTree& t, const uint64_t* h, int n) {
     int32_t s = alloc_mamba(t);
     auto r = t.insert(h, n, &s, 1, /*start=*/0, /*auto_recycle=*/true,
                       ComponentType::MAMBA);
     assert(r.error == InsertError::OK && r.unused_slots.empty());
     return s;
 }
-static InsertError mamba_fail(ShmRadixTree& t, const uint64_t* h, int n) {
+static InsertError mamba_fail(RadixShmemTree& t, const uint64_t* h, int n) {
     int32_t s = alloc_mamba(t);
     auto r = t.insert(h, n, &s, 1, /*start=*/0, /*auto_recycle=*/true,
                       ComponentType::MAMBA);
@@ -109,7 +109,7 @@ static InsertError mamba_fail(ShmRadixTree& t, const uint64_t* h, int n) {
     return r.error;
 }
 
-static TreeComponentQueryResult qc(ShmRadixTree& t, const uint64_t* h, int n,
+static TreeComponentQueryResult qc(RadixShmemTree& t, const uint64_t* h, int n,
                                    uint32_t mask) {
     auto r = t.query_components(h, n, mask, /*lock=*/false,
                                 /*update_meta=*/false);
@@ -117,7 +117,7 @@ static TreeComponentQueryResult qc(ShmRadixTree& t, const uint64_t* h, int n,
     assert(r.common_hit <= r.topology_match_length);
     return r;
 }
-static TreeComponentQueryResult qp(ShmRadixTree& t, const uint64_t* h, int n,
+static TreeComponentQueryResult qp(RadixShmemTree& t, const uint64_t* h, int n,
                                    uint32_t mask) {
     auto r = t.query_components(h, n, mask, /*lock=*/true,
                                 /*update_meta=*/false);
@@ -125,14 +125,14 @@ static TreeComponentQueryResult qp(ShmRadixTree& t, const uint64_t* h, int n,
     return r;
 }
 
-static void pressure(ShmRadixTree& t, int n) {
+static void pressure(RadixShmemTree& t, int n) {
     std::vector<int32_t> tmp;
     int got = t.allocate_slots(n, tmp);
     assert(got == n);
     t.recycle_slots(tmp.data(), got);
 }
 
-static int hit(ShmRadixTree& t, const uint64_t* h, int n) {
+static int hit(RadixShmemTree& t, const uint64_t* h, int n) {
     return (int)t.query_components(h, n, COMPONENT_MASK_FULL, false, false).common_hit;
 }
 
@@ -141,7 +141,7 @@ static void test_swa_any_boundary_acceptance() {
 
     const char* name = "/test_cq_swa_end";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(/*w=*/7, /*cs=*/3, 64));
+    auto t = RadixShmemTree::create(name, cfg(/*w=*/7, /*cs=*/3, 64));
     auto h = seq(1000, 12);
     insert_fresh(t, h.data(), 12);
     std::vector<int32_t> ws(12, INVALID_COMPONENT_SLOT);
@@ -173,7 +173,7 @@ static void test_swa_gap_fallback_and_reaccept() {
 
     const char* name = "/test_cq_swa_gap";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 3, 128));
+    auto t = RadixShmemTree::create(name, cfg(4, 3, 128));
     auto h = seq(2000, 12);
     insert_fresh(t, h.data(), 12);
     for (int e : {3, 6, 9}) publish_at(t, h.data(), e, 4);
@@ -200,7 +200,7 @@ static void test_mamba_node_end() {
 
     const char* name = "/test_cq_mamba";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(4000, 12);
     auto fs = insert_fresh(t, h.data(), 12);
 
@@ -236,7 +236,7 @@ static void test_joint_common_hit() {
 
     const char* name = "/test_cq_joint";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(5000, 12);
     insert_fresh(t, h.data(), 12);
     std::vector<int32_t> ws(12, INVALID_COMPONENT_SLOT);
@@ -267,7 +267,7 @@ static void test_joint_alternating_descent() {
 
     const char* name = "/test_cq_alt";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(5200, 12);
     insert_fresh(t, h.data(), 12);           // nodes [0,4) [4,8) [8,12)
     int32_t m4 = mamba_ok(t, h.data(), 4);
@@ -308,7 +308,7 @@ static void test_mask_validation_and_node_fww() {
 
     const char* name = "/test_cq_mask";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(/*w=*/8, /*cs=*/4, 32));
+    auto t = RadixShmemTree::create(name, cfg(/*w=*/8, /*cs=*/4, 32));
     auto h = seq(6000, 8);
     insert_fresh(t, h.data(), 8);
 
@@ -356,7 +356,7 @@ static void test_swa_publish_window_refresh() {
 
     const char* name = "/test_cq_cuts";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(/*w=*/4, /*cs=*/8, 32));
+    auto t = RadixShmemTree::create(name, cfg(/*w=*/4, /*cs=*/8, 32));
     auto h = seq(7000, 8);
     insert_fresh(t, h.data(), 8);
 
@@ -446,7 +446,7 @@ static void test_swa_positional_publish() {
 
     const char* name = "/test_cq_pos";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(/*w=*/4, /*cs=*/8, 64));
+    auto t = RadixShmemTree::create(name, cfg(/*w=*/4, /*cs=*/8, 64));
 
     // One position at a time (decode appends a block per step): every publish
     // covers [n-1, n) and the window at n is live as soon as its cells are.
@@ -515,7 +515,7 @@ static void test_update_meta_component_gating() {
     for (int use_full = 0; use_full <= 1; use_full++) {
         const char* name = "/test_cq_meta";
         shm_unlink(name);
-        auto t = ShmRadixTree::create(name, cfg(4, 4, 8));
+        auto t = RadixShmemTree::create(name, cfg(4, 4, 8));
         auto ha = seq(7000, 4), hb = seq(7100, 4);
         insert_fresh(t, ha.data(), 4);
         insert_fresh(t, hb.data(), 4);
@@ -543,7 +543,7 @@ static void test_update_meta_touches_full_extent() {
 
     const char* name = "/test_cq_meta_f";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 12));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 12));
     auto ha = seq(7200, 8), hb = seq(7300, 4);
     insert_fresh(t, ha.data(), 8);     // A[0,4) -> B[4,8): B is the older leaf
     insert_fresh(t, hb.data(), 4);     // newer leaf
@@ -570,7 +570,7 @@ static void test_component_slot_allocation() {
 
     const char* name = "/test_cq_alloc";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 16));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 16));
 
     std::vector<int32_t> v;
     const auto invalid_component = static_cast<ComponentType>(999u);
@@ -624,7 +624,7 @@ static void test_mamba_merge_keeps_checkpoint() {
 
     const char* name = "/test_cq_merge";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 32));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 32));
     auto h = seq(1000, 8);
     insert_fresh(t, h.data(), 4);
     mamba_ok(t, h.data(), 4);
@@ -648,7 +648,7 @@ static void test_pin_release_lifecycle() {
 
     const char* name = "/test_cq_pin";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 8));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 8));
     auto ha = seq(1000, 4), hb = seq(2000, 4);
     auto sa = insert_fresh(t, ha.data(), 4);
     insert_fresh(t, hb.data(), 4);
@@ -679,7 +679,7 @@ static void test_pin_per_lane_ends_and_overpin() {
 
     const char* name = "/test_cq_lanes";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(9000, 12);
     insert_fresh(t, h.data(), 4);
     std::vector<uint64_t> fork(h.begin(), h.begin() + 4);
@@ -701,7 +701,7 @@ static void test_pin_per_lane_ends_and_overpin() {
 
     const char* name2 = "/test_cq_overpin";
     shm_unlink(name2);
-    auto t2 = ShmRadixTree::create(name2, cfg(7, 3, 64));
+    auto t2 = RadixShmemTree::create(name2, cfg(7, 3, 64));
     auto h2 = seq(9700, 12);
     insert_fresh(t2, h2.data(), 12);
     for (int e : {3, 6, 9, 12}) publish_at(t2, h2.data(), e, 7);
@@ -728,7 +728,7 @@ static void test_pin_partial_terminal_then_split() {
 
     const char* name = "/test_cq_mid";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(8, 8, 16));
+    auto t = RadixShmemTree::create(name, cfg(8, 8, 16));
     auto ha = seq(4000, 8);
     insert_fresh(t, ha.data(), 8);
     insert_fresh(t, seq(4100, 8).data(), 8);
@@ -768,7 +768,7 @@ static void test_pin_swa_terminal_past_query() {
     // same ten caller keys (its last pinned node starts at 8 < 10).
     const char* name = "/test_cq_swa_tail";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(16000, 16);
     insert_fresh(t, h.data(), 16);
     assert(t.get_node_boundaries(h.data(), 16).size() == 4);
@@ -797,7 +797,7 @@ static void test_pin_swa_only_terminal_past_query() {
     // release with the ten caller keys must reach it (N1 and N2 pinned).
     const char* name = "/test_cq_swa_only_tail";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(16100, 16);
     insert_fresh(t, h.data(), 16);
     assert(t.get_node_boundaries(h.data(), 16).size() == 4);
@@ -822,7 +822,7 @@ static void test_pinned_split_then_release() {
 
     const char* name = "/test_cq_split";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 8, 32));
+    auto t = RadixShmemTree::create(name, cfg(4, 8, 32));
     auto ha = seq(5000, 8);
     insert_fresh(t, ha.data(), 8);
     publish_at(t, ha.data(), 8, 4);
@@ -856,7 +856,7 @@ static void test_release_trust_model() {
 
     const char* name = "/test_cq_release";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(8, 4, 32));
+    auto t = RadixShmemTree::create(name, cfg(8, 4, 32));
     auto h = seq(10000, 8);
     insert_fresh(t, h.data(), 8);
 
@@ -884,7 +884,7 @@ static void test_release_trust_model() {
 
     const char* name2 = "/test_cq_release_long";
     shm_unlink(name2);
-    auto t2 = ShmRadixTree::create(name2, cfg(4, 1, 64));
+    auto t2 = RadixShmemTree::create(name2, cfg(4, 1, 64));
     auto h2 = seq(11000, 20);
     insert_fresh(t2, h2.data(), 20);
     auto r4 = qp(t2, h2.data(), 20, COMPONENT_MASK_FULL);
@@ -904,7 +904,7 @@ static void test_facade_shape_and_finalize() {
 
     const char* name = "/test_cq_facade";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(1000, 12);
     auto fs = insert_fresh(t, h.data(), 12);
     for (int e : {4, 8, 12}) publish_at(t, h.data(), e, 4);
@@ -962,7 +962,7 @@ static void test_insert_arg_validation() {
 
     const char* name = "/test_cq_args";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 32));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 32));
     auto h = seq(12000, 8);
     insert_fresh(t, h.data(), 8);
     std::vector<int32_t> s;
@@ -1025,7 +1025,7 @@ static void test_mamba_only_pin_release() {
 
     const char* name = "/test_cq_mpin";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 8));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 8));
     auto ha = seq(13000, 4), hb = seq(13100, 4);
     insert_fresh(t, ha.data(), 4);
     insert_fresh(t, hb.data(), 4);
@@ -1050,7 +1050,7 @@ static void test_facade_bad_mask_and_crop_to_zero() {
 
     const char* name = "/test_cq_facade2";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 32));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 32));
     auto h = seq(2500, 8);
     insert_fresh(t, h.data(), 8);
     RadixClient c(name);
@@ -1080,7 +1080,7 @@ static void test_client_component_insert() {
 
     const char* name = "/test_cq_client_pub";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 32));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 32));
     RadixClient c(name);
     auto h = seq(3000, 8);
 
@@ -1114,9 +1114,9 @@ static void test_client_component_insert() {
     TEST_PASS();
 }
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 
-static PeerEntry peer_entry_of(ShmRadixTree& t) {
+static PeerEntry peer_entry_of(RadixShmemTree& t) {
     auto* hdr = reinterpret_cast<const ShmHeader*>(t.shm_base());
     PeerEntry e{};
     e.shm_size               = t.shm_size();
@@ -1132,7 +1132,7 @@ struct Rig {
     RdmaRemoteWalker walker;
     RemoteTreeInfo info;
 
-    explicit Rig(ShmRadixTree& t)
+    explicit Rig(RadixShmemTree& t)
         : scratch(aligned_alloc(4096, 1 << 20)),
           walker(ep, scratch, /*lkey=*/0, 1 << 20),
           info(walker.read_remote_info(
@@ -1163,7 +1163,7 @@ static void test_remote_parity_and_abi_gate() {
 
     const char* name = "/test_cq_remote_diff";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 3, 128));
+    auto t = RadixShmemTree::create(name, cfg(4, 3, 128));
     auto h = seq(1000, 12);
     insert_fresh(t, h.data(), 12);
     for (int e : {3, 6, 9}) publish_at(t, h.data(), e, 4);
@@ -1214,7 +1214,7 @@ static void test_remote_pin_incumbent_release() {
 
     const char* name = "/test_cq_remote_pin";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 8));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 8));
     auto ha = seq(2000, 4), hb = seq(2100, 4);
     auto sa = insert_fresh(t, ha.data(), 4);
     insert_fresh(t, hb.data(), 4);
@@ -1285,7 +1285,7 @@ static void test_remote_hints_and_failstop() {
 
     const char* name = "/test_cq_remote_hint";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 1, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 1, 64));
     auto h = seq(6000, 12);
     auto d = seq(9600, 13);
     for (int k = 1; k <= 12; k++) {
@@ -1340,7 +1340,7 @@ static void test_remote_hint_chain_is_the_walk() {
 
     const char* name = "/test_cq_remote_hint_chain";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));   // cs=4: nodes [0,4) [4,8) [8,12)
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));   // cs=4: nodes [0,4) [4,8) [8,12)
     auto h = seq(7000, 16);
     insert_fresh(t, h.data(), 12);
     auto bounds = t.get_node_boundaries(h.data(), 12);
@@ -1386,7 +1386,7 @@ static void test_remote_pin_swa_terminal_past_query() {
     // on [6,10). Pins: Full on three nodes, SWA on two -> 5 FAAs + 2 lock.
     const char* name = "/test_cq_remote_swa_tail";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(17000, 16);
     insert_fresh(t, h.data(), 16);
     publish_at(t, h.data(), 10, 4);
@@ -1420,7 +1420,7 @@ static void test_remote_pin_swa_only_terminal_past_query() {
     // SWA alone over the walker: 2 lock FAAs + swa_ref_count on N1 and N2.
     const char* name = "/test_cq_remote_swa_only_tail";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(17100, 16);
     insert_fresh(t, h.data(), 16);
     publish_at(t, h.data(), 10, 4);
@@ -1452,7 +1452,7 @@ static void test_remote_multinode_cut_and_release_guards() {
 
     const char* name = "/test_cq_remote_cut2";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(14000, 8);
     insert_fresh(t, h.data(), 4);
     std::vector<uint64_t> fork(h.begin(), h.begin() + 4);
@@ -1577,7 +1577,7 @@ int main() {
     test_facade_shape_and_finalize();
     test_facade_bad_mask_and_crop_to_zero();
     test_client_component_insert();
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     test_remote_parity_and_abi_gate();
     test_remote_pin_incumbent_release();
     test_remote_pin_swa_terminal_past_query();

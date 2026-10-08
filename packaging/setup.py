@@ -1,16 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Source-free packaging for shmradix.
+"""Source-free packaging for radixshmem.
 
-Packages a PRE-COMPILED shmradix/_core*.so (built separately in manylinux) plus
+Packages a PRE-COMPILED radixshmem/_core*.so (built separately in manylinux) plus
 the thin Python wrappers into a binary wheel. Does NOT compile anything and does
 NOT include any C++ source — all algorithm IP lives inside the .so.
 
 Layout expected next to this file at build time:
-    shmradix/__init__.py
-    shmradix/server.py
-    shmradix/_core.cpython-312-x86_64-linux-gnu.so   (swapped in per variant)
+    radixshmem/__init__.py
+    radixshmem/server.py
+    radixshmem/_core.cpython-312-x86_64-linux-gnu.so   (swapped in per variant)
 
 The wheel is forced to be a platform wheel (not py3-none-any) via
 has_ext_modules, so it carries the linux/cpXXX tag that auditwheel then rewrites
@@ -20,7 +20,7 @@ import os
 from setuptools import setup
 from setuptools.dist import Distribution
 
-VARIANT = os.environ.get("SHMRADIX_WHEEL_VARIANT", "")  # "rdma" | "cpu" | ""
+VARIANT = os.environ.get("RADIXSHMEM_WHEEL_VARIANT", "")  # "rdma" | "cpu" | ""
 LOCAL = f"+{VARIANT}" if VARIANT else ""
 
 
@@ -31,7 +31,7 @@ class BinaryDistribution(Distribution):
 
 
 setup(
-    name="shmradix",
+    name="radixshmem",
     version="0.1.0" + LOCAL,
     description="Shared-memory RadixTree for KV cache prefix matching (binary)",
     license="Apache-2.0",
@@ -42,14 +42,14 @@ setup(
         "Operating System :: POSIX :: Linux",
         "Programming Language :: Python :: 3.12",
     ],
-    packages=["shmradix"],
-    package_data={"shmradix": ["*.so", "py.typed"]},
+    packages=["radixshmem"],
+    package_data={"radixshmem": ["*.so", "py.typed"]},
     include_package_data=True,
     python_requires="==3.12.*",
     install_requires=["numpy"],
     distclass=BinaryDistribution,
     entry_points={
-        "console_scripts": ["radix-server=shmradix.server:main"],
+        "console_scripts": ["radix-server=radixshmem.server:main"],
     },
     zip_safe=False,
 )

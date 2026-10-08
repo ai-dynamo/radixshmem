@@ -20,9 +20,9 @@
 //
 // Loopback-only — all processes run on the host that owns the RDMA NIC.
 
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_server.h"
-#include "shmradix/types.h"
+#include "radix_client.h"
+#include "radix_server.h"
+#include "types.h"
 
 #include "etcd_test_harness.hpp"
 #include "test_utils.h"
@@ -64,13 +64,13 @@ std::string shm_name_for(int rank) {
 std::vector<uint64_t> prefix_b() {
     std::vector<int64_t> tok(kPrefixLen);
     std::iota(tok.begin(), tok.end(), int64_t{90000});
-    return shmradix::RadixClient::compute_hashes(
+    return radixshmem::RadixClient::compute_hashes(
         tok.data(), (int)tok.size(), kBlockSize);
 }
 
-shmradix::InsertResult
-insert_auto(shmradix::RadixClient& cli, const uint64_t* h, int n) {
-    int matched = (int)cli.query(h, n, shmradix::COMPONENT_MASK_FULL, /*local_only=*/true,
+radixshmem::InsertResult
+insert_auto(radixshmem::RadixClient& cli, const uint64_t* h, int n) {
+    int matched = (int)cli.query(h, n, radixshmem::COMPONENT_MASK_FULL, /*local_only=*/true,
                                  /*lock=*/false, /*update_meta=*/false)
                       .common_hit;
     int need = n - matched;
@@ -80,10 +80,10 @@ insert_auto(shmradix::RadixClient& cli, const uint64_t* h, int n) {
                       /*start=*/matched, /*auto_recycle=*/true);
 }
 
-shmradix::RadixClientConfig client_cfg(const std::string& node,
+radixshmem::RadixClientConfig client_cfg(const std::string& node,
                                        const std::string& registry,
                                        const std::string& cluster_id) {
-    shmradix::RadixClientConfig cc;
+    radixshmem::RadixClientConfig cc;
     cc.registry   = registry;
     cc.cluster_id = cluster_id;
     cc.node_name  = node;
@@ -99,15 +99,15 @@ bool wait_shm_ready(const std::string& shm_name, int timeout_sec) {
     while (std::chrono::steady_clock::now() < deadline) {
         int fd = ::shm_open(shm_name.c_str(), O_RDONLY, 0);
         if (fd >= 0) {
-            void* p = ::mmap(nullptr, sizeof(shmradix::ShmHeader), PROT_READ,
+            void* p = ::mmap(nullptr, sizeof(radixshmem::ShmHeader), PROT_READ,
                              MAP_SHARED, fd, 0);
             ::close(fd);
             if (p != MAP_FAILED) {
-                auto* hdr = static_cast<shmradix::ShmHeader*>(p);
+                auto* hdr = static_cast<radixshmem::ShmHeader*>(p);
                 uint64_t magic =
                     hdr->cluster_ready_magic.load(std::memory_order_acquire);
-                ::munmap(p, sizeof(shmradix::ShmHeader));
-                if (magic == shmradix::CLUSTER_MANIFEST_MAGIC) return true;
+                ::munmap(p, sizeof(radixshmem::ShmHeader));
+                if (magic == radixshmem::CLUSTER_MANIFEST_MAGIC) return true;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -124,7 +124,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     ::signal(SIGTERM, on_term);
     ::signal(SIGINT,  on_term);
 
-    shmradix::RadixServerConfig cfg;
+    radixshmem::RadixServerConfig cfg;
     cfg.name        = kShmPrefix;
     cfg.shm.hugepage_path = "";
     cfg.shm.max_blocks = 4096;
@@ -139,7 +139,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
 
-    shmradix::RadixServer srv(cfg);
+    radixshmem::RadixServer srv(cfg);
     if (!srv.bootstrap()) {
         fprintf(stderr, "[server %s] bootstrap failed\n", node.c_str());
         return 10;
@@ -154,9 +154,9 @@ int run_server_process(const std::string& node, const std::string& registry,
 
 // node2 writer: insert prefix B into node2's local tree + flush the RHT write
 // (node2 is a data peer; its RHT hint lands on a holder shard 0/1).
-int run_writer2_process(const shmradix::RadixClientConfig& cc) {
+int run_writer2_process(const radixshmem::RadixClientConfig& cc) {
     try {
-        shmradix::RadixClient cli(cc);
+        radixshmem::RadixClient cli(cc);
         if (!cli.is_distributed()) {
             fprintf(stderr, "[writer2] expected distributed mode\n");
             return 11;
@@ -167,7 +167,7 @@ int run_writer2_process(const shmradix::RadixClientConfig& cc) {
         }
         auto hashes = prefix_b();
         auto ins = insert_auto(cli, hashes.data(), (int)hashes.size());
-        if (ins.error != shmradix::InsertError::OK ||
+        if (ins.error != radixshmem::InsertError::OK ||
             !ins.unused_slots.empty()) {
             fprintf(stderr, "[writer2] insert incomplete unused=%zu (err=%u)\n",
                     ins.unused_slots.size(), (unsigned)ins.error);
@@ -186,9 +186,9 @@ int run_writer2_process(const shmradix::RadixClientConfig& cc) {
 // Long-lived reader on node0: attaches while the cluster is 2 nodes, then must
 // (a) sense node2 via its /peers watcher (world_size 2→3) and (b) remote-walk
 // prefix B on node2 through the lazily-built data-peer endpoint.
-int run_joined_reader_process(const shmradix::RadixClientConfig& cc) {
+int run_joined_reader_process(const radixshmem::RadixClientConfig& cc) {
     try {
-        shmradix::RadixClient cli(cc);
+        radixshmem::RadixClient cli(cc);
         if (!cli.is_distributed()) {
             fprintf(stderr, "[joined_reader] expected distributed mode\n");
             return 21;
@@ -216,10 +216,10 @@ int run_joined_reader_process(const shmradix::RadixClientConfig& cc) {
         // (b) Remote-walk prefix B; node2's endpoint is built lazily here on
         // first query. Retry until node2's writer flush is visible.
         auto hashes = prefix_b();
-        shmradix::ComponentQueryResult qr;
+        radixshmem::ComponentQueryResult qr;
         bool hit = false;
         while (std::chrono::steady_clock::now() < deadline) {
-            qr = cli.query(hashes.data(), (int)hashes.size(), shmradix::COMPONENT_MASK_FULL);
+            qr = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL);
             if (qr.common_hit == kPrefixLen && remote_src(qr) == 2) {
                 hit = true;
                 break;
@@ -284,11 +284,11 @@ int main(int argc, char** argv) {
         return run_writer2_process(client_cfg(argv[2], argv[3], argv[4]));
     }
 
-    shmradix_test::EtcdHarness etcd;
+    radixshmem_test::EtcdHarness etcd;
     if (!etcd.usable()) {
-        fprintf(stderr, "[parent] no etcd binary (set SHMRADIX_ETCD_BIN or "
+        fprintf(stderr, "[parent] no etcd binary (set RADIXSHMEM_ETCD_BIN or "
                         "put etcd on PATH) — skipping\n");
-        return shmradix_test::kSkipExitCode;
+        return radixshmem_test::kSkipExitCode;
     }
     const std::string registry   = etcd.registry();
     const std::string cluster_id = etcd.cluster_id();

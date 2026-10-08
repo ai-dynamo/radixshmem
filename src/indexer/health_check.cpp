@@ -1,19 +1,19 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// check_health(): lock-free audit of one attached ShmRadixTree. Reads the
+// check_health(): lock-free audit of one attached RadixShmemTree. Reads the
 // pthread lock words, the rdma_rwlock, then walks root->leaves once, tallying
 // slot references and refs; finally diffs each mempool's used-bitmap against
 // the tree. Never takes a lock, never writes shm.
 
-#include "shmradix/health_check.h"
-#include "shmradix/radix_tree.h"
+#include "health_check.h"
+#include "radix_tree.h"
 
 #include <pthread.h>
 #include <cstdio>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -83,11 +83,11 @@ struct PoolAudit {
 
 } // namespace
 
-// Friend of ShmRadixTree: the only place outside radix_tree.cpp that reads the
+// Friend of RadixShmemTree: the only place outside radix_tree.cpp that reads the
 // pools directly. Declared in radix_tree.h.
 class HealthAuditor {
 public:
-    static HealthReport run(const ShmRadixTree& t) {
+    static HealthReport run(const RadixShmemTree& t) {
         HealthReport r;
         if (!t.base_) { r.flags |= HEALTH_NOT_ATTACHED; return r; }
         const ShmHeader* hdr = t.header();
@@ -141,7 +141,7 @@ public:
     }
 };
 
-HealthReport check_health(const ShmRadixTree& tree) {
+HealthReport check_health(const RadixShmemTree& tree) {
     return HealthAuditor::run(tree);
 }
 
@@ -183,4 +183,4 @@ std::string HealthReport::describe() const {
     return s;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

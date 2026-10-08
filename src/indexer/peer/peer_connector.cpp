@@ -6,11 +6,11 @@
 #include "peer_registry.hpp"
 #include "xrc_connect.hpp"
 #include "rdma_transport_client.hpp"
-#include "shmradix/cluster_protocol.h"
-#ifndef SHMRADIX_NO_RDMA
-#include "shmradix/radix_client.h"
+#include "cluster_protocol.h"
+#ifndef RADIXSHMEM_NO_RDMA
+#include "radix_client.h"
 #endif
-#ifdef SHMRADIX_REMOTE_OP_RDMA
+#ifdef RADIXSHMEM_REMOTE_OP_RDMA
 #include "dc_bilateral.hpp"
 #endif
 
@@ -21,7 +21,7 @@
 #include <cstring>
 #include <shared_mutex>
 
-namespace shmradix {
+namespace radixshmem {
 
 PeerConnector::PeerConnector(PeerRegistry& peers, RdmaTransportClient& tx,
                              const PeerConnectorConfig& cfg)
@@ -35,7 +35,7 @@ static double secs_since(std::chrono::steady_clock::time_point t0) {
 }
 
 PeerConnector::~PeerConnector() {
-#ifdef SHMRADIX_REMOTE_OP_RDMA
+#ifdef RADIXSHMEM_REMOTE_OP_RDMA
     if (rc_stack_op_mu_ && rc_stack_op_mu_.use_count() > 1) {
         fprintf(stderr,
                 "[PeerConnector] WARNING: %ld dc remote-op session(s) (or "
@@ -279,18 +279,18 @@ bool PeerConnector::dec_ref_components_remote(int remote,
 
 // ==================== Remote-op session factory ====================
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 
 static int resolve_rc_client_rank(int default_rank) {
     int client_rank = default_rank;
-    if (const char* e = ::getenv("SHMRADIX_RC_CLIENT_RANK")) {
+    if (const char* e = ::getenv("RADIXSHMEM_RC_CLIENT_RANK")) {
         char* end = nullptr;
         long v = std::strtol(e, &end, 10);
         if (end != e && *end == '\0' && v >= 0 && v <= INT_MAX)
             client_rank = (int)v;
         else
             fprintf(stderr, "[PeerConnector] ignoring invalid "
-                    "SHMRADIX_RC_CLIENT_RANK='%s'\n", e);
+                    "RADIXSHMEM_RC_CLIENT_RANK='%s'\n", e);
     }
     return client_rank;
 }
@@ -308,7 +308,7 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
                                  " is not registered (node down)");
     int client_rank = rc_client_rank_;
     if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_DC) {
-#ifdef SHMRADIX_REMOTE_OP_RDMA
+#ifdef RADIXSHMEM_REMOTE_OP_RDMA
         if (p.rc_dct_num == 0)
             throw std::runtime_error(
                 "open_remote: peer rank " + std::to_string(rank) +
@@ -358,7 +358,7 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
             "control-plane backend — redeploy rank 0 with remote_op_transport "
             "= dc (or zmq)");
     }
-#ifdef SHMRADIX_HAS_ZMQ
+#ifdef RADIXSHMEM_HAS_ZMQ
     auto rc = std::make_shared<RemotePeer>(ep);
     rc->set_peer_rank(rank);
     return rc;
@@ -396,6 +396,6 @@ std::shared_ptr<RemotePeer> PeerConnector::open_remote(int rank) {
     return rc;
 }
 
-#endif  // !SHMRADIX_NO_RDMA
+#endif  // !RADIXSHMEM_NO_RDMA
 
-} // namespace shmradix
+} // namespace radixshmem

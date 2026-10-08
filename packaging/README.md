@@ -1,15 +1,15 @@
-# shmradix binary wheels (source-free distribution)
+# radixshmem binary wheels (source-free distribution)
 
-These wheels let others use shmradix **without any C++ source**. All
-algorithm code lives inside the compiled `shmradix/_core*.so`; the wheel contains
+These wheels let others use radixshmem **without any C++ source**. All
+algorithm code lives inside the compiled `radixshmem/_core*.so`; the wheel contains
 only that `.so` plus two thin Python files (`__init__.py`, `server.py`).
 
 ## Two variants
 
 | wheel | RDMA (cross-node) | runtime system deps |
 |-------|-------------------|---------------------|
-| `shmradix-0.1.0+cpu-...manylinux_2_28...whl`  | ❌ single-node shared memory only | none (libxxhash bundled) |
-| `shmradix-0.1.0+rdma-...manylinux_2_28...whl` | ✅ RDMA one-sided reads       | `libibverbs.so.1`, `libmlx5.so.1` |
+| `radixshmem-0.1.0+cpu-...manylinux_2_28...whl`  | ❌ single-node shared memory only | none (libxxhash bundled) |
+| `radixshmem-0.1.0+rdma-...manylinux_2_28...whl` | ✅ RDMA one-sided reads       | `libibverbs.so.1`, `libmlx5.so.1` |
 
 Both are `cp312` (CPython 3.12) and `manylinux_2_28` (glibc ≥ 2.28 — works on
 Ubuntu 22.04 / most modern distros).
@@ -18,21 +18,21 @@ Ubuntu 22.04 / most modern distros).
 
 Single-node (recommended default):
 ```bash
-pip install shmradix-0.1.0+cpu-*.whl
+pip install radixshmem-0.1.0+cpu-*.whl
 ```
 
 RDMA (needs the RDMA user-space libs on the host):
 ```bash
 # Debian/Ubuntu:  apt-get install libibverbs1 libmlx5-1
 # RHEL/CentOS:    dnf install libibverbs libmlx5
-pip install shmradix-0.1.0+rdma-*.whl
+pip install radixshmem-0.1.0+rdma-*.whl
 ```
 
 ## Constraints
 
 - **Python 3.12 only** (wheel is `cp312`). For another Python version, rebuild.
 - **glibc ≥ 2.28**.
-- RDMA variant requires the host RDMA libs above; otherwise `import shmradix`
+- RDMA variant requires the host RDMA libs above; otherwise `import radixshmem`
   fails with `libibverbs.so.1: cannot open shared object file`.
 
 ## Rebuilding (maintainers only — needs the source)

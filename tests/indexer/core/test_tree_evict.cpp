@@ -4,12 +4,12 @@
 // test_tree_evict — capacity management & strict LRU.
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
 #include <cassert>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // ==================================================================
 static void test_ref_count_protects_from_eviction() {

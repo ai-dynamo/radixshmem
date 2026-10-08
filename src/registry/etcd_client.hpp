@@ -7,12 +7,12 @@
 
 #pragma once
 
-#include "shmradix/config.h"
+#include "radixshmem_config.h"
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
 
-#include "shmradix/cluster_manifest.h"
-#include "shmradix/cluster_protocol.h"
+#include "cluster_manifest.h"
+#include "cluster_protocol.h"
 
 #include "libradix_etcd.h"
 
@@ -28,7 +28,7 @@
 #include <thread>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 namespace etcd {
 
 // ==================== base64 ====================
@@ -391,6 +391,6 @@ private:
 };
 
 } // namespace etcd
-} // namespace shmradix
+} // namespace radixshmem
 
-#endif // SHMRADIX_HAS_ETCD
+#endif // RADIXSHMEM_HAS_ETCD

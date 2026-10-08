@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_server.h"
-#include "shmradix/cluster_protocol.h"
-#include "shmradix/types.h"
+#include "radix_client.h"
+#include "radix_server.h"
+#include "cluster_protocol.h"
+#include "types.h"
 
 #include <chrono>
 #include <csignal>
@@ -19,14 +19,14 @@
 #include <unistd.h>
 #include <vector>
 
-#ifdef SHMRADIX_NO_RDMA
+#ifdef RADIXSHMEM_NO_RDMA
 int main() {
     fprintf(stderr, "remote_op_smoke: built without RDMA (no remote-op) — skipped\n");
     return 0;
 }
 #else
 
-using namespace shmradix;
+using namespace radixshmem;
 
 namespace {
 
@@ -239,4 +239,4 @@ int main(int argc, char** argv) {
     return worst;
 }
 
-#endif  // SHMRADIX_NO_RDMA
+#endif  // RADIXSHMEM_NO_RDMA

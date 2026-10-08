@@ -3,11 +3,11 @@
 
 #pragma once
 
-#include "shmradix/types.h"
+#include "types.h"
 #include <atomic>
 #include <cstdint>
 
-namespace shmradix {
+namespace radixshmem {
 
 class NodePool {
 public:
@@ -42,4 +42,4 @@ private:
     NodeComponentState* cst_ = nullptr;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

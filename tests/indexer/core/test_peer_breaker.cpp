@@ -8,14 +8,14 @@
 
 #include "test_utils.h"
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 #include "peer_breaker.hpp"
 
 #include <cassert>
 #include <chrono>
 #include <thread>
 
-using namespace shmradix;
+using namespace radixshmem;
 using Gate = PeerBreaker::Gate;
 
 static void sleep_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
@@ -103,7 +103,7 @@ int main() {
     return tests_report();
 }
 
-#else // SHMRADIX_NO_RDMA
+#else // RADIXSHMEM_NO_RDMA
 
 int main() {
     printf("=== test_peer_breaker ===\n\n  (skipped: built without RDMA)\n");

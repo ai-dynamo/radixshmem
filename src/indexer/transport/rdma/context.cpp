@@ -9,13 +9,13 @@
 #include <infiniband/verbs.h>
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 RdmaContext::RdmaContext(const char* dev_name, int port, int gid_idx)
     : port_(port), gid_idx_(gid_idx) {
     // QoS defaults from env; set_qos() may override before QPs connect.
-    if (const char* s = ::getenv("SHMRADIX_RDMA_SL")) sl_ = atoi(s);
-    if (const char* t = ::getenv("SHMRADIX_RDMA_TC")) tc_ = atoi(t);
+    if (const char* s = ::getenv("RADIXSHMEM_RDMA_SL")) sl_ = atoi(s);
+    if (const char* t = ::getenv("RADIXSHMEM_RDMA_TC")) tc_ = atoi(t);
 
     int num_devices = 0;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
@@ -78,7 +78,7 @@ RdmaMemoryRegion::RdmaMemoryRegion(ibv_pd* pd, void* addr, size_t len,
     if (!mr_)
         throw std::runtime_error("ibv_reg_mr failed: len=" +
                                  std::to_string(len / (1024 * 1024)) + "MB");
-    fprintf(stderr, "[shmradix] MR registered: %p len=%.1f MB rkey=%u\n",
+    fprintf(stderr, "[radixshmem] MR registered: %p len=%.1f MB rkey=%u\n",
             addr, len / (1024.0 * 1024.0), mr_->rkey);
 }
 
@@ -109,4 +109,4 @@ RdmaMrInfo RdmaMemoryRegion::info() const {
     return {mr_->rkey, (uint64_t)mr_->addr, mr_->length};
 }
 
-} // namespace shmradix
+} // namespace radixshmem

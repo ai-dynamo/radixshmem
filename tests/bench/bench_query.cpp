@@ -16,14 +16,14 @@
 
 #include "bench_util.h"
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
 #include <cassert>
 #include <cstdio>
 #include <string>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 using bench::HashGen;
 using bench::LatencyCollector;
 using bench::WorkloadConfig;

@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/slot_transfer.h"
+#include "slot_transfer.h"
 
 #include <cstdio>
 #include <mutex>
 #include <string>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 SlotTransfer::SlotTransfer(SlotStore& store, ITransferBackend& backend)
     : store_(store), backend_(backend) {}
@@ -103,7 +103,7 @@ int SlotTransfer::attach_peer(const std::string& peer_name, const StoreGeometry*
     if (it != peers_.end()) {
         // The cache never outvotes the registry.
         if (published != nullptr && !published->same_strides(it->second.geo)) {
-            fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' was attached with a "
+            fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' was attached with a "
                             "different pool layout than the one now published\n",
                     peer_name.c_str());
             return XFER_EGEOMETRY;
@@ -118,7 +118,7 @@ int SlotTransfer::attach_peer(const std::string& peer_name, const StoreGeometry*
         StoreGeometry unused;
         std::string why;
         resolve_peer(published, none, unused, why);
-        fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' %s\n", peer_name.c_str(), why.c_str());
+        fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' %s\n", peer_name.c_str(), why.c_str());
         return XFER_EGEOMETRY;
     }
 
@@ -129,7 +129,7 @@ int SlotTransfer::attach_peer(const std::string& peer_name, const StoreGeometry*
     Peer p;
     std::string why;
     if (!resolve_peer(published, info, p.geo, why)) {
-        fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' %s\n", peer_name.c_str(), why.c_str());
+        fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' %s\n", peer_name.c_str(), why.c_str());
         backend_.close_segment(info.id);
         return XFER_EGEOMETRY;
     }
@@ -144,14 +144,14 @@ int SlotTransfer::attach_peer(const std::string& peer_name, uint64_t peer_slot_b
     if (!store_.valid()) return XFER_EINVAL;
     if (peer_slot_bytes == 0) return XFER_EINVAL;
     if (store_.pool_mask() != COMPONENT_MASK_FULL) {
-        fprintf(stderr, "[shmradix] SlotTransfer: attach_peer(stride) is for FULL-only "
+        fprintf(stderr, "[radixshmem] SlotTransfer: attach_peer(stride) is for FULL-only "
                         "stores; this one has more pools — pass the peer's published "
                         "StoreGeometry\n");
         return XFER_EINVAL;
     }
     const uint64_t sb = store_.slot_bytes();
     if (peer_slot_bytes != PEER_SLOT_BYTES_UNCHECKED && peer_slot_bytes != sb) {
-        fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' has a %lu-byte slot "
+        fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' has a %lu-byte slot "
                         "stride, we have %lu — slot ids would not mean the same "
                         "bytes on both sides\n",
                 peer_name.c_str(), (unsigned long)peer_slot_bytes, (unsigned long)sb);
@@ -169,7 +169,7 @@ int SlotTransfer::detach_peer(const std::string& peer_name) {
     auto it = peers_.find(peer_name);
     if (it == peers_.end()) return XFER_OK;   // idempotent
     if (it->second.inflight > 0) {
-        fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' has %d batch(es) in "
+        fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' has %d batch(es) in "
                         "flight; wait() and release() them before detaching\n",
                 peer_name.c_str(), it->second.inflight);
         return XFER_EBUSY;
@@ -219,7 +219,7 @@ BatchHandle SlotTransfer::submit_batch(XferOp op, const std::string& peer, Compo
     if (n <= 0 || local_slots == nullptr || remote_slots == nullptr) return INVALID_BATCH;
     if (!component_type_valid(c)) return INVALID_BATCH;
     if (!store_.has_pool(c)) {
-        fprintf(stderr, "[shmradix] SlotTransfer: this store has no %s pool\n",
+        fprintf(stderr, "[radixshmem] SlotTransfer: this store has no %s pool\n",
                 component_type_name(c));
         return INVALID_BATCH;
     }
@@ -230,13 +230,13 @@ BatchHandle SlotTransfer::submit_batch(XferOp op, const std::string& peer, Compo
         std::lock_guard<std::mutex> lk(mu_);
         auto it = peers_.find(peer);
         if (it == peers_.end()) {
-            fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' is not attached\n", peer.c_str());
+            fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' is not attached\n", peer.c_str());
             return INVALID_BATCH;
         }
         p = it->second;
     }
     if (!p.geo.has(c)) {
-        fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' has no %s pool\n",
+        fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' has no %s pool\n",
                 peer.c_str(), component_type_name(c));
         return INVALID_BATCH;
     }
@@ -247,13 +247,13 @@ BatchHandle SlotTransfer::submit_batch(XferOp op, const std::string& peer, Compo
     // All-or-nothing: validate everything before building anything.
     for (int i = 0; i < n; ++i) {
         if (local_slots[i] < 0 || (uint64_t)local_slots[i] >= local_n) {
-            fprintf(stderr, "[shmradix] SlotTransfer: local %s slot %d out of range "
+            fprintf(stderr, "[radixshmem] SlotTransfer: local %s slot %d out of range "
                             "[0,%lu)\n", component_type_name(c), local_slots[i],
                     (unsigned long)local_n);
             return INVALID_BATCH;
         }
         if (remote_slots[i] < 0 || (uint64_t)remote_slots[i] >= rp.num_slots) {
-            fprintf(stderr, "[shmradix] SlotTransfer: remote %s slot %d out of range "
+            fprintf(stderr, "[radixshmem] SlotTransfer: remote %s slot %d out of range "
                             "[0,%lu) on peer '%s'\n", component_type_name(c),
                     remote_slots[i], (unsigned long)rp.num_slots, peer.c_str());
             return INVALID_BATCH;
@@ -288,7 +288,7 @@ BatchHandle SlotTransfer::submit_batch(XferOp op, const std::string& peer, Compo
         std::lock_guard<std::mutex> lk(mu_);
         auto it = peers_.find(peer);
         if (it == peers_.end() || it->second.id != p.id) {
-            fprintf(stderr, "[shmradix] SlotTransfer: peer '%s' was detached while "
+            fprintf(stderr, "[radixshmem] SlotTransfer: peer '%s' was detached while "
                             "the batch was being built\n", peer.c_str());
             return INVALID_BATCH;
         }
@@ -328,4 +328,4 @@ int SlotTransfer::release(BatchHandle h) {
     return rc;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

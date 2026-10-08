@@ -5,7 +5,7 @@
 
 #include <cassert>
 
-namespace shmradix {
+namespace radixshmem {
 
 ChildTable::ChildTable(uint32_t* buckets, ChainHTEntry* entries,
                uint32_t bucket_count, uint32_t entry_capacity,
@@ -146,4 +146,4 @@ void ChildTable::collect_children(const TreeNode* parent,
     }
 }
 
-} // namespace shmradix
+} // namespace radixshmem

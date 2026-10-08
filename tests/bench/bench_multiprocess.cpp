@@ -15,9 +15,9 @@
 #include <vector>
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
-using namespace shmradix;
+using namespace radixshmem;
 using Clock = std::chrono::high_resolution_clock;
 
 

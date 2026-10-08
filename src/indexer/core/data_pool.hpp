@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "shmradix/types.h"
+#include "types.h"
 #include <cstdint>
 
-namespace shmradix {
+namespace radixshmem {
 
 class DataPool {
 public:
@@ -58,4 +58,4 @@ private:
     bool swa_lane_ = false;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

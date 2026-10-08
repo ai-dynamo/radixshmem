@@ -6,7 +6,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 DataPool::DataPool(void* shm_base, BuddyHeader* header, bool swa_lane)
     : base_(shm_base), header_(header), swa_lane_(swa_lane) {}
@@ -236,4 +236,4 @@ float DataPool::utilization() const {
     return (float)used / (float)header_->blocks_size;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

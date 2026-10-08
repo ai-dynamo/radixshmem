@@ -27,9 +27,9 @@
 #include <vector>
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
-using namespace shmradix;
+using namespace radixshmem;
 using Clock = std::chrono::high_resolution_clock;
 
 // ======================================================================
@@ -338,7 +338,7 @@ static void client_thread_fn(int thread_id, int node_id,
         int full_num_tokens = (int)full_tokens.size();
         int full_num_hashes = full_num_tokens / cfg.block_size;
 
-        shmradix::InsertResult ins_result;
+        radixshmem::InsertResult ins_result;
         if (full_num_hashes > 0) {
             auto full_hashes = RadixClient::compute_hashes(
                 full_tokens.data(), full_num_tokens, cfg.block_size);
@@ -364,7 +364,7 @@ static void client_thread_fn(int thread_id, int node_id,
         if (query_us > metrics.max_query_us) metrics.max_query_us = query_us;
         metrics.inserts++;
         metrics.requests_done++;
-        if (ins_result.error != shmradix::InsertError::OK)
+        if (ins_result.error != radixshmem::InsertError::OK)
             metrics.insert_errors++;
 
         metrics.latency_buf[metrics.active_buf.load(std::memory_order_relaxed)]
@@ -662,7 +662,7 @@ int main(int argc, char** argv) {
     printf("Starting %d tree server(s)...\n", cfg.num_nodes);
     fflush(stdout);
 
-    shmradix::ShmConfig shm_cfg;
+    radixshmem::ShmConfig shm_cfg;
     shm_cfg.max_nodes = cfg.max_nodes_shm;
     shm_cfg.max_blocks = cfg.max_blocks_shm;
 

@@ -16,16 +16,16 @@
 // against that peer is still unreleased.
 
 #include "data_test_utils.h"
-#include "shmradix/slot_store.h"
-#include "shmradix/slot_transfer.h"
-#include "shmradix/transfer.h"
+#include "slot_store.h"
+#include "slot_transfer.h"
+#include "transfer.h"
 
 #include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 static constexpr uint64_t kSlots     = 64;
 static constexpr uint64_t kSlotBytes = 65536;

@@ -17,7 +17,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace shmradix {
+namespace radixshmem {
 
 struct DciQp {
     ibv_qp*        qp   = nullptr;
@@ -644,4 +644,4 @@ DcRecvCompletion DcTarget::poll(int timeout_ms, uint32_t want_dctn) {
     }
 }
 
-} // namespace shmradix
+} // namespace radixshmem

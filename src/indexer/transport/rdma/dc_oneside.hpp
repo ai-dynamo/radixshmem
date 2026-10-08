@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 // One received message pulled off a DcTarget CQ by poll(); dctn = receiving DCT (demux key).
 struct DcRecvCompletion {
@@ -204,4 +204,4 @@ private:
     std::vector<PoolBuf> pool_;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

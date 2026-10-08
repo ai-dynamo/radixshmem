@@ -23,8 +23,8 @@
 // plain host.
 
 #include "data_test_utils.h"
-#include "shmradix/slot_store.h"
-#include "shmradix/transfer.h"
+#include "slot_store.h"
+#include "transfer.h"
 
 #include <algorithm>
 #include <cstring>
@@ -34,7 +34,7 @@
 #include <dirent.h>
 #include <unistd.h>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // The HCAs this host exposes to ibverbs, in sysfs order. Reading sysfs rather
 // than calling ibv_get_device_list keeps the test off libibverbs directly --

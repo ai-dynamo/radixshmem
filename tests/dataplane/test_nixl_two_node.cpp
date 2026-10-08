@@ -17,7 +17,7 @@
 // registers its own (zeroed) buffer, opens the server's segment, issues a
 // READ pulling the pattern across, and verifies every byte.
 
-#include "shmradix/transfer.h"
+#include "transfer.h"
 
 #include <chrono>
 #include <cstdio>
@@ -28,7 +28,7 @@
 
 #include <unistd.h>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 namespace {
 

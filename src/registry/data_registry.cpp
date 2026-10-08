@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/data_registry.h"
+#include "data_registry.h"
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
 
 #include "etcd_client.hpp"
 
@@ -11,7 +11,7 @@
 #include <cstdio>
 #include <cstring>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -127,7 +127,7 @@ bool DataPlaneRegistry::lookup(const std::string& node, DataPlaneEntry& out,
         return false;
     }
     if (!decode_entry(val, out)) {
-        fprintf(stderr, "[shmradix] DataPlaneRegistry: node '%s' published a blob "
+        fprintf(stderr, "[radixshmem] DataPlaneRegistry: node '%s' published a blob "
                         "this build cannot decode (wrong version, or malformed "
                         "— e.g. an unterminated segment name)\n", node.c_str());
         return false;
@@ -192,6 +192,6 @@ bool DataPlaneRegistry::validate_uniform(const DataPlaneEntry& local,
     return true;
 }
 
-} // namespace shmradix
+} // namespace radixshmem
 
-#endif // SHMRADIX_HAS_ETCD
+#endif // RADIXSHMEM_HAS_ETCD

@@ -5,12 +5,12 @@
 // (ref_count survives splits caused by later inserts).
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
 #include <cassert>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // ==================================================================
 static void test_inc_dec_ref_path() {

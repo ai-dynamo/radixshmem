@@ -3,11 +3,11 @@
 
 #include "etcd_registry.hpp"
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
 
-#include "shmradix/radix_server.h"
-#include "shmradix/cluster_manifest.h"
-#include "shmradix/cluster_protocol.h"
+#include "radix_server.h"
+#include "cluster_manifest.h"
+#include "cluster_protocol.h"
 
 #include "etcd_client.hpp"
 #include "xrc_connect.hpp"
@@ -24,7 +24,7 @@
 
 #include <unistd.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -439,6 +439,6 @@ bool EtcdRegistry::join_existing(std::vector<PeerEntry>& out) {
     return true;
 }
 
-} // namespace shmradix
+} // namespace radixshmem
 
-#endif // SHMRADIX_HAS_ETCD
+#endif // RADIXSHMEM_HAS_ETCD

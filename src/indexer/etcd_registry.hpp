@@ -6,21 +6,21 @@
 // leader assigns dense ranks by sorted /peers order, resolves the shard map from
 // the observed node count, and every node publishes its final PeerEntry + shm name.
 //
-// Guarded on SHMRADIX_HAS_ETCD: when etcd is not built in, this TU is empty and
+// Guarded on RADIXSHMEM_HAS_ETCD: when etcd is not built in, this TU is empty and
 // there is no cluster bootstrap (CMake FATAL_ERRORs before that in RDMA builds).
 
 #pragma once
 
-#include "shmradix/config.h"
+#include "radixshmem_config.h"
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
 
-#include "shmradix/cluster_registry.h"
+#include "cluster_registry.h"
 
 #include <memory>
 #include <string>
 
-namespace shmradix {
+namespace radixshmem {
 
 class RadixServer;
 struct ShardMapMsg;
@@ -80,6 +80,6 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace shmradix
+} // namespace radixshmem
 
-#endif // SHMRADIX_HAS_ETCD
+#endif // RADIXSHMEM_HAS_ETCD

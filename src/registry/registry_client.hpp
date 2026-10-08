@@ -7,12 +7,12 @@
 
 #pragma once
 
-#include "shmradix/config.h"
+#include "radixshmem_config.h"
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
 
-#include "shmradix/cluster_manifest.h"
-#include "shmradix/cluster_protocol.h"
+#include "cluster_manifest.h"
+#include "cluster_protocol.h"
 
 #include "etcd_client.hpp"
 
@@ -23,7 +23,7 @@
 #include <unordered_map>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 struct RegistryClientConfig {
     std::string registry;
@@ -179,6 +179,6 @@ private:
     std::unordered_map<std::string, int> rank_of_node_;   // watcher thread after start_watch
 };
 
-} // namespace shmradix
+} // namespace radixshmem
 
-#endif // SHMRADIX_HAS_ETCD
+#endif // RADIXSHMEM_HAS_ETCD

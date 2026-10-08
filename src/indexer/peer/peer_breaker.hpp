@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "shmradix/types.h"
+#include "types.h"
 
 #include <atomic>
 #include <chrono>
@@ -17,7 +17,7 @@
 #include <string>
 #include <unordered_map>
 
-namespace shmradix {
+namespace radixshmem {
 
 class PeerBreaker {
 public:
@@ -68,4 +68,4 @@ private:
     std::unordered_map<int, Peer> peers_;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

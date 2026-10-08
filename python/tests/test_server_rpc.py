@@ -11,13 +11,13 @@ import uuid
 import numpy as np
 import pytest
 
-import shmradix
-from shmradix import Geometry, RadixClient, RadixServer, ServerConfig
+import radixshmem
+from radixshmem import Geometry, RadixClient, RadixServer, ServerConfig
 
-pytestmark = pytest.mark.skipif(not hasattr(shmradix, "_data"), reason="shmradix._data not built")
+pytestmark = pytest.mark.skipif(not hasattr(radixshmem, "_data"), reason="radixshmem._data not built")
 
-OK = shmradix.InsertError.OK
-FULL, SWA = shmradix.ComponentType.FULL, shmradix.ComponentType.SWA
+OK = radixshmem.InsertError.OK
+FULL, SWA = radixshmem.ComponentType.FULL, radixshmem.ComponentType.SWA
 
 
 @pytest.fixture
@@ -62,7 +62,7 @@ def up(c, geo, timeout=30):
 
 
 def hashes(n, base=0):
-    return shmradix.compute_hashes(np.arange(base, base + 4 * n, dtype=np.int64), 4)
+    return radixshmem.compute_hashes(np.arange(base, base + 4 * n, dtype=np.int64), 4)
 
 
 def test_client_configures_a_waiting_server_and_attaches_when_ready(cfg):
@@ -74,10 +74,10 @@ def test_client_configures_a_waiting_server_and_attaches_when_ready(cfg):
         a = client(c)
         assert a.info.mode == "waiting" and a.info.data_plane and a.geometry is None
         assert a.info.last_error == "" and a.info.data_bytes == 4 << 20
-        with pytest.raises(shmradix.ServerNotReady) as ei:
+        with pytest.raises(radixshmem.ServerNotReady) as ei:
             a.query(hashes(1))
         assert ei.value.mode == "waiting"
-        with pytest.raises(shmradix.ServerNotReady):
+        with pytest.raises(radixshmem.ServerNotReady):
             a.store
         with pytest.raises(TimeoutError, match="waiting"):
             a.wait_ready(0.2)
@@ -95,7 +95,7 @@ def test_client_configures_a_waiting_server_and_attaches_when_ready(cfg):
         assert d.info.mode == "ready"
         d.close()
         assert b.configure(geo).mode == "ready"
-        with pytest.raises(shmradix.GeometryMismatch, match="block_size"):
+        with pytest.raises(radixshmem.GeometryMismatch, match="block_size"):
             client(c, geometry(block_size=8, swa_slot_bytes=1024, swa_window_blocks=2))
         with pytest.raises(ValueError, match="num_slots"):
             client(c, geometry(full_slots=10))
@@ -142,15 +142,15 @@ def test_index_only_takes_the_counts_from_the_client(cfg):
         h = hashes(2)
         assert cl.insert(h, cl.allocate_slots(2)).error == OK
         assert cl.query(h).common_hit == 2
-        with pytest.raises(shmradix.DataPlaneUnavailable):
+        with pytest.raises(radixshmem.DataPlaneUnavailable):
             cl.pull_async(h)
-        with pytest.raises(shmradix.DataPlaneUnavailable):
+        with pytest.raises(radixshmem.DataPlaneUnavailable):
             cl.slot_view(0)
-        with pytest.raises(shmradix.DataPlaneUnavailable):
+        with pytest.raises(radixshmem.DataPlaneUnavailable):
             srv.submit([(1, 0, [0], [0])], 100)
         with pytest.raises(ValueError, match="index-only"):
             client(c, geometry())                                    # no counts
-        with pytest.raises(shmradix.GeometryMismatch, match="num_slots"):
+        with pytest.raises(radixshmem.GeometryMismatch, match="num_slots"):
             cl.configure(geometry(full_slots=32))
         cl.close()
     finally:
@@ -172,7 +172,7 @@ def test_failed_configuration_returns_to_waiting_with_the_error(cfg):
             cl.wait_ready(30)
         info = cl.status()
         assert info.mode == "waiting" and "no memory for you" in info.last_error and info.geometry is None
-        with pytest.raises(shmradix.ServerNotReady, match="no memory for you"):
+        with pytest.raises(radixshmem.ServerNotReady, match="no memory for you"):
             cl.query(hashes(1))
         assert not os.path.exists(f"/dev/shm{c.name}_data")
         del srv._bring_up                                   # the next configure starts over
@@ -186,7 +186,7 @@ def test_failed_configuration_returns_to_waiting_with_the_error(cfg):
 
 
 def test_cli_builds_the_server_config():
-    from shmradix import cli
+    from radixshmem import cli
 
     c = cli.build_config(cli.parse_args([
         "--name", "/x", "--data-bytes", "64M", "--swa-ratio", "0.25", "--transfer-dev", "mlx5_0,mlx5_1",
@@ -226,7 +226,7 @@ def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):
         assert ro.check_health() == 0
         ro.close()
 
-        core = shmradix._core.RadixClient(c.name, local_read_only=True)     # index-only callers
+        core = radixshmem._core.RadixClient(c.name, local_read_only=True)     # index-only callers
         assert not core.is_distributed()
         assert core.query(h, update_meta=False).common_hit == 3
         with pytest.raises(RuntimeError):
@@ -282,7 +282,7 @@ class _Transport:
 
     def submit(self, items, timeout_ms):
         if self.busy:
-            raise shmradix.ServerBusy("full")
+            raise radixshmem.ServerBusy("full")
         self.n += 1
         self.items[self.n] = items
         self.submitted.append(items)
@@ -456,7 +456,7 @@ class _Xfer:
 
 
 def test_server_jobs_complete_timeout_busy_and_expire(cfg):
-    from shmradix import _data
+    from radixshmem import _data
 
     c = cfg(**data(data_bytes=1 << 20, max_inflight=2, max_pending_jobs=3, job_ttl_s=0.2))
     srv = up(c, geometry())
@@ -487,7 +487,7 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
         x.reject = False
 
         ts = [srv.submit([item], 5000) for _ in range(3)]
-        with pytest.raises(shmradix.ServerBusy):
+        with pytest.raises(radixshmem.ServerBusy):
             srv.submit([item], 5000)
         assert srv.wait_any([999], 10) == {"done": {}, "unknown": [999]}
         time.sleep(1.5)

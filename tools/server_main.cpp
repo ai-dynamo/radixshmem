@@ -18,8 +18,8 @@
 #include <exception>
 #include <thread>
 
-#include "shmradix/radix_server.h"
-#include "shmradix/radix_tree.h"
+#include "radix_server.h"
+#include "radix_tree.h"
 
 static volatile sig_atomic_t g_running = 1;
 
@@ -28,7 +28,7 @@ static void signal_handler(int) { g_running = 0; }
 static void print_usage(const char* prog) {
     printf("Usage: %s [options]\n", prog);
     printf("\nTree options:\n");
-    printf("  --name <string>          Shared memory name (default: /shmradix)\n");
+    printf("  --name <string>          Shared memory name (default: /radixshmem)\n");
     printf("  --max-blocks <int>       Mempool capacity in blocks (default: 0 = disabled)\n");
     printf("  --block-size <int>       Tokens per block (default: 1)\n");
     printf("  --max-nodes <int>        NodePool capacity (default: auto = max_blocks*min(block_size/128,1))\n");
@@ -59,7 +59,7 @@ static void print_usage(const char* prog) {
 }
 
 int main(int argc, char** argv) {
-    shmradix::RadixServerConfig cfg;
+    radixshmem::RadixServerConfig cfg;
     const char* evict_policy_str = "lru";
     int interval = 5;
 
@@ -116,7 +116,7 @@ int main(int argc, char** argv) {
     }
 
     if (strcmp(evict_policy_str, "lru") == 0)
-        cfg.shm.evict_policy = shmradix::EvictPolicy::LRU;
+        cfg.shm.evict_policy = radixshmem::EvictPolicy::LRU;
     else {
         fprintf(stderr, "Unknown evict policy: %s (supported: lru)\n",
                 evict_policy_str);
@@ -157,7 +157,7 @@ int main(int argc, char** argv) {
                cfg.shm.max_nodes == 0 ? " (auto)" : "");
         printf("  Register chunk: %d tokens (%d blocks)\n", cfg.register_chunk_tokens,
                cfg.shm.effective_register_chunk_size());
-        auto layout = shmradix::ShmRadixTree::compute_layout(cfg.shm);
+        auto layout = radixshmem::RadixShmemTree::compute_layout(cfg.shm);
         auto [dp_v, dp_u] = fmt_size(layout.data_pool_size);
         printf("  Data pool:      %.2f %s\n", dp_v, dp_u);
         printf("  BG evict ratio: %.2f%s\n", cfg.shm.background_evict_ratio,
@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
         printf("  Stats interval: %d s\n\n", interval);
     }
 
-    shmradix::RadixServer srv(cfg);
+    radixshmem::RadixServer srv(cfg);
     try {
         if (!srv.bootstrap()) {
             fprintf(stderr, "RadixServer bootstrap failed\n");

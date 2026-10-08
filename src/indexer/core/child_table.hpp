@@ -3,11 +3,11 @@
 
 #pragma once
 
-#include "shmradix/types.h"
+#include "types.h"
 #include <cstdint>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 class ChildTable {
 public:
@@ -47,4 +47,4 @@ private:
     uint32_t* free_head_ = nullptr;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

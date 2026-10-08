@@ -28,7 +28,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-using shmradix::XrcSendQpSharedState;
+using radixshmem::XrcSendQpSharedState;
 
 constexpr const char* SHM_NAME = "/test_xrc_shared_state";
 constexpr int  N_PROCS = 8;

@@ -7,7 +7,7 @@
 #include <cstdio>
 #include <iterator>
 
-namespace shmradix {
+namespace radixshmem {
 
 PeerBreaker::PeerBreaker(std::string who, PeerFaultCounters* shared,
                          int backoff_ms, int max_backoff_ms)
@@ -133,4 +133,4 @@ std::string PeerBreaker::summary(const uint64_t (&n)[kOps]) {
     return s.empty() ? "nothing" : s;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

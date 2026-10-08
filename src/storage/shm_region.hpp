@@ -3,7 +3,7 @@
 
 // ShmRegion — a named shared-memory mapping: hugepage file first (a file under
 // hugepage_path), falling back to POSIX shm_open. The owner creates and unlinks;
-// attachers only map. Same strategy the indexer's ShmRadixTree uses, kept as a
+// attachers only map. Same strategy the indexer's RadixShmemTree uses, kept as a
 // standalone unit here so the data plane never pulls in an indexer header.
 
 #pragma once
@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <string>
 
-namespace shmradix {
+namespace radixshmem {
 
 inline constexpr uint64_t SHM_REGION_HUGEPAGE_BYTES = 2ULL * 1024 * 1024;
 
@@ -71,4 +71,4 @@ private:
     std::string path_;   // hugepage file path, empty when backed by shm_open
 };
 
-} // namespace shmradix
+} // namespace radixshmem

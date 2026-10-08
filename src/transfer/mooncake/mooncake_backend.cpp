@@ -34,7 +34,7 @@
 #include <sched.h>
 #include <unistd.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -115,7 +115,7 @@ MooncakeBackend::~MooncakeBackend() {
     for (const auto& kv : batches_) {
         if (kv.second.is_local) continue;
         if (!engine_->freeBatchID(kv.second.id).ok()) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: batch %lu still in flight at "
+            fprintf(stderr, "[radixshmem] MooncakeBackend: batch %lu still in flight at "
                             "teardown; leaking its descriptor\n",
                     (unsigned long)kv.first);
         }
@@ -149,7 +149,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
         want = cfg.ip_or_host + ":" + std::to_string(cfg.rpc_port);
     }
     if (engine_->init(cfg.metadata, want, cfg.ip_or_host, cfg.rpc_port) != 0) {
-        fprintf(stderr, "[shmradix] MooncakeBackend: engine init failed "
+        fprintf(stderr, "[radixshmem] MooncakeBackend: engine init failed "
                         "(metadata='%s', name='%s')\n",
                 cfg.metadata.c_str(), want.c_str());
         engine_.reset();
@@ -158,7 +158,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
 
     if (!auto_discover) {
         if (engine_->installTransport(cfg.protocol, nullptr) == nullptr) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: installTransport('%s') failed\n",
+            fprintf(stderr, "[radixshmem] MooncakeBackend: installTransport('%s') failed\n",
                     cfg.protocol.c_str());
             engine_.reset();
             return false;
@@ -167,7 +167,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
 
     local_segment_ = engine_->getLocalIpAndPort();
     if (local_segment_.empty() || local_segment_[0] == ':') {
-        fprintf(stderr, "[shmradix] MooncakeBackend: engine bound an unusable segment "
+        fprintf(stderr, "[radixshmem] MooncakeBackend: engine bound an unusable segment "
                         "name '%s' (no host) — set TransferConfig::ip_or_host\n",
                 local_segment_.c_str());
         engine_.reset();
@@ -178,7 +178,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
     const std::string want_host = want.substr(0, want.rfind(':'));
     const std::string got_host  = local_segment_.substr(0, local_segment_.rfind(':'));
     if (!want_host.empty() && want_host != got_host) {
-        fprintf(stderr, "[shmradix] MooncakeBackend: requested host '%s' but bound "
+        fprintf(stderr, "[radixshmem] MooncakeBackend: requested host '%s' but bound "
                         "'%s'; peers must use the latter\n",
                 want_host.c_str(), local_segment_.c_str());
     }
@@ -201,7 +201,7 @@ int MooncakeBackend::register_memory(void* addr, uint64_t len, const std::string
     // process already publishes (plan D3).
     const std::string loc = location.empty() ? mooncake::kWildcardLocation : location;
     if (engine_->registerLocalMemory(addr, len, loc, publish_, publish_) != 0) {
-        fprintf(stderr, "[shmradix] MooncakeBackend: registerLocalMemory(%p, %lu) failed\n",
+        fprintf(stderr, "[radixshmem] MooncakeBackend: registerLocalMemory(%p, %lu) failed\n",
                 addr, (unsigned long)len);
         return XFER_EBACKEND;
     }
@@ -257,7 +257,7 @@ int MooncakeBackend::open_segment(const std::string& seg_name, SegmentInfo& out)
         std::lock_guard<std::mutex> lk(mu_);
         AddrRange r{};
         if (!own_region(r)) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: own segment is not one "
+            fprintf(stderr, "[radixshmem] MooncakeBackend: own segment is not one "
                             "contiguous registered region\n");
             return XFER_EGEOMETRY;
         }
@@ -267,13 +267,13 @@ int MooncakeBackend::open_segment(const std::string& seg_name, SegmentInfo& out)
     } else {
         const mooncake::SegmentHandle h = engine_->openSegment(seg_name);
         if (static_cast<int64_t>(h) < 0) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: openSegment('%s') failed\n",
+            fprintf(stderr, "[radixshmem] MooncakeBackend: openSegment('%s') failed\n",
                     seg_name.c_str());
             return XFER_ENOENT;
         }
         auto desc = engine_->getMetadata()->getSegmentDescByID(h);
         if (!desc) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: no descriptor for segment '%s'\n",
+            fprintf(stderr, "[radixshmem] MooncakeBackend: no descriptor for segment '%s'\n",
                     seg_name.c_str());
             engine_->closeSegment(h);
             return XFER_ENOENT;
@@ -285,13 +285,13 @@ int MooncakeBackend::open_segment(const std::string& seg_name, SegmentInfo& out)
         std::vector<AddrRange> merged = merge_contiguous(std::move(raw));
 
         if (merged.empty()) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: segment '%s' publishes no buffers\n",
+            fprintf(stderr, "[radixshmem] MooncakeBackend: segment '%s' publishes no buffers\n",
                     seg_name.c_str());
             engine_->closeSegment(h);
             return XFER_ENOENT;
         }
         if (merged.size() != 1) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: segment '%s' publishes %zu "
+            fprintf(stderr, "[radixshmem] MooncakeBackend: segment '%s' publishes %zu "
                             "disjoint regions; a data segment must be one contiguous "
                             "range\n", seg_name.c_str(), merged.size());
             engine_->closeSegment(h);
@@ -348,18 +348,18 @@ BatchHandle MooncakeBackend::submit(const TransferDesc* descs, int n) {
     for (int i = 0; i < n; ++i) {
         const TransferDesc& d = descs[i];
         if (d.length == 0 || d.local_addr == nullptr) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: desc %d has null addr or zero length\n", i);
+            fprintf(stderr, "[radixshmem] MooncakeBackend: desc %d has null addr or zero length\n", i);
             return INVALID_BATCH;
         }
         if (!covers_local(d.local_addr, d.length)) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: desc %d local range [%p,+%lu) "
+            fprintf(stderr, "[radixshmem] MooncakeBackend: desc %d local range [%p,+%lu) "
                             "is not inside any registered region\n",
                     i, d.local_addr, (unsigned long)d.length);
             return INVALID_BATCH;
         }
         auto it = open_.find(d.target);
         if (it == open_.end()) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: desc %d targets unknown segment %d\n",
+            fprintf(stderr, "[radixshmem] MooncakeBackend: desc %d targets unknown segment %d\n",
                     i, (int)d.target);
             return INVALID_BATCH;
         }
@@ -367,7 +367,7 @@ BatchHandle MooncakeBackend::submit(const TransferDesc* descs, int n) {
         uint64_t rend = 0;
         if (__builtin_add_overflow(d.target_offset, d.length, &rend) ||
             d.target_offset < seg.info.base || rend > seg.info.base + seg.info.length) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: desc %d remote range "
+            fprintf(stderr, "[radixshmem] MooncakeBackend: desc %d remote range "
                             "[0x%lx,+%lu) escapes segment %d [0x%lx,+%lu)\n",
                     i, (unsigned long)d.target_offset, (unsigned long)d.length,
                     (int)d.target, (unsigned long)seg.info.base,
@@ -376,7 +376,7 @@ BatchHandle MooncakeBackend::submit(const TransferDesc* descs, int n) {
         }
         if (i == 0) is_self = seg.is_self;
         else if (is_self != seg.is_self) {
-            fprintf(stderr, "[shmradix] MooncakeBackend: batch mixes the local segment "
+            fprintf(stderr, "[radixshmem] MooncakeBackend: batch mixes the local segment "
                             "with a remote one; split it\n");
             return INVALID_BATCH;
         }
@@ -411,7 +411,7 @@ BatchHandle MooncakeBackend::submit(const TransferDesc* descs, int n) {
 
     const mooncake::BatchID bid = engine_->allocateBatchID(static_cast<size_t>(n));
     if (bid == mooncake::INVALID_BATCH_ID) {
-        fprintf(stderr, "[shmradix] MooncakeBackend: allocateBatchID(%d) failed\n", n);
+        fprintf(stderr, "[radixshmem] MooncakeBackend: allocateBatchID(%d) failed\n", n);
         return INVALID_BATCH;
     }
 
@@ -420,7 +420,7 @@ BatchHandle MooncakeBackend::submit(const TransferDesc* descs, int n) {
     lk.unlock();
     const auto st = engine_->submitTransfer(bid, reqs);
     if (!st.ok()) {
-        fprintf(stderr, "[shmradix] MooncakeBackend: submitTransfer failed: %.*s\n",
+        fprintf(stderr, "[radixshmem] MooncakeBackend: submitTransfer failed: %.*s\n",
                 (int)st.message().size(), st.message().data());
         engine_->freeBatchID(bid);
         return INVALID_BATCH;
@@ -483,7 +483,7 @@ int MooncakeBackend::release(BatchHandle h) {
     const auto st = engine_->freeBatchID(it->second.id);
     if (!st.ok()) {
         if (st.IsBatchBusy()) return XFER_EBUSY;
-        fprintf(stderr, "[shmradix] MooncakeBackend: freeBatchID failed: %.*s\n",
+        fprintf(stderr, "[radixshmem] MooncakeBackend: freeBatchID failed: %.*s\n",
                 (int)st.message().size(), st.message().data());
     }
     batches_.erase(it);
@@ -498,4 +498,4 @@ std::unique_ptr<ITransferBackend> create_mooncake_backend(const TransferConfig& 
     return be;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

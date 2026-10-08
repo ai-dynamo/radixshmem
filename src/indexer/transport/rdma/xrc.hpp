@@ -14,7 +14,7 @@
 #include <infiniband/verbs.h>
 #include <pthread.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 struct XrcPeerInfo {
     uint32_t          recv_qp_num;   // peer's XRC RECV QP num
@@ -169,4 +169,4 @@ private:
     bool state_owned_ = false;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -3,11 +3,11 @@
 
 #pragma once
 
-#include "shmradix/health_check.h"
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_server.h"
-#include "shmradix/radix_tree.h"
-#include "shmradix/types.h"
+#include "health_check.h"
+#include "radix_client.h"
+#include "radix_server.h"
+#include "radix_tree.h"
+#include "types.h"
 
 #include <cassert>
 #include <cstdio>
@@ -32,38 +32,38 @@
 // All counters and the runner are in this header so every binary is
 // self-contained — no extra shared.cpp to link.
 
-namespace shmradix_test {
+namespace radixshmem_test {
 inline int& tests_run()    { static int v = 0; return v; }
 inline int& tests_passed() { static int v = 0; return v; }
-} // namespace shmradix_test
+} // namespace radixshmem_test
 
 #define TEST_BEGIN(name)                                                       \
     do {                                                                       \
-        shmradix_test::tests_run()++;                                          \
+        radixshmem_test::tests_run()++;                                          \
         printf("  [%d] %-50s",                                                 \
-               shmradix_test::tests_run(), name);                              \
+               radixshmem_test::tests_run(), name);                              \
         fflush(stdout);                                                        \
     } while (0)
 
 #define TEST_PASS()                                                            \
     do {                                                                       \
-        shmradix_test::tests_passed()++;                                       \
+        radixshmem_test::tests_passed()++;                                       \
         printf("PASS\n");                                                      \
     } while (0)
 
 inline int tests_report() {
     printf("\n%d/%d tests passed.\n",
-           shmradix_test::tests_passed(), shmradix_test::tests_run());
-    return (shmradix_test::tests_passed() == shmradix_test::tests_run()) ? 0 : 1;
+           radixshmem_test::tests_passed(), radixshmem_test::tests_run());
+    return (radixshmem_test::tests_passed() == radixshmem_test::tests_run()) ? 0 : 1;
 }
 
-inline shmradix::ShmConfig default_cfg() {
-    return shmradix::ShmConfig{1000, 10000};
+inline radixshmem::ShmConfig default_cfg() {
+    return radixshmem::ShmConfig{1000, 10000};
 }
 
 // Force LRU eviction of at least `n` slots, restoring free count when done.
 // Returns mempool_free() after the eviction (matches the old reserve() semantics).
-inline int force_evict(shmradix::RadixClient& client, int n) {
+inline int force_evict(radixshmem::RadixClient& client, int n) {
     std::vector<int32_t> tmp;
     client.allocate_slots(n, tmp);
     int got = (int)tmp.size();
@@ -74,34 +74,34 @@ inline int force_evict(shmradix::RadixClient& client, int n) {
 // End-of-test leak audit (no locks taken): prints the report and asserts when
 // any HealthFlag outside `allowed` is set. Tests that deliberately leave pins
 // or slots behind pass the expected bits in `allowed`.
-// SHMRADIX_HEALTH_SOFT=1 downgrades the assert to a report (lists every leaking
+// RADIXSHMEM_HEALTH_SOFT=1 downgrades the assert to a report (lists every leaking
 // test in one run instead of aborting at the first).
-inline void expect_health_report(const shmradix::HealthReport& r, uint32_t allowed) {
+inline void expect_health_report(const radixshmem::HealthReport& r, uint32_t allowed) {
     if (!(r.flags & ~allowed)) return;
     fprintf(stderr, "\nhealth check failed (flags=0x%x allowed=0x%x):\n%s",
             r.flags, allowed, r.describe().c_str());
-    if (getenv("SHMRADIX_HEALTH_SOFT")) return;
+    if (getenv("RADIXSHMEM_HEALTH_SOFT")) return;
     assert((r.flags & ~allowed) == 0);
 }
 
-inline void expect_healthy(const shmradix::RadixClient& client,
+inline void expect_healthy(const radixshmem::RadixClient& client,
                            uint32_t allowed = 0) {
-    shmradix::HealthReport r;
+    radixshmem::HealthReport r;
     client.check_health(&r);
     expect_health_report(r, allowed);
 }
 
-inline void expect_healthy(const shmradix::ShmRadixTree& tree,
+inline void expect_healthy(const radixshmem::RadixShmemTree& tree,
                            uint32_t allowed = 0) {
-    expect_health_report(shmradix::check_health(tree), allowed);
+    expect_health_report(radixshmem::check_health(tree), allowed);
 }
 
 // Cluster tests: a server process audits its tree on SIGTERM and exits with
 // kHealthExitCode when anything leaked; the parent reaps with reap_servers().
 constexpr int kHealthExitCode = 50;
 
-inline bool server_healthy(const shmradix::RadixServer& srv, const char* tag) {
-    shmradix::HealthReport r;
+inline bool server_healthy(const radixshmem::RadixServer& srv, const char* tag) {
+    radixshmem::HealthReport r;
     srv.check_health(&r);
     fprintf(stderr, "[server %s] check_health: %s", tag, r.describe().c_str());
     return r.ok();
@@ -121,19 +121,19 @@ inline int reap_servers(std::vector<pid_t>& pids) {
     return unhealthy;
 }
 
-inline int32_t remote_src(const shmradix::ComponentQueryResult& r) {
+inline int32_t remote_src(const radixshmem::ComponentQueryResult& r) {
     return r.full_fragments.empty() ? -1 : r.full_fragments.back().source_rank;
 }
 
 inline const std::vector<int32_t>&
-hit_slots(const shmradix::ComponentQueryResult& r) {
+hit_slots(const radixshmem::ComponentQueryResult& r) {
     static const std::vector<int32_t> kEmpty;
     return r.full_fragments.empty() ? kEmpty : r.full_fragments[0].slot_ids;
 }
 
-inline int query_hit(shmradix::RadixClient& client, const uint64_t* h, int n,
+inline int query_hit(radixshmem::RadixClient& client, const uint64_t* h, int n,
                      bool local_only = false, bool update_meta = false) {
-    return client.query(h, n, shmradix::COMPONENT_MASK_FULL, local_only,
+    return client.query(h, n, radixshmem::COMPONENT_MASK_FULL, local_only,
                         /*lock=*/false, update_meta).common_hit;
 }
 
@@ -141,8 +141,8 @@ inline int query_hit(shmradix::RadixClient& client, const uint64_t* h, int n,
 // false, no LRU touch), allocates only n - matched, and binds those slots to
 // hashes[matched:] via start=matched. insert auto-recycles any unused slots
 // (leading redundant + unlanded suffix), so no manual tail recycle here.
-inline shmradix::InsertResult
-insert_auto(shmradix::RadixClient& client, const uint64_t* h, int n) {
+inline radixshmem::InsertResult
+insert_auto(radixshmem::RadixClient& client, const uint64_t* h, int n) {
     int matched = query_hit(client, h, n);
     int need = n - matched;
     std::vector<int32_t> slots;
@@ -153,16 +153,16 @@ insert_auto(shmradix::RadixClient& client, const uint64_t* h, int n) {
 
 // Pin [0, n) of `h` via query(lock=true); call the returned handle to release.
 // Dropping the handle without calling it leaves the pin in place.
-inline shmradix::FinalizeFn pin_path(shmradix::RadixClient& client,
+inline radixshmem::FinalizeFn pin_path(radixshmem::RadixClient& client,
                                      const uint64_t* h, int n) {
-    auto r = client.query(h, n, shmradix::COMPONENT_MASK_FULL,
+    auto r = client.query(h, n, radixshmem::COMPONENT_MASK_FULL,
                           /*local_only=*/false, /*lock=*/true,
                           /*update_meta=*/false);
     return std::move(r.finalize);
 }
 
-inline shmradix::InsertResult
-insert_pinned(shmradix::RadixClient& client, const uint64_t* h, int n) {
+inline radixshmem::InsertResult
+insert_pinned(radixshmem::RadixClient& client, const uint64_t* h, int n) {
     // Re-peek matched so a same-thread rejection (matched < peeked) is visible.
     int matched = query_hit(client, h, n);
     int need = n - matched;
@@ -179,7 +179,7 @@ insert_pinned(shmradix::RadixClient& client, const uint64_t* h, int n) {
 class ServerLauncher {
 public:
     ServerLauncher(const std::string& name,
-                   const shmradix::ShmConfig& config = shmradix::ShmConfig{})
+                   const radixshmem::ShmConfig& config = radixshmem::ShmConfig{})
         : name_(name), pid_(-1) {
         std::string bin = server_bin_path();
 
@@ -281,7 +281,7 @@ private:
                 abort();
             }
             try {
-                auto tree = shmradix::ShmRadixTree::attach(name_);
+                auto tree = radixshmem::RadixShmemTree::attach(name_);
                 tree.detach();
                 return;
             } catch (...) {}

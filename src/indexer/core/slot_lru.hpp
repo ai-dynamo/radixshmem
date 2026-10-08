@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "shmradix/types.h"
+#include "types.h"
 
-namespace shmradix {
+namespace radixshmem {
 
 // Per-component LRU over slot ids; entries live in shm, indexed by slot.
 class SlotLru {
@@ -40,4 +40,4 @@ private:
     AuxListAnchors* anchors_ = nullptr;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

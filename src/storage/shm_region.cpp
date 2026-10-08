@@ -19,7 +19,7 @@
 #define MADV_POPULATE_WRITE 23   // Linux 5.14+
 #endif
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -139,7 +139,7 @@ ShmRegion ShmRegion::create(const std::string& name, uint64_t bytes,
                     r.bytes_ = hp_bytes;
                     r.is_hugepage_ = true;
                     r.path_ = path;
-                    fprintf(stderr, "[shmradix] ShmRegion: hugepages %s (%.1f MB)\n",
+                    fprintf(stderr, "[radixshmem] ShmRegion: hugepages %s (%.1f MB)\n",
                             path.c_str(), hp_bytes / (1024.0 * 1024.0));
                     return r;
                 }
@@ -148,7 +148,7 @@ ShmRegion ShmRegion::create(const std::string& name, uint64_t bytes,
             ::unlink(path.c_str());
         }
         fprintf(stderr,
-                "[shmradix] ShmRegion: hugepage alloc failed for %s, falling back to shm_open\n",
+                "[radixshmem] ShmRegion: hugepage alloc failed for %s, falling back to shm_open\n",
                 name.c_str());
     }
 
@@ -213,4 +213,4 @@ void ShmRegion::unlink(const std::string& name, const std::string& hugepage_path
     unlink_both(name, hugepage_path);
 }
 
-} // namespace shmradix
+} // namespace radixshmem

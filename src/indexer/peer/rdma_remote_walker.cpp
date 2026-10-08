@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/rdma_remote_walker.h"
+#include "rdma_remote_walker.h"
 
 #include "component_set.hpp"
 
@@ -12,7 +12,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace shmradix {
+namespace radixshmem {
 
 static constexpr int MAX_LOCK_RETRIES = 10000;
 
@@ -649,7 +649,7 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
     if (!rdma_read_lock(remote)) return false;
 
     // Legacy trust model: descend by hash keys exactly like the local
-    // ShmRadixTree::dec_ref and decrement unconditionally inside each lane's
+    // RadixShmemTree::dec_ref and decrement unconditionally inside each lane's
     // recorded range.
     auto dec1 = [&](uint64_t addr) {
         ep_.rdma_fetch_add(addr, remote.rkey, (uint64_t)-1LL, local_buf_,
@@ -690,4 +690,4 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
     return true;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -15,7 +15,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 struct AddrRange {
     uint64_t addr = 0;
@@ -27,4 +27,4 @@ struct AddrRange {
 // are dropped. The result is sorted and disjoint, with a gap between every pair.
 std::vector<AddrRange> merge_contiguous(std::vector<AddrRange> in);
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -22,9 +22,9 @@
 //
 // Loopback-only — all processes run on the host that owns the RDMA NIC.
 
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_server.h"
-#include "shmradix/types.h"
+#include "radix_client.h"
+#include "radix_server.h"
+#include "types.h"
 
 #include "etcd_test_harness.hpp"
 #include "test_utils.h"
@@ -66,9 +66,9 @@ std::string shm_name_for(int rank) {
 
 // allocate the shortfall then insert; slots bind to hashes[matched:] via
 // start=matched and insert auto-recycles anything unused.
-shmradix::InsertResult
-insert_auto(shmradix::RadixClient& cli, const uint64_t* h, int n) {
-    int matched = (int)cli.query(h, n, shmradix::COMPONENT_MASK_FULL, /*local_only=*/true,
+radixshmem::InsertResult
+insert_auto(radixshmem::RadixClient& cli, const uint64_t* h, int n) {
+    int matched = (int)cli.query(h, n, radixshmem::COMPONENT_MASK_FULL, /*local_only=*/true,
                                  /*lock=*/false, /*update_meta=*/false)
                       .common_hit;
     int need = n - matched;
@@ -79,10 +79,10 @@ insert_auto(shmradix::RadixClient& cli, const uint64_t* h, int n) {
 }
 
 // Build the etcd-config client for `node`; discovers its shm via /shm/<node>.
-shmradix::RadixClientConfig client_cfg(const std::string& node,
+radixshmem::RadixClientConfig client_cfg(const std::string& node,
                                        const std::string& registry,
                                        const std::string& cluster_id) {
-    shmradix::RadixClientConfig cc;
+    radixshmem::RadixClientConfig cc;
     cc.registry   = registry;
     cc.cluster_id = cluster_id;
     cc.node_name  = node;
@@ -102,15 +102,15 @@ bool wait_shm_ready(const std::string& shm_name, int timeout_sec) {
     while (std::chrono::steady_clock::now() < deadline) {
         int fd = ::shm_open(shm_name.c_str(), O_RDONLY, 0);
         if (fd >= 0) {
-            void* p = ::mmap(nullptr, sizeof(shmradix::ShmHeader), PROT_READ,
+            void* p = ::mmap(nullptr, sizeof(radixshmem::ShmHeader), PROT_READ,
                              MAP_SHARED, fd, 0);
             ::close(fd);
             if (p != MAP_FAILED) {
-                auto* hdr = static_cast<shmradix::ShmHeader*>(p);
+                auto* hdr = static_cast<radixshmem::ShmHeader*>(p);
                 uint64_t magic =
                     hdr->cluster_ready_magic.load(std::memory_order_acquire);
-                ::munmap(p, sizeof(shmradix::ShmHeader));
-                if (magic == shmradix::CLUSTER_MANIFEST_MAGIC) return true;
+                ::munmap(p, sizeof(radixshmem::ShmHeader));
+                if (magic == radixshmem::CLUSTER_MANIFEST_MAGIC) return true;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -130,7 +130,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     ::signal(SIGTERM, on_term);
     ::signal(SIGINT,  on_term);
 
-    shmradix::RadixServerConfig cfg;
+    radixshmem::RadixServerConfig cfg;
     cfg.name        = kShmPrefix;
     cfg.shm.hugepage_path = "";
     cfg.shm.max_blocks = 4096;
@@ -145,7 +145,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
 
-    shmradix::RadixServer srv(cfg);
+    radixshmem::RadixServer srv(cfg);
     if (!srv.bootstrap()) {
         fprintf(stderr, "[server %s] bootstrap failed\n", node.c_str());
         return 10;
@@ -159,20 +159,20 @@ int run_server_process(const std::string& node, const std::string& registry,
 }
 
 // Writer client (node0): inserts kPrefixLen hashes, flushes RHT writes, exits.
-int run_writer_process(const shmradix::RadixClientConfig& cc) {
+int run_writer_process(const radixshmem::RadixClientConfig& cc) {
     try {
-        shmradix::RadixClient cli(cc);
+        radixshmem::RadixClient cli(cc);
         if (!cli.is_distributed()) {
             fprintf(stderr, "[writer] expected distributed mode\n");
             return 11;
         }
         std::vector<int64_t> tokens(kPrefixLen);
         std::iota(tokens.begin(), tokens.end(), int64_t{1000});
-        auto hashes = shmradix::RadixClient::compute_hashes(
+        auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
 
         auto ins = insert_auto(cli, hashes.data(), (int)hashes.size());
-        if (ins.error != shmradix::InsertError::OK ||
+        if (ins.error != radixshmem::InsertError::OK ||
             !ins.unused_slots.empty()) {
             fprintf(stderr,
                     "[writer] insert incomplete (unused=%zu, err=%u)\n",
@@ -190,19 +190,19 @@ int run_writer_process(const shmradix::RadixClientConfig& cc) {
 
 // Reader client (node1): queries the same prefix; result comes back via RDMA
 // remote-walk against rank 0.
-int run_reader_process(const shmradix::RadixClientConfig& cc) {
+int run_reader_process(const radixshmem::RadixClientConfig& cc) {
     try {
-        shmradix::RadixClient cli(cc);
+        radixshmem::RadixClient cli(cc);
         if (!cli.is_distributed()) {
             fprintf(stderr, "[reader] expected distributed mode\n");
             return 21;
         }
         std::vector<int64_t> tokens(kPrefixLen);
         std::iota(tokens.begin(), tokens.end(), int64_t{1000});
-        auto hashes = shmradix::RadixClient::compute_hashes(
+        auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
 
-        auto qr = cli.query(hashes.data(), (int)hashes.size(), shmradix::COMPONENT_MASK_FULL);
+        auto qr = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL);
 
         bool ok = true;
         if (remote_src(qr) != 0) {
@@ -233,19 +233,19 @@ int run_reader_process(const shmradix::RadixClientConfig& cc) {
 }
 
 // Lock reader (node1): full query(lock=true) → dec_ref_remote cycle.
-int run_lock_dec_reader_process(const shmradix::RadixClientConfig& cc) {
+int run_lock_dec_reader_process(const radixshmem::RadixClientConfig& cc) {
     try {
-        shmradix::RadixClient cli(cc);
+        radixshmem::RadixClient cli(cc);
         if (!cli.is_distributed()) {
             fprintf(stderr, "[lockdec] expected distributed mode\n");
             return 51;
         }
         std::vector<int64_t> tokens(kPrefixLen);
         std::iota(tokens.begin(), tokens.end(), int64_t{1000});
-        auto hashes = shmradix::RadixClient::compute_hashes(
+        auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
 
-        auto qr = cli.query(hashes.data(), (int)hashes.size(), shmradix::COMPONENT_MASK_FULL,
+        auto qr = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL,
                               /*local_only=*/false, /*lock=*/true);
         if (qr.common_hit != kPrefixLen) {
             fprintf(stderr, "[lockdec] expected total_hit=%d got %d\n",
@@ -271,34 +271,34 @@ int run_lock_dec_reader_process(const shmradix::RadixClientConfig& cc) {
 // (forces a remote split). Reader on rank 1 query(lock=true) over A must
 // inc_ref both fragments; dec_ref_remote must reach both. Verified by
 // force-evicting on rank 0 afterward — the prefix must be fully gone.
-int run_split_remote_process(const shmradix::RadixClientConfig& cc0,
-                             const shmradix::RadixClientConfig& cc1) {
+int run_split_remote_process(const radixshmem::RadixClientConfig& cc0,
+                             const radixshmem::RadixClientConfig& cc1) {
     try {
         {
-            shmradix::RadixClient w(cc0);
+            radixshmem::RadixClient w(cc0);
             if (!w.is_distributed()) return 71;
             std::vector<int64_t> ta(16);
             std::iota(ta.begin(), ta.end(), int64_t{7000});
-            auto ha = shmradix::RadixClient::compute_hashes(
+            auto ha = radixshmem::RadixClient::compute_hashes(
                 ta.data(), 16, kBlockSize);
             insert_auto(w, ha.data(), 16);
             std::vector<int64_t> tb(16);
             for (int i = 0; i < 8; i++) tb[i] = 7000 + i;
             for (int i = 8; i < 16; i++) tb[i] = 7100 + (i - 8);
-            auto hb = shmradix::RadixClient::compute_hashes(
+            auto hb = radixshmem::RadixClient::compute_hashes(
                 tb.data(), 16, kBlockSize);
             insert_auto(w, hb.data(), 16);   // triggers split on rank 0
             w.flush();
         }
 
-        shmradix::RadixClient r(cc1);
+        radixshmem::RadixClient r(cc1);
         if (!r.is_distributed()) return 72;
         std::vector<int64_t> ta(16);
         std::iota(ta.begin(), ta.end(), int64_t{7000});
-        auto ha = shmradix::RadixClient::compute_hashes(
+        auto ha = radixshmem::RadixClient::compute_hashes(
             ta.data(), 16, kBlockSize);
 
-        auto qr = r.query(ha.data(), 16, shmradix::COMPONENT_MASK_FULL, /*local_only=*/false, /*lock=*/true);
+        auto qr = r.query(ha.data(), 16, radixshmem::COMPONENT_MASK_FULL, /*local_only=*/false, /*lock=*/true);
         if (qr.common_hit != 16) {
             fprintf(stderr, "[split_remote] hit=%d expected 16\n",
                     qr.common_hit);
@@ -308,11 +308,11 @@ int run_split_remote_process(const shmradix::RadixClientConfig& cc0,
         qr.finalize();
 
         {
-            shmradix::RadixClient w(cc0);
+            radixshmem::RadixClient w(cc0);
             std::vector<int32_t> tmp;
             w.allocate_slots((int)w.mempool_total(), tmp);
             if (!tmp.empty()) w.recycle_slots(tmp.data(), (int)tmp.size());
-            auto q = w.query(ha.data(), 16, shmradix::COMPONENT_MASK_FULL, /*local_only=*/true,
+            auto q = w.query(ha.data(), 16, radixshmem::COMPONENT_MASK_FULL, /*local_only=*/true,
                               /*lock=*/false, /*update_meta=*/false);
             if (q.common_hit != 0) {
                 fprintf(stderr,
@@ -331,20 +331,20 @@ int run_split_remote_process(const shmradix::RadixClientConfig& cc0,
 
 // RHT-aligned probe: writer inserts a long cs-aligned prefix on rank 0; reader
 // on rank 1 queries it back in full via RDMA remote walk.
-int run_rht_aligned_probe_process(const shmradix::RadixClientConfig& cc0,
-                                  const shmradix::RadixClientConfig& cc1) {
+int run_rht_aligned_probe_process(const radixshmem::RadixClientConfig& cc0,
+                                  const radixshmem::RadixClientConfig& cc1) {
     try {
         constexpr int kLen = 256;  // 2 * cs (128 default)
         std::vector<int64_t> tok(kLen);
         std::iota(tok.begin(), tok.end(), int64_t{80000});
-        auto hashes = shmradix::RadixClient::compute_hashes(
+        auto hashes = radixshmem::RadixClient::compute_hashes(
             tok.data(), kLen, kBlockSize);
 
         {
-            shmradix::RadixClient w(cc0);
+            radixshmem::RadixClient w(cc0);
             if (!w.is_distributed()) return 81;
             auto ins = insert_auto(w, hashes.data(), kLen);
-            if (ins.error != shmradix::InsertError::OK ||
+            if (ins.error != radixshmem::InsertError::OK ||
                 !ins.unused_slots.empty()) {
                 fprintf(stderr, "[rht_probe] writer insert short (unused=%zu)\n",
                         ins.unused_slots.size());
@@ -353,9 +353,9 @@ int run_rht_aligned_probe_process(const shmradix::RadixClientConfig& cc0,
             w.flush();
         }
 
-        shmradix::RadixClient r(cc1);
+        radixshmem::RadixClient r(cc1);
         if (!r.is_distributed()) return 83;
-        auto qr = r.query(hashes.data(), kLen, shmradix::COMPONENT_MASK_FULL);
+        auto qr = r.query(hashes.data(), kLen, radixshmem::COMPONENT_MASK_FULL);
         if (qr.common_hit != kLen) {
             fprintf(stderr, "[rht_probe] expected hit=%d got %d\n",
                     kLen, qr.common_hit);
@@ -375,9 +375,9 @@ int run_rht_aligned_probe_process(const shmradix::RadixClientConfig& cc0,
 // Multi-chunk query-lock reader (node0): insert a multi-node prefix, pin via
 // query(lock=true), finalize, and verify every fragment released (no ref leak
 // blocking eviction).
-int run_multichunk_finalize_process(const shmradix::RadixClientConfig& cc0) {
+int run_multichunk_finalize_process(const radixshmem::RadixClientConfig& cc0) {
     try {
-        shmradix::RadixClient cli(cc0);
+        radixshmem::RadixClient cli(cc0);
         if (!cli.is_distributed()) {
             fprintf(stderr, "[mchunk] expected distributed mode\n");
             return 61;
@@ -385,14 +385,14 @@ int run_multichunk_finalize_process(const shmradix::RadixClientConfig& cc0) {
         constexpr int kLen = 320;
         std::vector<int64_t> tokens(kLen);
         std::iota(tokens.begin(), tokens.end(), int64_t{50000});
-        auto hashes = shmradix::RadixClient::compute_hashes(
+        auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
 
         std::vector<int32_t> slots;
         cli.allocate_slots(kLen, slots);
         auto ins = cli.insert(hashes.data(), (int)hashes.size(),
                               slots.data(), (int)slots.size());
-        if (ins.error != shmradix::InsertError::OK) {
+        if (ins.error != radixshmem::InsertError::OK) {
             fprintf(stderr, "[mchunk] insert error=%u\n", (unsigned)ins.error);
             return 62;
         }
@@ -401,14 +401,14 @@ int run_multichunk_finalize_process(const shmradix::RadixClientConfig& cc0) {
                     ins.unused_slots.size());
             return 63;
         }
-        auto qlock = cli.query(hashes.data(), (int)hashes.size(), shmradix::COMPONENT_MASK_FULL,
+        auto qlock = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL,
                                /*local_only=*/true, /*lock=*/true);
         if (!(bool)qlock.finalize) {
             fprintf(stderr, "[mchunk] finalize unexpectedly empty\n");
             return 64;
         }
         qlock.finalize();
-        auto qr = cli.query(hashes.data(), (int)hashes.size(), shmradix::COMPONENT_MASK_FULL,
+        auto qr = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL,
                               /*local_only=*/true);
         if (qr.common_hit != kLen) {
             fprintf(stderr,
@@ -419,7 +419,7 @@ int run_multichunk_finalize_process(const shmradix::RadixClientConfig& cc0) {
         std::vector<int32_t> tmp;
         cli.allocate_slots((int)cli.mempool_total(), tmp);
         if (!tmp.empty()) cli.recycle_slots(tmp.data(), (int)tmp.size());
-        auto qr2 = cli.query(hashes.data(), (int)hashes.size(), shmradix::COMPONENT_MASK_FULL,
+        auto qr2 = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL,
                                /*local_only=*/true);
         if (qr2.common_hit != 0) {
             fprintf(stderr,
@@ -442,7 +442,7 @@ int run_multichunk_finalize_process(const shmradix::RadixClientConfig& cc0) {
 // refuses every mutation.
 int run_local_read_only_process() {
     try {
-        shmradix::RadixClient ro(shm_name_for(0), /*local_read_only=*/true);
+        radixshmem::RadixClient ro(shm_name_for(0), /*local_read_only=*/true);
         if (ro.is_distributed() || ro.rank() != 0 || ro.world_size() != 1) {
             fprintf(stderr, "[local_read_only]expected a standalone rank-0 view, got "
                             "dist=%d rank=%d world=%d\n",
@@ -451,9 +451,9 @@ int run_local_read_only_process() {
         }
         std::vector<int64_t> tokens(kPrefixLen);
         std::iota(tokens.begin(), tokens.end(), int64_t{1000});
-        auto hashes = shmradix::RadixClient::compute_hashes(
+        auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
-        auto qr = ro.query(hashes.data(), (int)hashes.size(), shmradix::COMPONENT_MASK_FULL);
+        auto qr = ro.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL);
         if (qr.common_hit != kPrefixLen || qr.rdma_read_count != 0) {
             fprintf(stderr, "[local_read_only]expected local hit %d with no RDMA, got %d "
                             "(%d reads)\n",
@@ -552,11 +552,11 @@ int main(int argc, char** argv) {
     }
 
     // Private etcd for this run — the sole cluster bootstrap backend.
-    shmradix_test::EtcdHarness etcd;
+    radixshmem_test::EtcdHarness etcd;
     if (!etcd.usable()) {
-        fprintf(stderr, "[parent] no etcd binary (set SHMRADIX_ETCD_BIN or "
+        fprintf(stderr, "[parent] no etcd binary (set RADIXSHMEM_ETCD_BIN or "
                         "put etcd on PATH) — skipping\n");
-        return shmradix_test::kSkipExitCode;
+        return radixshmem_test::kSkipExitCode;
     }
     const std::string registry   = etcd.registry();
     const std::string cluster_id = etcd.cluster_id();

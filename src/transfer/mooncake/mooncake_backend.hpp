@@ -11,13 +11,13 @@
 // Nothing but this factory crosses the boundary, which is also what keeps the
 // abstraction honest: callers cannot reach the engine even if they wanted to.
 
-#include "shmradix/transfer.h"
+#include "transfer.h"
 
 #include <memory>
 
-namespace shmradix {
+namespace radixshmem {
 
 // Returns nullptr when the engine fails to initialise (the reason is logged).
 std::unique_ptr<ITransferBackend> create_mooncake_backend(const TransferConfig& cfg);
 
-} // namespace shmradix
+} // namespace radixshmem

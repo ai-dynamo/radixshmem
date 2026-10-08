@@ -5,7 +5,7 @@
 
 #include <algorithm>
 
-namespace shmradix {
+namespace radixshmem {
 
 std::vector<AddrRange> merge_contiguous(std::vector<AddrRange> in) {
     std::vector<AddrRange> out;
@@ -32,4 +32,4 @@ std::vector<AddrRange> merge_contiguous(std::vector<AddrRange> in) {
     return out;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

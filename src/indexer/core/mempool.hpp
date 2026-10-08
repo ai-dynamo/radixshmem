@@ -3,10 +3,10 @@
 
 #pragma once
 
-#include "shmradix/types.h"
+#include "types.h"
 #include <cstdint>
 
-namespace shmradix {
+namespace radixshmem {
 
 class Mempool {
 public:
@@ -65,4 +65,4 @@ private:
     uint64_t* used_bitmap_ = nullptr;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

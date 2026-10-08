@@ -19,9 +19,9 @@
 
 #include "test_utils.h"
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 #include "rht_core.hpp"   // private module header: this test drives RhtEngine directly
-#include "shmradix/rht_chain.h"
+#include "rht_chain.h"
 
 #include <algorithm>
 #include <cassert>
@@ -31,7 +31,7 @@
 #include <thread>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 static void sleep_for_ms(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
@@ -574,7 +574,7 @@ int main() {
     return tests_report();
 }
 
-#else // SHMRADIX_NO_RDMA
+#else // RADIXSHMEM_NO_RDMA
 
 int main() {
     printf("=== test_rht_engine ===\n\n  (skipped: built without RDMA)\n");

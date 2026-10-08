@@ -4,9 +4,9 @@
 // EV1 lifecycle coverage for the aux component chains; they have no public
 // read API by design, so the validator reads the shm structures directly.
 
-#include "shmradix/cluster_manifest.h"
-#include "shmradix/config.h"
-#include "shmradix/radix_tree.h"
+#include "cluster_manifest.h"
+#include "radixshmem_config.h"
+#include "radix_tree.h"
 #include "test_utils.h"
 
 #include <algorithm>
@@ -16,7 +16,7 @@
 #include <thread>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 static constexpr uint32_t FS = COMPONENT_MASK_FULL | COMPONENT_MASK_SWA;
 static constexpr uint32_t FM = COMPONENT_MASK_FULL | COMPONENT_MASK_MAMBA;
@@ -42,7 +42,7 @@ static ShmConfig cfg(uint32_t w, int cs, uint32_t max_blocks) {
     return c;
 }
 
-static std::vector<int32_t> insert_fresh(ShmRadixTree& t, const uint64_t* h,
+static std::vector<int32_t> insert_fresh(RadixShmemTree& t, const uint64_t* h,
                                          int n, int start = 0) {
     std::vector<int32_t> slots;
     int got = t.allocate_slots(n - start, slots);
@@ -52,7 +52,7 @@ static std::vector<int32_t> insert_fresh(ShmRadixTree& t, const uint64_t* h,
     return slots;
 }
 
-static void publish_swa(ShmRadixTree& t, const uint64_t* h, int n, int W) {
+static void publish_swa(RadixShmemTree& t, const uint64_t* h, int n, int W) {
     const int start = n > W ? n - W : 0;
     std::vector<int32_t> s;
     int got = t.allocate_slots(n - start, s, ComponentType::SWA);
@@ -62,7 +62,7 @@ static void publish_swa(ShmRadixTree& t, const uint64_t* h, int n, int W) {
     assert(r.error == InsertError::OK);
 }
 
-static int32_t publish_mamba(ShmRadixTree& t, const uint64_t* h, int n) {
+static int32_t publish_mamba(RadixShmemTree& t, const uint64_t* h, int n) {
     std::vector<int32_t> s;
     int got = t.allocate_slots(1, s, ComponentType::MAMBA);
     assert(got == 1);
@@ -72,33 +72,33 @@ static int32_t publish_mamba(ShmRadixTree& t, const uint64_t* h, int n) {
     return s[0];
 }
 
-static ShmHeader* hdr_of(ShmRadixTree& t) {
+static ShmHeader* hdr_of(RadixShmemTree& t) {
     return reinterpret_cast<ShmHeader*>(t.shm_base());
 }
-static NodeComponentState* cst_of(ShmRadixTree& t, uint32_t id) {
+static NodeComponentState* cst_of(RadixShmemTree& t, uint32_t id) {
     ShmHeader* h = hdr_of(t);
     return reinterpret_cast<NodeComponentState*>(
                (char*)t.shm_base() + h->component_state_offset) + id;
 }
-static TreeNode* node_of(ShmRadixTree& t, uint32_t id) {
+static TreeNode* node_of(RadixShmemTree& t, uint32_t id) {
     ShmHeader* h = hdr_of(t);
     return reinterpret_cast<TreeNode*>(
                (char*)t.shm_base() + h->node_pool_offset) + id;
 }
-static SlotLruEntry* lru_of(ShmRadixTree& t, bool swa) {
+static SlotLruEntry* lru_of(RadixShmemTree& t, bool swa) {
     ShmHeader* h = hdr_of(t);
     const uint64_t off = swa ? h->swa_lru_offset : h->mamba_lru_offset;
     return off ? reinterpret_cast<SlotLruEntry*>((char*)t.shm_base() + off)
                : nullptr;
 }
-static const int32_t* swa_lane(ShmRadixTree& t, uint32_t id) {
+static const int32_t* swa_lane(RadixShmemTree& t, uint32_t id) {
     TreeNode* n = node_of(t, id);
     return reinterpret_cast<const int32_t*>(
         (char*)t.shm_base() + n->data_offset + 12u * n->num_blocks);
 }
 
 // Slots in list order (head = oldest), validating the back links.
-static std::vector<int32_t> slots(ShmRadixTree& t, bool swa) {
+static std::vector<int32_t> slots(RadixShmemTree& t, bool swa) {
     std::vector<int32_t> out;
     SlotLruEntry* e = lru_of(t, swa);
     if (e == nullptr) return out;
@@ -117,7 +117,7 @@ static std::vector<int32_t> slots(ShmRadixTree& t, bool swa) {
     return out;
 }
 // Node ids in list order, consecutive repeats collapsed.
-static std::vector<uint32_t> chain(ShmRadixTree& t, bool swa) {
+static std::vector<uint32_t> chain(RadixShmemTree& t, bool swa) {
     std::vector<uint32_t> ids;
     SlotLruEntry* e = lru_of(t, swa);
     for (int32_t s : slots(t, swa)) {
@@ -126,19 +126,19 @@ static std::vector<uint32_t> chain(ShmRadixTree& t, bool swa) {
     }
     return ids;
 }
-static uint64_t swa_ts(ShmRadixTree& t, uint32_t id) {   // node's oldest block
+static uint64_t swa_ts(RadixShmemTree& t, uint32_t id) {   // node's oldest block
     uint64_t m = UINT64_MAX;
     SlotLruEntry* e = lru_of(t, true);
     for (int32_t s : slots(t, true))
         if (e[s].node_id == id && e[s].ts < m) m = e[s].ts;
     return m;
 }
-static uint64_t mamba_ts(ShmRadixTree& t, uint32_t id) {
+static uint64_t mamba_ts(RadixShmemTree& t, uint32_t id) {
     return lru_of(t, false)[node_of(t, id)->mamba_checkpoint_slot].ts;
 }
 
 // Live blocks actually present in the node's SWA lane (0 without a lane).
-static uint32_t lane_live_count(ShmRadixTree& t, uint32_t id) {
+static uint32_t lane_live_count(RadixShmemTree& t, uint32_t id) {
     ShmHeader* h = hdr_of(t);
     if (!component_has_swa(h->component_config.component_mask)) return 0;
     TreeNode* n = node_of(t, id);
@@ -150,7 +150,7 @@ static uint32_t lane_live_count(ShmRadixTree& t, uint32_t id) {
 }
 
 // Both lists and the lanes/checkpoints describe the same slots; ts ascends.
-static void check_membership(ShmRadixTree& t) {
+static void check_membership(RadixShmemTree& t) {
     auto sw = slots(t, true), mb = slots(t, false);
     SlotLruEntry* es = lru_of(t, true);
     SlotLruEntry* em = lru_of(t, false);
@@ -185,7 +185,7 @@ static void test_publish_and_fww() {
 
     const char* name = "/tce_publish";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(0x100, 8);
     insert_fresh(t, h.data(), 8);
     assert(chain(t, true).empty() && chain(t, false).empty());
@@ -247,7 +247,7 @@ static void test_touch_quadrants() {
 
     const char* name = "/tce_touch";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto ha = seq(0xA00, 8), hb = seq(0xB00, 8);
     insert_fresh(t, ha.data(), 8);
     insert_fresh(t, hb.data(), 8);
@@ -301,7 +301,7 @@ static void test_touch_window_order() {
 
     const char* name = "/tce_touchw";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(0xC10, 8), he = seq(0xD10, 4);
     insert_fresh(t, h.data(), 8);
     insert_fresh(t, he.data(), 4);
@@ -328,7 +328,7 @@ static void test_split_membership() {
 
     const char* name = "/tce_split";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(8, 8, 64));
+    auto t = RadixShmemTree::create(name, cfg(8, 8, 64));
     auto h = seq(0xD00, 8), he = seq(0xE00, 4);
     insert_fresh(t, h.data(), 8);
     insert_fresh(t, he.data(), 4);
@@ -361,7 +361,7 @@ static void test_merge_membership() {
 
     const char* name = "/tce_merge";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 16, 64));   // cs off the 4-block grid: folds stay folds
+    auto t = RadixShmemTree::create(name, cfg(4, 16, 64));   // cs off the 4-block grid: folds stay folds
     auto h = seq(0xF00, 8), hb = seq(0x1000, 4);
     insert_fresh(t, h.data(), 4);
     insert_fresh(t, hb.data(), 4);
@@ -405,7 +405,7 @@ static void test_cascade_and_node_reuse() {
 
     const char* name = "/tce_cascade";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto ha = seq(0x2000, 4), hb = seq(0x3000, 4), hc = seq(0x4000, 4),
          hd = seq(0x5000, 4);
     insert_fresh(t, ha.data(), 4);
@@ -454,7 +454,7 @@ static void test_independent_eviction() {
 
     const char* name = "/tce_walk";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     int cascades = 0;
     t.set_evict_callback([&](const std::vector<EvictedNode>&) { cascades++; });
     auto ha = seq(0x8000, 4), hb = seq(0x9000, 4), hc = seq(0xA000, 4);
@@ -500,7 +500,7 @@ static void test_evict_swa_by_slot() {
 
     const char* name = "/tce_swa_slots";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto ha = seq(0x3100, 4), hb = seq(0x3200, 8), hc = seq(0x3300, 8);
     insert_fresh(t, ha.data(), 4);
     insert_fresh(t, hb.data(), 8);
@@ -553,7 +553,7 @@ static void test_evict_ref_gate() {
 
     const char* name = "/tce_gate";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto ha = seq(0xB000, 4), hb = seq(0xC000, 4), hc = seq(0xD000, 4);
     for (auto* h : {&ha, &hb, &hc}) {
         insert_fresh(t, h->data(), 4);
@@ -594,7 +594,7 @@ static void test_try_entry_gates() {
 
     const char* name = "/tce_entry";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 4, 64));
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     auto h = seq(0xE000, 4);
     insert_fresh(t, h.data(), 4);
     publish_swa(t, h.data(), 4, 4);
@@ -621,7 +621,7 @@ static void test_try_entry_gates() {
     c2.mamba_state_bytes = 0;
     c2.swa_max_blocks = 0;
     c2.mamba_max_slots = 0;
-    auto t2 = ShmRadixTree::create(name2, c2);
+    auto t2 = RadixShmemTree::create(name2, c2);
     assert(t2.try_evict_component_batch(ComponentType::SWA, 4) == 0);
     assert(t2.try_evict_component_batch(ComponentType::MAMBA, 4) == 0);
     t2.destroy();
@@ -639,7 +639,7 @@ static void test_allocate_retry() {
     ShmConfig c = cfg(4, 4, 64);
     c.swa_max_blocks = 8;
     c.mamba_max_slots = 2;
-    auto t = ShmRadixTree::create(name, c);
+    auto t = RadixShmemTree::create(name, c);
     auto ha = seq(0x1100, 4), hb = seq(0x1200, 4), hc = seq(0x1300, 4);
     insert_fresh(t, ha.data(), 4);
     insert_fresh(t, hb.data(), 4);
@@ -687,7 +687,7 @@ static void test_merge_live_swa() {
 
     const char* name = "/tce_merge_swa";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 16, 64));   // cs off the 4-block grid: folds stay folds
+    auto t = RadixShmemTree::create(name, cfg(4, 16, 64));   // cs off the 4-block grid: folds stay folds
     auto h = seq(0x2F00, 8);
     insert_fresh(t, h.data(), 4);
     publish_swa(t, h.data(), 4, 4);            // A[0,4) live 4
@@ -725,7 +725,7 @@ static void test_merge_ref_gate() {
 
     const char* name = "/tce_merge_ref";
     shm_unlink(name);
-    auto t = ShmRadixTree::create(name, cfg(4, 16, 64));   // cs off the 4-block grid: folds stay folds
+    auto t = RadixShmemTree::create(name, cfg(4, 16, 64));   // cs off the 4-block grid: folds stay folds
     auto ha = seq(0x4100, 12), hb = seq(0x4200, 12);
     insert_fresh(t, ha.data(), 4);
     insert_fresh(t, hb.data(), 4);
@@ -769,8 +769,8 @@ static void test_partial_component_configs() {
     c_fm.swa_max_blocks = 0;
     shm_unlink("/tce_cfg_fs");
     shm_unlink("/tce_cfg_fm");
-    auto ts = ShmRadixTree::create("/tce_cfg_fs", c_fs);
-    auto tm = ShmRadixTree::create("/tce_cfg_fm", c_fm);
+    auto ts = RadixShmemTree::create("/tce_cfg_fs", c_fs);
+    auto tm = RadixShmemTree::create("/tce_cfg_fm", c_fm);
     assert(hdr_of(ts)->swa_lru_offset != 0 && hdr_of(ts)->mamba_lru_offset == 0);
     assert(hdr_of(tm)->swa_lru_offset == 0 && hdr_of(tm)->mamba_lru_offset != 0);
 
@@ -834,9 +834,9 @@ static void test_layout_follows_mask() {
     auto c_fsm = cfg(4, 4, 64);
     for (const char* n : {"/tce_lay_f", "/tce_lay_fm", "/tce_lay_fsm"})
         shm_unlink(n);
-    auto tf   = ShmRadixTree::create("/tce_lay_f", c_full);
-    auto tfm  = ShmRadixTree::create("/tce_lay_fm", c_fm);
-    auto tfsm = ShmRadixTree::create("/tce_lay_fsm", c_fsm);
+    auto tf   = RadixShmemTree::create("/tce_lay_f", c_full);
+    auto tfm  = RadixShmemTree::create("/tce_lay_fm", c_fm);
+    auto tfsm = RadixShmemTree::create("/tce_lay_fsm", c_fsm);
 
     // CST only with an aux component; the SWA lane only with SWA (12 vs 16
     // B/block). The buddy pool rounds to 64 KB, so compare the configured

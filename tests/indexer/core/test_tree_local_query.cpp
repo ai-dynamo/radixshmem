@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // test_tree_local_query — exhaustive branch coverage of the local-tree query
-// path (ShmRadixTree::query_internal, exposed via RadixClient::query with
+// path (RadixShmemTree::query_internal, exposed via RadixClient::query with
 // local_only=true). Each test maps to a specific control branch or boundary of
 // query_internal (src/indexer/core/radix_tree.cpp §954-1031) and the QueryResult surface
 // (common_hit / hit slots), plus the public-API
-// lock / update_meta semantics layered on top in ShmRadixTree::query.
+// lock / update_meta semantics layered on top in RadixShmemTree::query.
 //
 // Branch map (query_internal):
 //   §962-1024 empty tree / root-only          → test_empty_tree, test_miss_first_block
@@ -31,8 +31,8 @@
 #include <set>
 #include <vector>
 
-using namespace shmradix;
-using namespace shmradix_test;
+using namespace radixshmem;
+using namespace radixshmem_test;
 
 // Cumulative-prefix hashes for a length-n token run starting at `base`, cs=1.
 static std::vector<uint64_t> seq(int64_t base, int n) {

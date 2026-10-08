@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 class RdmaTransportClient {
   public:
@@ -99,4 +99,4 @@ class RdmaTransportClient {
     std::vector<ibv_ah*>               retired_ah_;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -12,7 +12,7 @@
 #include <random>
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -273,4 +273,4 @@ void DcServerTransport::send_reply(const ReplyContext& ctx,
     }
 }
 
-} // namespace shmradix
+} // namespace radixshmem

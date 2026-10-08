@@ -7,20 +7,20 @@
 // into an rht_only RadixClient. This TU is the sole home of the heavy RDMA headers;
 // radix_server.h stays verbs-free for the python bindings + tests.
 
-#include "shmradix/radix_server.h"
+#include "radix_server.h"
 
-#include "shmradix/local.h"
-#include "shmradix/radix_tree.h"
+#include "local.h"
+#include "radix_tree.h"
 #include "net_util.hpp"
 
-#ifndef SHMRADIX_NO_RDMA
-#include "shmradix/radix_client.h"
-#include "shmradix/cluster_manifest.h"
-#include "shmradix/cluster_protocol.h"
-#include "shmradix/cluster_registry.h"
+#ifndef RADIXSHMEM_NO_RDMA
+#include "radix_client.h"
+#include "cluster_manifest.h"
+#include "cluster_protocol.h"
+#include "cluster_registry.h"
 #include "rdma_transport.hpp"
-#include "shmradix/rht_endpoint.h"
-#include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path; self-guards on SHMRADIX_HAS_ETCD)
+#include "rht_endpoint.h"
+#include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path; self-guards on RADIXSHMEM_HAS_ETCD)
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -43,19 +43,19 @@
 #include <thread>
 #include <utility>
 
-namespace shmradix {
+namespace radixshmem {
 
 // =====================================================================
 // tree accessors + stats
 // =====================================================================
 
-ShmRadixTree&       RadixServer::tree()       { return *tree_; }
-const ShmRadixTree& RadixServer::tree() const { return *tree_; }
+RadixShmemTree&       RadixServer::tree()       { return *tree_; }
+const RadixShmemTree& RadixServer::tree() const { return *tree_; }
 
 const std::string& RadixServer::shm_name() const { return shm_name_; }
 
 int64_t RadixServer::lease_id() const {
-#if !defined(SHMRADIX_NO_RDMA) && defined(SHMRADIX_HAS_ETCD)
+#if !defined(RADIXSHMEM_NO_RDMA) && defined(RADIXSHMEM_HAS_ETCD)
     return registry_ ? registry_->lease_id() : 0;
 #else
     return 0;
@@ -81,7 +81,7 @@ uint64_t RadixServer::insert_error_mempool_count()   const { return tree_->inser
 
 int RadixServer::check_health(HealthReport* report) const {
     HealthReport r;
-    if (tree_) r = shmradix::check_health(*tree_);
+    if (tree_) r = radixshmem::check_health(*tree_);
     else       r.flags = HEALTH_NOT_ATTACHED;
     if (report) *report = r;
     return (int)r.flags;
@@ -129,7 +129,7 @@ void RadixServer::evictor_loop() {
     }
 }
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 
 // =====================================================================
 // cluster bring-up — TCP + shard-map helpers
@@ -527,7 +527,7 @@ bool RadixServer::cluster_bootstrap() {
             cfg_.rank, actual_listen_port_);
 
     // etcd rendezvous: discover peers + order bringup via etcd (sole path).
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
     // registry uri = "etcd://host:port" → strip scheme to "host:port".
     std::string ep = cfg_.registry;
     auto pos = ep.find("://");
@@ -551,7 +551,7 @@ bool RadixServer::cluster_bootstrap() {
 #endif
 }
 
-#endif  // !SHMRADIX_NO_RDMA
+#endif  // !RADIXSHMEM_NO_RDMA
 
 // =====================================================================
 // RadixServer lifecycle
@@ -566,7 +566,7 @@ bool want_cluster(const RadixServerConfig& c) {
 } // namespace
 
 RadixServer::RadixServer(const RadixServerConfig& cfg) : cfg_(cfg) {
-#ifdef SHMRADIX_NO_RDMA
+#ifdef RADIXSHMEM_NO_RDMA
     if (want_cluster(cfg_))
         throw std::runtime_error(
             "RadixServer: built without RDMA — distributed deployments "
@@ -582,17 +582,17 @@ RadixServer::RadixServer(const std::string& name, const ShmConfig& shm) {
 }
 
 RadixServer::~RadixServer() {
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     // Stop remote-op serving thread FIRST (holds refs to svc_* + REP socket).
     rc_stop();
 #endif
     // Stop the evictor before anything that touches tree_ is torn down.
     stop_evictor();
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     // Release the eviction-service client (its evict callback touches tree_).
     svc_client_.reset();   // releases (not frees) the borrowed svc_tree_
     svc_tree_.reset();
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
     registry_.reset();     // revokes the lease: peers see this node leave at once
 #endif
 
@@ -647,28 +647,28 @@ bool RadixServer::bootstrap() {
         shm_name = cfg_.name + "_" + cfg_.node_name;
 
     // Bring up the shm region + evictor.
-    tree_ = std::make_unique<ShmRadixTree>(ShmRadixTree::create(shm_name, shm));
+    tree_ = std::make_unique<RadixShmemTree>(RadixShmemTree::create(shm_name, shm));
     shm_name_        = shm_name;
     start_evictor();
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     if (distributed) {
         bind_ip_ = bind_ip;   // published as PeerEntry.host
 
         // Deployment-level env overrides.
-        if (const char* t = ::getenv("SHMRADIX_RHT_TRANSPORT"))
+        if (const char* t = ::getenv("RADIXSHMEM_RHT_TRANSPORT"))
             cfg_.rht_transport = t;
-        if (const char* t = ::getenv("SHMRADIX_PEER_INDEX_TRANSPORT"))
+        if (const char* t = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
             cfg_.peer_index_transport = t;
-        if (const char* w = ::getenv("SHMRADIX_RHT_SLOTS"))
+        if (const char* w = ::getenv("RADIXSHMEM_RHT_SLOTS"))
             cfg_.rht_slots_per_bucket = atoi(w);
-        if (const char* rot = ::getenv("SHMRADIX_REMOTE_OP_TRANSPORT"))
+        if (const char* rot = ::getenv("RADIXSHMEM_REMOTE_OP_TRANSPORT"))
             cfg_.remote_op_transport = rot;
-        if (const char* r = ::getenv("SHMRADIX_REGISTRY"))
+        if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))
             cfg_.registry = r;
-        if (const char* c = ::getenv("SHMRADIX_CLUSTER_ID"))
+        if (const char* c = ::getenv("RADIXSHMEM_CLUSTER_ID"))
             cfg_.cluster_id = c;
-        if (const char* n = ::getenv("SHMRADIX_NODE_NAME"))
+        if (const char* n = ::getenv("RADIXSHMEM_NODE_NAME"))
             cfg_.node_name = n;
 
         // Removed backend: fail loud rather than remap to zmq.
@@ -744,10 +744,10 @@ bool RadixServer::bootstrap() {
         }
     }
 #endif
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     rc_spawn();
 #endif
     return true;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

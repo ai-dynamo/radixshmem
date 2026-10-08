@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // test_slot_store — SlotStore contract: geometry, addressing, cross-process
-// attach, lifecycle. Links shmradix_data only (no indexer symbols available).
+// attach, lifecycle. Links radixshmem_data only (no indexer symbols available).
 //
 //   - geometry: slot_bytes rounded up to slot_align, data_bytes/num_slots exact
 //   - addressing: slot i at data_base + i*stride, out-of-range rejected
@@ -13,7 +13,7 @@
 //   - hugepage path falls back to shm_open when unavailable
 
 #include "data_test_utils.h"
-#include "shmradix/slot_store.h"
+#include "slot_store.h"
 
 #include <cstring>
 #include <fcntl.h>
@@ -22,7 +22,7 @@
 #include <unistd.h>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // Plain shm keeps every test deterministic on hosts without reserved hugepages.
 static SlotStoreConfig cfg(const std::string& name, uint64_t slots,

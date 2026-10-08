@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cstring>
 
-namespace shmradix {
+namespace radixshmem {
 
 Mempool::Mempool(MempoolHeader* header, uint32_t* free_stack,
                  uint64_t* used_bitmap)
@@ -95,4 +95,4 @@ bool Mempool::enabled() const {
     return header_ != nullptr;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

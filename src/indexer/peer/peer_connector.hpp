@@ -7,10 +7,10 @@
 
 #pragma once
 
-#include "shmradix/config.h"
-#include "shmradix/cluster_manifest.h"
-#include "shmradix/rdma_remote_walker.h"
-#include "shmradix/types.h"
+#include "radixshmem_config.h"
+#include "cluster_manifest.h"
+#include "rdma_remote_walker.h"
+#include "types.h"
 
 #include "peer_breaker.hpp"
 
@@ -20,11 +20,11 @@
 #include <mutex>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 class PeerRegistry;
 class RdmaTransportClient;
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 class RemotePeer;
 class DcInitiator;
 class DcTarget;
@@ -77,7 +77,7 @@ class PeerConnector {
     void peer_changed(int rank);
     void peer_left(int rank);
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     // Fresh remote-op session to `rank` (ZMQ or DC); caller owns the handle.
     std::shared_ptr<RemotePeer> open_remote(int rank);
 #endif
@@ -88,7 +88,7 @@ class PeerConnector {
     // A walk failed: drop the endpoint, the next allowed walk reconnects.
     void fault(int rank, const char* op, const std::exception& e,
                std::chrono::steady_clock::time_point t0);
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     std::shared_ptr<RemotePeer> build_rc_session(int rank);
 #endif
 
@@ -106,7 +106,7 @@ class PeerConnector {
     std::vector<Slot> slots_;   // rank-indexed, guarded by peers_.mutex()
     std::unique_ptr<PeerBreaker> breaker_;
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     std::unique_ptr<DcInitiator> dc_rc_ini_;
     std::unique_ptr<DcTarget>    dc_rc_tgt_;
     std::mutex rc_open_mu_;
@@ -115,4 +115,4 @@ class PeerConnector {
 #endif
 };
 
-} // namespace shmradix
+} // namespace radixshmem

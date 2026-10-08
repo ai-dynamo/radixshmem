@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <infiniband/verbs.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 class RdmaContext {
 public:
@@ -29,7 +29,7 @@ public:
     int gid_index() const { return gid_idx_; }
     const union ibv_gid& gid() const { return gid_; }
 
-    // QoS knobs at QP RTR (sl / traffic_class); env SHMRADIX_RDMA_SL/_TC, override via set_qos.
+    // QoS knobs at QP RTR (sl / traffic_class); env RADIXSHMEM_RDMA_SL/_TC, override via set_qos.
     int  sl() const { return sl_; }
     int  traffic_class() const { return tc_; }
     void set_qos(int sl, int tc) { sl_ = sl; tc_ = tc; }
@@ -67,4 +67,4 @@ private:
     ibv_mr* mr_ = nullptr;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

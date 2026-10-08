@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "shmradix/cluster_manifest.h"
+#include "cluster_manifest.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,7 +18,7 @@
 #include <shared_mutex>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 class PeerRegistry {
   public:
@@ -81,4 +81,4 @@ class PeerRegistry {
     GrowFn                    on_grow_;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

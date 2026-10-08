@@ -10,7 +10,7 @@
 // the test SKIPs (exit 77) rather than failing, so environments without etcd
 // (e.g. CI not yet provisioned) don't red the whole suite.
 //
-// etcd binary discovery: $SHMRADIX_ETCD_BIN, else "etcd" on $PATH.
+// etcd binary discovery: $RADIXSHMEM_ETCD_BIN, else "etcd" on $PATH.
 // Endpoint handed to servers: "etcd://127.0.0.1:<client_port>".
 // cluster_id namespace: "radix-test-<pid>" — unique per test run, so a stale
 // key prefix from an aborted run never leaks into a fresh etcd.
@@ -34,14 +34,14 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-namespace shmradix_test {
+namespace radixshmem_test {
 
 // Exit code ctest maps to "Skipped" via SKIP_RETURN_CODE (see CMakeLists.txt).
 constexpr int kSkipExitCode = 77;
 
 // Locate the etcd binary: env override first, then PATH.
 inline std::string find_etcd_binary() {
-    if (const char* p = ::getenv("SHMRADIX_ETCD_BIN")) {
+    if (const char* p = ::getenv("RADIXSHMEM_ETCD_BIN")) {
         if (::access(p, X_OK) == 0) return p;
     }
     // Probe PATH via `command -v` semantics without spawning a shell: scan $PATH.
@@ -226,4 +226,4 @@ private:
     bool        usable_ = false;
 };
 
-} // namespace shmradix_test
+} // namespace radixshmem_test

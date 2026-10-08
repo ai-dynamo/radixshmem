@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/rht_endpoint.h"
+#include "rht_endpoint.h"
 #include "rht_core.hpp"
 
 #include <algorithm>
@@ -14,7 +14,7 @@
 #include <unordered_map>
 #include <infiniband/verbs.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 // ==================== RhtShardAddr <-> PeerEntry ====================
 //
@@ -302,4 +302,4 @@ void RhtConsumer::reset_owned_shard() {
         if (kv.second.valid()) kv.second.reset();
 }
 
-} // namespace shmradix
+} // namespace radixshmem

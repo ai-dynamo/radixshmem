@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// shmradix._data — Python bindings for the data plane (SlotStore + transfer
-// backend + SlotTransfer). A separate extension from shmradix._core: the data
+// radixshmem._data — Python bindings for the data plane (SlotStore + transfer
+// backend + SlotTransfer). A separate extension from radixshmem._core: the data
 // plane does not link the indexer.
 //
 // Lifetime: SlotTransfer borrows its store and backend; keep_alive pins both.
@@ -11,12 +11,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include "shmradix/component_kind.h"
-#include "shmradix/data_registry.h"
-#include "shmradix/slot_geometry.h"
-#include "shmradix/slot_store.h"
-#include "shmradix/slot_transfer.h"
-#include "shmradix/transfer.h"
+#include "component_kind.h"
+#include "data_registry.h"
+#include "slot_geometry.h"
+#include "slot_store.h"
+#include "slot_transfer.h"
+#include "transfer.h"
 
 #include <cstring>
 #include <memory>
@@ -25,7 +25,7 @@
 #include <vector>
 
 namespace py = pybind11;
-using namespace shmradix;
+using namespace radixshmem;
 
 namespace {
 
@@ -78,7 +78,7 @@ std::string pool_repr(const PoolGeometry& g) {
 } // namespace
 
 PYBIND11_MODULE(_data, m) {
-    m.doc() = "shmradix data plane: shared-memory slot pools and slot-granular transfers";
+    m.doc() = "radixshmem data plane: shared-memory slot pools and slot-granular transfers";
 
     // ==================== return codes / enums ====================
     m.attr("XFER_OK")        = XFER_OK;
@@ -91,10 +91,10 @@ PYBIND11_MODULE(_data, m) {
     m.attr("PEER_SLOT_BYTES_UNCHECKED") = PEER_SLOT_BYTES_UNCHECKED;
     // Transfer backends compiled in (tests SKIP on a missing one).
     py::list backends;
-#ifdef SHMRADIX_HAS_MOONCAKE
+#ifdef RADIXSHMEM_HAS_MOONCAKE
     backends.append("mooncake");
 #endif
-#ifdef SHMRADIX_HAS_NIXL
+#ifdef RADIXSHMEM_HAS_NIXL
     backends.append("nixl");
 #endif
     m.attr("TRANSFER_BACKENDS") = backends;
@@ -460,7 +460,7 @@ PYBIND11_MODULE(_data, m) {
              py::call_guard<py::gil_scoped_release>(),
              "XFER_OK, or XFER_EBUSY while the batch is still running.");
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
     // ==================== data-plane registry (etcd) ====================
     py::class_<DataPlaneEntry>(m, "DataPlaneEntry")
         .def_readonly("pool_mask", &DataPlaneEntry::pool_mask)

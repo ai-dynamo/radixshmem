@@ -6,8 +6,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT/build"
 JOBS="$(nproc 2>/dev/null || echo 4)"
-# One interpreter for everything below: CMake builds shmradix._core and
-# shmradix._data against its pybind11, and pip installs the package into it.
+# One interpreter for everything below: CMake builds radixshmem._core and
+# radixshmem._data against its pybind11, and pip installs the package into it.
 PYTHON="${PYTHON:-python3}"
 
 # ---------- C++ + Python extension modules ----------

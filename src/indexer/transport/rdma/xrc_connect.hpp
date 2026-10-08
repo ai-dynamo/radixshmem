@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "shmradix/cluster_protocol.h"
+#include "cluster_protocol.h"
 #include "rdma_transport.hpp"
 
 #include <arpa/inet.h>
@@ -19,7 +19,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 inline bool xrc_send_all(int fd, const void* data, size_t len) {
     const char* p = static_cast<const char*>(data);
@@ -118,4 +118,4 @@ inline std::unique_ptr<XrcSendQp> xrc_connect(RdmaContext& ctx, ibv_cq* cq,
     return ep;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

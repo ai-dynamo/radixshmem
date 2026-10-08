@@ -5,22 +5,22 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include "shmradix/hash.h"
-#include "shmradix/health_check.h"
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_server.h"
-#include "shmradix/types.h"
+#include "hash.h"
+#include "health_check.h"
+#include "radix_client.h"
+#include "radix_server.h"
+#include "types.h"
 
-#include "shmradix/cluster_protocol.h"
+#include "cluster_protocol.h"
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
 #include "etcd_client.hpp"   // src/registry: the Go-wrapper etcd client, bound as _core.EtcdKv
 #endif
 
 #include <optional>
 
 namespace py = pybind11;
-using namespace shmradix;
+using namespace radixshmem;
 
 static py::array_t<int32_t> vec_to_npy_i32(const std::vector<int32_t>& v) {
     py::array_t<int32_t> arr(static_cast<py::ssize_t>(v.size()));
@@ -65,7 +65,7 @@ static py::array_t<uint64_t> py_compute_hashes(py::array_t<int64_t> token_ids,
 }
 
 PYBIND11_MODULE(_core, m) {
-    m.doc() = "shmradix: shared-memory radix tree for KV cache prefix matching";
+    m.doc() = "radixshmem: shared-memory radix tree for KV cache prefix matching";
 
     // ==================== Enums ====================
 
@@ -94,7 +94,7 @@ PYBIND11_MODULE(_core, m) {
 
 
     m.attr("MAX_REMOTE_OP_BLOCKS") = MAX_REMOTE_OP_BLOCKS;
-    // Largest register chunk in blocks (register_chunk_tokens / block_size) ShmRadixTree::create accepts.
+    // Largest register chunk in blocks (register_chunk_tokens / block_size) RadixShmemTree::create accepts.
     m.attr("MAX_REGISTER_CHUNK_SIZE") = BuddyHeader::MAX_DATA_BLOCKS;
     py::enum_<ComponentType>(m, "ComponentType")
         .value("FULL", ComponentType::FULL)
@@ -420,11 +420,11 @@ PYBIND11_MODULE(_core, m) {
             HealthReport r; s.check_health(&r); return r;
         }, "Lock-free leak audit; returns the full HealthReport.");
 
-#ifdef SHMRADIX_HAS_ETCD
+#ifdef RADIXSHMEM_HAS_ETCD
     // ==================== EtcdKv ====================
     // Plain key/value access to the cluster's etcd, sharing the process-global
     // connection with RadixServer / DataPlaneRegistry. Values are text (JSON,
-    // base64). Used by shmradix.server for radix/<cluster_id>/geometry/<node>.
+    // base64). Used by radixshmem.server for radix/<cluster_id>/geometry/<node>.
 
     py::class_<etcd::Client>(m, "EtcdKv")
         .def(py::init([](const std::string& registry) {
@@ -585,7 +585,7 @@ PYBIND11_MODULE(_core, m) {
         .def("health_report", [](const RadixClient& c) {
             HealthReport r; c.check_health(&r); return r;
         }, "Lock-free leak audit; returns the full HealthReport.")
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
         .def("remote_allocate", [](RadixClient& c, int rank, int n) {
             AllocateReply rep;
@@ -652,7 +652,7 @@ PYBIND11_MODULE(_core, m) {
         .def_static("compute_hashes", &py_compute_hashes,
                      py::arg("token_ids"), py::arg("tokens_per_block"));
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     // ==================== Remote-op control plane ====================
     // (RemoteStatus is registered unconditionally in the Enums section above.)
 
@@ -661,7 +661,7 @@ PYBIND11_MODULE(_core, m) {
         .def_property_readonly("slots", [](const AllocateReply& r) {
             return vec_to_npy_i32(r.slots);
         });
-#endif  // !SHMRADIX_NO_RDMA
+#endif  // !RADIXSHMEM_NO_RDMA
 
     // ==================== Free functions ====================
 

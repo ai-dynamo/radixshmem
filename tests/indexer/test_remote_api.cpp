@@ -14,9 +14,9 @@
 #include "rdma_test_env.h"
 #include "etcd_test_harness.hpp"
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_server.h"
-#include "shmradix/types.h"
+#include "radix_client.h"
+#include "radix_server.h"
+#include "types.h"
 
 #include <chrono>
 #include <csignal>
@@ -57,7 +57,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     ::signal(SIGTERM, on_term);
     ::signal(SIGINT,  on_term);
 
-    shmradix::RadixServerConfig cfg;
+    radixshmem::RadixServerConfig cfg;
     cfg.name        = kShmPrefix;
     cfg.shm.hugepage_path = "";
     cfg.shm.max_blocks = 4096;
@@ -76,7 +76,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     }
 
     try {
-        shmradix::RadixServer srv(cfg);
+        radixshmem::RadixServer srv(cfg);
         if (!srv.bootstrap()) {
             fprintf(stderr, "[server %s] bootstrap failed\n", node.c_str());
             return 10;
@@ -101,15 +101,15 @@ bool wait_shm_ready(const std::string& shm_name, int timeout_sec) {
     while (std::chrono::steady_clock::now() < deadline) {
         int fd = ::shm_open(shm_name.c_str(), O_RDONLY, 0);
         if (fd >= 0) {
-            void* base = ::mmap(nullptr, sizeof(shmradix::ShmHeader),
+            void* base = ::mmap(nullptr, sizeof(radixshmem::ShmHeader),
                                 PROT_READ, MAP_SHARED, fd, 0);
             ::close(fd);
             if (base != MAP_FAILED) {
-                auto* hdr = static_cast<shmradix::ShmHeader*>(base);
+                auto* hdr = static_cast<radixshmem::ShmHeader*>(base);
                 uint64_t v =
                     hdr->cluster_ready_magic.load(std::memory_order_acquire);
-                ::munmap(base, sizeof(shmradix::ShmHeader));
-                if (v == shmradix::CLUSTER_MANIFEST_MAGIC) return true;
+                ::munmap(base, sizeof(radixshmem::ShmHeader));
+                if (v == radixshmem::CLUSTER_MANIFEST_MAGIC) return true;
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -117,10 +117,10 @@ bool wait_shm_ready(const std::string& shm_name, int timeout_sec) {
     return false;
 }
 
-std::vector<shmradix::HashType> make_hashes(int64_t base, int n) {
+std::vector<radixshmem::HashType> make_hashes(int64_t base, int n) {
     std::vector<int64_t> tok(n);
     std::iota(tok.begin(), tok.end(), base);
-    return shmradix::RadixClient::compute_hashes(tok.data(), n, kBlockSize);
+    return radixshmem::RadixClient::compute_hashes(tok.data(), n, kBlockSize);
 }
 
 int wait_one(pid_t pid, const char* who) {
@@ -149,9 +149,9 @@ pid_t spawn(const std::vector<std::string>& argv) {
 // Local-tree insert (upstream insert_auto): peek LOCAL matched prefix, allocate
 // shortfall, bind slots to hashes[matched:] via start=matched, auto-recycle
 // surplus. Returns the number of blocks this call newly landed.
-int insert_auto_local(shmradix::RadixClient& c,
-                      const shmradix::HashType* h, int n) {
-    int matched = c.query(h, n, shmradix::COMPONENT_MASK_FULL,
+int insert_auto_local(radixshmem::RadixClient& c,
+                      const radixshmem::HashType* h, int n) {
+    int matched = c.query(h, n, radixshmem::COMPONENT_MASK_FULL,
                           /*local_only=*/true, /*lock=*/false,
                           /*update_meta=*/false).common_hit;
     std::vector<int32_t> slots;
@@ -162,8 +162,8 @@ int insert_auto_local(shmradix::RadixClient& c,
 }
 
 // Seed a prefix into B's local tree. pin=false: evictable insert; pin=true: inc_ref path (unevictable).
-int seed_prefix_on_B(const std::vector<shmradix::HashType>& h, bool pin) {
-    shmradix::RadixClient b(shm_name_for(kTargetRank));
+int seed_prefix_on_B(const std::vector<radixshmem::HashType>& h, bool pin) {
+    radixshmem::RadixClient b(shm_name_for(kTargetRank));
     int n = (int)h.size();
     int inserted = insert_auto_local(b, h.data(), n);
     if (pin) (void)pin_path(b, h.data(), n);   // handle dropped: stays pinned
@@ -173,15 +173,15 @@ int seed_prefix_on_B(const std::vector<shmradix::HashType>& h, bool pin) {
 
 // Eviction pressure on B: allocate whole mempool (evicts unpinned leaves) then recycle (upstream force_evict).
 void evict_pressure_on_B() {
-    shmradix::RadixClient b(shm_name_for(kTargetRank));
+    radixshmem::RadixClient b(shm_name_for(kTargetRank));
     std::vector<int32_t> tmp;
     b.allocate_slots((int)b.mempool_total(), tmp);
     if (!tmp.empty()) b.recycle_slots(tmp.data(), (int)tmp.size());
 }
 
-int b_local_hit(const std::vector<shmradix::HashType>& h) {
-    shmradix::RadixClient b(shm_name_for(kTargetRank));
-    return b.query(h.data(), (int)h.size(), shmradix::COMPONENT_MASK_FULL,
+int b_local_hit(const std::vector<radixshmem::HashType>& h) {
+    radixshmem::RadixClient b(shm_name_for(kTargetRank));
+    return b.query(h.data(), (int)h.size(), radixshmem::COMPONENT_MASK_FULL,
                    /*local_only=*/true).common_hit;
 }
 
@@ -192,14 +192,14 @@ int run_session_reuse() {
         auto h = make_hashes(1000, n);
         if (seed_prefix_on_B(h, /*pin=*/false) != n) return 60;
 
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
         if (!cli.is_distributed()) return 61;
 
         // No handle: repeated rank-first queries reuse the client's cached session.
         auto q1 = cli.remote_query(kTargetRank, h.data(), n);
         auto q2 = cli.remote_query(kTargetRank, h.data(), n);
-        if (q1.status != shmradix::RemoteStatus::OK || q1.total_hit_length != n ||
-            q2.status != shmradix::RemoteStatus::OK || q2.total_hit_length != n) {
+        if (q1.status != radixshmem::RemoteStatus::OK || q1.total_hit_length != n ||
+            q2.status != radixshmem::RemoteStatus::OK || q2.total_hit_length != n) {
             fprintf(stderr, "[reuse] q1 status=%d hit=%d / q2 status=%d hit=%d\n",
                     (int)q1.status, q1.total_hit_length,
                     (int)q2.status, q2.total_hit_length);
@@ -218,21 +218,21 @@ int run_control_vs_golden() {
     try {
         const int n = 16, head_n = 8;
         auto h = make_hashes(2000, n);
-        std::vector<shmradix::HashType> head(h.begin(), h.begin() + head_n);
+        std::vector<radixshmem::HashType> head(h.begin(), h.begin() + head_n);
         if (seed_prefix_on_B(head, /*pin=*/false) != head_n) return 70;
         // Extend with PINNED blocks — query reports pinned/unpinned uniformly.
         if (seed_prefix_on_B(h, /*pin=*/true) != n - head_n) return 71;
 
-        shmradix::ComponentQueryResult golden;
+        radixshmem::ComponentQueryResult golden;
         {
-            shmradix::RadixClient b(shm_name_for(kTargetRank));
-            golden = b.query(h.data(), n, shmradix::COMPONENT_MASK_FULL,
+            radixshmem::RadixClient b(shm_name_for(kTargetRank));
+            golden = b.query(h.data(), n, radixshmem::COMPONENT_MASK_FULL,
                              /*local_only=*/true);
         }
 
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
         auto r = cli.remote_query(kTargetRank, h.data(), n);
-        if (r.status != shmradix::RemoteStatus::OK) {
+        if (r.status != radixshmem::RemoteStatus::OK) {
             fprintf(stderr, "[golden] status=%d\n", (int)r.status); return 72;
         }
         if (r.total_hit_length != golden.common_hit) {
@@ -266,33 +266,33 @@ int run_bad_target() {
         const int n = 4;
         auto h = make_hashes(3000, n);
         std::vector<int32_t> dummy_slots(n, 0);
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
 
         // Illegal ranks (self / out of range / negative): every op reports
         // BAD_TARGET or REMOTE_FAILED inline — never a throw, nothing on the wire.
         int bad_ranks[] = { kInitiatorRank /*self*/, kWorldSize, 99, -1 };
         for (int t : bad_ranks) {
             auto r = cli.remote_query(t, h.data(), n);
-            if (r.status != shmradix::RemoteStatus::BAD_TARGET ||
+            if (r.status != radixshmem::RemoteStatus::BAD_TARGET ||
                 r.rdma_read_count != 0 || r.total_hit_length != 0) {
                 fprintf(stderr, "[badtgt] query(rank=%d) status=%d\n",
                         t, (int)r.status);
                 return 81;
             }
             if (cli.remote_allocate(t, n).status
-                    != shmradix::RemoteStatus::BAD_TARGET) return 82;
+                    != radixshmem::RemoteStatus::BAD_TARGET) return 82;
             if (cli.remote_insert(t, h.data(), n, 0, n, dummy_slots.data()).error
-                    != shmradix::InsertError::REMOTE_FAILED) return 83;
+                    != radixshmem::InsertError::REMOTE_FAILED) return 83;
             if (cli.remote_unlock(t, h.data(), n, n)
-                    != shmradix::RemoteStatus::BAD_TARGET) return 84;
+                    != radixshmem::RemoteStatus::BAD_TARGET) return 84;
             if (cli.remote_recycle(t, dummy_slots.data(), n)
-                    != shmradix::RemoteStatus::BAD_TARGET) return 84;
+                    != radixshmem::RemoteStatus::BAD_TARGET) return 84;
         }
         // Self-guard also holds on a rank that SERVES remote ops.
         {
-            shmradix::RadixClient b(shm_name_for(kTargetRank));
+            radixshmem::RadixClient b(shm_name_for(kTargetRank));
             if (b.remote_query(kTargetRank, h.data(), n).status
-                    != shmradix::RemoteStatus::BAD_TARGET) return 86;
+                    != radixshmem::RemoteStatus::BAD_TARGET) return 86;
         }
         fprintf(stderr, "[badtgt] OK self/oob/negative → BAD_TARGET inline\n");
         return 0;
@@ -309,9 +309,9 @@ int run_lock_closure() {
         auto h = make_hashes(4000, n);
         if (seed_prefix_on_B(h, /*pin=*/false) != n) return 90;
 
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
         auto r = cli.remote_query(kTargetRank, h.data(), n, /*lock=*/true);
-        if (r.status != shmradix::RemoteStatus::OK || r.total_hit_length != n)
+        if (r.status != radixshmem::RemoteStatus::OK || r.total_hit_length != n)
             return 91;
         if (!r.finalize) return 92;   // lock=true must arm the closure
 
@@ -339,10 +339,10 @@ int run_insert_finalize() {
     try {
         const int n = 16;
         auto h = make_hashes(5000, n);
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
 
         auto rep = cli.remote_allocate(kTargetRank, n);
-        if (rep.status != shmradix::RemoteStatus::OK) {
+        if (rep.status != radixshmem::RemoteStatus::OK) {
             fprintf(stderr, "[2phase] allocate status=%d\n", (int)rep.status);
             return 100;
         }
@@ -351,8 +351,8 @@ int run_insert_finalize() {
 
         // Between phases: nothing published, allocation lives outside tree — B must NOT match.
         {
-            shmradix::RadixClient b(shm_name_for(kTargetRank));
-            auto bq = b.query(h.data(), n, shmradix::COMPONENT_MASK_FULL,
+            radixshmem::RadixClient b(shm_name_for(kTargetRank));
+            auto bq = b.query(h.data(), n, radixshmem::COMPONENT_MASK_FULL,
                               /*local_only=*/true);
             if (bq.common_hit != 0) {
                 fprintf(stderr, "[2phase] pre-finalize hit=%d (published "
@@ -363,11 +363,11 @@ int run_insert_finalize() {
         // (caller's KV transfer happens here) — phase 2. Fresh prefix: start=0, publish all n.
         if (cli.remote_insert(kTargetRank, h.data(), n,
                                 0, n, rep.slots.data()).error
-                != shmradix::InsertError::OK)
+                != radixshmem::InsertError::OK)
             return 103;
         {
-            shmradix::RadixClient b(shm_name_for(kTargetRank));
-            auto bq = b.query(h.data(), n, shmradix::COMPONENT_MASK_FULL,
+            radixshmem::RadixClient b(shm_name_for(kTargetRank));
+            auto bq = b.query(h.data(), n, radixshmem::COMPONENT_MASK_FULL,
                               /*local_only=*/true);
             if (bq.common_hit != n) return 104;
             if (hit_slots(bq) != rep.slots) {
@@ -388,13 +388,13 @@ int run_release_abort() {
     try {
         const int n = 16;
         auto h = make_hashes(6000, n);
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
 
-        shmradix::RadixClient b(shm_name_for(kTargetRank));
+        radixshmem::RadixClient b(shm_name_for(kTargetRank));
         uint32_t used0 = b.mempool_used();
 
         auto rep = cli.remote_allocate(kTargetRank, n);
-        if (rep.status != shmradix::RemoteStatus::OK ||
+        if (rep.status != radixshmem::RemoteStatus::OK ||
             (int)rep.slots.size() != n) return 110;
 
         // Allocation outside tree: no match, but slots checked out of B's pool.
@@ -405,7 +405,7 @@ int run_release_abort() {
         }
         // Abort: recycle the slots — B returns them to the pool.
         if (cli.remote_recycle(kTargetRank, rep.slots.data(), n)
-                != shmradix::RemoteStatus::OK)
+                != radixshmem::RemoteStatus::OK)
             return 112;
         if (b_local_hit(h) != 0 || b.mempool_used() != used0) {
             fprintf(stderr, "[abort] aborted allocation not recycled "
@@ -425,25 +425,25 @@ int run_full_dedup() {
     try {
         const int n = 16;
         auto h = make_hashes(7000, n);
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
 
         // First publish: allocate n, insert all n.
         auto rep = cli.remote_allocate(kTargetRank, n);
-        if (rep.status != shmradix::RemoteStatus::OK ||
+        if (rep.status != radixshmem::RemoteStatus::OK ||
             (int)rep.slots.size() != n) return 120;
         auto first = cli.remote_insert(kTargetRank, h.data(), n, 0, n,
                                        rep.slots.data());
-        if (first.error != shmradix::InsertError::OK) return 121;
+        if (first.error != radixshmem::InsertError::OK) return 121;
 
         // Second round: allocate again, re-insert the SAME prefix. Dedup is now
         // in phase-2 INSERT — local insert matches the whole prefix and consumes
         // 0 slots; auto_recycle returns the surplus reservation.
         auto rep2 = cli.remote_allocate(kTargetRank, n);
-        if (rep2.status != shmradix::RemoteStatus::OK ||
+        if (rep2.status != radixshmem::RemoteStatus::OK ||
             (int)rep2.slots.size() != n) return 122;
         auto dup = cli.remote_insert(kTargetRank, h.data(), n, 0, n,
                                      rep2.slots.data(), /*auto_recycle=*/true);
-        if (dup.error != shmradix::InsertError::OK) return 123;
+        if (dup.error != radixshmem::InsertError::OK) return 123;
         if ((int)dup.unused_slots.size() != n) {
             fprintf(stderr, "[dedup] re-insert landed %d slots (expected 0)\n",
                     n - (int)dup.unused_slots.size());
@@ -469,10 +469,10 @@ int run_full_dedup() {
 int g_to_parent_fd = -1, g_from_parent_fd = -1;
 int run_timeout_and_rebuild() {
     try {
-        shmradix::RadixClient cli(shm_name_for(kInitiatorRank));
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
         auto h = make_hashes(50000, 4);
         auto ok = cli.remote_query(kTargetRank, h.data(), 4);   // B still up
-        if (ok.status != shmradix::RemoteStatus::OK) return 180;
+        if (ok.status != radixshmem::RemoteStatus::OK) return 180;
 
         char b = 1;
         if (::write(g_to_parent_fd, &b, 1) != 1) return 181;
@@ -480,7 +480,7 @@ int run_timeout_and_rebuild() {
 
         // #2: TIMEOUT reported in status, no hang, no throw.
         auto r = cli.remote_query(kTargetRank, h.data(), 4);
-        if (r.status != shmradix::RemoteStatus::TIMEOUT) {
+        if (r.status != radixshmem::RemoteStatus::TIMEOUT) {
             fprintf(stderr, "[timeout] status=%d expected TIMEOUT\n",
                     (int)r.status);
             return 183;
@@ -488,9 +488,9 @@ int run_timeout_and_rebuild() {
         // #3: the cached session survives; repeated ops keep reporting TIMEOUT,
         // never crash (no per-call handle to invalidate).
         auto q = cli.remote_query(kTargetRank, h.data(), 4);
-        if (q.status != shmradix::RemoteStatus::TIMEOUT) return 184;
+        if (q.status != radixshmem::RemoteStatus::TIMEOUT) return 184;
         auto rep = cli.remote_allocate(kTargetRank, 4);
-        if (rep.status != shmradix::RemoteStatus::TIMEOUT) return 185;
+        if (rep.status != radixshmem::RemoteStatus::TIMEOUT) return 185;
         fprintf(stderr, "[timeout] OK TIMEOUT + cached session safe\n");
         return 0;
     } catch (const std::exception& e) {
@@ -537,11 +537,11 @@ int main(int argc, char** argv) {
     kRdmaDev = resolve_index_dev_or_skip(kRdmaDev.c_str());
 
     // Private etcd — sole cluster bootstrap backend; no etcd binary → SKIP.
-    shmradix_test::EtcdHarness etcd;
+    radixshmem_test::EtcdHarness etcd;
     if (!etcd.usable()) {
-        fprintf(stderr, "[parent] no etcd binary (set SHMRADIX_ETCD_BIN or "
+        fprintf(stderr, "[parent] no etcd binary (set RADIXSHMEM_ETCD_BIN or "
                         "put etcd on PATH) — skipping\n");
-        return shmradix_test::kSkipExitCode;
+        return radixshmem_test::kSkipExitCode;
     }
     const std::string registry   = etcd.registry();
     const std::string cluster_id = etcd.cluster_id();

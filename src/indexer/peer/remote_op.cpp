@@ -3,12 +3,12 @@
 
 // Client half of the remote-op plane: RemotePeer, a request/reply session to a
 // peer's local tree. Server half lives in remote_op_service.cpp.
-#include "shmradix/radix_client.h"          // RemotePeer decl + reply structs
+#include "radix_client.h"          // RemotePeer decl + reply structs
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 
-#include "shmradix/cluster_protocol.h"       // remote-op wire structs
-#include "shmradix/bilateral_transport.h"    // IRemoteOpClientTransport
+#include "cluster_protocol.h"       // remote-op wire structs
+#include "bilateral_transport.h"    // IRemoteOpClientTransport
 
 #include <cstdint>
 #include <cstring>
@@ -17,7 +17,7 @@
 #include <utility>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -203,6 +203,6 @@ QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
     return out;
 }
 
-}  // namespace shmradix
+}  // namespace radixshmem
 
-#endif  // !SHMRADIX_NO_RDMA
+#endif  // !RADIXSHMEM_NO_RDMA

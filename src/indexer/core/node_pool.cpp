@@ -7,7 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 NodePool::NodePool(TreeNode* nodes, uint32_t capacity,
                    uint32_t* free_head, std::atomic<uint32_t>* pool_size,
@@ -89,4 +89,4 @@ uint32_t NodePool::size() const {
     return pool_size_->load(std::memory_order_relaxed);
 }
 
-} // namespace shmradix
+} // namespace radixshmem

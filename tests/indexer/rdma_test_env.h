@@ -10,9 +10,9 @@
 #include <cstdlib>
 #include <string>
 
-// Returns SHMRADIX_RDMA_DEV else `def`; exits 77 if absent. Call at top of main(), before forking.
+// Returns RADIXSHMEM_RDMA_DEV else `def`; exits 77 if absent. Call at top of main(), before forking.
 inline std::string resolve_index_dev_or_skip(const char* def) {
-    const char* env = ::getenv("SHMRADIX_RDMA_DEV");
+    const char* env = ::getenv("RADIXSHMEM_RDMA_DEV");
     std::string want = env ? env : def;
     int n = 0;
     ibv_device** list = ibv_get_device_list(&n);
@@ -23,7 +23,7 @@ inline std::string resolve_index_dev_or_skip(const char* def) {
     if (list) ibv_free_device_list(list);
     if (!found) {
         printf("SKIP: RDMA device '%s' not found on this host (%d device(s) "
-               "present; set SHMRADIX_RDMA_DEV to override)\n",
+               "present; set RADIXSHMEM_RDMA_DEV to override)\n",
                want.c_str(), n);
         exit(77);
     }

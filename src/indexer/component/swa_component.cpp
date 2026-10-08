@@ -2,14 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "component_set.hpp"
-#include "shmradix/radix_tree.h"
+#include "radix_tree.h"
 
 #include <cassert>
 #include <cstdio>
 
-namespace shmradix {
+namespace radixshmem {
 
-void ShmRadixTree::relink_swa(uint32_t id) {
+void RadixShmemTree::relink_swa(uint32_t id) {
     TreeNode* node = nodes_.get(id);
     const int nb = (int)node->num_blocks;
     const int32_t* lane = data_.get_swa_slots(node->data_offset, nb);
@@ -29,7 +29,7 @@ void ShmRadixTree::relink_swa(uint32_t id) {
 // is a query-side acceptance rule, so a publisher may cover one position (a
 // decode step) or a whole node. A whole window is the special case
 // num_slots == min(W, n).
-InsertResult ShmRadixTree::insert_swa(const uint64_t* hashes, int n,
+InsertResult RadixShmemTree::insert_swa(const uint64_t* hashes, int n,
                                       const int32_t* slots, int num_slots,
                                       bool auto_recycle) {
     set_write_op("insert_swa");
@@ -92,7 +92,7 @@ InsertResult ShmRadixTree::insert_swa(const uint64_t* hashes, int n,
     return finish();
 }
 
-void ShmRadixTree::retire_swa(uint32_t id, std::vector<int32_t>& out) {
+void RadixShmemTree::retire_swa(uint32_t id, std::vector<int32_t>& out) {
     if (!has_swa_) return;
     NodeComponentState* cs = nodes_.component_state(id);
     if (cs->swa_live_blocks == 0) return;
@@ -108,7 +108,7 @@ void ShmRadixTree::retire_swa(uint32_t id, std::vector<int32_t>& out) {
     cs->swa_live_blocks = 0;
 }
 
-int ShmRadixTree::evict_swa_walk(int need_slots) {
+int RadixShmemTree::evict_swa_walk(int need_slots) {
     if (!has_swa_) return 0;
     std::vector<int32_t> tmp;
     uint32_t cur = swa_lru_.head();
@@ -127,9 +127,9 @@ int ShmRadixTree::evict_swa_walk(int need_slots) {
     }
     int got = swa_mempool_.recycle(tmp.data(), (int)tmp.size());
     if (got != (int)tmp.size())
-        fprintf(stderr, "[shmradix] WARNING: SWA evict recycled %d/%d slots "
+        fprintf(stderr, "[radixshmem] WARNING: SWA evict recycled %d/%d slots "
                 "(duplicate or foreign slot id)\n", got, (int)tmp.size());
     return got;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

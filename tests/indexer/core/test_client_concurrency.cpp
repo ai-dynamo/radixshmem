@@ -9,7 +9,7 @@
 // Merged from the former test_client_share + test_concurrent.
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
 #include <atomic>
 #include <cassert>
@@ -19,7 +19,7 @@
 #include <unistd.h>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // ==================================================================
 // Sharing #1: in-process clients share writes, and a forked child on the

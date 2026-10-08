@@ -4,19 +4,19 @@
 // Server half of the remote-op plane: RadixServer::rc_* endpoint + op handlers,
 // the pollers that serve a peer's insert/query/release against our local tree.
 // Client half (RemotePeer) lives in peer/remote_op.cpp.
-#include "shmradix/radix_server.h"
+#include "radix_server.h"
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 
-#include "shmradix/local.h"                 // LocalTreeConnector (svc_tree_)
-#include "shmradix/radix_client.h"          // RadixClient (svc_client_)
-#include "shmradix/cluster_protocol.h"      // remote-op wire structs
-#include "shmradix/bilateral_transport.h"   // IRemoteOpServerTransport
-#include "shmradix/cluster_manifest.h"      // REMOTE_OP_TRANSPORT_*
-#ifdef SHMRADIX_REMOTE_OP_RDMA
+#include "local.h"                 // LocalTreeConnector (svc_tree_)
+#include "radix_client.h"          // RadixClient (svc_client_)
+#include "cluster_protocol.h"      // remote-op wire structs
+#include "bilateral_transport.h"   // IRemoteOpServerTransport
+#include "cluster_manifest.h"      // REMOTE_OP_TRANSPORT_*
+#ifdef RADIXSHMEM_REMOTE_OP_RDMA
 #include "dc_bilateral.hpp"                 // DcServerTransport
 #endif
-#ifdef SHMRADIX_HAS_ZMQ
+#ifdef RADIXSHMEM_HAS_ZMQ
 #include "zmq_transport.hpp"                // ZmqServerTransport (fallback)
 #endif
 
@@ -35,13 +35,13 @@
 #include <utility>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
 int rc_resolve_lanes() {
     int lanes = 1;
-    if (const char* e = ::getenv("SHMRADIX_RC_LANES")) {
+    if (const char* e = ::getenv("RADIXSHMEM_RC_LANES")) {
         int v = std::atoi(e);
         if (v >= 1 && v <= 8) lanes = v;
     }
@@ -69,9 +69,9 @@ RemoteOpAddr RadixServer::rc_build_endpoint(uint32_t rot_auth,
     // Body of the build_remote_op callback.
     RemoteOpAddr addr{};
     if (rot_auth == REMOTE_OP_TRANSPORT_DC) {
-#ifdef SHMRADIX_REMOTE_OP_RDMA
+#ifdef RADIXSHMEM_REMOTE_OP_RDMA
         int k_pool = 64;
-        if (const char* e = ::getenv("SHMRADIX_RC_KPOOL")) {
+        if (const char* e = ::getenv("RADIXSHMEM_RC_KPOOL")) {
             int v = std::atoi(e);
             if (v >= 1 && v <= 4096) k_pool = v;
         }
@@ -94,7 +94,7 @@ RemoteOpAddr RadixServer::rc_build_endpoint(uint32_t rot_auth,
             "(removed xrc/rdma backend?) — redeploy rank 0 with "
             "remote_op_transport = dc or zmq");
     }
-#ifdef SHMRADIX_HAS_ZMQ
+#ifdef RADIXSHMEM_HAS_ZMQ
     auto z = std::make_unique<ZmqServerTransport>(cfg_.zmq_listen_port);
     addr.port = z->bind();   // actual bound port (throws on failure)
     rc_server_ = std::move(z);
@@ -343,6 +343,6 @@ void RadixServer::rc_loop(int lane) {
     }
 }
 
-}  // namespace shmradix
+}  // namespace radixshmem
 
-#endif  // !SHMRADIX_NO_RDMA
+#endif  // !RADIXSHMEM_NO_RDMA

@@ -21,9 +21,9 @@
 // RDMA reads / atomics per query.
 
 #include "bench_util.h"
-#include "shmradix/radix_client.h"
-#include "shmradix/radix_server.h"
-#include "shmradix/types.h"
+#include "radix_client.h"
+#include "radix_server.h"
+#include "types.h"
 
 #include <atomic>
 #include <cassert>
@@ -39,7 +39,7 @@
 #include <unistd.h>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 using bench::HashGen;
 using bench::LatencyCollector;
 using bench::WorkloadConfig;
@@ -93,7 +93,7 @@ InsertResult insert_auto(RadixClient& cli, const uint64_t* h, int n) {
                       /*start=*/matched, /*auto_recycle=*/true);
 }
 
-// hugepage-first probe, matching ShmRadixTree::attach() — a shm_open-only
+// hugepage-first probe, matching RadixShmemTree::attach() — a shm_open-only
 // probe misses segments the server built on /dev/hugepages.
 int open_cluster_shm(const std::string& shm_name) {
     std::string base = (!shm_name.empty() && shm_name[0] == '/')

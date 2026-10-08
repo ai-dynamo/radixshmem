@@ -12,7 +12,7 @@
 #include <cstring>
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 class FakeRdmaEndpoint : public IRdmaEndpoint {
 public:

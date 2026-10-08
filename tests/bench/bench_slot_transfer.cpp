@@ -18,9 +18,9 @@
 // --devices restricts the NICs used; without it, hosts with a RoCE management
 // NIC can see ~1 s retry spikes in the `max` column.
 
-#include "shmradix/slot_store.h"
-#include "shmradix/slot_transfer.h"
-#include "shmradix/transfer.h"
+#include "slot_store.h"
+#include "slot_transfer.h"
+#include "transfer.h"
 
 #include <algorithm>
 #include <chrono>
@@ -34,7 +34,7 @@
 #include <unistd.h>
 #include <sys/wait.h>
 
-using namespace shmradix;
+using namespace radixshmem;
 using Clock = std::chrono::steady_clock;
 
 namespace {

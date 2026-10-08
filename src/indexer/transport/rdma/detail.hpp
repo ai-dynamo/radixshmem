@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <cstdlib>
 
-namespace shmradix {
+namespace radixshmem {
 
 // Index-plane QPs report a dead peer after (retries + 1) ACK timeouts; the
 // defaults (14 = 67 ms, 1 retry) measured ~0.5 s on ConnectX, whose per-attempt
@@ -18,7 +18,7 @@ namespace shmradix {
 // QP ACK timeout exponent (4.096us * 2^t per attempt).
 inline uint8_t qp_ack_timeout() {
     static uint8_t v = []() -> uint8_t {
-        const char* e = ::getenv("SHMRADIX_QP_TIMEOUT");
+        const char* e = ::getenv("RADIXSHMEM_QP_TIMEOUT");
         int t = e ? atoi(e) : 14;
         if (t < 0) t = 0;
         if (t > 31) t = 31;
@@ -30,7 +30,7 @@ inline uint8_t qp_ack_timeout() {
 // Transport retries after the first attempt (0-7).
 inline uint8_t qp_retry_cnt() {
     static uint8_t v = []() -> uint8_t {
-        const char* e = ::getenv("SHMRADIX_QP_RETRY_CNT");
+        const char* e = ::getenv("RADIXSHMEM_QP_RETRY_CNT");
         int r = e ? atoi(e) : 1;
         if (r < 0) r = 0;
         if (r > 7) r = 7;
@@ -39,4 +39,4 @@ inline uint8_t qp_retry_cnt() {
     return v;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

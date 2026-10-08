@@ -10,7 +10,7 @@
 #include <cstdint>
 #include <infiniband/verbs.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 // One entry of a chained multi-read.
 struct RdmaReadOp {
@@ -87,4 +87,4 @@ public:
     virtual bool broken() { return false; }
 };
 
-} // namespace shmradix
+} // namespace radixshmem

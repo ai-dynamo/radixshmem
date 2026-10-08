@@ -3,19 +3,19 @@
 
 #pragma once
 
-#include "shmradix/config.h"   // feature macros (CMake-generated, build tree)
+#include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 
-#ifdef SHMRADIX_HAS_ZMQ
+#ifdef RADIXSHMEM_HAS_ZMQ
 
-#include "shmradix/cluster_protocol.h"      // RemoteStatus
-#include "shmradix/bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
+#include "cluster_protocol.h"      // RemoteStatus
+#include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 class ZmqClientTransport : public IRemoteOpClientTransport {
 public:
@@ -69,6 +69,6 @@ private:
     int      cur_timeo_   = 50;
 };
 
-}  // namespace shmradix
+}  // namespace radixshmem
 
-#endif  // SHMRADIX_HAS_ZMQ
+#endif  // RADIXSHMEM_HAS_ZMQ

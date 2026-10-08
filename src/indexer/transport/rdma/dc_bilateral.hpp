@@ -3,9 +3,9 @@
 
 #pragma once
 
-#include "shmradix/cluster_protocol.h"     // RemoteStatus, RemoteOp* headers
+#include "cluster_protocol.h"     // RemoteStatus, RemoteOp* headers
 #include "rdma_transport.hpp"        // DcInitiator, DcTarget, dc_create_ah
-#include "shmradix/bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
+#include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
 
 #include <array>
 #include <atomic>
@@ -14,7 +14,7 @@
 #include <memory>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 // ---- wire ctrl header (48B, 8B-aligned, all fields naturally aligned) ----
 constexpr uint32_t DC_CTRL_MAGIC      = 0xDCC0DE01;
@@ -118,4 +118,4 @@ private:
     std::atomic<uint64_t> hdrs_dropped_{0};  // malformed request ctrl header
 };
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -16,7 +16,7 @@
 #include <stdexcept>
 #include <unordered_map>
 
-namespace shmradix {
+namespace radixshmem {
 
 // ==================== XRCD ====================
 
@@ -688,4 +688,4 @@ uint64_t XrcSendQp::rdma_fetch_add(uint64_t remote_addr, uint32_t remote_rkey,
     return *(uint64_t*)local_result_buf;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

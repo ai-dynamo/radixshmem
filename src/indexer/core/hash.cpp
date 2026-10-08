@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/hash.h"
+#include "hash.h"
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 Hasher::Hasher() {
     state_ = XXH64_createState();
@@ -36,4 +36,4 @@ void gen_hashes(const int64_t* token_ids, int num_tokens, int tokens_per_block,
     }
 }
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/radix_tree.h"
-#include "shmradix/cluster_manifest.h"
+#include "radix_tree.h"
+#include "cluster_manifest.h"
 #include "component_set.hpp"
 
 #include <algorithm>
@@ -24,7 +24,7 @@
 
 namespace {
 long lock_trace_threshold_us() {
-    static long t = [] { const char* e = ::getenv("SHMRADIX_LOCK_TRACE"); return e ? atol(e) : -1L; }();
+    static long t = [] { const char* e = ::getenv("RADIXSHMEM_LOCK_TRACE"); return e ? atol(e) : -1L; }();
     return t;
 }
 uint64_t lt_now_us() {
@@ -44,7 +44,7 @@ void lt_check_stuck(uint64_t prev, const char* where) {
 }
 #endif
 
-namespace shmradix {
+namespace radixshmem {
 
 static void validate_component_config(uint32_t mask, uint32_t swa_window_blocks,
                                       const char* operation) {
@@ -57,9 +57,9 @@ static void validate_component_config(uint32_t mask, uint32_t swa_window_blocks,
 
 // ==================== Lifecycle ====================
 
-ShmRadixTree::~ShmRadixTree() { detach(); }
+RadixShmemTree::~RadixShmemTree() { detach(); }
 
-ShmRadixTree::ShmRadixTree(ShmRadixTree&& o) noexcept
+RadixShmemTree::RadixShmemTree(RadixShmemTree&& o) noexcept
     : base_(o.base_), size_(o.size_), name_(std::move(o.name_)),
       is_owner_(o.is_owner_), is_hugepage_(o.is_hugepage_), fd_(o.fd_),
       nodes_(o.nodes_), data_(o.data_), child_table_(o.child_table_),
@@ -73,7 +73,7 @@ ShmRadixTree::ShmRadixTree(ShmRadixTree&& o) noexcept
     o.fd_ = -1;
 }
 
-ShmRadixTree& ShmRadixTree::operator=(ShmRadixTree&& o) noexcept {
+RadixShmemTree& RadixShmemTree::operator=(RadixShmemTree&& o) noexcept {
     if (this != &o) {
         detach();
         base_ = o.base_;
@@ -103,7 +103,7 @@ ShmRadixTree& ShmRadixTree::operator=(ShmRadixTree&& o) noexcept {
     return *this;
 }
 
-uint32_t ShmRadixTree::next_power_of_2(uint32_t v) {
+uint32_t RadixShmemTree::next_power_of_2(uint32_t v) {
     v--;
     v |= v >> 1;
     v |= v >> 2;
@@ -113,7 +113,7 @@ uint32_t ShmRadixTree::next_power_of_2(uint32_t v) {
     return v + 1;
 }
 
-void ShmRadixTree::init_pools() {
+void RadixShmemTree::init_pools() {
     ShmHeader* hdr = header();
     const uint32_t cmask = hdr->component_config.component_mask;
     has_swa_   = component_has_swa(cmask);
@@ -160,7 +160,7 @@ void ShmRadixTree::init_pools() {
                              hdr->mamba_mempool_total_blocks, &hdr->mamba_list);
 }
 
-void ShmRadixTree::alloc_root() {
+void RadixShmemTree::alloc_root() {
     ShmHeader* hdr = header();
     uint32_t root_id = nodes_.alloc();
     hdr->root_node_id = root_id;
@@ -170,7 +170,7 @@ void ShmRadixTree::alloc_root() {
     root->parent_id = INVALID_NODE_ID;
 }
 
-void ShmRadixTree::reset() {
+void RadixShmemTree::reset() {
     set_write_op("reset");
     write_lock();
 
@@ -203,7 +203,7 @@ void ShmRadixTree::reset() {
     write_unlock();
 }
 
-ShmLayoutInfo ShmRadixTree::compute_layout(const ShmConfig& config) {
+ShmLayoutInfo RadixShmemTree::compute_layout(const ShmConfig& config) {
     ShmLayoutInfo info{};
     info.header_size = align_up(sizeof(ShmHeader), 64);
     info.node_pool_size = (uint64_t)config.max_nodes * sizeof(TreeNode);
@@ -243,7 +243,7 @@ ShmLayoutInfo ShmRadixTree::compute_layout(const ShmConfig& config) {
     return info;
 }
 
-ShmRadixTree ShmRadixTree::create(const std::string& name,
+RadixShmemTree RadixShmemTree::create(const std::string& name,
                                   const ShmConfig& config) {
     validate_component_config(config.component_mask,
                               config.swa_window_blocks, "create");
@@ -254,7 +254,7 @@ ShmRadixTree ShmRadixTree::create(const std::string& name,
             " tokens = " + std::to_string(cs) + " blocks) exceeds buddy allocator max capacity (" +
             std::to_string(BuddyHeader::MAX_DATA_BLOCKS) + " blocks)");
 
-    ShmRadixTree tree;
+    RadixShmemTree tree;
     tree.name_ = name;
     tree.is_owner_ = true;
     tree.background_evict_ratio_ = config.background_evict_ratio;
@@ -289,7 +289,7 @@ ShmRadixTree ShmRadixTree::create(const std::string& name,
                     tree.name_ = hp_path;
                     tree.is_hugepage_ = true;
                     hugepage_ok = true;
-                    fprintf(stderr, "[shmradix] Using hugepages: %s (%.1f MB)\n",
+                    fprintf(stderr, "[radixshmem] Using hugepages: %s (%.1f MB)\n",
                             hp_path.c_str(), tree.size_ / (1024.0 * 1024.0));
                 } else {
                     close(fd);
@@ -301,7 +301,7 @@ ShmRadixTree ShmRadixTree::create(const std::string& name,
             }
         }
         if (!hugepage_ok)
-            fprintf(stderr, "[shmradix] Hugepage alloc failed, falling back to shm_open\n");
+            fprintf(stderr, "[radixshmem] Hugepage alloc failed, falling back to shm_open\n");
     }
 
     if (!hugepage_ok) {
@@ -476,9 +476,9 @@ ShmRadixTree ShmRadixTree::create(const std::string& name,
     return tree;
 }
 
-ShmRadixTree ShmRadixTree::attach(const std::string& name,
+RadixShmemTree RadixShmemTree::attach(const std::string& name,
                                   const std::string& hugepage_path) {
-    ShmRadixTree tree;
+    RadixShmemTree tree;
     tree.is_owner_ = false;
 
     // Try hugepage path first
@@ -559,7 +559,7 @@ ShmRadixTree ShmRadixTree::attach(const std::string& name,
     return tree;
 }
 
-void ShmRadixTree::detach() {
+void RadixShmemTree::detach() {
     if (base_ && base_ != MAP_FAILED) {
         munmap(base_, size_);
         base_ = nullptr;
@@ -570,7 +570,7 @@ void ShmRadixTree::detach() {
     }
 }
 
-void ShmRadixTree::destroy() {
+void RadixShmemTree::destroy() {
     if (base_ && base_ != MAP_FAILED && is_owner_) {
         pthread_rwlock_destroy(&header()->rwlock);
         pthread_mutex_destroy(&header()->lru_mutex);
@@ -587,18 +587,18 @@ void ShmRadixTree::destroy() {
 
 // ==================== Accessors ====================
 
-ShmHeader* ShmRadixTree::header() const {
+ShmHeader* RadixShmemTree::header() const {
     return reinterpret_cast<ShmHeader*>(base_);
 }
 
 // ==================== Concurrency helpers ====================
 
-pthread_rwlock_t* ShmRadixTree::rwlock() const {
+pthread_rwlock_t* RadixShmemTree::rwlock() const {
     return &header()->rwlock;
 }
 
-void ShmRadixTree::read_lock() { pthread_rwlock_rdlock(rwlock()); }
-void ShmRadixTree::read_unlock() { pthread_rwlock_unlock(rwlock()); }
+void RadixShmemTree::read_lock() { pthread_rwlock_rdlock(rwlock()); }
+void RadixShmemTree::read_unlock() { pthread_rwlock_unlock(rwlock()); }
 
 static constexpr int64_t RDMA_WRITE_BIT = 1LL << 63;
 
@@ -612,7 +612,7 @@ static inline void rdma_rwlock_flush(const volatile void* addr) {
 #endif
 }
 
-bool ShmRadixTree::try_write_lock() {
+bool RadixShmemTree::try_write_lock() {
     if (pthread_rwlock_trywrlock(rwlock()) != 0)
         return false;
     const bool tr = lock_trace_threshold_us() >= 0;
@@ -621,9 +621,9 @@ bool ShmRadixTree::try_write_lock() {
     return true;
 }
 
-void ShmRadixTree::set_write_op(const char* op) { g_write_op = op; }
+void RadixShmemTree::set_write_op(const char* op) { g_write_op = op; }
 
-void ShmRadixTree::rdma_writer_enter(bool tr) {
+void RadixShmemTree::rdma_writer_enter(bool tr) {
     auto* flag = &header()->rdma_write_flag;
     auto* cnt  = &header()->rdma_reader_count;
     lt_check_stuck(flag->exchange(RDMA_WRITE_BIT, std::memory_order_acq_rel), "write_lock");
@@ -638,7 +638,7 @@ void ShmRadixTree::rdma_writer_enter(bool tr) {
 #endif
         if (++stall_spins == (1ull << 24)) {
             fprintf(stderr,
-                    "[ShmRadixTree] write_lock stalled for seconds: "
+                    "[RadixShmemTree] write_lock stalled for seconds: "
                     "rdma_reader_count=%lld not draining — leaked/stuck "
                     "remote readers?\n",
                     (long long)cnt->load(std::memory_order_relaxed));
@@ -647,7 +647,7 @@ void ShmRadixTree::rdma_writer_enter(bool tr) {
     if (tr) g_lt_drain = lt_now_us();
 }
 
-void ShmRadixTree::write_lock() {
+void RadixShmemTree::write_lock() {
     const bool tr = lock_trace_threshold_us() >= 0;
     if (tr) g_lt_req = lt_now_us();
     pthread_rwlock_wrlock(rwlock());
@@ -655,7 +655,7 @@ void ShmRadixTree::write_lock() {
     rdma_writer_enter(tr);
 }
 
-void ShmRadixTree::write_unlock() {
+void RadixShmemTree::write_unlock() {
     auto* flag = &header()->rdma_write_flag;
     flag->store(0, std::memory_order_release);
     rdma_rwlock_flush(flag);
@@ -673,28 +673,28 @@ void ShmRadixTree::write_unlock() {
         g_lt_req = 0;
     }
 }
-void ShmRadixTree::lru_lock() { pthread_mutex_lock(&header()->lru_mutex); }
-void ShmRadixTree::lru_unlock() { pthread_mutex_unlock(&header()->lru_mutex); }
+void RadixShmemTree::lru_lock() { pthread_mutex_lock(&header()->lru_mutex); }
+void RadixShmemTree::lru_unlock() { pthread_mutex_unlock(&header()->lru_mutex); }
 
 
-void ShmRadixTree::touch_node_atomic(uint32_t node_id, uint64_t ts) {
+void RadixShmemTree::touch_node_atomic(uint32_t node_id, uint64_t ts) {
     nodes_.get(node_id)->last_access_time.store(ts, std::memory_order_relaxed);
 }
 
-void ShmRadixTree::touch_node(uint32_t node_id) {
+void RadixShmemTree::touch_node(uint32_t node_id) {
     uint64_t t = now_ts();
     nodes_.get(node_id)->last_access_time.store(t, std::memory_order_relaxed);
     if (is_in_leaf_list(node_id))
         leaf_list_move_to_tail(node_id);
 }
 
-uint64_t ShmRadixTree::now_ts() {
+uint64_t RadixShmemTree::now_ts() {
     return (uint64_t)std::chrono::steady_clock::now().time_since_epoch().count();
 }
 
 // ==================== Child management ====================
 
-bool ShmRadixTree::add_child(uint32_t parent_id, uint64_t token_hash,
+bool RadixShmemTree::add_child(uint32_t parent_id, uint64_t token_hash,
                              uint32_t child_id) {
     TreeNode* parent = nodes_.get(parent_id);
     if (!child_table_.insert(parent_id, token_hash, child_id, parent))
@@ -704,7 +704,7 @@ bool ShmRadixTree::add_child(uint32_t parent_id, uint64_t token_hash,
     return true;
 }
 
-void ShmRadixTree::remove_child(uint32_t parent_id, uint64_t token_hash,
+void RadixShmemTree::remove_child(uint32_t parent_id, uint64_t token_hash,
                                 uint32_t child_id) {
     TreeNode* parent = nodes_.get(parent_id);
     child_table_.remove(parent_id, token_hash, parent);
@@ -727,7 +727,7 @@ static void copy_lanes(DataPool& d, uint64_t dst, int dst_n, int dst_pos,
                d.get_swa_slots(src, src_n) + src_pos, count * sizeof(int32_t));
 }
 
-uint32_t ShmRadixTree::split_node(uint32_t node_id, int prefix_length) {
+uint32_t RadixShmemTree::split_node(uint32_t node_id, int prefix_length) {
 
     TreeNode* node = nodes_.get(node_id);
     int n = (int)node->num_blocks;
@@ -809,7 +809,7 @@ uint32_t ShmRadixTree::split_node(uint32_t node_id, int prefix_length) {
 
 // Pin-eligibility for restructuring/eviction: all three component ref
 // classes (full/swa/mamba) on the node must be zero.
-bool ShmRadixTree::component_refs_zero(uint32_t node_id) const {
+bool RadixShmemTree::component_refs_zero(uint32_t node_id) const {
     if (nodes_.get(node_id)->ref_count.load(std::memory_order_relaxed) != 0)
         return false;
     if (!has_aux_) return true;
@@ -820,7 +820,7 @@ bool ShmRadixTree::component_refs_zero(uint32_t node_id) const {
 
 // Fold an only-child ready leaf up into its ready parent (inverse of split_node,
 // same alloc-first discipline). Caller holds write_lock and checked the trigger.
-MergeOutcome ShmRadixTree::merge_leaf_into_parent(uint32_t leaf_id,
+MergeOutcome RadixShmemTree::merge_leaf_into_parent(uint32_t leaf_id,
                                                   int abs_leaf_start) {
     const int cs = cs_;
     MergeOutcome out;
@@ -956,7 +956,7 @@ MergeOutcome ShmRadixTree::merge_leaf_into_parent(uint32_t leaf_id,
 
 // ==================== Leaf list ====================
 
-void ShmRadixTree::leaf_list_add(uint32_t node_id) {
+void RadixShmemTree::leaf_list_add(uint32_t node_id) {
     ShmHeader* hdr = header();
     if (is_in_leaf_list(node_id))   // duplicate add would corrupt prev/next links
         return;
@@ -970,7 +970,7 @@ void ShmRadixTree::leaf_list_add(uint32_t node_id) {
     hdr->leaf_list_tail = node_id;
 }
 
-void ShmRadixTree::leaf_list_remove(uint32_t node_id) {
+void RadixShmemTree::leaf_list_remove(uint32_t node_id) {
     if (!is_in_leaf_list(node_id)) return;
     ShmHeader* hdr = header();
     TreeNode* node = nodes_.get(node_id);
@@ -986,13 +986,13 @@ void ShmRadixTree::leaf_list_remove(uint32_t node_id) {
     node->leaf_next = INVALID_NODE_ID;
 }
 
-void ShmRadixTree::leaf_list_move_to_tail(uint32_t node_id) {
+void RadixShmemTree::leaf_list_move_to_tail(uint32_t node_id) {
     if (header()->leaf_list_tail == node_id) return;
     leaf_list_remove(node_id);
     leaf_list_add(node_id);
 }
 
-void ShmRadixTree::leaf_list_insert_by_access_time(uint32_t node_id) {
+void RadixShmemTree::leaf_list_insert_by_access_time(uint32_t node_id) {
     ShmHeader* hdr = header();
     TreeNode* node = nodes_.get(node_id);
     uint64_t t = node->last_access_time.load(std::memory_order_relaxed);
@@ -1022,14 +1022,14 @@ void ShmRadixTree::leaf_list_insert_by_access_time(uint32_t node_id) {
     hdr->leaf_list_head = node_id;
 }
 
-bool ShmRadixTree::is_in_leaf_list(uint32_t node_id) const {
+bool RadixShmemTree::is_in_leaf_list(uint32_t node_id) const {
     return header()->leaf_list_head == node_id ||
            nodes_.get(node_id)->leaf_prev != INVALID_NODE_ID;
 }
 
 // ==================== Eviction internals ====================
 
-int ShmRadixTree::evict_node(uint32_t node_id, std::vector<int32_t>& out) {
+int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out) {
     TreeNode* node = nodes_.get(node_id);
     int n = (int)node->num_blocks;
     uint32_t parent_id = node->parent_id;
@@ -1072,7 +1072,7 @@ int ShmRadixTree::evict_node(uint32_t node_id, std::vector<int32_t>& out) {
     return n;
 }
 
-void ShmRadixTree::post_evict_fixup(uint32_t check_id) {
+void RadixShmemTree::post_evict_fixup(uint32_t check_id) {
     if (check_id != header()->root_node_id &&
         nodes_.get(check_id)->children_count == 0)
         leaf_list_insert_by_access_time(check_id);
@@ -1080,7 +1080,7 @@ void ShmRadixTree::post_evict_fixup(uint32_t check_id) {
 
 // ==================== Core operations ====================
 
-TreeComponentQueryResult ShmRadixTree::query_components(
+TreeComponentQueryResult RadixShmemTree::query_components(
         const uint64_t* hashes, int n, uint32_t mask, bool lock,
         bool update_meta) {
     const ComponentConfig& config = header()->component_config;
@@ -1130,7 +1130,7 @@ TreeComponentQueryResult ShmRadixTree::query_components(
 
 // Runs under the read lock; eviction needs the write lock, so no gap opens.
 // Full covers [0, full_hit); SWA/Mamba cover the aux boundary common_hit.
-void ShmRadixTree::inc_ref(const std::vector<MatchedNodeSpanView>& spans,
+void RadixShmemTree::inc_ref(const std::vector<MatchedNodeSpanView>& spans,
                            uint32_t mask, uint32_t common_hit,
                            uint32_t swa_start, uint32_t full_hit,
                            PinRecord& pin) {
@@ -1157,7 +1157,7 @@ void ShmRadixTree::inc_ref(const std::vector<MatchedNodeSpanView>& spans,
             ->mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-void ShmRadixTree::touch_full(const std::vector<MatchedNodeSpanView>& spans,
+void RadixShmemTree::touch_full(const std::vector<MatchedNodeSpanView>& spans,
                              uint32_t mask, uint32_t full_hit,
                              uint32_t last_node_id) {
     if ((mask & COMPONENT_MASK_FULL) == 0 || full_hit == 0)
@@ -1176,13 +1176,13 @@ void ShmRadixTree::touch_full(const std::vector<MatchedNodeSpanView>& spans,
 
 // Match-and-pin against the current tree; unlike void inc_ref, partial pins
 // are visible in the record. Fused callers use query_components(lock=true).
-PinRecord ShmRadixTree::inc_ref(const uint64_t* hashes, int n, uint32_t mask) {
+PinRecord RadixShmemTree::inc_ref(const uint64_t* hashes, int n, uint32_t mask) {
     return std::move(query_components(hashes, n, mask,
                                       /*lock=*/true,
                                       /*update_meta=*/false).pin);
 }
 
-void ShmRadixTree::flush_lru(const uint32_t* node_ids, int count) {
+void RadixShmemTree::flush_lru(const uint32_t* node_ids, int count) {
     lru_lock();
     for (int i = 0; i < count; i++) {
         uint32_t id = node_ids[i];
@@ -1192,7 +1192,7 @@ void ShmRadixTree::flush_lru(const uint32_t* node_ids, int count) {
     lru_unlock();
 }
 
-bool ShmRadixTree::dec_ref(const uint64_t* hashes, int n,
+bool RadixShmemTree::dec_ref(const uint64_t* hashes, int n,
                             PinRecord&& pin) {
     const bool full_present = pin.full.start < pin.full.end;
     // Lanes this shm does not carry cannot hold a pin: ignore those ranges.
@@ -1240,7 +1240,7 @@ bool ShmRadixTree::dec_ref(const uint64_t* hashes, int n,
     return true;
 }
 
-QueryInternalDetail ShmRadixTree::query_internal(const uint64_t* hashes, int n,
+QueryInternalDetail RadixShmemTree::query_internal(const uint64_t* hashes, int n,
                                                  uint64_t ts, bool touch) {
     QueryInternalDetail result;
 
@@ -1296,7 +1296,7 @@ QueryInternalDetail ShmRadixTree::query_internal(const uint64_t* hashes, int n,
     return result;
 }
 
-std::vector<MatchedNodeSpanView> ShmRadixTree::path_spans(
+std::vector<MatchedNodeSpanView> RadixShmemTree::path_spans(
         const QueryInternalDetail& m) {
     std::vector<MatchedNodeSpanView> spans;
     const uint32_t root = header()->root_node_id;
@@ -1332,11 +1332,11 @@ std::vector<MatchedNodeSpanView> ShmRadixTree::path_spans(
 }
 
 
-void ShmRadixTree::inc_ref(uint32_t node_id) {
+void RadixShmemTree::inc_ref(uint32_t node_id) {
     nodes_.get(node_id)->ref_count.fetch_add(1, std::memory_order_relaxed);
 }
 
-bool ShmRadixTree::dec_ref(std::atomic<int64_t>& ref) noexcept {
+bool RadixShmemTree::dec_ref(std::atomic<int64_t>& ref) noexcept {
     int64_t cur = ref.load(std::memory_order_relaxed);
     while (cur > 0) {
         if (ref.compare_exchange_weak(cur, cur - 1, std::memory_order_relaxed))
@@ -1345,12 +1345,12 @@ bool ShmRadixTree::dec_ref(std::atomic<int64_t>& ref) noexcept {
     return false;
 }
 
-void ShmRadixTree::dec_ref(uint32_t node_id) {
+void RadixShmemTree::dec_ref(uint32_t node_id) {
     // Legacy semantics: silently clamp at zero.
     (void)dec_ref(nodes_.get(node_id)->ref_count);
 }
 
-std::vector<NodeBoundary> ShmRadixTree::get_node_boundaries(
+std::vector<NodeBoundary> RadixShmemTree::get_node_boundaries(
     const uint64_t* hashes, int n) {
     std::vector<NodeBoundary> boundaries;
     if (n <= 0) return boundaries;
@@ -1391,7 +1391,7 @@ std::vector<NodeBoundary> ShmRadixTree::get_node_boundaries(
     return boundaries;
 }
 
-InsertResult ShmRadixTree::insert(const uint64_t* hashes, int n,
+InsertResult RadixShmemTree::insert(const uint64_t* hashes, int n,
                                   const int32_t* slots, int num_slots,
                                   int start, bool auto_recycle,
                                   ComponentType component) {
@@ -1423,7 +1423,7 @@ InsertResult ShmRadixTree::insert(const uint64_t* hashes, int n,
 
 // Core insert: ext_slots positionally bound from `start` (ext_slots[i] holds data
 // for hashes[start+i]); leading redundant + unlanded suffix slots go to unused_slots.
-InsertResult ShmRadixTree::insert_impl(const uint64_t* hashes, int n,
+InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
                                        const int32_t* ext_slots,
                                        int ext_num_slots,
                                        int start, bool auto_recycle) {
@@ -1543,7 +1543,7 @@ InsertResult ShmRadixTree::insert_impl(const uint64_t* hashes, int n,
             if (new_id == INVALID_NODE_ID) {
                 result.error = InsertError::NODE_POOL_FULL;
                 header()->insert_error_node_pool.fetch_add(1, std::memory_order_relaxed);
-                fprintf(stderr, "[shmradix] WARNING: node pool full (%u/%u), "
+                fprintf(stderr, "[radixshmem] WARNING: node pool full (%u/%u), "
                         "increase max_nodes\n",
                         nodes_.size(), header()->node_pool_capacity);
                 break;
@@ -1558,7 +1558,7 @@ InsertResult ShmRadixTree::insert_impl(const uint64_t* hashes, int n,
                 nodes_.free(new_id);
                 result.error = InsertError::DATA_POOL_FULL;
                 header()->insert_error_data_pool.fetch_add(1, std::memory_order_relaxed);
-                fprintf(stderr, "[shmradix] WARNING: data pool full (%.1f%%), "
+                fprintf(stderr, "[radixshmem] WARNING: data pool full (%.1f%%), "
                         "increase max_blocks or data_pool_ratio\n",
                         data_.utilization() * 100.0f);
                 break;
@@ -1650,7 +1650,7 @@ static inline uint64_t access_time_of(const TreeNode* n) {
     return n->last_access_time.load(std::memory_order_relaxed);
 }
 
-int ShmRadixTree::evict_walk(int need) {
+int RadixShmemTree::evict_walk(int need) {
     int freed = 0;
     std::vector<int32_t> tmp;
     // Restart from head after each eviction (evict_node mutates leaf_list);
@@ -1672,14 +1672,14 @@ int ShmRadixTree::evict_walk(int need) {
     return freed;
 }
 
-int ShmRadixTree::evict(int need, uint32_t protect) {
+int RadixShmemTree::evict(int need, uint32_t protect) {
     if (protect != INVALID_NODE_ID) inc_ref(protect);
     int freed = evict_walk(need);
     if (protect != INVALID_NODE_ID) dec_ref(protect);
     return freed;
 }
 
-bool ShmRadixTree::node_head_matches(uint32_t node_id, uint64_t first_hash) {
+bool RadixShmemTree::node_head_matches(uint32_t node_id, uint64_t first_hash) {
     if (node_id >= header()->node_pool_capacity) return false;
     read_lock();
     const TreeNode* nd = nodes_.get(node_id);
@@ -1690,13 +1690,13 @@ bool ShmRadixTree::node_head_matches(uint32_t node_id, uint64_t first_hash) {
     return live;
 }
 
-std::vector<EvictedNode>& ShmRadixTree::evicted_pending() {
+std::vector<EvictedNode>& RadixShmemTree::evicted_pending() {
     // Per-thread buffer: foreground inserter and background evictor never share.
     static thread_local std::vector<EvictedNode> buf;
     return buf;
 }
 
-void ShmRadixTree::flush_evicted() {
+void RadixShmemTree::flush_evicted() {
     // Call after the write lock is dropped. The buffer is thread_local, so the
     // foreground and evictor threads each drain their own.
     auto& batch = evicted_pending();
@@ -1705,7 +1705,7 @@ void ShmRadixTree::flush_evicted() {
     batch.clear();
 }
 
-int ShmRadixTree::try_evict_batch(int target_blocks) {
+int RadixShmemTree::try_evict_batch(int target_blocks) {
     set_write_op("evict_bg");
     if (!try_write_lock()) return 0;
     int freed = evict_walk(target_blocks);
@@ -1714,7 +1714,7 @@ int ShmRadixTree::try_evict_batch(int target_blocks) {
     return freed;
 }
 
-int ShmRadixTree::try_evict_component_batch(ComponentType component,
+int RadixShmemTree::try_evict_component_batch(ComponentType component,
                                             int target_slots) {
     set_write_op("evict_comp_bg");
     if (component != ComponentType::SWA && component != ComponentType::MAMBA)
@@ -1731,7 +1731,7 @@ int ShmRadixTree::try_evict_component_batch(ComponentType component,
 
 // ==================== Slot allocation (for external slot mgmt)
 
-Mempool* ShmRadixTree::try_component_pool(ComponentType component) noexcept {
+Mempool* RadixShmemTree::try_component_pool(ComponentType component) noexcept {
     switch (component) {
     case ComponentType::FULL:
         return &mempool_;
@@ -1743,7 +1743,7 @@ Mempool* ShmRadixTree::try_component_pool(ComponentType component) noexcept {
     return nullptr;
 }
 
-int ShmRadixTree::allocate_slots(int num_slots, std::vector<int32_t>& out,
+int RadixShmemTree::allocate_slots(int num_slots, std::vector<int32_t>& out,
                                  ComponentType component) {
     set_write_op("alloc");
     out.clear();
@@ -1782,7 +1782,7 @@ int ShmRadixTree::allocate_slots(int num_slots, std::vector<int32_t>& out,
     return got;
 }
 
-void ShmRadixTree::recycle_slots(const int32_t* slots, int num,
+void RadixShmemTree::recycle_slots(const int32_t* slots, int num,
                                  ComponentType component) {
     set_write_op("recycle");
     Mempool* pool = try_component_pool(component);
@@ -1795,59 +1795,59 @@ void ShmRadixTree::recycle_slots(const int32_t* slots, int num,
 
 // ==================== Stats & debug ====================
 
-uint32_t ShmRadixTree::total_radix_nodes() const {
+uint32_t RadixShmemTree::total_radix_nodes() const {
     return nodes_.size();
 }
 
-uint64_t ShmRadixTree::total_blocks() const {
+uint64_t RadixShmemTree::total_blocks() const {
     return header()->total_blocks.load(std::memory_order_relaxed);
 }
 
-float ShmRadixTree::data_pool_utilization() const {
+float RadixShmemTree::data_pool_utilization() const {
     return data_.utilization();
 }
 
-uint32_t ShmRadixTree::node_pool_capacity() const {
+uint32_t RadixShmemTree::node_pool_capacity() const {
     return header()->node_pool_capacity;
 }
 
-uint32_t ShmRadixTree::node_pool_free() const {
+uint32_t RadixShmemTree::node_pool_free() const {
     return header()->node_pool_capacity - nodes_.size();
 }
 
-uint32_t ShmRadixTree::mempool_total() const { return mempool_.total(); }
-uint32_t ShmRadixTree::mempool_free() const { return mempool_.num_free(); }
-uint32_t ShmRadixTree::mempool_used() const { return mempool_.num_used(); }
-uint32_t ShmRadixTree::swa_mempool_total() const { return swa_mempool_.total(); }
-uint32_t ShmRadixTree::swa_mempool_free() const { return swa_mempool_.num_free(); }
-uint32_t ShmRadixTree::mamba_mempool_total() const { return mamba_mempool_.total(); }
-uint32_t ShmRadixTree::mamba_mempool_free() const { return mamba_mempool_.num_free(); }
+uint32_t RadixShmemTree::mempool_total() const { return mempool_.total(); }
+uint32_t RadixShmemTree::mempool_free() const { return mempool_.num_free(); }
+uint32_t RadixShmemTree::mempool_used() const { return mempool_.num_used(); }
+uint32_t RadixShmemTree::swa_mempool_total() const { return swa_mempool_.total(); }
+uint32_t RadixShmemTree::swa_mempool_free() const { return swa_mempool_.num_free(); }
+uint32_t RadixShmemTree::mamba_mempool_total() const { return mamba_mempool_.total(); }
+uint32_t RadixShmemTree::mamba_mempool_free() const { return mamba_mempool_.num_free(); }
 
-ComponentConfig ShmRadixTree::component_config() const {
+ComponentConfig RadixShmemTree::component_config() const {
     return header()->component_config;
 }
 
-PeerFaultCounters* ShmRadixTree::peer_faults() const {
+PeerFaultCounters* RadixShmemTree::peer_faults() const {
     return &header()->peer_faults;
 }
 
-uint64_t ShmRadixTree::insert_success_count() const {
+uint64_t RadixShmemTree::insert_success_count() const {
     return header()->insert_success.load(std::memory_order_relaxed);
 }
-uint64_t ShmRadixTree::insert_error_node_pool_count() const {
+uint64_t RadixShmemTree::insert_error_node_pool_count() const {
     return header()->insert_error_node_pool.load(std::memory_order_relaxed);
 }
-uint64_t ShmRadixTree::insert_error_data_pool_count() const {
+uint64_t RadixShmemTree::insert_error_data_pool_count() const {
     return header()->insert_error_data_pool.load(std::memory_order_relaxed);
 }
-uint64_t ShmRadixTree::insert_error_ht_pool_count() const {
+uint64_t RadixShmemTree::insert_error_ht_pool_count() const {
     return header()->insert_error_ht_pool.load(std::memory_order_relaxed);
 }
-uint64_t ShmRadixTree::insert_error_mempool_count() const {
+uint64_t RadixShmemTree::insert_error_mempool_count() const {
     return header()->insert_error_mempool.load(std::memory_order_relaxed);
 }
 
-void ShmRadixTree::print_node(uint32_t node_id, int indent) const {
+void RadixShmemTree::print_node(uint32_t node_id, int indent) const {
     TreeNode* node = nodes_.get(node_id);
     for (int i = 0; i < indent; i++) printf("  ");
 
@@ -1887,11 +1887,11 @@ void ShmRadixTree::print_node(uint32_t node_id, int indent) const {
     }
 }
 
-void ShmRadixTree::print_tree() const {
-    printf("=== ShmRadixTree (nodes=%u blocks=%llu) ===\n",
+void RadixShmemTree::print_tree() const {
+    printf("=== RadixShmemTree (nodes=%u blocks=%llu) ===\n",
            total_radix_nodes(), (unsigned long long)total_blocks());
     print_node(header()->root_node_id, 0);
     printf("===\n");
 }
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -7,15 +7,15 @@
 // check that a holder's shard is zeroed (RDMA builds only).
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
-#ifndef SHMRADIX_NO_RDMA
+#include "radix_client.h"
+#ifndef RADIXSHMEM_NO_RDMA
 #include "rht_core.hpp"   // private module header: this test pokes RhtShard directly
 #endif
 
 #include <cassert>
 #include <vector>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 // Insert three overlapping prefixes so the tree has splits, several nodes, and
 // a non-trivial mempool/data-pool footprint. Returns the fresh-tree baselines
@@ -166,7 +166,7 @@ static void test_reset_then_fill_and_reset_slots_recycled() {
     TEST_PASS();
 }
 
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
 // ==================================================================
 // Standalone RhtShard::reset() — the holder-side memset that
 // ClientCluster::reset_owned_rht_shard() drives. Verifies every slot is zeroed
@@ -218,7 +218,7 @@ static void test_rht_shard_reset() {
 
     TEST_PASS();   // no radix tree in this case: nothing to audit
 }
-#endif // SHMRADIX_NO_RDMA
+#endif // RADIXSHMEM_NO_RDMA
 
 // A holder receives a REQUESTED capacity and must allocate the normalized
 // bucket count (power of two, floor 16) so the engine's mask on every peer
@@ -255,7 +255,7 @@ int main() {
     test_reinsert_after_reset();
     test_double_reset_idempotent();
     test_reset_then_fill_and_reset_slots_recycled();
-#ifndef SHMRADIX_NO_RDMA
+#ifndef RADIXSHMEM_NO_RDMA
     test_rht_shard_reset();
     test_rht_shard_capacity_normalized();
 #endif

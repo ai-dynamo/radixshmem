@@ -10,13 +10,13 @@
 // translation unit and every NIXL type stays inside it. Nothing but this
 // factory crosses the boundary.
 
-#include "shmradix/transfer.h"
+#include "transfer.h"
 
 #include <memory>
 
-namespace shmradix {
+namespace radixshmem {
 
 // Returns nullptr when the agent fails to initialise (the reason is logged).
 std::unique_ptr<ITransferBackend> create_nixl_backend(const TransferConfig& cfg);
 
-} // namespace shmradix
+} // namespace radixshmem

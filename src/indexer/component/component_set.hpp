@@ -5,7 +5,7 @@
 
 #include "component_types.hpp"
 
-namespace shmradix {
+namespace radixshmem {
 
 // Stateless per-call facade over the fixed three components. Full is the
 // topology hit itself; SWA/Mamba are resolved bottom-up from the terminal and
@@ -50,4 +50,4 @@ void record_pin_tail(const MatchedNodeSpanView* spans, size_t num,
                      const PinCoverage& cov, uint32_t full_hi, uint32_t L,
                      PinRecord& pin);
 
-} // namespace shmradix
+} // namespace radixshmem

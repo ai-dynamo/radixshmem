@@ -10,13 +10,13 @@ from setuptools.command.build_ext import build_ext
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUILD_DIR = os.path.join(PROJECT_ROOT, "build")
-PACKAGE_DIR = os.path.join(PROJECT_ROOT, "python", "shmradix")
+PACKAGE_DIR = os.path.join(PROJECT_ROOT, "python", "radixshmem")
 
 # Extension name -> CMake target. The top-level CMakeLists.txt builds both
 # modules from one pybind11 against one interpreter; nothing is compiled here.
 CMAKE_TARGETS = {
-    "shmradix._core": "shmradix_core_py",
-    "shmradix._data": "shmradix_data_py",
+    "radixshmem._core": "radixshmem_core_py",
+    "radixshmem._data": "radixshmem_data_py",
 }
 
 
@@ -40,7 +40,7 @@ class CMakeBuild(build_ext):
     def build_extensions(self):
         import pybind11
 
-        env_flag = os.environ.get("SHMRADIX_ENABLE_RDMA", "auto").lower()
+        env_flag = os.environ.get("RADIXSHMEM_ENABLE_RDMA", "auto").lower()
         if env_flag in ("0", "off", "false", "no"):
             enable_rdma = False
         elif env_flag in ("1", "on", "true", "yes"):
@@ -74,10 +74,10 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    packages=["shmradix"],
+    packages=["radixshmem"],
     ext_modules=[CMakeExtension(name) for name in CMAKE_TARGETS],
     cmdclass={"build_ext": CMakeBuild},
     # console_scripts lives in pyproject.toml ([project.scripts]) — declaring it
     # here too would be dead weight, [project] metadata wins.
-    package_data={"shmradix": ["py.typed"]},
+    package_data={"radixshmem": ["py.typed"]},
 )

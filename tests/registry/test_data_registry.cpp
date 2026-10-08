@@ -5,7 +5,7 @@
 // registry: publish, look up, and the bootstrap gate that refuses a cluster
 // whose nodes disagree on the slot stride.
 //
-// Links shmradix_registry alone, and includes no indexer header (hence the data
+// Links radixshmem_registry alone, and includes no indexer header (hence the data
 // plane's runner) — which is what proves src/registry is plane-neutral.
 //
 // Single process throughout. Several logical nodes are just several node names,
@@ -18,18 +18,18 @@
 #include "data_test_utils.h"
 #include "etcd_test_harness.hpp"
 
-#include "shmradix/config.h"
+#include "radixshmem_config.h"
 
-#ifndef SHMRADIX_HAS_ETCD
+#ifndef RADIXSHMEM_HAS_ETCD
 int main() { printf("built without etcd — SKIP\n"); return 77; }
 #else
 
-#include "shmradix/data_registry.h"
+#include "data_registry.h"
 #include "etcd_client.hpp"
 
 #include <string>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 static constexpr uint64_t kSlotBytes = 65536;
 static constexpr uint64_t kSlots     = 4096;
@@ -332,10 +332,10 @@ int main() {
     test_entry_builder();
     test_multi_pool_entry();
 
-    shmradix_test::EtcdHarness etcd_srv;
+    radixshmem_test::EtcdHarness etcd_srv;
     if (!etcd_srv.usable()) {
         printf("  no etcd binary — SKIP\n");
-        return shmradix_test::kSkipExitCode;
+        return radixshmem_test::kSkipExitCode;
     }
 
     const std::string registry   = etcd_srv.registry();
@@ -357,4 +357,4 @@ int main() {
     return tests_report();
 }
 
-#endif // SHMRADIX_HAS_ETCD
+#endif // RADIXSHMEM_HAS_ETCD

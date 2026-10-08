@@ -11,7 +11,7 @@
 #include <cstdint>
 #include <infiniband/verbs.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 class RdmaEndpoint {
 public:
@@ -84,4 +84,4 @@ private:
 // Connect two endpoints in loopback (same machine)
 void rdma_loopback_connect(RdmaEndpoint& a, RdmaEndpoint& b);
 
-} // namespace shmradix
+} // namespace radixshmem

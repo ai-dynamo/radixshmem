@@ -34,7 +34,7 @@
 #include <sched.h>
 #include <unistd.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -148,7 +148,7 @@ NixlBackend::~NixlBackend() {
     for (const auto& kv : batches_) {
         if (kv.second.is_local || kv.second.req == nullptr) continue;
         if (agent_->getXferStatus(kv.second.req) == NIXL_IN_PROG) {
-            fprintf(stderr, "[shmradix] NixlBackend: batch %lu still in flight at "
+            fprintf(stderr, "[radixshmem] NixlBackend: batch %lu still in flight at "
                             "teardown; leaking its request handle\n",
                     (unsigned long)kv.first);
             continue;
@@ -180,7 +180,7 @@ bool NixlBackend::init(const TransferConfig& cfg) {
     std::string want = cfg.local_segment;
     if (want.empty()) {
         if (cfg.ip_or_host.empty()) {
-            fprintf(stderr, "[shmradix] NixlBackend: no local_segment and no "
+            fprintf(stderr, "[radixshmem] NixlBackend: no local_segment and no "
                             "ip_or_host — cannot pick an address to publish\n");
             return false;
         }
@@ -189,7 +189,7 @@ bool NixlBackend::init(const TransferConfig& cfg) {
     std::string self_host;
     int self_port = 0;
     if (!split_host_port(want, self_host, self_port)) {
-        fprintf(stderr, "[shmradix] NixlBackend: local segment '%s' is not a "
+        fprintf(stderr, "[radixshmem] NixlBackend: local segment '%s' is not a "
                         "'host:port' address\n", want.c_str());
         return false;
     }
@@ -199,7 +199,7 @@ bool NixlBackend::init(const TransferConfig& cfg) {
         // publish as local_segment() must be the literal port we bound, or
         // peers connect to the wrong place. rpc_port=0 ("engine picks") is a
         // Mooncake-only convenience; the nixl backend needs an explicit port.
-        fprintf(stderr, "[shmradix] NixlBackend: rpc_port=0 ('engine picks') is "
+        fprintf(stderr, "[radixshmem] NixlBackend: rpc_port=0 ('engine picks') is "
                         "not supported — pass an explicit --transfer-port for "
                         "the nixl backend\n");
         return false;
@@ -213,7 +213,7 @@ bool NixlBackend::init(const TransferConfig& cfg) {
     try {
         agent_.reset(new nixlAgent(local_segment_, agent_cfg));
     } catch (const std::exception& e) {
-        fprintf(stderr, "[shmradix] NixlBackend: nixlAgent('%s') failed: %s\n",
+        fprintf(stderr, "[radixshmem] NixlBackend: nixlAgent('%s') failed: %s\n",
                 local_segment_.c_str(), e.what());
         agent_.reset();
         return false;
@@ -231,7 +231,7 @@ bool NixlBackend::init(const TransferConfig& cfg) {
     nixlBackendH* backend = nullptr;
     const nixl_status_t st = agent_->createBackend("UCX", params, backend);
     if (st != NIXL_SUCCESS || backend == nullptr) {
-        fprintf(stderr, "[shmradix] NixlBackend: createBackend(UCX) failed: %d\n", (int)st);
+        fprintf(stderr, "[radixshmem] NixlBackend: createBackend(UCX) failed: %d\n", (int)st);
         agent_.reset();
         return false;
     }
@@ -288,7 +288,7 @@ int NixlBackend::register_memory(void* addr, uint64_t len, const std::string& /*
     descs.addDesc(nixlBlobDesc(r.addr, r.len, 0, ""));
     const nixl_status_t st = agent_->registerMem(descs);
     if (st != NIXL_SUCCESS) {
-        fprintf(stderr, "[shmradix] NixlBackend: registerMem(%p, %lu) failed: %d\n",
+        fprintf(stderr, "[radixshmem] NixlBackend: registerMem(%p, %lu) failed: %d\n",
                 addr, (unsigned long)len, (int)st);
         return XFER_EBACKEND;
     }
@@ -361,7 +361,7 @@ int NixlBackend::open_segment(const std::string& seg_name, SegmentInfo& out) {
         std::lock_guard<std::mutex> lk(mu_);
         AddrRange r{};
         if (!own_region(r)) {
-            fprintf(stderr, "[shmradix] NixlBackend: own segment is not one "
+            fprintf(stderr, "[radixshmem] NixlBackend: own segment is not one "
                             "contiguous registered region\n");
             return XFER_EGEOMETRY;
         }
@@ -372,7 +372,7 @@ int NixlBackend::open_segment(const std::string& seg_name, SegmentInfo& out) {
         std::string host;
         int port = 0;
         if (!split_host_port(seg_name, host, port)) {
-            fprintf(stderr, "[shmradix] NixlBackend: peer segment '%s' is not a "
+            fprintf(stderr, "[radixshmem] NixlBackend: peer segment '%s' is not a "
                             "'host:port' address\n", seg_name.c_str());
             return XFER_EINVAL;
         }
@@ -408,7 +408,7 @@ int NixlBackend::open_segment(const std::string& seg_name, SegmentInfo& out) {
             }
         }
         if (!got) {
-            fprintf(stderr, "[shmradix] NixlBackend: open_segment('%s') timed out "
+            fprintf(stderr, "[radixshmem] NixlBackend: open_segment('%s') timed out "
                             "waiting for peer buffer geometry after %lds\n",
                     seg_name.c_str(), (long)kBufGeomTimeout.count());
             return XFER_ENOENT;
@@ -454,18 +454,18 @@ BatchHandle NixlBackend::submit(const TransferDesc* descs, int n) {
     for (int i = 0; i < n; ++i) {
         const TransferDesc& d = descs[i];
         if (d.length == 0 || d.local_addr == nullptr) {
-            fprintf(stderr, "[shmradix] NixlBackend: desc %d has null addr or zero length\n", i);
+            fprintf(stderr, "[radixshmem] NixlBackend: desc %d has null addr or zero length\n", i);
             return INVALID_BATCH;
         }
         if (!covers_local(d.local_addr, d.length)) {
-            fprintf(stderr, "[shmradix] NixlBackend: desc %d local range [%p,+%lu) "
+            fprintf(stderr, "[radixshmem] NixlBackend: desc %d local range [%p,+%lu) "
                             "is not inside any registered region\n",
                     i, d.local_addr, (unsigned long)d.length);
             return INVALID_BATCH;
         }
         auto it = open_.find(d.target);
         if (it == open_.end()) {
-            fprintf(stderr, "[shmradix] NixlBackend: desc %d targets unknown segment %d\n",
+            fprintf(stderr, "[radixshmem] NixlBackend: desc %d targets unknown segment %d\n",
                     i, (int)d.target);
             return INVALID_BATCH;
         }
@@ -473,7 +473,7 @@ BatchHandle NixlBackend::submit(const TransferDesc* descs, int n) {
         uint64_t rend = 0;
         if (__builtin_add_overflow(d.target_offset, d.length, &rend) ||
             d.target_offset < seg.info.base || rend > seg.info.base + seg.info.length) {
-            fprintf(stderr, "[shmradix] NixlBackend: desc %d remote range "
+            fprintf(stderr, "[radixshmem] NixlBackend: desc %d remote range "
                             "[0x%lx,+%lu) escapes segment %d [0x%lx,+%lu)\n",
                     i, (unsigned long)d.target_offset, (unsigned long)d.length,
                     (int)d.target, (unsigned long)seg.info.base,
@@ -482,13 +482,13 @@ BatchHandle NixlBackend::submit(const TransferDesc* descs, int n) {
         }
         if (i == 0) { is_self = seg.is_self; target = d.target; }
         else if (is_self != seg.is_self || target != d.target) {
-            fprintf(stderr, "[shmradix] NixlBackend: batch targets more than one "
+            fprintf(stderr, "[radixshmem] NixlBackend: batch targets more than one "
                             "segment, or mixes the local segment with a remote one; "
                             "split it\n");
             return INVALID_BATCH;
         }
         if (d.op != op) {
-            fprintf(stderr, "[shmradix] NixlBackend: batch mixes READ and WRITE; "
+            fprintf(stderr, "[radixshmem] NixlBackend: batch mixes READ and WRITE; "
                             "split it (NIXL's createXferReq takes one op per batch)\n");
             return INVALID_BATCH;
         }
@@ -514,7 +514,7 @@ BatchHandle NixlBackend::submit(const TransferDesc* descs, int n) {
         if (kv.second == target) { remote_agent = kv.first; break; }
     }
     if (remote_agent.empty()) {
-        fprintf(stderr, "[shmradix] NixlBackend: segment %d has no name on record\n",
+        fprintf(stderr, "[radixshmem] NixlBackend: segment %d has no name on record\n",
                 (int)target);
         return INVALID_BATCH;
     }
@@ -533,13 +533,13 @@ BatchHandle NixlBackend::submit(const TransferDesc* descs, int n) {
     nixl_status_t st = agent_->createXferReq(nixl_op, local_descs, remote_descs,
                                              remote_agent, req);
     if (st != NIXL_SUCCESS || req == nullptr) {
-        fprintf(stderr, "[shmradix] NixlBackend: createXferReq to '%s' failed: %d\n",
+        fprintf(stderr, "[radixshmem] NixlBackend: createXferReq to '%s' failed: %d\n",
                 remote_agent.c_str(), (int)st);
         return INVALID_BATCH;
     }
     st = agent_->postXferReq(req);
     if (st != NIXL_SUCCESS && st != NIXL_IN_PROG) {
-        fprintf(stderr, "[shmradix] NixlBackend: postXferReq to '%s' failed: %d\n",
+        fprintf(stderr, "[radixshmem] NixlBackend: postXferReq to '%s' failed: %d\n",
                 remote_agent.c_str(), (int)st);
         agent_->releaseXferReq(req);
         return INVALID_BATCH;
@@ -605,7 +605,7 @@ int NixlBackend::release(BatchHandle h) {
 
     const nixl_status_t st = agent_->releaseXferReq(it->second.req);
     if (st != NIXL_SUCCESS) {
-        fprintf(stderr, "[shmradix] NixlBackend: releaseXferReq failed: %d\n", (int)st);
+        fprintf(stderr, "[radixshmem] NixlBackend: releaseXferReq failed: %d\n", (int)st);
         return XFER_EBACKEND;
     }
     batches_.erase(it);
@@ -620,4 +620,4 @@ std::unique_ptr<ITransferBackend> create_nixl_backend(const TransferConfig& cfg)
     return be;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

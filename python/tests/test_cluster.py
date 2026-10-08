@@ -4,7 +4,7 @@
 """Multi-node smoke test driven entirely from Python.
 
 Simulates a cluster on one host: a private etcd, N index-only `radix-server`
-processes (`python -m shmradix.cli`, so the CLI itself is under test) that a
+processes (`python -m radixshmem.cli`, so the CLI itself is under test) that a
 client configures one by one (index-only servers take their slot counts from
 the client), and re-exec'd client processes that attach by shm name and
 cross-check what they see.
@@ -43,9 +43,9 @@ LEASE_TTL = 10           # etcd lease of every server; [8] waits it out
 
 def _hashes(count: int, base: int = 1000):
     import numpy as np
-    import shmradix
+    import radixshmem
     tokens = np.arange(base, base + count, dtype=np.int64)
-    return shmradix.compute_hashes(tokens, tokens_per_block=BLOCK_SIZE)
+    return radixshmem.compute_hashes(tokens, tokens_per_block=BLOCK_SIZE)
 
 
 def _publish(cli, base):
@@ -56,9 +56,9 @@ def _publish(cli, base):
 
 
 def _find(cli, base):
-    import shmradix
+    import radixshmem
     t0 = time.time()
-    qr = cli.query(_hashes(PREFIX_LEN, base=base), mask=shmradix.COMPONENT_MASK_FULL)
+    qr = cli.query(_hashes(PREFIX_LEN, base=base), mask=radixshmem.COMPONENT_MASK_FULL)
     frags = qr.full_fragments
     return {"total_hit_length": int(qr.common_hit),
             "remote_node_id": int(frags[-1][0]) if frags else -1,
@@ -67,15 +67,15 @@ def _find(cli, base):
 
 def client_main(role: str, shm_name: str) -> int:
     """Runs in a re-exec'd process; prints one JSON line on stdout."""
-    import shmradix
+    import radixshmem
 
     if role == "local_read_only":
         # Read-only attach without the cluster plane (no etcd, no RDMA): the
         # node's own tree and rank are visible, every mutation is refused.
         import numpy as np
-        ro = shmradix._core.RadixClient(shm_name, local_read_only=True)
+        ro = radixshmem._core.RadixClient(shm_name, local_read_only=True)
         h = _hashes(PREFIX_LEN)
-        q = ro.query(h, mask=shmradix.COMPONENT_MASK_FULL, update_meta=False)
+        q = ro.query(h, mask=radixshmem.COMPONENT_MASK_FULL, update_meta=False)
         refused = 0
         for call in (lambda: ro.allocate_slots(1),
                      lambda: ro.insert(h[:1], np.zeros(1, dtype=np.int32)), ro.reset):
@@ -89,7 +89,7 @@ def client_main(role: str, shm_name: str) -> int:
             "rdma_read_count": int(q.rdma_read_count), "refused": refused}), flush=True)
         return 0
 
-    cli = shmradix._core.RadixClient(shm_name)
+    cli = radixshmem._core.RadixClient(shm_name)
     out = {
         "role": role,
         "shm": shm_name,
@@ -100,7 +100,7 @@ def client_main(role: str, shm_name: str) -> int:
 
     if role == "writer":
         h = _hashes(PREFIX_LEN)
-        matched = int(cli.query(h, mask=shmradix.COMPONENT_MASK_FULL,
+        matched = int(cli.query(h, mask=radixshmem.COMPONENT_MASK_FULL,
                                 update_meta=False).common_hit)
         slots = cli.allocate_slots(len(h) - matched)
         res = cli.insert(h, slots, start=matched)
@@ -110,7 +110,7 @@ def client_main(role: str, shm_name: str) -> int:
 
     elif role == "reader":
         h = _hashes(PREFIX_LEN)
-        qr = cli.query(h, mask=shmradix.COMPONENT_MASK_FULL)
+        qr = cli.query(h, mask=radixshmem.COMPONENT_MASK_FULL)
         own = int(cli.rank())
         frags = qr.full_fragments
         local_hit = sum(len(f[2]) for f in frags if f[0] == own)
@@ -159,7 +159,7 @@ def client_main(role: str, shm_name: str) -> int:
 
     elif role == "rank_twice":
         # A second client on the same node must resolve the same etcd rank.
-        cli2 = shmradix._core.RadixClient(shm_name)
+        cli2 = radixshmem._core.RadixClient(shm_name)
         out["rank2"] = cli2.rank()
 
     elif role.startswith("turn"):
@@ -169,13 +169,13 @@ def client_main(role: str, shm_name: str) -> int:
         k = int(role[4:])
         n = (k + 1) * TURN_LEN
         h = _hashes(n, base=5000)
-        fm = shmradix.COMPONENT_MASK_FULL | shmradix.COMPONENT_MASK_MAMBA
+        fm = radixshmem.COMPONENT_MASK_FULL | radixshmem.COMPONENT_MASK_MAMBA
         q = cli.query(h[:k * TURN_LEN], mask=fm, update_meta=False) if k else None
-        have = int(cli.query(h, mask=shmradix.COMPONENT_MASK_FULL, local_only=True,
+        have = int(cli.query(h, mask=radixshmem.COMPONENT_MASK_FULL, local_only=True,
                              update_meta=False).common_hit)
         res = cli.insert(h, cli.allocate_slots(n - have), start=have)
-        mres = cli.insert(h, cli.allocate_slots(1, shmradix.ComponentType.MAMBA),
-                          component=shmradix.ComponentType.MAMBA)
+        mres = cli.insert(h, cli.allocate_slots(1, radixshmem.ComponentType.MAMBA),
+                          component=radixshmem.ComponentType.MAMBA)
         cli.flush()
         out.update(hit=int(q.common_hit) if q else 0, expected=k * TURN_LEN,
                    rdma_read_count=int(q.rdma_read_count) if q else 0,
@@ -230,7 +230,7 @@ def start_etcd(workdir: str):
 
 def server_cmd(i, n, registry, cluster_id, workdir, index_dev, gid_idx, transports):
     cmd = [
-        sys.executable, "-m", "shmradix.cli",
+        sys.executable, "-m", "radixshmem.cli",
         "--name", SHM_PREFIX,
         "--node-name", f"node{i}",
         "--registry", registry,
@@ -299,10 +299,10 @@ def configure_all(n, workdir):
 
 
 def configure_one(workdir, i):
-    import shmradix
+    import radixshmem
 
-    geo = shmradix.Geometry(block_size=BLOCK_SIZE, full_slots=MAX_BLOCKS, mamba_slots=64)
-    cl = shmradix.RadixClient(SHM_PREFIX, endpoint=endpoint(workdir, i))
+    geo = radixshmem.Geometry(block_size=BLOCK_SIZE, full_slots=MAX_BLOCKS, mamba_slots=64)
+    cl = radixshmem.RadixClient(SHM_PREFIX, endpoint=endpoint(workdir, i))
     info = cl.info
     check(info.mode == "waiting" and not info.data_plane and info.geometry is None,
           f"node{i} starts waiting for a geometry, index only")
@@ -363,13 +363,13 @@ def check(cond, msg):
 
 
 def orchestrate(args) -> int:
-    import shmradix
+    import radixshmem
 
     if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{args.index_dev}")
-            or not hasattr(shmradix._core, "EtcdKv")):
-        print(f"SKIP: needs etcd, RDMA device {args.index_dev!r} and shmradix built with etcd")
+            or not hasattr(radixshmem._core, "EtcdKv")):
+        print(f"SKIP: needs etcd, RDMA device {args.index_dev!r} and radixshmem built with etcd")
         return 77
-    workdir = tempfile.mkdtemp(prefix="shmradix-cluster-")
+    workdir = tempfile.mkdtemp(prefix="radixshmem-cluster-")
     cluster_id = f"pytest{os.getpid()}"
     etcd_proc = servers = None
     logs = []
@@ -386,13 +386,13 @@ def orchestrate(args) -> int:
         configure_all(args.nodes, workdir)
         wait_banner(servers, logs, "Cluster ready", args.timeout)
 
-        import shmradix
+        import radixshmem
         ranks = []
         for i, path in enumerate(logs):
             line = [l for l in read(path).splitlines() if "Cluster ready" in l][0]
             ranks.append(int(line.split("rank=")[1].split("/")[0]))
             print(f"  node{i}: {line.strip()}")
-            cl = shmradix.RadixClient(SHM_PREFIX, endpoint=endpoint(workdir, i))
+            cl = radixshmem.RadixClient(SHM_PREFIX, endpoint=endpoint(workdir, i))
             info = cl.wait_ready(10)
             cl.close()
             check(info.mode == "ready" and info.rank == ranks[i] and info.world_size == args.nodes
@@ -402,9 +402,9 @@ def orchestrate(args) -> int:
         check(sorted(ranks) == list(range(args.nodes)),
               f"etcd handed out dense ranks {sorted(ranks)}")
         try:
-            shmradix.RadixClient(SHM_PREFIX, shmradix.Geometry(block_size=BLOCK_SIZE, full_slots=MAX_BLOCKS),
+            radixshmem.RadixClient(SHM_PREFIX, radixshmem.Geometry(block_size=BLOCK_SIZE, full_slots=MAX_BLOCKS),
                                  endpoint=endpoint(workdir, 1))
-        except shmradix.GeometryMismatch as e:
+        except radixshmem.GeometryMismatch as e:
             check("mamba" in str(e), f"node1 refuses a geometry without the Mamba pool ({e})")
         else:
             raise AssertionError("node1 accepted a conflicting geometry")
@@ -547,7 +547,7 @@ def orchestrate(args) -> int:
                 os.unlink(stale)
             except OSError:
                 pass
-        if os.environ.get("SHMRADIX_KEEP_LOGS"):
+        if os.environ.get("RADIXSHMEM_KEEP_LOGS"):
             print(f"logs kept in {workdir}")
         else:
             shutil.rmtree(workdir, ignore_errors=True)

@@ -9,7 +9,7 @@ pull_async() jobs.
     python3 test_p2p_pull.py [--index-dev mlx5_bond_0] [--transfer-dev mlx5_bond_0] [--gid-idx 3]
 
 Needs etcd, an RDMA device and the Mooncake backend; exits 77 when missing.
-SHMRADIX_TEST_LEASE_S=45 sleeps that long before the reader attaches, past the
+RADIXSHMEM_TEST_LEASE_S=45 sleeps that long before the reader attaches, past the
 etcd lease TTL, to prove the lease keepalive. Clients are re-exec'd, never
 forked (the etcd Go runtime and ibverbs do not survive fork()).
 """
@@ -39,12 +39,12 @@ def _pattern(k: int, i: int) -> bytes:
 
 def client_main(role: str, endpoint: str) -> int:
     import numpy as np
-    import shmradix
+    import radixshmem
 
-    c = shmradix.RadixClient(NAME, endpoint=endpoint)
+    c = radixshmem.RadixClient(NAME, endpoint=endpoint)
     assert c.geometry["pools"]["full"]["slot_bytes"] == SLOT_BYTES
     out = {"role": role, "rank": c.rank(), "world_size": c.world_size(), "mode": c.info.mode}
-    hs = [shmradix.compute_hashes(np.arange(1000 * (k + 1), 1000 * (k + 1) + PREFIX_LEN, dtype=np.int64), 1)
+    hs = [radixshmem.compute_hashes(np.arange(1000 * (k + 1), 1000 * (k + 1) + PREFIX_LEN, dtype=np.int64), 1)
           for k in range(PREFIXES)]
     if role == "writer":
         errors = set()
@@ -148,14 +148,14 @@ def check(cond, msg):
 
 
 def orchestrate(a) -> int:
-    import shmradix
+    import radixshmem
 
     if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{a.index_dev}")
-            or not hasattr(shmradix, "_data") or "mooncake" not in shmradix._data.TRANSFER_BACKENDS
-            or not hasattr(shmradix._core, "EtcdKv")):
-        print(f"SKIP: needs etcd, RDMA device {a.index_dev!r} and shmradix built with etcd + Mooncake")
+            or not hasattr(radixshmem, "_data") or "mooncake" not in radixshmem._data.TRANSFER_BACKENDS
+            or not hasattr(radixshmem._core, "EtcdKv")):
+        print(f"SKIP: needs etcd, RDMA device {a.index_dev!r} and radixshmem built with etcd + Mooncake")
         return 77
-    workdir = tempfile.mkdtemp(prefix="shmradix-p2p-")
+    workdir = tempfile.mkdtemp(prefix="radixshmem-p2p-")
     cluster_id = f"p2p{os.getpid()}"
     etcd_proc, servers, logs = None, [], []
     try:
@@ -167,7 +167,7 @@ def orchestrate(a) -> int:
         print("\n[1] two radix-server processes, index + data plane, no geometry on the command line")
         for i in range(2):
             logs.append(os.path.join(workdir, f"server{i}.log"))
-            cmd = [sys.executable, "-m", "shmradix.cli", "--name", NAME, "--node-name", f"node{i}",
+            cmd = [sys.executable, "-m", "radixshmem.cli", "--name", NAME, "--node-name", f"node{i}",
                    "--data-name", f"{NAME}_data{i}", "--data-bytes", "64M", "--no-prefault",
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
@@ -185,12 +185,12 @@ def orchestrate(a) -> int:
                 return 77
             raise
         # this process only talks gRPC: a client that never calls the index never attaches shm
-        probes = [shmradix.RadixClient(NAME, endpoint=ep) for ep in endpoints]
+        probes = [radixshmem.RadixClient(NAME, endpoint=ep) for ep in endpoints]
         for i, cl in enumerate(probes):
             check(cl.info.mode == "waiting" and cl.info.geometry is None, f"node{i} is waiting for a geometry")
 
         print("\n[2] a client brings node0 the geometry; node1 takes it from etcd; the cluster forms")
-        cl0 = shmradix.RadixClient(NAME, shmradix.Geometry(block_size=1, full_slot_bytes=SLOT_BYTES),
+        cl0 = radixshmem.RadixClient(NAME, radixshmem.Geometry(block_size=1, full_slot_bytes=SLOT_BYTES),
                                    endpoint=endpoints[0])
         info = cl0.info
         check(info.mode == "configuring" and info.geometry["pools"]["full"]["num_slots"] == (64 << 20) // SLOT_BYTES,
@@ -205,9 +205,9 @@ def orchestrate(a) -> int:
         ranks = [int(read(l).split("rank=")[1].split("/")[0]) for l in logs]
         check(sorted(ranks) == [0, 1], f"etcd handed out ranks {ranks}")
         try:
-            shmradix.RadixClient(NAME, shmradix.Geometry(block_size=2, full_slot_bytes=SLOT_BYTES),
+            radixshmem.RadixClient(NAME, radixshmem.Geometry(block_size=2, full_slot_bytes=SLOT_BYTES),
                                  endpoint=endpoints[1])
-        except shmradix.GeometryMismatch as e:
+        except radixshmem.GeometryMismatch as e:
             check("block_size" in str(e), f"node1 refuses another geometry ({e})")
         else:
             raise AssertionError("node1 accepted a conflicting geometry")
@@ -217,7 +217,7 @@ def orchestrate(a) -> int:
         print(f"  {w}")
         check(w["insert_errors"] == ["InsertError.OK"] and w["mode"] == "ready", "writer inserted")
 
-        lease_s = float(os.environ.get("SHMRADIX_TEST_LEASE_S", "0"))
+        lease_s = float(os.environ.get("RADIXSHMEM_TEST_LEASE_S", "0"))
         if lease_s > 0:
             print(f"\n[3b] sleeping {lease_s:.0f}s past the etcd lease TTL")
             time.sleep(lease_s)
@@ -257,7 +257,7 @@ def orchestrate(a) -> int:
                 os.unlink(stale)
             except OSError:
                 pass
-        if os.environ.get("SHMRADIX_KEEP_LOGS"):
+        if os.environ.get("RADIXSHMEM_KEEP_LOGS"):
             print(f"logs kept in {workdir}")
         else:
             shutil.rmtree(workdir, ignore_errors=True)

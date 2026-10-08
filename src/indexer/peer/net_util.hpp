@@ -13,7 +13,7 @@
 #include <cstdio>
 #include <string>
 
-namespace shmradix {
+namespace radixshmem {
 
 // IPv4 bound to a named interface (e.g. "eth0"), or empty if none.
 inline std::string interface_ipv4(const std::string& iface) {
@@ -57,4 +57,4 @@ inline std::string resolve_bind_ip(const std::string& address,
     return address;
 }
 
-} // namespace shmradix
+} // namespace radixshmem

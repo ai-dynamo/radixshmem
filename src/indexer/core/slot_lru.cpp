@@ -3,7 +3,7 @@
 
 #include "slot_lru.hpp"
 
-namespace shmradix {
+namespace radixshmem {
 
 SlotLru::SlotLru(SlotLruEntry* entries, uint32_t capacity,
                  AuxListAnchors* anchors)
@@ -63,4 +63,4 @@ void SlotLru::unlink(int32_t slot) {
     e = SlotLruEntry{INVALID_SLOT_LINK, INVALID_SLOT_LINK, INVALID_NODE_ID, 0, 0};
 }
 
-} // namespace shmradix
+} // namespace radixshmem

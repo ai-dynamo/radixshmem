@@ -17,9 +17,9 @@
 // fork), and the whole file SKIPs when no engine can come up.
 
 #include "data_test_utils.h"
-#include "shmradix/slot_store.h"
-#include "shmradix/slot_transfer.h"
-#include "shmradix/transfer.h"
+#include "slot_store.h"
+#include "slot_transfer.h"
+#include "transfer.h"
 
 #include <cstring>
 #include <string>
@@ -27,7 +27,7 @@
 
 #include <unistd.h>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 static constexpr uint64_t kSlots     = 64;
 static constexpr uint64_t kSlotBytes = 65536;

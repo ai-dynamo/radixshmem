@@ -541,7 +541,7 @@ wheels = [
 ]
 
 [[package]]
-name = "shmradix"
+name = "radixshmem"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

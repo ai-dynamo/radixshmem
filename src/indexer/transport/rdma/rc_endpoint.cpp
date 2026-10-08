@@ -13,7 +13,7 @@
 #include <infiniband/verbs.h>
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 RdmaEndpoint::RdmaEndpoint(RdmaContext& ctx) : ctx_(&ctx) {
     cq_ = ibv_create_cq(ctx.ctx(), 128, nullptr, nullptr, 0);
@@ -565,4 +565,4 @@ void rdma_loopback_connect(RdmaEndpoint& a, RdmaEndpoint& b) {
     b.connect(info_a);
 }
 
-} // namespace shmradix
+} // namespace radixshmem

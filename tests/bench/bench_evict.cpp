@@ -10,9 +10,9 @@
 #include <vector>
 
 #include "test_utils.h"
-#include "shmradix/radix_client.h"
+#include "radix_client.h"
 
-using namespace shmradix;
+using namespace radixshmem;
 
 struct SeqData {
     std::vector<int64_t> tokens;
@@ -204,7 +204,7 @@ static void bench_ref_count_filtering() {
 
     std::mt19937_64 rng(65536);
     std::vector<SeqData> seqs;
-    std::vector<shmradix::FinalizeFn> locks;
+    std::vector<radixshmem::FinalizeFn> locks;
 
     for (int i = 0; i < NUM_SEQS; i++) {
         auto s = make_seq(rng, SEQ_LEN, i * SEQ_LEN);

@@ -8,8 +8,8 @@
 // close/reopen. Without a working UCX agent the cases report SKIP.
 
 #include "data_test_utils.h"
-#include "shmradix/slot_store.h"
-#include "shmradix/transfer.h"
+#include "slot_store.h"
+#include "transfer.h"
 
 #include <chrono>
 #include <cstring>
@@ -21,7 +21,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-using namespace shmradix;
+using namespace radixshmem;
 
 static SlotStoreConfig store_cfg(const std::string& name, uint64_t slots,
                                  uint64_t slot_bytes) {

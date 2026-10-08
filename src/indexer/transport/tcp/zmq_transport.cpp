@@ -3,9 +3,9 @@
 
 #include "zmq_transport.hpp"
 
-#ifdef SHMRADIX_HAS_ZMQ
+#ifdef RADIXSHMEM_HAS_ZMQ
 
-#include "shmradix/radix_client.h"   // RemotePeer decl (convenience ctor below)
+#include "radix_client.h"   // RemotePeer decl (convenience ctor below)
 
 #include <zmq.h>
 
@@ -16,7 +16,7 @@
 #include <memory>
 #include <stdexcept>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 // Upper bound on a single reply message — derived from the protocol
@@ -168,6 +168,6 @@ void ZmqServerTransport::send_reply(const ReplyContext& /*ctx*/,
     }
 }
 
-}  // namespace shmradix
+}  // namespace radixshmem
 
-#endif  // SHMRADIX_HAS_ZMQ
+#endif  // RADIXSHMEM_HAS_ZMQ

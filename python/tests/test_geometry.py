@@ -3,9 +3,9 @@
 
 import pytest
 
-from shmradix import Geometry
-from shmradix import _geometry as G
-from shmradix.server import ServerConfig
+from radixshmem import Geometry
+from radixshmem import _geometry as G
+from radixshmem.server import ServerConfig
 
 
 def cfg(**kw):

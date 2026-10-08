@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/local.h"
-#include "shmradix/hash.h"
+#include "local.h"
+#include "hash.h"
 
-namespace shmradix {
+namespace radixshmem {
 
 // ==================== LocalTreeConnector ====================
 
 LocalTreeConnector::LocalTreeConnector(const std::string& name)
-    : tree_(ShmRadixTree::attach(name)), name_(name) {}
+    : tree_(RadixShmemTree::attach(name)), name_(name) {}
 
 LocalTreeConnector::~LocalTreeConnector() {
     tree_.detach();
@@ -69,11 +69,11 @@ uint32_t LocalTreeConnector::mempool_used() const { return tree_.mempool_used();
 void LocalTreeConnector::print_tree() const { tree_.print_tree(); }
 
 int LocalTreeConnector::check_health(HealthReport* report) const {
-    HealthReport r = shmradix::check_health(tree_);
+    HealthReport r = radixshmem::check_health(tree_);
     if (report) *report = r;
     return (int)r.flags;
 }
 
 const std::string& LocalTreeConnector::name() const { return name_; }
 
-} // namespace shmradix
+} // namespace radixshmem

@@ -6,7 +6,7 @@ requires = ["setuptools>=64", "pybind11==3.1.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "shmradix"
+name = "radixshmem"
 version = "0.1.0"
 description = "Shared-memory RadixTree for KV cache prefix matching"
 requires-python = ">=3.8"
@@ -22,7 +22,7 @@ dependencies = ["numpy", "grpcio>=1.60"]
 # PEP 621 metadata wins over setup.py, so the console script has to live here —
 # entry_points in setup.py is silently ignored while this table exists.
 [project.scripts]
-radix-server = "shmradix.cli:main"
+radix-server = "radixshmem.cli:main"
 
 [tool.uv]
 managed = true

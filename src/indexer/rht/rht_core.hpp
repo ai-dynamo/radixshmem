@@ -3,7 +3,7 @@
 
 // RHT core: the shared layer under both endpoints (holder and consumer).
 // PRIVATE header (src/indexer/rht): pulls in the verbs transport surface.
-// Callers outside the module use shmradix/rht_endpoint.h + rht_types.h only.
+// Callers outside the module use rht_endpoint.h + rht_types.h only.
 //
 //   RhtShard   — one shard's standalone POSIX shm region (header + flat uint64
 //                bucket array). Created on holder ranks, RDMA-registered, and
@@ -13,11 +13,11 @@
 //                RDMA per shard. Endpoints assemble one and forward to it.
 //
 // Public value types (RHTValue, RhtInsertEntry, RhtRemoveEntry, RhtShardAddr)
-// live in shmradix/rht_types.h.
+// live in rht_types.h.
 
 #pragma once
 
-#include "shmradix/rht_types.h"
+#include "rht_types.h"
 #include "peer_breaker.hpp"
 #include "rdma_transport.hpp"
 
@@ -29,7 +29,7 @@
 #include <string>
 #include <vector>
 
-namespace shmradix {
+namespace radixshmem {
 
 // ==================== RhtShard — one shard's shm base ====================
 
@@ -196,4 +196,4 @@ private:
     std::function<void(int)> release_;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

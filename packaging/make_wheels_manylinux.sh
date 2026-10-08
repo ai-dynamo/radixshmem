@@ -26,15 +26,15 @@ build_one () {
     # Stage a clean source-free package tree.
     cp "$PKG/setup.py" "$PKG/pyproject.toml" "$stage/"
     cp "$ROOT/LICENSE" "$ROOT/ATTRIBUTIONS.md" "$stage/"
-    mkdir -p "$stage/shmradix"
-    cp "$ROOT/python/shmradix/__init__.py" "$stage/shmradix/"
-    cp "$ROOT/python/shmradix/server.py"   "$stage/shmradix/"
-    : > "$stage/shmradix/py.typed"
+    mkdir -p "$stage/radixshmem"
+    cp "$ROOT/python/radixshmem/__init__.py" "$stage/radixshmem/"
+    cp "$ROOT/python/radixshmem/server.py"   "$stage/radixshmem/"
+    : > "$stage/radixshmem/py.typed"
     # Swap in this variant's prebuilt .so under the canonical extension name.
     cp "$PKG/prebuilt/$so" \
-       "$stage/shmradix/_core.cpython-312-x86_64-linux-gnu.so"
+       "$stage/radixshmem/_core.cpython-312-x86_64-linux-gnu.so"
 
-    ( cd "$stage" && SHMRADIX_WHEEL_VARIANT="$variant" \
+    ( cd "$stage" && RADIXSHMEM_WHEEL_VARIANT="$variant" \
         "$PY" -m build --wheel --no-isolation )
 
     local raw; raw=$(ls "$stage"/dist/*.whl)

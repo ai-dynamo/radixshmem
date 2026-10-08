@@ -4,7 +4,7 @@
 """mooncake_bench.py — application-level mooncake-trace stress test for RadixShmem.
 
 Counterpart to dynamo's `mooncake_bench.rs`, but exercising the *Python
-integration layer* (shmradix._core.RadixServer / RadixClient) — the same surface the
+integration layer* (radixshmem._core.RadixServer / RadixClient) — the same surface the
 vLLM OffloadingConnector integration will ultimately call.
 
 MVP scope: single process holding both server (writer) and client (reader/writer).
@@ -48,10 +48,10 @@ from time import perf_counter, perf_counter_ns
 import numpy as np
 
 try:
-    import shmradix
+    import radixshmem
 except ImportError as e:  # pragma: no cover
     sys.stderr.write(
-        "ERROR: cannot import shmradix. Run inside the radixshmem_vllm container "
+        "ERROR: cannot import radixshmem. Run inside the radixshmem_vllm container "
         "or with python/ on PYTHONPATH.\n"
     )
     raise
@@ -303,14 +303,14 @@ def run_workload(
     # the default heuristic assumes). Overflowing the node pool currently
     # *segfaults* the engine instead of returning NODE_POOL_FULL, so we give it
     # 4x max_blocks worth of nodes — comfortably above observed node counts.
-    shm_cfg = shmradix._core.ShmConfig(
+    shm_cfg = radixshmem._core.ShmConfig(
         max_nodes=max(1 << 20, max_blocks * 4),
         max_blocks=max_blocks,
         block_size=1,               # we feed precomputed block hashes (1 hash = 1 block)
         data_pool_ratio=data_pool_ratio,
     )
-    server = shmradix._core.RadixServer(shm_name, shm_cfg)
-    client = shmradix._core.RadixClient(shm_name)
+    server = radixshmem._core.RadixServer(shm_name, shm_cfg)
+    client = radixshmem._core.RadixClient(shm_name)
 
     cum_blocks = [0]
     sampler = None
@@ -347,7 +347,7 @@ def run_workload(
 
             h = req.hashes
             t = perf_counter_ns()
-            qr = client.query(h, mask=shmradix.COMPONENT_MASK_FULL,
+            qr = client.query(h, mask=radixshmem.COMPONENT_MASK_FULL,
                               local_only=cfg.local_only, lock=cfg.lock,
                               update_meta=cfg.update_meta)
             q_lat.add(perf_counter_ns() - t)
@@ -378,7 +378,7 @@ def run_workload(
             i += 1
             h = req.hashes
             t = perf_counter_ns()
-            qr = client.query(h, mask=shmradix.COMPONENT_MASK_FULL,
+            qr = client.query(h, mask=radixshmem.COMPONENT_MASK_FULL,
                               local_only=cfg.local_only, lock=cfg.lock,
                               update_meta=cfg.update_meta)
             q_lat.add(perf_counter_ns() - t)

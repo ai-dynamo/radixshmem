@@ -5,7 +5,7 @@
 
 #include <cassert>
 
-namespace shmradix {
+namespace radixshmem {
 
 uint32_t ComponentSet::mamba_at_or_below(const MatchedPathView& path,
                                          uint32_t limit) noexcept {
@@ -170,4 +170,4 @@ void record_pin_tail(const MatchedNodeSpanView* spans, size_t num,
     }
 }
 
-} // namespace shmradix
+} // namespace radixshmem

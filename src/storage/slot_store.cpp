@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-#include "shmradix/slot_store.h"
+#include "slot_store.h"
 
 #include "shm_region.hpp"
 
@@ -14,7 +14,7 @@
 
 #include <unistd.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 namespace {
 
@@ -230,4 +230,4 @@ void SlotStore::destroy(const std::string& name, const std::string& hugepage_pat
     ShmRegion::unlink(name, hugepage_path);
 }
 
-} // namespace shmradix
+} // namespace radixshmem

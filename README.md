@@ -24,8 +24,8 @@ first node in the cluster to receive a `Geometry` publishes it to etcd and the o
 talk to the local server over gRPC (a unix socket by default) and read and write the index directly in shared
 memory.
 
-- `shmradix.RadixClient`: Python client for query, insert, and KV block pulls (`pull_async`).
-- `radix-server` (`shmradix.RadixServer`): one server process per node, holding the index, the SlotStore, and
+- `radixshmem.RadixClient`: Python client for query, insert, and KV block pulls (`pull_async`).
+- `radix-server` (`radixshmem.RadixServer`): one server process per node, holding the index, the SlotStore, and
   the transfer engine.
 
 ## Framework support
@@ -46,8 +46,8 @@ Dependencies: C++17 compiler, CMake, [xxHash](https://github.com/Cyan4973/xxHash
 cd python && pip install -e .
 ```
 
-`pip install` runs CMake to build `shmradix._core` and `shmradix._data` under `build/`. RDMA is enabled
-when the `libibverbs` headers are found; set `SHMRADIX_ENABLE_RDMA=0/1` to choose explicitly.
+`pip install` runs CMake to build `radixshmem._core` and `radixshmem._data` under `build/`. RDMA is enabled
+when the `libibverbs` headers are found; set `RADIXSHMEM_ENABLE_RDMA=0/1` to choose explicitly.
 
 The data-plane transfer backends are optional: `scripts/build_mooncake.sh` and `scripts/build_nixl.sh` build
 Mooncake / NIXL from upstream source at a pinned commit and install them under `third_party/`, where CMake
@@ -155,9 +155,9 @@ hit on a peer into local slots (the server performs the transfer) and publishes 
 index-only mode, `pull_async()` raises `DataPlaneUnavailable`.
 
 ```python
-import shmradix
+import radixshmem
 
-client = shmradix.RadixClient("/my_kv_cache", shmradix.Geometry(block_size=16, full_slot_bytes=1179648))
+client = radixshmem.RadixClient("/my_kv_cache", radixshmem.Geometry(block_size=16, full_slot_bytes=1179648))
 client.wait_ready(timeout_s=600)
 assert client.geometry["block_size"] == 16 and client.geometry["pools"]["full"]["slot_bytes"] >= page_bytes
 job = client.pull_async(hashes)         # returns immediately; the server performs the transfer

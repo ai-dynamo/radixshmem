@@ -5,11 +5,11 @@
 
 // Internal matched-path views used by ComponentSet and tree walkers.
 
-#include "shmradix/component_types.h"
+#include "component_types.h"
 
 #include <cstdint>
 
-namespace shmradix {
+namespace radixshmem {
 
 // One matched node fragment. Lane pointers cover the FULL node while
 // matched_blocks marks the consumed prefix; borrowed, read-lock lifetime only.
@@ -37,4 +37,4 @@ struct ComponentQueryContext {
     MatchedPathView path;
 };
 
-} // namespace shmradix
+} // namespace radixshmem

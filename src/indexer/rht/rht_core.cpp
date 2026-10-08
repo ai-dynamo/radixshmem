@@ -17,7 +17,7 @@
 #include <thread>
 #include <unistd.h>
 
-namespace shmradix {
+namespace radixshmem {
 
 // align_up comes from types.h (via cluster_manifest.h in rht_types.h).
 
@@ -686,4 +686,4 @@ void RhtEngine::remove_batch(const RhtRemoveEntry* entries, int count) {
         remove(entries[i].key, entries[i].node_id, entries[i].tree_node_id);
 }
 
-} // namespace shmradix
+} // namespace radixshmem
