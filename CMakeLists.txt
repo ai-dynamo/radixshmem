@@ -622,7 +622,38 @@ if(BUILD_PYTHON_MODULES)
                  COMMAND ${Python3_EXECUTABLE} tests/test_shmradix_data.py
                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python)
         set_tests_properties(test_data_python PROPERTIES
-            DEPENDS shmradix_data_py TIMEOUT 300)
+            DEPENDS shmradix_data_py TIMEOUT 300
+            ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python")
+
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
+            RESULT_VARIABLE _pytest_rc OUTPUT_QUIET ERROR_QUIET)
+        foreach(_t test_geometry test_server_rpc test_shmradix)
+            if(_pytest_rc EQUAL 0)
+                add_test(NAME py_${_t}
+                         COMMAND ${Python3_EXECUTABLE} -m pytest -q tests/${_t}.py)
+            else()
+                add_test(NAME py_${_t}
+                         COMMAND ${Python3_EXECUTABLE} -c "print('SKIP: pytest not installed'); raise SystemExit(77)")
+            endif()
+        endforeach()
+        add_test(NAME py_test_cluster COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
+        add_test(NAME py_test_p2p_pull COMMAND ${Python3_EXECUTABLE} tests/test_p2p_pull.py)
+        set(_stress_args --concurrency 8 --duration 10 --warmup-sec 2 --turns 3,6
+            --isl-step 50,100 --osl 10,30 --max-blocks 200000 --max-nodes 200000
+            --swa-max-blocks 50000 --mamba-max-slots 10000 --report-sec 5)
+        add_test(NAME py_agentic_stress_1node
+                 COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 1
+                         --base-port 19100 ${_stress_args})
+        add_test(NAME py_agentic_stress_2node
+                 COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 2
+                         --base-port 19200 ${_stress_args})
+        foreach(_t py_test_geometry py_test_server_rpc py_test_shmradix py_test_cluster
+                   py_test_p2p_pull py_agentic_stress_1node py_agentic_stress_2node)
+            set_tests_properties(${_t} PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
+                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
+                SKIP_RETURN_CODE 77 TIMEOUT 600)
+        endforeach()
         message(STATUS "shmradix._core + shmradix._data: building "
                        "(pybind11 ${pybind11_VERSION}, ${Python3_EXECUTABLE})")
     else()

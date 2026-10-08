@@ -1,0 +1,80 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  compliance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pre-commit uv
+      - name: pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+      - name: DCO sign-off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            range="$BASE..$HEAD"
+          else
+            range="-1 $HEAD"
+          fi
+          status=0
+          for c in $(git rev-list --no-merges $range); do
+            git log -1 --format=%B "$c" > /tmp/msg
+            tools/check_signoff.sh /tmp/msg || { echo "  in $(git log -1 --format='%h %s' "$c")"; status=1; }
+          done
+          exit $status
+
+  build-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake pkg-config \
+            libibverbs-dev libxxhash-dev libzmq3-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/registry/etcd_go/go.mod
+          cache-dependency-path: src/registry/etcd_go/go.sum
+      - name: Install Python build deps
+        run: pip install pybind11==3.1.0 numpy "grpcio>=1.60" setuptools pytest
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+            -DENABLE_MOONCAKE=OFF \
+            -DENABLE_NIXL=OFF \
+            -DPython3_EXECUTABLE="$(command -v python)"
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+      - name: Install Python package
+        run: pip install --no-build-isolation -e python
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

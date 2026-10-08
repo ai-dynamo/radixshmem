@@ -38,6 +38,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
