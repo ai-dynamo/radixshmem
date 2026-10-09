@@ -35,7 +35,7 @@ The Python wheels bundle the third-party binaries and statically linked code lis
 Runtime dependencies installed separately by pip and not bundled: numpy (BSD-3-Clause), grpcio (Apache-2.0).
 System libraries excluded from the `+rdma` wheel and supplied by the host: rdma-core (`libibverbs`, `libmlx5`; GPL-2.0 OR BSD-2-Clause), libnl (LGPL-2.1).
 
-The Apache-2.0 components are covered by the license text in [LICENSE](LICENSE). The notices for the remaining components follow.
+The Apache-2.0 components are covered by the license text in [LICENSE](LICENSE). Apache-2.0 components that ship an upstream NOTICE file carry it below, followed by the notices for the remaining components.
 
 ## xxHash
 
@@ -132,6 +132,18 @@ DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
 THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## github.com/coreos/go-semver, github.com/coreos/go-systemd/v22
+
+Upstream NOTICE, identical in go-semver v0.3.0 and go-systemd/v22 v22.3.2 (Apache-2.0):
+
+```
+CoreOS Project
+Copyright 2018 CoreOS, Inc
+
+This product includes software developed at CoreOS, Inc.
+(http://www.coreos.com/).
 ```
 
 ## github.com/gogo/protobuf
