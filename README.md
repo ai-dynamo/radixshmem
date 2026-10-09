@@ -1,15 +1,9 @@
 # RadixShmem
 
-RadixShmem manages a global KV cache with a distributed radix tree. It provides a low-latency, decentralized
-index service and integrates high-performance transfer backends (NIXL and the Mooncake Transfer Engine). By
-unifying the L2 (host memory) and L3 (remote storage) KV cache tiers, it gives inference engines cluster-wide KV
-cache sharing.
-
-## Architecture
-
-<p align="center">
-  <img src="docs/figures/architecture.png" alt="RadixShmem architecture" width="90%">
-</p>
+RadixShmem is a KV cache index built on a distributed radix tree. It exposes insert and lookup interfaces
+for managing the KV cache globally across a cluster. It also provides an optional data
+plane that uses a transfer engine (NIXL, Mooncake) to enable peer-to-peer KV cache sharing for
+inference engines.
 
 ## Framework support
 
@@ -24,9 +18,9 @@ cache sharing.
 cd python && pip install -e .
 ```
 
-The optional data-plane backends are built with `scripts/build_mooncake.sh` or `scripts/build_nixl.sh`.
+The optional data-plane backends are built separately; see [Transfer backends](#transfer-backends).
 
-### Start the server
+### Start the server (with data plane)
 
 Each node runs one `radix-server`, which manages `--data-bytes` of host memory; the slot size is configured
 by the client. In a distributed setup, `--index-dev` and `--transfer-dev` select the devices for the control
@@ -116,6 +110,53 @@ client.insert(hashes, slots, start=matched)
 ```
 
 The full API (methods, parameters, result fields, error codes) is in [`docs/api.md`](docs/api.md).
+
+## Transfer backends
+
+### 1. NIXL
+
+Build NIXL:
+
+```bash
+scripts/build_nixl.sh
+cd python && pip install -e .
+```
+
+Start the server with `--transfer-backend nixl`. NIXL cannot pick its own port, so `--transfer-port` is
+required:
+
+```bash
+radix-server --name /my_kv_cache --data-bytes 1024G \
+    --transfer-backend nixl --transfer-port 17000 \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+```
+
+### 2. Mooncake
+
+Build Mooncake:
+
+```bash
+scripts/build_mooncake.sh
+cd python && pip install -e .
+```
+
+Start the server with `--transfer-backend mooncake`:
+
+```bash
+radix-server --name /my_kv_cache --data-bytes 1024G \
+    --transfer-backend mooncake \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+```
+
+To check which backends were built in:
+
+```bash
+python -c "import radixshmem; print(radixshmem._data.TRANSFER_BACKENDS)"
+```
 
 ## License
 
