@@ -191,6 +191,7 @@ ComponentQueryResult PeerConnector::walk_components(
         return result;
     }
 
+    std::lock_guard<std::mutex> wg(walk_mu_);
     std::shared_lock<std::shared_mutex> lk(peers_.mutex());
     auto& slot = slots_[remote];
     if (!slot.ep) return result;   // invalidated by a concurrent replacement
@@ -260,6 +261,7 @@ bool PeerConnector::dec_ref_components_remote(int remote,
                                               const uint64_t* hashes, int n,
                                               PinRecord&& pin) {
     if (remote < 0 || remote >= peers_.world_size()) return false;
+    std::lock_guard<std::mutex> wg(walk_mu_);
     std::shared_lock<std::shared_mutex> lk(peers_.mutex());
     if (remote >= (int)slots_.size()) return false;
     auto& slot = slots_[remote];

@@ -104,6 +104,8 @@ class PeerConnector {
         bool                         failed = false;   // reconnect with a short timeout
     };
     std::vector<Slot> slots_;   // rank-indexed, guarded by peers_.mutex()
+    // walk and release share tx_.buf(); interleaved threads read torn entries.
+    std::mutex walk_mu_;
     std::unique_ptr<PeerBreaker> breaker_;
 
 #ifndef RADIXSHMEM_NO_RDMA
