@@ -79,8 +79,7 @@ public:
         rdma_read_multi(ops, count, local_lkey);
         return 0;
     }
-    // Collect `pending` completions from any endpoint on this CQ. One polling
-    // thread per CQ. No-op by default.
+    // Collect `pending` of this endpoint's own completions (callers wait on each endpoint posted to). No-op by default.
     virtual void rdma_read_multi_wait(int pending) { (void)pending; }
 
     // True once an op failed on this endpoint and it can only be replaced.

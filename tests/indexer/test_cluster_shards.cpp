@@ -11,6 +11,7 @@
 //     holder 0 and/or holder 1 (sharded by key % 2), NOT on rank 2.
 //   * A reader on a different rank finds the full prefix via RHT lookup +
 //     RDMA remote-walk against rank 2 (the tree owner).
+//   * A reader on rank 2 (no local shard) finds holder 0's prefix: every lookup round spans both holders' QPs.
 //
 // Loopback-only, same single-host RDMA NIC. Rank is registry-assigned from the
 // sorted /peers order, so node0/node1/node2 map to ranks 0/1/2 deterministically
@@ -43,6 +44,9 @@ constexpr int    kWorldSize     = 3;
 constexpr int    kNumShards     = 2;          // M < N
 constexpr int    kBlockSize     = 1;
 constexpr int    kPrefixLen     = 64;
+constexpr int    kChunkTokens   = 1;          // one RHT probe per block: 64 keys, both shards
+constexpr int64_t kBase2        = 3000;       // rank 2's prefix tokens
+constexpr int64_t kBase0        = 9000;       // rank 0's prefix tokens
 constexpr int    kBootstrapTO   = 30;
 constexpr const char* kShmPrefix = "/test_dcshard";
 constexpr const char* kRdmaDev   = "mlx5_bond_0";
@@ -116,6 +120,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.shm.hugepage_path = "";
     cfg.shm.max_blocks = 4096;
     cfg.shm.block_size = kBlockSize;
+    cfg.register_chunk_tokens = kChunkTokens;
     cfg.num_rht_shards  = kNumShards;            // M = 2
     cfg.rht_shard_holders = {0, 1};              // holders are ranks 0 and 1 (leader-authoritative)
     cfg.expected_min_nodes = kWorldSize;
@@ -138,14 +143,14 @@ int run_server_process(const std::string& node, const std::string& registry,
     return server_healthy(srv, node.c_str()) ? 0 : kHealthExitCode;
 }
 
-int run_writer_process(const radixshmem::RadixClientConfig& cc) {
+int run_writer_process(const radixshmem::RadixClientConfig& cc, int64_t base) {
     try {
         radixshmem::RadixClient cli(cc);
         if (!cli.is_distributed()) { fprintf(stderr, "[writer] not distributed\n"); return 11; }
         if (cli.world_size() != kWorldSize) { fprintf(stderr, "[writer] world=%d\n", cli.world_size()); return 12; }
 
         std::vector<int64_t> tokens(kPrefixLen);
-        std::iota(tokens.begin(), tokens.end(), int64_t{3000});
+        std::iota(tokens.begin(), tokens.end(), base);
         auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
 
@@ -157,7 +162,8 @@ int run_writer_process(const radixshmem::RadixClientConfig& cc) {
             return 13;
         }
         cli.flush();
-        fprintf(stderr, "[writer] inserted %d hashes from non-holder rank 2\n", kPrefixLen);
+        fprintf(stderr, "[writer] inserted %d hashes (tokens from %lld) on rank %d\n",
+                kPrefixLen, (long long)base, cli.rank());
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[writer] exception: %s\n", e.what());
@@ -171,7 +177,7 @@ int run_reader_process(const radixshmem::RadixClientConfig& cc) {
         if (!cli.is_distributed()) { fprintf(stderr, "[reader] not distributed\n"); return 21; }
 
         std::vector<int64_t> tokens(kPrefixLen);
-        std::iota(tokens.begin(), tokens.end(), int64_t{3000});
+        std::iota(tokens.begin(), tokens.end(), kBase2);
         auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
 
@@ -199,6 +205,40 @@ int run_reader_process(const radixshmem::RadixClientConfig& cc) {
     }
 }
 
+// Rank 2 holds no shard: each probe round posts on both holders' QPs and must return, routing to holder 0.
+int run_remote_reader_process(const radixshmem::RadixClientConfig& cc) {
+    try {
+        radixshmem::RadixClient cli(cc);
+        if (!cli.is_distributed()) { fprintf(stderr, "[remote_reader] not distributed\n"); return 51; }
+        if (cli.rank() != 2) { fprintf(stderr, "[remote_reader] rank=%d expected 2\n", cli.rank()); return 52; }
+
+        std::vector<int64_t> tokens(kPrefixLen);
+        std::iota(tokens.begin(), tokens.end(), kBase0);
+        auto hashes = radixshmem::RadixClient::compute_hashes(
+            tokens.data(), (int)tokens.size(), kBlockSize);
+
+        auto pr = cli.rht_probe(hashes.data(), (int)hashes.size());
+        bool ok = true;
+        if (pr.rank != 0 || pr.depth <= 0) {   // depth is advisory; the route is not
+            fprintf(stderr, "[remote_reader] rht_probe=(%d,%d) expected rank 0\n", pr.rank, pr.depth);
+            ok = false;
+        }
+        auto qr = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL);
+        if (qr.common_hit != kPrefixLen || remote_src(qr) != 0) {
+            fprintf(stderr, "[remote_reader] total_hit=%d remote_src=%d expected %d/0\n",
+                    qr.common_hit, remote_src(qr), kPrefixLen);
+            ok = false;
+        }
+        if (!ok) return 53;
+        fprintf(stderr, "[remote_reader] OK probe=(%d,%d) total=%d remote_src=%d\n",
+                pr.rank, pr.depth, qr.common_hit, remote_src(qr));
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[remote_reader] exception: %s\n", e.what());
+        return 54;
+    }
+}
+
 pid_t spawn(const std::vector<std::string>& argv) {
     pid_t p = ::fork();
     if (p != 0) return p;
@@ -212,12 +252,29 @@ pid_t spawn(const std::vector<std::string>& argv) {
 }
 
 int run_client_case(const char* self, const std::string& cs, int node_rank,
-                    const std::string& registry, const std::string& cluster_id) {
+                    const std::string& registry, const std::string& cluster_id,
+                    int timeout_sec = 0) {
     pid_t p = spawn({self, "--client", cs, node_name_for(node_rank),
                      registry, cluster_id});
     if (p < 0) return -1;
     int status = 0;
-    if (::waitpid(p, &status, 0) != p) return -1;
+    if (timeout_sec > 0) {   // a hung RDMA poll never returns: kill and fail
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(timeout_sec);
+        pid_t w;
+        while ((w = ::waitpid(p, &status, WNOHANG)) == 0) {
+            if (std::chrono::steady_clock::now() > deadline) {
+                fprintf(stderr, "[parent] client %s still running after %d s; killing\n",
+                        cs.c_str(), timeout_sec);
+                ::kill(p, SIGKILL);
+                ::waitpid(p, &status, 0);
+                return -3;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (w != p) return -1;
+    } else if (::waitpid(p, &status, 0) != p) {
+        return -1;
+    }
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     fprintf(stderr, "[parent] client %s abnormal status=%d\n", cs.c_str(), status);
     return -2;
@@ -226,8 +283,10 @@ int run_client_case(const char* self, const std::string& cs, int node_rank,
 int client_main(const std::string& cs, const std::string& node,
                 const std::string& registry, const std::string& cluster_id) {
     auto cc = client_cfg(node, registry, cluster_id);
-    if (cs == "writer") return run_writer_process(cc);
+    if (cs == "writer") return run_writer_process(cc, kBase2);
+    if (cs == "writer0") return run_writer_process(cc, kBase0);
     if (cs == "reader") return run_reader_process(cc);
+    if (cs == "remote_reader") return run_remote_reader_process(cc);
     fprintf(stderr, "[client] unknown case '%s'\n", cs.c_str());
     return 90;
 }
@@ -276,11 +335,16 @@ int main(int argc, char** argv) {
 
     int writer_rc = run_client_case(argv[0], "writer", 2, registry, cluster_id);
     int reader_rc = run_client_case(argv[0], "reader", 0, registry, cluster_id);
+    int writer0_rc = run_client_case(argv[0], "writer0", 0, registry, cluster_id);
+    int remote_rc = run_client_case(argv[0], "remote_reader", 2, registry, cluster_id,
+                                    /*timeout_sec=*/60);
 
     kill_servers();
 
     if (writer_rc != 0) { fprintf(stderr, "FAIL: writer rc=%d\n", writer_rc); return writer_rc ? writer_rc : 40; }
     if (reader_rc != 0) { fprintf(stderr, "FAIL: reader rc=%d\n", reader_rc); return reader_rc ? reader_rc : 41; }
+    if (writer0_rc != 0) { fprintf(stderr, "FAIL: writer0 rc=%d\n", writer0_rc); return writer0_rc > 0 ? writer0_rc : 43; }
+    if (remote_rc != 0) { fprintf(stderr, "FAIL: remote_reader rc=%d\n", remote_rc); return remote_rc > 0 ? remote_rc : 44; }
     if (unhealthy) { fprintf(stderr, "FAIL: %d server(s) leaked (check_health)\n", unhealthy); return 42; }
     fprintf(stderr, "PASS: test_cluster_shards (N=%d, M=%d)\n", kWorldSize, kNumShards);
     return 0;

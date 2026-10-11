@@ -79,6 +79,9 @@ struct XrcSendQpSharedState {
     pthread_mutex_t mu;               // serializes all datapath ops
     std::atomic<int> inflight_unsignaled;   // WRs since last signaled
     std::atomic<int> outstanding_signaled;  // signaled WRs awaiting CQE
+    // Shared CQ: SYNC CQEs (or a WC error) of this QP taken by another poller land here.
+    std::atomic<int> sync_credits;
+    std::atomic<int> sync_error;
 
     // Init as cross-process robust mutex (creator only, exactly once).
     static void init_shared(XrcSendQpSharedState* s);
