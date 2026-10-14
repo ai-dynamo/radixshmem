@@ -1280,6 +1280,52 @@ static void test_remote_pin_incumbent_release() {
     TEST_PASS();
 }
 
+static void test_remote_throw_releases_reader_count() {
+    TEST_BEGIN("remote: an op throwing mid-walk leaves no reader count");
+
+    const char* name = "/test_cq_remote_throw";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 8));
+    auto h = seq(2600, 4);
+    insert_fresh(t, h.data(), 4);
+    publish_at(t, h.data(), 4, 4);
+    mamba_ok(t, h.data(), 4);
+    auto* hdr = reinterpret_cast<ShmHeader*>(t.shm_base());
+
+    Rig r(t);
+    for (int at = 2; at <= 6; at++) {
+        r.ep.reset_counters();
+        r.ep.fail_read_at = at;
+        bool threw = false;
+        try {
+            r.walker.walk_components(r.info, h.data(), 4, FSM, /*lock=*/true);
+        } catch (const std::runtime_error&) {
+            threw = true;
+        }
+        assert(threw);
+        assert(hdr->rdma_reader_count.load() == 0);
+    }
+    r.ep.fail_read_at = 0;
+
+    r.ep.reset_counters();
+    auto res = r.walker.walk_components(r.info, h.data(), 4, FSM, /*lock=*/true);
+    assert(res.tree.common_hit == 4 && !res.remote_pin.empty());
+    r.ep.reset_counters();
+    r.ep.fail_read_at = 2;
+    bool threw = false;
+    try {
+        r.walker.dec_ref_components_remote(r.info, h.data(), 4,
+                                           std::move(res.remote_pin));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    assert(threw);
+    assert(hdr->rdma_reader_count.load() == 0);
+
+    t.destroy();
+    TEST_PASS();
+}
+
 static void test_remote_hints_and_failstop() {
     TEST_BEGIN("remote: hint fast path parity; injected failures fail stop");
 
@@ -1580,6 +1626,7 @@ int main() {
 #ifndef RADIXSHMEM_NO_RDMA
     test_remote_parity_and_abi_gate();
     test_remote_pin_incumbent_release();
+    test_remote_throw_releases_reader_count();
     test_remote_pin_swa_terminal_past_query();
     test_remote_pin_swa_only_terminal_past_query();
     test_remote_hints_and_failstop();

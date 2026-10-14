@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <random>
 #include <stdexcept>
@@ -551,7 +552,7 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
     const size_t scratch_buckets = rdma_buf_bytes_ / bucket_bytes;
     assert(scratch_buckets >= 1);   // guaranteed by enable_rdma
     std::vector<size_t> next(groups.size(), 0);
-    struct Posted { size_t g, from, off; int n; };
+    struct Posted { size_t g, from, off; int n, owed; };
     std::vector<Posted> posted;
     RdmaReadOp ops[RDMA_READ_CHAIN_MAX];
 
@@ -563,11 +564,20 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
         next[g] = groups[g].size();
     };
 
+    // Each endpoint only collects its own completions: wait on every one posted to; a throw still drains the rest.
+    auto wait_posted = [&]() {
+        std::exception_ptr first;
+        for (const Posted& p : posted) {
+            if (p.owed <= 0) continue;
+            try { eps[p.g]->rdma_read_multi_wait(p.owed); }
+            catch (...) { if (!first) first = std::current_exception(); }
+        }
+        if (first) std::rethrow_exception(first);
+    };
+
     while (remaining > 0) {
         posted.clear();
         size_t used = 0;
-        int pending = 0;
-        IRdmaEndpoint* waiter = nullptr;
         size_t cur = SIZE_MAX;   // group being posted
         auto t0 = Clock::now();
         try {
@@ -590,18 +600,16 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
                 const int owed =
                     eps[g]->rdma_read_multi_post(ops, n, rdma_lkey_);
                 cur = SIZE_MAX;
-                if (owed > 0 && waiter == nullptr) waiter = eps[g];
-                pending += owed;
-                posted.push_back({g, next[g], used, n});
+                posted.push_back({g, next[g], used, n, owed});
                 next[g] += n;
                 used += n;
                 remaining -= n;
             }
-            if (pending > 0) waiter->rdma_read_multi_wait(pending);
+            wait_posted();
         } catch (const std::exception& e) {
             if (!breaker_) {
                 // Collect what was posted, or a later sync poll takes it.
-                if (cur != SIZE_MAX && pending > 0) waiter->rdma_read_multi_wait(pending);
+                if (cur != SIZE_MAX) wait_posted();
                 throw;
             }
             bool collected = false;
@@ -609,7 +617,7 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
                 fault(groups[cur][0].shard, "RHT lookup", e, t0);
                 drop_group(cur);
                 try {
-                    if (pending > 0) waiter->rdma_read_multi_wait(pending);
+                    wait_posted();
                     collected = true;
                 } catch (const std::exception&) {
                 }

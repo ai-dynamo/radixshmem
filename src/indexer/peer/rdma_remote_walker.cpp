@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include <cstdio>
 #include "rdma_remote_walker.h"
 
 #include "component_set.hpp"
@@ -9,6 +10,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -78,6 +80,22 @@ void RdmaRemoteWalker::dec_ref_node(const RemoteTreeInfo& remote,
     atomic_count_++;
 }
 
+namespace {
+template <class F>
+struct OnThrow {
+    F f;
+    int depth;
+    bool armed = true;
+    ~OnThrow() {
+        if (armed && std::uncaught_exceptions() > depth) {
+            try { f(); } catch (...) {}
+        }
+    }
+};
+template <class F>
+OnThrow<F> on_throw(F f) { return OnThrow<F>{std::move(f), std::uncaught_exceptions()}; }
+}  // namespace
+
 // ==================== RDMA rwlock ====================
 
 // Read-before-FAA (fixes the remote-reader writer-livelock).
@@ -93,8 +111,10 @@ bool RdmaRemoteWalker::rdma_read_lock(const RemoteTreeInfo& remote) {
         ep_.rdma_fetch_add(remote.rdma_reader_count_addr, remote.rkey, 1,
                            local_buf_, local_lkey_);
         atomic_count_++;
+        auto undo = on_throw([&] { rdma_read_unlock(remote); });
         if (!flag_set())
             return true;
+        undo.armed = false;
         ep_.rdma_fetch_add(remote.rdma_reader_count_addr, remote.rkey,
                            (uint64_t)-1LL, local_buf_, local_lkey_);
         atomic_count_++;
@@ -206,7 +226,12 @@ uint32_t RdmaRemoteWalker::ht_lookup(const RemoteTreeInfo& remote,
     read_count_++;
     memcpy(&entry_idx, local_buf_, sizeof(uint32_t));
 
+    // A torn entry can point outside the pool or loop; fail closed before a READ leaves the MR.
+    uint32_t hops = 0;
     while (entry_idx != HT_END) {
+        if (entry_idx >= remote.global_ht_entry_capacity ||
+            ++hops > remote.global_ht_entry_capacity)
+            return INVALID_NODE_ID;
         ChainHTEntry entry;
         ep_.rdma_read(local_buf_, local_lkey_,
                       ht_entry_addr(remote, entry_idx), remote.rkey,
@@ -539,6 +564,7 @@ RemoteComponentWalkResult RdmaRemoteWalker::walk_components_impl(
         return error_result(RemoteStatus::OK);
     if (!rdma_read_lock(remote))
         return error_result(RemoteStatus::TIMEOUT);
+    auto unlock_on_throw = on_throw([&] { rdma_read_unlock(remote); });
 
     std::vector<ComponentPathNode> nodes;
     int matched = 0;
@@ -586,6 +612,7 @@ RemoteComponentWalkResult RdmaRemoteWalker::walk_components_impl(
             cst_addr(remote, spans[cov.aux_k].node_id) +
                     remote.component_state_entry_size >
                 remote.base_addr + remote.mr.length) {
+            unlock_on_throw.armed = false;
             rdma_read_unlock(remote);
             return error_result(RemoteStatus::INTERNAL);
         }
@@ -607,6 +634,7 @@ RemoteComponentWalkResult RdmaRemoteWalker::walk_components_impl(
         if (cov.pin_mamba)
             pin1(cst_addr(remote, spans[cov.aux_k].node_id) + MAMBA_REF_OFF);
     }
+    unlock_on_throw.armed = false;
     rdma_read_unlock(remote);
     return RemoteComponentWalkResult{std::move(tree), std::move(rp),
                                      read_count_, atomic_count_};
@@ -647,6 +675,7 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
     }
 
     if (!rdma_read_lock(remote)) return false;
+    auto unlock_on_throw = on_throw([&] { rdma_read_unlock(remote); });
 
     // Legacy trust model: descend by hash keys exactly like the local
     // RadixShmemTree::dec_ref and decrement unconditionally inside each lane's
@@ -658,11 +687,23 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
     };
     uint32_t parent_id = remote.root_node_id;
     int matched = 0;
+    // An FAA outside the peer's MR kills the QP before the unlock and leaks its reader count.
+    const uint64_t mr_end = remote.base_addr + remote.mr.length;
+    auto cst_in_mr = [&](uint32_t node_id) {
+        return remote.mr.length != 0 &&
+               cst_addr(remote, node_id) + remote.component_state_entry_size <= mr_end;
+    };
 
     while (matched < end) {
         // Descend to the child keyed by k[matched].
         uint32_t child_id = ht_lookup(remote, parent_id, k[matched]);
         if (child_id == INVALID_NODE_ID) break;
+        if (child_id >= remote.node_pool_capacity) {
+            fprintf(stderr, "[RdmaRemoteWalker] release: node id %u beyond the "
+                    "peer's node pool (%u); stopping the descent\n",
+                    child_id, remote.node_pool_capacity);
+            break;
+        }
 
         TreeNodeData child = read_node(remote, child_id);
         int nb = (int)child.num_blocks;
@@ -673,11 +714,19 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
         if (full_present && matched >= (int)pin.full.start &&
             matched < (int)pin.full.end)
             dec_ref_node(remote, child_id);
-        if (swa_present && matched >= (int)pin.swa.start &&
-            matched < (int)pin.swa.end)
-            dec1(cst_addr(remote, child_id) + SWA_REF_OFF);
-        if (mamba_present && node_end == (int)pin.mamba_end)
-            dec1(cst_addr(remote, child_id) + MAMBA_REF_OFF);
+        const bool want_swa = swa_present && matched >= (int)pin.swa.start &&
+                              matched < (int)pin.swa.end;
+        const bool want_mamba = mamba_present && node_end == (int)pin.mamba_end;
+        if ((want_swa || want_mamba) && !cst_in_mr(child_id)) {
+            fprintf(stderr, "[RdmaRemoteWalker] release: component state of node "
+                    "%u lies outside the peer's MR; skipping its lane refcounts\n",
+                    child_id);
+        } else {
+            if (want_swa)
+                dec1(cst_addr(remote, child_id) + SWA_REF_OFF);
+            if (want_mamba)
+                dec1(cst_addr(remote, child_id) + MAMBA_REF_OFF);
+        }
 
         matched = node_end;
         parent_id = child_id;
@@ -686,6 +735,7 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
         if (matched >= end) break;
     }
 
+    unlock_on_throw.armed = false;
     rdma_read_unlock(remote);
     return true;
 }

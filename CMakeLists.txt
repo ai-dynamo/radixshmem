@@ -647,13 +647,20 @@ if(BUILD_PYTHON_MODULES)
         add_test(NAME py_agentic_stress_2node
                  COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 2
                          --base-port 19200 ${_stress_args})
+        add_test(NAME py_agentic_stress_3node_threads
+                 COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 3
+                         --base-port 19300 ${_stress_args} --concurrency 32
+                         --executors-per-worker 8 --rht-slots 4 --register-chunk-size 1
+                         --flush-after-insert)
         foreach(_t py_test_geometry py_test_server_rpc py_test_radixshmem py_test_cluster
-                   py_test_p2p_pull py_agentic_stress_1node py_agentic_stress_2node)
+                   py_test_p2p_pull py_agentic_stress_1node py_agentic_stress_2node
+                   py_agentic_stress_3node_threads)
             set_tests_properties(${_t} PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
                 ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
                 SKIP_RETURN_CODE 77 TIMEOUT 600)
         endforeach()
+        set_tests_properties(py_agentic_stress_3node_threads PROPERTIES TIMEOUT 180)
         message(STATUS "radixshmem._core + radixshmem._data: building "
                        "(pybind11 ${pybind11_VERSION}, ${Python3_EXECUTABLE})")
     else()

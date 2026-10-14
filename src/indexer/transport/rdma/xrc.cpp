@@ -181,6 +181,8 @@ void XrcSendQpSharedState::init_shared(XrcSendQpSharedState* s) {
     pthread_mutexattr_destroy(&attr);
     s->inflight_unsignaled.store(0, std::memory_order_relaxed);
     s->outstanding_signaled.store(0, std::memory_order_relaxed);
+    s->sync_credits.store(0, std::memory_order_relaxed);
+    s->sync_error.store(0, std::memory_order_relaxed);
 }
 
 void XrcSendQpSharedState::init_private(XrcSendQpSharedState* s) {
@@ -192,6 +194,8 @@ void XrcSendQpSharedState::init_private(XrcSendQpSharedState* s) {
     pthread_mutexattr_destroy(&attr);
     s->inflight_unsignaled.store(0, std::memory_order_relaxed);
     s->outstanding_signaled.store(0, std::memory_order_relaxed);
+    s->sync_credits.store(0, std::memory_order_relaxed);
+    s->sync_error.store(0, std::memory_order_relaxed);
 }
 
 void XrcSendQpSharedState::destroy(XrcSendQpSharedState* s) {
@@ -200,8 +204,8 @@ void XrcSendQpSharedState::destroy(XrcSendQpSharedState* s) {
 
 // ---------- XrcSendQp ----------
 
-// Shared-CQ accounting: credit each ASYNC CQE to its owning QP (wc.qp_num)
-// via a process-global registry, not the polling QP.
+// Shared-CQ accounting: credit each CQE to its owning QP (wc.qp_num) via a
+// process-global registry, not the polling QP.
 namespace {
 std::mutex g_xrc_reg_mu;
 std::unordered_map<uint32_t, XrcSendQpSharedState*> g_xrc_reg;
@@ -214,19 +218,33 @@ void xrc_reg_remove(uint32_t qp_num) {
     std::lock_guard<std::mutex> g(g_xrc_reg_mu);
     g_xrc_reg.erase(qp_num);
 }
-// Credit one ASYNC completion to its owning QP; returns true iff that QP is `self`.
-bool xrc_credit_async(const ibv_wc& wc, XrcSendQpSharedState* self) {
-    XrcSendQpSharedState* owner = nullptr;
-    {
-        std::lock_guard<std::mutex> g(g_xrc_reg_mu);
-        auto it = g_xrc_reg.find(wc.qp_num);
-        if (it != g_xrc_reg.end()) owner = it->second;
+XrcSendQpSharedState* xrc_owner_state(uint32_t qp_num) {
+    std::lock_guard<std::mutex> g(g_xrc_reg_mu);
+    auto it = g_xrc_reg.find(qp_num);
+    return it == g_xrc_reg.end() ? nullptr : it->second;
+}
+
+constexpr uint64_t XRC_WR_ID_SYNC  = 11;
+constexpr uint64_t XRC_WR_ID_ASYNC = 12;
+
+void xrc_dec_signaled(XrcSendQpSharedState* s) {
+    int c = s->outstanding_signaled.load(std::memory_order_acquire);
+    while (c > 0 &&
+           !s->outstanding_signaled.compare_exchange_weak(c, c - 1, std::memory_order_acq_rel)) {
     }
-    if (!owner) owner = self;   // defensive: unknown qp_num
-    int prev = owner->outstanding_signaled.load(std::memory_order_relaxed);
-    if (prev > 0)
-        owner->outstanding_signaled.store(prev - 1, std::memory_order_relaxed);
-    return owner == self;
+}
+
+void xrc_credit_foreign(const ibv_wc& wc) {
+    XrcSendQpSharedState* owner = xrc_owner_state(wc.qp_num);
+    if (!owner) return;
+    if (wc.status != IBV_WC_SUCCESS) {
+        int expected = 0;
+        owner->sync_error.compare_exchange_strong(expected, (int)wc.status);
+    } else if (wc.wr_id == XRC_WR_ID_ASYNC) {
+        xrc_dec_signaled(owner);
+    } else {
+        owner->sync_credits.fetch_add(1, std::memory_order_acq_rel);
+    }
 }
 }  // namespace
 
@@ -349,12 +367,39 @@ void XrcSendQp::connect(const XrcPeerInfo& peer) {
     }
 }
 
-// XRC wr tags, separate id space from RC to avoid CQ mix-ups.
-static constexpr uint64_t XRC_WR_ID_SYNC  = 11;
-static constexpr uint64_t XRC_WR_ID_ASYNC = 12;
+void XrcSendQp::throw_if_failed(const char* what) {
+    if (int err = state_->sync_error.exchange(0, std::memory_order_acq_rel)) {
+        char msg[256];
+        snprintf(msg, sizeof(msg),
+                 "XRC %s WC error: status=%d qp_num=%u (polled by another queue)",
+                 what, err, qp_num_);
+        throw std::runtime_error(msg);
+    }
+}
+
+void XrcSendQp::throw_wc(const ibv_wc& wc, const char* what) {
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+             "XRC %s WC error: status=%d opcode=%d vendor=%u qp_num=%u wr_id=%lu",
+             what, wc.status, wc.opcode, wc.vendor_err, wc.qp_num,
+             (unsigned long)wc.wr_id);
+    throw std::runtime_error(msg);
+}
 
 void XrcSendQp::poll_sync(int n, const char* what) {
+    // A completion of ours that another QP's poller took off the shared CQ
+    // arrives as a credit; it can land at any time while we spin.
+    auto take_credit = [&]() {
+        int c = state_->sync_credits.load(std::memory_order_acquire);
+        while (c > 0) {
+            if (state_->sync_credits.compare_exchange_weak(c, c - 1, std::memory_order_acq_rel))
+                return true;
+        }
+        return false;
+    };
     while (n > 0) {
+        throw_if_failed(what);
+        if (take_credit()) { n--; continue; }
         ibv_wc wc = {};
         int ne = ibv_poll_cq(cq_, 1, &wc);
         if (ne == 0) continue;
@@ -363,21 +408,10 @@ void XrcSendQp::poll_sync(int n, const char* what) {
             snprintf(msg, sizeof(msg), "XRC %s: ibv_poll_cq failed", what);
             throw std::runtime_error(msg);
         }
-        if (wc.status != IBV_WC_SUCCESS) {
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                     "XRC %s WC error: status=%d opcode=%d vendor=%u "
-                     "qp_num=%u wr_id=%lu",
-                     what, wc.status, wc.opcode, wc.vendor_err, wc.qp_num,
-                     (unsigned long)wc.wr_id);
-            throw std::runtime_error(msg);
-        }
-        if (wc.wr_id == XRC_WR_ID_ASYNC) {
-            // Credit to the QP that owns this CQE (by qp_num), not necessarily us.
-            xrc_credit_async(wc, state_);
-            continue;
-        }
-        n--;   // a SYNC completion on this CQ
+        if (wc.qp_num != qp_num_) { xrc_credit_foreign(wc); continue; }
+        if (wc.status != IBV_WC_SUCCESS) throw_wc(wc, what);
+        if (wc.wr_id == XRC_WR_ID_ASYNC) { xrc_dec_signaled(state_); continue; }
+        n--;
     }
 }
 
@@ -431,25 +465,21 @@ void XrcSendQp::post_and_poll_locked(ibv_send_wr& wr) {
 }
 
 void XrcSendQp::drain_one_signaled_locked() {
-    // Drain until OUR queue advances by one signaled completion; credit others' CQEs.
-    while (true) {
+    const int start = state_->outstanding_signaled.load(std::memory_order_acquire);
+    while (state_->outstanding_signaled.load(std::memory_order_acquire) >= start &&
+           start > 0) {
+        throw_if_failed("async drain");
         ibv_wc wc = {};
         int ne = ibv_poll_cq(cq_, 1, &wc);
         if (ne == 0) continue;
         if (ne < 0)
             throw std::runtime_error("XRC poll_cq (async drain) failed");
-        if (wc.status != IBV_WC_SUCCESS) {
-            char msg[256];
-            snprintf(msg, sizeof(msg),
-                     "XRC async WC error: status=%d vendor=%u qp_num=%u",
-                     wc.status, wc.vendor_err, wc.qp_num);
-            throw std::runtime_error(msg);
-        }
-        if (wc.wr_id == XRC_WR_ID_ASYNC) {
-            if (xrc_credit_async(wc, state_))
-                return;          // our own queue advanced
-            // else: someone else's CQE — credited to them, keep draining.
-        }
+        if (wc.qp_num != qp_num_) { xrc_credit_foreign(wc); continue; }
+        if (wc.status != IBV_WC_SUCCESS) throw_wc(wc, "async drain");
+        if (wc.wr_id == XRC_WR_ID_ASYNC)
+            xrc_dec_signaled(state_);
+        else
+            state_->sync_credits.fetch_add(1, std::memory_order_acq_rel);
     }
 }
 
@@ -534,7 +564,7 @@ int XrcSendQp::rdma_read_multi_post(const RdmaReadOp* ops, int count,
     return 1;
 }
 
-// Unlocked; collects any QP's SYNC completions on this CQ.
+// Unlocked; waits for this QP's own SYNC completions (others' are credited to their owners).
 void XrcSendQp::rdma_read_multi_wait(int pending) {
     poll_sync(pending, "read_multi_wait");
 }
