@@ -110,6 +110,7 @@ struct RhtConsumer::Impl {
     std::mutex                        changes_mu;
     std::vector<Change>               changes;
     std::atomic<bool>                 has_changes{false};
+    std::mutex                        op_mu;
 
     bool holds_shard(int rank) const {
         return rank != my_rank &&
@@ -268,22 +269,26 @@ void RhtConsumer::sync_changes() {
 RhtConsumer::~RhtConsumer() = default;
 
 void RhtConsumer::insert_batch(const RhtInsertEntry* entries, int count) {
+    std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->insert_batch(entries, count);
 }
 
 void RhtConsumer::lookup_batch(const uint64_t* keys, int count,
                                std::vector<RHTValue>* results) {
+    std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->lookup_batch(keys, count, results);
 }
 
 void RhtConsumer::remove_batch(const RhtRemoveEntry* entries, int count) {
+    std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->remove_batch(entries, count);
 }
 
 void RhtConsumer::dump_bucket(uint64_t key, std::vector<RhtRawCell>& out) {
+    std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     std::vector<RhtSlot> raw;
     impl_->rht->dump_bucket(key, raw);
@@ -292,6 +297,7 @@ void RhtConsumer::dump_bucket(uint64_t key, std::vector<RhtRawCell>& out) {
 }
 
 void RhtConsumer::flush() {
+    std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->flush();
 }
