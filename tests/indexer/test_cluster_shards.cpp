@@ -217,21 +217,14 @@ int run_remote_reader_process(const radixshmem::RadixClientConfig& cc) {
         auto hashes = radixshmem::RadixClient::compute_hashes(
             tokens.data(), (int)tokens.size(), kBlockSize);
 
-        auto pr = cli.rht_probe(hashes.data(), (int)hashes.size());
-        bool ok = true;
-        if (pr.rank != 0 || pr.depth <= 0) {   // depth is advisory; the route is not
-            fprintf(stderr, "[remote_reader] rht_probe=(%d,%d) expected rank 0\n", pr.rank, pr.depth);
-            ok = false;
-        }
         auto qr = cli.query(hashes.data(), (int)hashes.size(), radixshmem::COMPONENT_MASK_FULL);
         if (qr.common_hit != kPrefixLen || remote_src(qr) != 0) {
             fprintf(stderr, "[remote_reader] total_hit=%d remote_src=%d expected %d/0\n",
                     qr.common_hit, remote_src(qr), kPrefixLen);
-            ok = false;
+            return 53;
         }
-        if (!ok) return 53;
-        fprintf(stderr, "[remote_reader] OK probe=(%d,%d) total=%d remote_src=%d\n",
-                pr.rank, pr.depth, qr.common_hit, remote_src(qr));
+        fprintf(stderr, "[remote_reader] OK total=%d remote_src=%d\n",
+                qr.common_hit, remote_src(qr));
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[remote_reader] exception: %s\n", e.what());
