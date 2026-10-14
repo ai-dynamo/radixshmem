@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -79,6 +80,22 @@ void RdmaRemoteWalker::dec_ref_node(const RemoteTreeInfo& remote,
     atomic_count_++;
 }
 
+namespace {
+template <class F>
+struct OnThrow {
+    F f;
+    int depth;
+    bool armed = true;
+    ~OnThrow() {
+        if (armed && std::uncaught_exceptions() > depth) {
+            try { f(); } catch (...) {}
+        }
+    }
+};
+template <class F>
+OnThrow<F> on_throw(F f) { return OnThrow<F>{std::move(f), std::uncaught_exceptions()}; }
+}  // namespace
+
 // ==================== RDMA rwlock ====================
 
 // Read-before-FAA (fixes the remote-reader writer-livelock).
@@ -94,8 +111,10 @@ bool RdmaRemoteWalker::rdma_read_lock(const RemoteTreeInfo& remote) {
         ep_.rdma_fetch_add(remote.rdma_reader_count_addr, remote.rkey, 1,
                            local_buf_, local_lkey_);
         atomic_count_++;
+        auto undo = on_throw([&] { rdma_read_unlock(remote); });
         if (!flag_set())
             return true;
+        undo.armed = false;
         ep_.rdma_fetch_add(remote.rdma_reader_count_addr, remote.rkey,
                            (uint64_t)-1LL, local_buf_, local_lkey_);
         atomic_count_++;
@@ -545,6 +564,7 @@ RemoteComponentWalkResult RdmaRemoteWalker::walk_components_impl(
         return error_result(RemoteStatus::OK);
     if (!rdma_read_lock(remote))
         return error_result(RemoteStatus::TIMEOUT);
+    auto unlock_on_throw = on_throw([&] { rdma_read_unlock(remote); });
 
     std::vector<ComponentPathNode> nodes;
     int matched = 0;
@@ -592,6 +612,7 @@ RemoteComponentWalkResult RdmaRemoteWalker::walk_components_impl(
             cst_addr(remote, spans[cov.aux_k].node_id) +
                     remote.component_state_entry_size >
                 remote.base_addr + remote.mr.length) {
+            unlock_on_throw.armed = false;
             rdma_read_unlock(remote);
             return error_result(RemoteStatus::INTERNAL);
         }
@@ -613,6 +634,7 @@ RemoteComponentWalkResult RdmaRemoteWalker::walk_components_impl(
         if (cov.pin_mamba)
             pin1(cst_addr(remote, spans[cov.aux_k].node_id) + MAMBA_REF_OFF);
     }
+    unlock_on_throw.armed = false;
     rdma_read_unlock(remote);
     return RemoteComponentWalkResult{std::move(tree), std::move(rp),
                                      read_count_, atomic_count_};
@@ -653,6 +675,7 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
     }
 
     if (!rdma_read_lock(remote)) return false;
+    auto unlock_on_throw = on_throw([&] { rdma_read_unlock(remote); });
 
     // Legacy trust model: descend by hash keys exactly like the local
     // RadixShmemTree::dec_ref and decrement unconditionally inside each lane's
@@ -712,6 +735,7 @@ bool RdmaRemoteWalker::dec_ref_components_remote(const RemoteTreeInfo& remote,
         if (matched >= end) break;
     }
 
+    unlock_on_throw.armed = false;
     rdma_read_unlock(remote);
     return true;
 }
