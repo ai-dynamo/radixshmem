@@ -156,6 +156,8 @@ private:
                                 uint32_t local_lkey);
     // Poll cq_ for n SYNC completions; ASYNC ones are credited to their QP.
     void poll_sync(int n, const char* what);
+    void throw_if_failed(const char* what);
+    [[noreturn]] void throw_wc(const ibv_wc& wc, const char* what);
 
     ibv_qp*  qp_ = nullptr;
     uint32_t qp_num_ = 0;
