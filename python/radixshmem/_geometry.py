@@ -197,7 +197,8 @@ def geometry_bytes(g: Dict[str, Any]) -> int:
     return sum(int(p["slot_bytes"]) * int(p["num_slots"]) for p in g["pools"].values())
 
 
-def shm_config(g: Dict[str, Any], *, background_evict_ratio: float, data_pool_ratio: float):
+def shm_config(g: Dict[str, Any], *, background_evict_ratio: float, data_pool_ratio: float,
+               kvevent_ring_capacity: int = 0):
     pools = g["pools"]
     cfg = _core.ShmConfig()
     cfg.max_nodes = int(g.get("max_nodes", 0)) or (2 * int(pools["full"]["num_slots"]) + 1024)
@@ -217,6 +218,9 @@ def shm_config(g: Dict[str, Any], *, background_evict_ratio: float, data_pool_ra
         cfg.mamba_max_slots = int(pools["mamba"]["num_slots"])
         cfg.mamba_state_bytes = int(pools["mamba"].get("slot_bytes", 0))   # 0 = unstamped
     cfg.component_mask = mask
+    # 0 = no ring; the region then carries no event area at all and
+    # evictions stay invisible to a router, as they were before.
+    cfg.kvevent_ring_capacity = int(kvevent_ring_capacity)
     return cfg
 
 

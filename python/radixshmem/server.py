@@ -117,6 +117,11 @@ class ServerConfig:
     background_evict_ratio: float = 0.05
     data_pool_ratio: float = 4.0     # DataPool bytes = full_slots x ratio x (12 | 16 with SWA)
     evict_policy: str = "lru"
+    # KV-event eviction ring: entries of 14 hashes each, rounded up to a power
+    # of two (min 64). 0 = no ring, and evictions stay invisible to routers.
+    # Size it for the slowest consumer's poll interval: a consumer that falls
+    # behind by more than `capacity` entries must do a full resync.
+    kvevent_ring_capacity: int = 0
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     rpc_workers: int = 32            # one blocks per client with jobs in flight
@@ -532,7 +537,8 @@ class RadixServer:
     def _bring_up(self) -> None:
         c, g = self.cfg, self._geometry
         shm = _geometry.shm_config(g, background_evict_ratio=c.background_evict_ratio,
-                                   data_pool_ratio=c.data_pool_ratio)
+                                   data_pool_ratio=c.data_pool_ratio,
+                                   kvevent_ring_capacity=c.kvevent_ring_capacity)
         shm.evict_policy = {"lru": EvictPolicy.LRU}[c.evict_policy]
         shm.max_nodes = shm.effective_max_nodes()
         index = _core.RadixServer(self._core_config(shm, g))

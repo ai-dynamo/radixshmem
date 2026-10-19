@@ -23,6 +23,7 @@ struct RemoteHit;
 
 class LocalTreeConnector;
 class RadixServer;
+class KvEventRingReader;   // kvevent.h; held by pointer to keep this header thin
 #ifndef RADIXSHMEM_NO_RDMA
 class RdmaTransportClient;
 class RdmaContext;
@@ -185,6 +186,28 @@ public:
     // without a local tree.
     PeerFaultCounters* peer_faults() const;
 
+    // ==================== KV-event consumption ====================
+    //
+    // Evictions happen inside the radix_server process; the consumers that
+    // republish them as router BlockRemoved events live here. This drains the
+    // shm ring the tree publishes into. Safe to call from any attached
+    // process: each client owns its own cursor and cannot block the evictor.
+    //
+    // Only meaningful when the region was created with a non-zero
+    // kvevent_ring_capacity; otherwise enabled() is false and drain() is empty.
+    bool kvevent_enabled() const;
+    // Skip history so a late attacher doesn't republish removes for blocks it
+    // never told the router about. Called once, right after attach.
+    void kvevent_seek_to_head();
+    struct KvEventBatch {
+        std::vector<uint64_t> hashes;
+        // Events were lost (the evictor lapped this cursor, or the region was
+        // recreated). The caller must publish AllBlocksCleared and rebuild,
+        // since the missing removes can never be recovered.
+        bool overflow = false;
+    };
+    KvEventBatch kvevent_drain(size_t max_hashes = 65536);
+
     // Server-side eviction client: remove RHT entries for locally-evicted nodes
     // (only cells still matching this rank). Empty list ok; flushes at end.
     struct EvictedKey { uint64_t first_hash; uint32_t tree_node_id; };
@@ -253,6 +276,11 @@ private:
     bool owns_local_ = true;
     bool local_read_only_ = false;   // read-only attach, never joins the cluster
     void require_writable(const char* op) const;
+
+    // Lazily bound on first kvevent_* call: an attacher that never consumes
+    // events pays nothing, and binding is idempotent.
+    std::unique_ptr<KvEventRingReader> kvevent_reader_;
+    KvEventRingReader* kvevent_reader();
 
     // Pin release, reachable only through a query(lock=true) finalize:
     // one PinRecord on the local tree / on peer `remote_node`.

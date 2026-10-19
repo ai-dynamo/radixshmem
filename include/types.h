@@ -22,7 +22,7 @@ using HashType = uint64_t;
 static constexpr uint32_t INVALID_NODE_ID = UINT32_MAX;
 static constexpr uint64_t INVALID_OFFSET = UINT64_MAX;
 static constexpr uint64_t SHM_MAGIC = 0x534852444958ULL;
-static constexpr uint32_t SHM_VERSION = 26;   // 26: peer fault counters
+static constexpr uint32_t SHM_VERSION = 27;   // 27: KV-event eviction ring
 // cluster_ready_magic sentinel — same-host clients spin on it as a local ready flag.
 static constexpr uint64_t CLUSTER_MANIFEST_MAGIC = 0x434c5354524d4644ULL; // "CLSTRMFD"
 static constexpr size_t HUGEPAGE_SIZE = 2ULL * 1024 * 1024;
@@ -238,6 +238,12 @@ struct ShmHeader {
     int32_t  register_chunk_size;
     uint32_t _rcs_pad;
 
+    // KV-event eviction ring (create-time). Offset 0 = no ring in this region;
+    // every consumer then sees eviction as invisible, as before.
+    uint64_t kvevent_ring_offset;
+    uint32_t kvevent_ring_capacity;
+    uint32_t _kvevent_pad;
+
     // ---- Component ABI (create-time; attach fails closed on mismatch) ----
     ComponentConfig component_config;
     uint64_t component_state_offset;       // NodeComponentState[node_pool_capacity]
@@ -340,6 +346,10 @@ struct ShmConfig {
     uint64_t mamba_state_bytes = 0;
     uint32_t swa_max_blocks   = 0;   // SWA slot-id space (SwaMempool capacity)
     uint32_t mamba_max_slots  = 0;   // Mamba checkpoint slot-id space
+
+    // KV-event eviction ring. 0 disables it entirely (no region cost). Rounded
+    // up to a power of two on create; see kvevent.h.
+    uint32_t kvevent_ring_capacity = 0;
 
     // register_chunk_tokens in blocks (cs): node-boundary alignment and RHT
     // registration stride, at least one block; 0 stays 0 (unaligned).

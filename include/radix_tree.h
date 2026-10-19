@@ -6,6 +6,7 @@
 #include "data_pool.hpp"
 #include "child_table.hpp"
 #include "component_types.h"
+#include "kvevent.h"
 #include "mempool.hpp"
 #include "slot_lru.hpp"
 #include "node_pool.hpp"
@@ -22,10 +23,13 @@ struct MatchedNodeSpanView;
 class HealthAuditor;   // src/indexer/health_check.cpp (read-only audit)
 
 // Evicted node reported to the RHT-cleanup callback. first_hash = RHT key
-// (block-0 hash); tree_node_id = registered slot id.
+// (block-0 hash); tree_node_id = registered slot id. block_hashes carries
+// every block the node held, which RHT cleanup ignores but KV-event
+// observers need: a router's BlockRemoved names each block individually.
 struct EvictedNode {
     uint64_t first_hash;
     uint32_t tree_node_id;
+    std::vector<uint64_t> block_hashes;
 };
 
 // Result of one merge_leaf_into_parent() call.
@@ -49,8 +53,10 @@ struct ShmLayoutInfo {
     uint64_t mamba_mempool_size;
     uint64_t swa_lru_size;           // SlotLruEntry[swa_max_blocks]
     uint64_t mamba_lru_size;         // SlotLruEntry[mamba_max_slots]
+    uint64_t kvevent_ring_size;      // KV-event ring; 0 = disabled
     uint32_t ht_bucket_count;
     uint32_t ht_entry_capacity;
+    uint32_t kvevent_ring_capacity;  // entries; 0 = disabled
 };
 
 class RadixShmemTree {
@@ -137,8 +143,33 @@ public:
     EvictPolicy evict_policy() const { return evict_policy_; }
 
     // Optional eviction callback (RHT cleanup), fired AFTER the write lock drops.
+    // Single slot, owned by RHT cleanup. Additional consumers must register
+    // through add_evict_observer instead of displacing it.
     using EvictCallback = std::function<void(const std::vector<EvictedNode>&)>;
     void set_evict_callback(EvictCallback cb) { evict_cb_ = std::move(cb); }
+
+    // Additional eviction consumers (KV-event publication). Fired after
+    // evict_cb_, on the same post-unlock path. Observers must not re-enter
+    // the tree. Registration is not thread-safe against concurrent eviction;
+    // register during setup.
+    void add_evict_observer(EvictCallback cb) {
+        evict_observers_.push_back(std::move(cb));
+    }
+    bool has_evict_consumers() const {
+        return evict_cb_ != nullptr || !evict_observers_.empty() ||
+               kvevent_writer_.enabled();
+    }
+    // True when someone needs the full per-node hash list, not just the head
+    // hash that RHT cleanup uses.
+    bool wants_evicted_hashes() const {
+        return !evict_observers_.empty() || kvevent_writer_.enabled();
+    }
+
+    // KV-event ring writer bound to this shm region. Disabled (no-op) when
+    // the region was created without a ring.
+    KvEventRingWriter& kvevent_writer() { return kvevent_writer_; }
+    // Byte offset of the ring header within the region; 0 when absent.
+    uint64_t kvevent_ring_offset() const;
     // True iff node_id is live again with this first hash: the evicted id was
     // recycled (LIFO pool) for the same prefix before its RHT removal ran.
     bool node_head_matches(uint32_t node_id, uint64_t first_hash);
@@ -222,6 +253,8 @@ private:
 
     // Eviction-cleanup plumbing (RHT); pending buffer is thread_local.
     EvictCallback evict_cb_;
+    std::vector<EvictCallback> evict_observers_;
+    KvEventRingWriter kvevent_writer_;
     static std::vector<EvictedNode>& evicted_pending();
     void flush_evicted();
 

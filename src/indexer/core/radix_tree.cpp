@@ -68,9 +68,12 @@ RadixShmemTree::RadixShmemTree(RadixShmemTree&& o) noexcept
       mamba_lru_(o.mamba_lru_), background_evict_ratio_(o.background_evict_ratio_),
       evict_policy_(o.evict_policy_), cs_(o.cs_), has_swa_(o.has_swa_),
       has_mamba_(o.has_mamba_), has_aux_(o.has_aux_),
-      evict_cb_(std::move(o.evict_cb_)) {
+      evict_cb_(std::move(o.evict_cb_)),
+      evict_observers_(std::move(o.evict_observers_)),
+      kvevent_writer_(o.kvevent_writer_) {
     o.base_ = nullptr;
     o.fd_ = -1;
+    o.kvevent_writer_ = KvEventRingWriter();
 }
 
 RadixShmemTree& RadixShmemTree::operator=(RadixShmemTree&& o) noexcept {
@@ -97,8 +100,11 @@ RadixShmemTree& RadixShmemTree::operator=(RadixShmemTree&& o) noexcept {
         has_mamba_ = o.has_mamba_;
         has_aux_ = o.has_aux_;
         evict_cb_ = std::move(o.evict_cb_);
+        evict_observers_ = std::move(o.evict_observers_);
+        kvevent_writer_ = o.kvevent_writer_;
         o.base_ = nullptr;
         o.fd_ = -1;
+        o.kvevent_writer_ = KvEventRingWriter();
     }
     return *this;
 }
@@ -158,6 +164,16 @@ void RadixShmemTree::init_pools() {
         mamba_lru_ = SlotLru(reinterpret_cast<SlotLruEntry*>(
                                  (char*)base_ + hdr->mamba_lru_offset),
                              hdr->mamba_mempool_total_blocks, &hdr->mamba_list);
+
+    // KV-event ring. Binding it on attach too is harmless: only the process
+    // running the evictor ever publishes, and readers bind separately.
+    if (hdr->kvevent_ring_offset != 0)
+        kvevent_writer_ = KvEventRingWriter((char*)base_ + hdr->kvevent_ring_offset);
+}
+
+uint64_t RadixShmemTree::kvevent_ring_offset() const {
+    if (base_ == nullptr) return 0;
+    return header()->kvevent_ring_offset;
 }
 
 void RadixShmemTree::alloc_root() {
@@ -234,12 +250,17 @@ ShmLayoutInfo RadixShmemTree::compute_layout(const ShmConfig& config) {
     info.swa_lru_size = SlotLru::region_bytes(config.swa_max_blocks);
     info.mamba_lru_size = SlotLru::region_bytes(config.mamba_max_slots);
 
+    info.kvevent_ring_capacity =
+        kvevent_ring_normalize_capacity(config.kvevent_ring_capacity);
+    info.kvevent_ring_size = kvevent_ring_bytes(info.kvevent_ring_capacity);
+
     info.total_size = info.header_size + info.node_pool_size
                     + info.component_state_size
                     + info.data_pool_size + info.ht_size
                     + info.mempool_size
                     + info.swa_mempool_size + info.mamba_mempool_size
-                    + info.swa_lru_size + info.mamba_lru_size;
+                    + info.swa_lru_size + info.mamba_lru_size
+                    + info.kvevent_ring_size;
     return info;
 }
 
@@ -372,6 +393,15 @@ RadixShmemTree RadixShmemTree::create(const std::string& name,
         pool_cursor += l.bytes;
         if (l.count > 0)
             SlotLru::init_region((char*)tree.base_ + *l.offset, l.count);
+    }
+
+    // KV-event eviction ring (last region; 0 capacity = absent, offset 0).
+    hdr->kvevent_ring_capacity = layout.kvevent_ring_capacity;
+    hdr->kvevent_ring_offset = layout.kvevent_ring_size ? pool_cursor : 0;
+    if (layout.kvevent_ring_size) {
+        KvEventRingWriter::init((char*)tree.base_ + hdr->kvevent_ring_offset,
+                                layout.kvevent_ring_capacity);
+        pool_cursor += layout.kvevent_ring_size;
     }
 
     hdr->component_config.abi_version          = COMPONENT_ABI_VERSION;
@@ -1035,9 +1065,20 @@ int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out) {
     uint32_t parent_id = node->parent_id;
     uint64_t head_hash = data_.get_hashes(node->data_offset)[0];
 
-    // Record (first_hash, node_id) for distributed RHT cleanup (flushed after unlock).
-    if (evict_cb_)
-        evicted_pending().push_back({head_hash, node_id});
+    // Record (first_hash, node_id) for distributed RHT cleanup, plus every
+    // block hash for KV-event publication (flushed after unlock). The full
+    // hash list is only materialised when someone is listening: the hashes
+    // live in the data pool and are gone once the node is freed below.
+    if (has_evict_consumers()) {
+        EvictedNode rec;
+        rec.first_hash = head_hash;
+        rec.tree_node_id = node_id;
+        if (wants_evicted_hashes()) {
+            const uint64_t* hashes = data_.get_hashes(node->data_offset);
+            rec.block_hashes.assign(hashes, hashes + n);
+        }
+        evicted_pending().push_back(std::move(rec));
+    }
 
     int32_t* slots = data_.get_slots(node->data_offset, n);
     for (int i = 0; i < n; i++)
@@ -1700,8 +1741,19 @@ void RadixShmemTree::flush_evicted() {
     // Call after the write lock is dropped. The buffer is thread_local, so the
     // foreground and evictor threads each drain their own.
     auto& batch = evicted_pending();
-    if (evict_cb_ && !batch.empty())
-        evict_cb_(batch);
+    if (!batch.empty()) {
+        if (evict_cb_) evict_cb_(batch);
+        for (auto& obs : evict_observers_) obs(batch);
+        if (kvevent_writer_.enabled()) {
+            // One publish per node: entries never straddle two nodes, so a
+            // consumer that loses a slot loses whole blocks, never a
+            // half-decoded hash list.
+            for (const auto& e : batch)
+                if (!e.block_hashes.empty())
+                    kvevent_writer_.publish(e.block_hashes.data(),
+                                            (uint32_t)e.block_hashes.size());
+        }
+    }
     batch.clear();
 }
 
