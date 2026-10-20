@@ -399,7 +399,9 @@ class RadixServer:
                 node_name=idx.node_name() if idx else c.cluster.node_name,
                 segment=self._xfer.local_segment if self._xfer else "",
                 data_bytes=c.data_bytes,
-                last_error=self.last_error)
+                last_error=self.last_error,
+                swa_ratio=float(c.swa_ratio),
+                mamba_ratio=float(c.mamba_ratio))
 
     def configure(self, geometry) -> NodeInfo:
         """Take a client's geometry: validate it, plan the pools, check it
