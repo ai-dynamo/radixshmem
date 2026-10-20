@@ -54,7 +54,7 @@ static void print_usage(const char* prog) {
     printf("  --num-rht-shards <int>   RHT shard count M (default: 0 = M==world-size)\n");
     printf("  --rht-shard-holders <list> Comma-separated holder ranks, e.g. 0,2,4,6\n");
     printf("                           (authoritative only on rank 0; default: ranks [0,M))\n");
-    printf("  --rht-slots <int>        RHT slots per bucket W (1|2|4|8, default 1)\n");
+    printf("  --rht-slots <int>        RHT slots per bucket W (1|2|4|8, default 4)\n");
     printf("\n  --help                   Show this help\n");
 }
 

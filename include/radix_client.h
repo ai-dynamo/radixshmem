@@ -329,7 +329,7 @@ private:
     // ---- RHT plane (from /config) ----
     int              num_shards_ = 0;
     uint32_t         rht_capacity_ = 0;
-    uint32_t         rht_slots_ = 1;
+    uint32_t         rht_slots_ = 4;
     std::vector<int> holder_of_shard_;
     std::unordered_map<int, std::unique_ptr<IRdmaEndpoint>> rht_holder_qps_;
     std::unique_ptr<RhtConsumer> rht_conn_;

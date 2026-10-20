@@ -296,13 +296,13 @@ void RadixServer::resolve_shard_map(int n_obs) {
     // Authoritative remote-op control-plane transport (rank 0's cfg).
     remote_op_transport_ = rot_from_cfg(cfg_.remote_op_transport);
 
-    // Authoritative RHT slots-per-bucket (W). Validate ∈ {1,2,4,8}; default 1.
-    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 1;
+    // Authoritative RHT slots-per-bucket (W). Validate ∈ {1,2,4,8}; default 4.
+    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 4;
     if (W != 1 && W != 2 && W != 4 && W != 8) {
         fprintf(stderr,
                 "[RadixServer rank 0] WARN: rht_slots=%d not in {1,2,4,8}, "
-                "using 1\n", W);
-        W = 1;
+                "using 4\n", W);
+        W = 4;
     }
     rht_slots_ = (uint32_t)W;
 }
@@ -316,7 +316,7 @@ void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
     rdma_tc_      = sm.rdma_tc;
     rht_transport_        = sm.rht_transport;
     peer_index_transport_ = sm.peer_index_transport;
-    rht_slots_     = sm.rht_slots ? sm.rht_slots : 1;
+    rht_slots_     = sm.rht_slots ? sm.rht_slots : 4;
     dc_access_key_ = sm.dc_access_key;
     remote_op_transport_ = sm.remote_op_transport;
     ctx_->set_qos(rdma_sl_, rdma_tc_);   // adopt authoritative QoS before QPs connect
@@ -399,8 +399,8 @@ std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
                 return diff(("holder of shard " + std::to_string(s)).c_str(),
                             sm.holder_rank[s], cfg_.rht_shard_holders[s % nh]);
     }
-    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 1;
-    if (W != 1 && W != 2 && W != 4 && W != 8) W = 1;
+    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 4;
+    if (W != 1 && W != 2 && W != 4 && W != 8) W = 4;
     if ((int)sm.rht_slots != W) return diff("rht_slots", sm.rht_slots, W);
     auto tp = [](const std::string& s) {
         return s == "dc" ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;

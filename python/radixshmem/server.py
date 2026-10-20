@@ -74,7 +74,7 @@ class ClusterConfig:
     peer_index_transport: str = "xrc" # remote walk into peer trees: "xrc" | "dc"
     num_rht_shards: int = 0
     rht_shard_holders: List[int] = field(default_factory=list)
-    rht_slots_per_bucket: int = 1
+    rht_slots_per_bucket: int = 4
     enable_remote_insert: bool = False
     enable_remote_query: bool = False
     zmq_listen_port: int = 0
