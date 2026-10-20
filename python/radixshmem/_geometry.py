@@ -293,7 +293,7 @@ def check_attached(g: Dict[str, Any], client, store) -> None:
         diffs.append(f"swa.window_blocks: index={cc.swa_window_blocks} "
                      f"geometry={g['pools']['swa']['window_blocks']}")
     if (store is not None and want["mamba"] and have["mamba"]
-            and int(cc.mamba_state_bytes) not in (0, int(store.pool(ct.MAMBA).slot_bytes))):
+            and int(cc.mamba_state_bytes) > int(store.pool(ct.MAMBA).slot_bytes)):
         diffs.append(f"mamba.slot_bytes: index stamp={cc.mamba_state_bytes} "
                      f"store={store.pool(ct.MAMBA).slot_bytes}")
     if int(client.block_size()) != int(g["block_size"]):

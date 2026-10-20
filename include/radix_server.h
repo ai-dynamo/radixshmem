@@ -77,7 +77,7 @@ struct RadixServerConfig {
     std::string       peer_index_transport = "xrc";
 
     // RHT slots per bucket (W): must be in {1,2,4,8}. rank 0 authoritative (broadcast).
-    int               rht_slots_per_bucket = 1;
+    int               rht_slots_per_bucket = 4;
 
     bool              enable_remote_insert = false;   // remote-insert control plane
     bool              enable_remote_query = false;    // remote-query control plane
@@ -189,7 +189,7 @@ private:
     // Authoritative shard map (resolved on rank 0, broadcast to all).
     int                  num_shards_ = 0;       // M
     uint32_t             rht_capacity_ = 0;     // requested per-shard buckets (RHT normalizes)
-    uint32_t             rht_slots_ = 1;        // W: slots per bucket
+    uint32_t             rht_slots_ = 4;        // W: slots per bucket
     std::vector<int>     holder_of_shard_;      // size M: shard s → holder rank
     int                  my_local_shard_ = -1;  // shard this rank holds, or -1
     int                  rdma_sl_ = 5;          // authoritative QoS (rank 0)

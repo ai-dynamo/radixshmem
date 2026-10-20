@@ -154,7 +154,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="remote walks into peer trees")
     g.add_argument("--num-rht-shards", type=int, default=0)
     g.add_argument("--rht-shard-holders", default="", help="comma-separated ranks")
-    g.add_argument("--rht-slots", type=int, default=1, choices=[1, 2, 4, 8])
+    g.add_argument("--rht-slots", type=int, default=4, choices=[1, 2, 4, 8])
     g.add_argument("--enable-remote-insert", action="store_true")
     g.add_argument("--enable-remote-query", action="store_true")
     g.add_argument("--zmq-listen-port", type=int, default=0)

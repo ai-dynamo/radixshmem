@@ -74,7 +74,7 @@ class ClusterConfig:
     peer_index_transport: str = "xrc" # remote walk into peer trees: "xrc" | "dc"
     num_rht_shards: int = 0
     rht_shard_holders: List[int] = field(default_factory=list)
-    rht_slots_per_bucket: int = 1
+    rht_slots_per_bucket: int = 4
     enable_remote_insert: bool = False
     enable_remote_query: bool = False
     zmq_listen_port: int = 0
@@ -399,7 +399,9 @@ class RadixServer:
                 node_name=idx.node_name() if idx else c.cluster.node_name,
                 segment=self._xfer.local_segment if self._xfer else "",
                 data_bytes=c.data_bytes,
-                last_error=self.last_error)
+                last_error=self.last_error,
+                swa_ratio=float(c.swa_ratio),
+                mamba_ratio=float(c.mamba_ratio))
 
     def configure(self, geometry) -> NodeInfo:
         """Take a client's geometry: validate it, plan the pools, check it

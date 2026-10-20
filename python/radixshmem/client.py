@@ -56,6 +56,8 @@ class NodeInfo:
     segment: str = ""
     data_bytes: int = 0
     last_error: str = ""            # why the last configuration failed; "" when none did
+    swa_ratio: float = 0.0
+    mamba_ratio: float = 0.0
 
 
 @dataclass

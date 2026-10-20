@@ -130,7 +130,7 @@ void RadixClient::read_topology() {
 
     num_shards_   = (int)sm.num_shards;
     rht_capacity_ = sm.rht_capacity;
-    rht_slots_    = sm.rht_slots ? sm.rht_slots : 1;
+    rht_slots_    = sm.rht_slots ? sm.rht_slots : 4;
     holder_of_shard_.assign(num_shards_, 0);
     for (int s = 0; s < num_shards_; s++)
         holder_of_shard_[s] = (int)sm.holder_rank[s];
