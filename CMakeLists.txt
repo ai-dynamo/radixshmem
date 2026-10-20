@@ -46,6 +46,9 @@ set(_radixshmem_sources
     src/indexer/core/child_table.cpp
     src/indexer/core/mempool.cpp
     src/indexer/core/radix_tree.cpp
+    # KV-event eviction ring: shm channel from the in-process evictor to the
+    # out-of-process consumers that publish BlockRemoved to the router.
+    src/indexer/core/kvevent.cpp
     # component match semantics (Full/SWA/Mamba), shared by local + RDMA walkers
     src/indexer/component/component_set.cpp
     src/indexer/component/swa_component.cpp
@@ -335,6 +338,10 @@ set(_core_unit_tests
     test_rht_engine
     # PeerBreaker: skip/probe/backoff of an unreachable peer.
     test_peer_breaker
+    # KV-event eviction ring: the ring primitive on a plain buffer, then the
+    # same ring wired into a live tree (what an eviction actually publishes).
+    test_kvevent_ring
+    test_tree_kvevent
 )
 foreach(_t ${_core_unit_tests})
     add_executable(${_t} tests/indexer/core/${_t}.cpp)

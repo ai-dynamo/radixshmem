@@ -277,6 +277,29 @@ class RadixClient:
     def slot_view(self, slot: int, kind: ComponentType = FULL):
         return self.store.slot_view(int(slot), kind)
 
+    # ------------------------------------------------------- KV-cache events
+
+    @property
+    def kvevent_enabled(self) -> bool:
+        """True when the region carries an eviction ring (server was started
+        with --kvevent-ring-capacity)."""
+        return bool(self._index.kvevent_enabled())
+
+    def kvevent_seek_to_head(self) -> None:
+        """Skip history. Call once on attach, before the first drain, so a late
+        consumer does not republish removes for blocks it never stored."""
+        self._index.kvevent_seek_to_head()
+
+    def kvevent_drain(self, max_hashes: int = 65536):
+        """Block hashes evicted since the last drain.
+
+        Returns (hashes: np.ndarray[uint64], overflow: bool). overflow=True
+        means the evictor lapped this cursor and events were lost for good:
+        the caller must resync (publish AllBlocksCleared and re-announce),
+        not just forward what came back.
+        """
+        return self._index.kvevent_drain(int(max_hashes))
+
     def close(self) -> None:
         self._closed = True
         self._work.set()

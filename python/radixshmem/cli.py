@@ -93,6 +93,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--data-pool-ratio", type=float, default=4.0,
                    help="index DataPool = full slots x ratio x bytes per block (default: 4.0)")
     g.add_argument("--evict-policy", default="lru", choices=["lru"])
+    g.add_argument("--kvevent-ring-capacity", type=int, default=0,
+                   help="KV-event eviction ring entries (14 hashes each, rounded "
+                        "up to a power of two, min 64); 0 = no ring, evictions "
+                        "stay invisible to KV-cache-aware routers")
     g.add_argument("--hugepage-path", default="",
                    help="hugetlbfs mount for the index and the slot store (default: plain /dev/shm)")
 
@@ -188,7 +192,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
-        evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
+        evict_policy=a.evict_policy, kvevent_ring_capacity=a.kvevent_ring_capacity,
+        endpoint=a.endpoint, rpc_workers=a.rpc_workers,
         cluster=cluster, **kw)
 
 
