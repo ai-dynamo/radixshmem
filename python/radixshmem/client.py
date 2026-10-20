@@ -56,8 +56,6 @@ class NodeInfo:
     segment: str = ""
     data_bytes: int = 0
     last_error: str = ""            # why the last configuration failed; "" when none did
-    swa_ratio: float = 0.0
-    mamba_ratio: float = 0.0
 
 
 @dataclass
@@ -79,7 +77,15 @@ class PullResult:
 class PullJob:
     """Handle of one pull_async(). ``wait()`` blocks until the job completed and
     returns its PullResult; a failed or refused transfer completes the job with
-    the local hit, it never raises."""
+    the local hit, it never raises.
+
+    Progress fields (block counts relative to the hash array passed to
+    ``pull_async``, which may itself be a sub-range of a longer sequence):
+
+    * ``local_hit`` / ``planned_hit`` — known as soon as ``pull_async`` returns.
+    * ``published_hit`` — ``local_hit`` while the transfer runs; after completion
+      the published common_hit (or ``local_hit`` if the future failed).
+    """
 
     def __init__(self, job_id: int, client: "RadixClient"):
         self.job_id = job_id
@@ -99,6 +105,10 @@ class PullJob:
         # that plus the remote run being pulled (equal when nothing is pulled).
         self.local_hit = 0
         self.planned_hit = 0
+        # Absolute offsets into the caller's original hash array when pull_async
+        # was given start/end (chunked prefetch). Default: whole array.
+        self.hash_start = 0
+        self.hash_end = 0
 
     def done(self) -> bool:
         return self._f.done()
@@ -106,6 +116,22 @@ class PullJob:
     @property
     def cancelled(self) -> bool:
         return self._cancelled
+
+    @property
+    def published_hit(self) -> int:
+        """Blocks known to be local for this job's hash span.
+
+        Before completion this is the pre-transfer local hit; afterwards it is
+        the published ``common_hit`` (still relative to this job's hashes).
+        """
+        if not self._f.done():
+            return int(self.local_hit)
+        if self._f.exception() is not None:
+            return int(self.local_hit)
+        try:
+            return int(self._f.result(timeout=0).common_hit)
+        except Exception:  # noqa: BLE001
+            return int(self.local_hit)
 
     def wait(self, timeout: Optional[float] = None) -> PullResult:
         if self._cancelled:
@@ -289,21 +315,36 @@ class RadixClient:
     # ------------------------------------------------------------ pull_async
 
     def pull_async(self, hashes, mask: int = COMPONENT_MASK_FULL, *, lock: bool = True,
-                   timeout_ms: int = 30000, block: bool = True) -> PullJob:
+                   timeout_ms: int = 30000, block: bool = True,
+                   start: int = 0, end: Optional[int] = None) -> PullJob:
         """query, stage local slots for every remote piece, hand the transfer to
         the server and return; the completer publishes the blocks when the
         server reports them and completes the job with local slots for
         [0, common_hit). With ``block=False`` a client at ``max_outstanding``
-        does not wait: the job completes at once with the local hit."""
+        does not wait: the job completes at once with the local hit.
+
+        ``start`` / ``end`` select a half-open block range of ``hashes`` so a
+        caller can prefetch in chunks without slicing the array themselves.
+        Job progress fields (``local_hit``, ``planned_hit``, ``published_hit``)
+        are relative to that sub-range; ``hash_start`` / ``hash_end`` record
+        the absolute offsets into the original array.
+        """
         if self.local_read_only:
             raise RuntimeError("local_read_only client: pull_async needs the cluster plane; "
                                "use query() for the local hit")
+        full = np.ascontiguousarray(hashes, dtype=np.uint64)
+        n = int(full.shape[0])
+        lo = int(start)
+        hi = n if end is None else int(end)
+        if not 0 <= lo <= hi <= n:
+            raise ValueError(f"pull_async range [{lo}, {hi}) out of bounds for {n} hashes")
         self.store
         with self._mu:
             job = PullJob(self._next_id, self)
             self._next_id += 1
             self._jobs[job.job_id] = job
-        job._hashes = np.ascontiguousarray(hashes, dtype=np.uint64)
+        job._hashes = full[lo:hi]
+        job.hash_start, job.hash_end = lo, hi
         job._mask, job._lock = mask, lock
         job._q = q = self._index.query(job._hashes, mask=mask, local_only=False, lock=True,
                                        update_meta=True)
