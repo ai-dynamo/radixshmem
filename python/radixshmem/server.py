@@ -18,7 +18,10 @@ cluster (``configuring`` -> ``ready``, or back to ``waiting`` with
 
 Transfers are jobs: ``submit`` queues one, a single transfer thread feeds the
 engine and polls completions, ``wait_any`` sleeps on an Event until one of the
-caller's jobs is done. Nothing else polls.
+caller's jobs is done. Nothing else polls. With ``transfer_log`` set, every
+transfer that moved data is logged as one line (time, size, bandwidth); the
+transfer thread only stamps times and queues a tuple, a log thread formats and
+writes them.
 """
 
 from __future__ import annotations
@@ -27,9 +30,11 @@ import fcntl
 import json
 import socket
 import struct
+import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
@@ -111,6 +116,7 @@ class ServerConfig:
     max_inflight: int = 256          # batches in flight at the engine
     max_pending_jobs: int = 4096     # queued + running + uncollected jobs before Submit is refused
     job_ttl_s: float = 60.0          # seconds an uncollected job is kept
+    transfer_log: str = ""           # one line per transfer with bytes > 0: "-" = stdout, a path appends, "" = off
     # index tuning
     max_nodes: int = 0               # radix node pool, 0 = auto
     register_chunk_tokens: int = 4096  # RHT registration granularity unless the geometry brings its own
@@ -213,9 +219,11 @@ class _GeometryRegistry:
 
 
 class _Job:
-    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters")
+    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters",
+                 "submitted_ns")
 
     def __init__(self, items: List[TransferItem], deadline: float):
+        self.submitted_ns = time.perf_counter_ns()
         self.ticket = 0
         self.items = items
         self.segs: List[Optional[str]] = []
@@ -225,6 +233,65 @@ class _Job:
         self.done = False
         self.done_at = 0.0
         self.waiters: List[threading.Event] = []
+
+
+class _TransferLog:
+    """Per-transfer log lines. ``add`` (transfer thread) only appends a tuple
+    of perf_counter_ns stamps and counts; a daemon thread formats and writes
+    the queued records once per ``period_s``, and ``close`` writes the rest.
+
+    Line: ``xfer <UTC end time> peer=<rank> kind=<pool> slots=<n> desc=<n>
+    bytes=<n> us=<issue to completion> MBps=<bytes/us> wait_us=<submit to
+    issue> inflight=<batches already in flight at issue>`` plus ``state=<..>``
+    when the transfer did not complete."""
+
+    def __init__(self, target: str, period_s: float = 1.0):
+        self._q: Deque[tuple] = deque()
+        self._own = target != "-"
+        self._out = open(target, "a", buffering=1) if self._own else sys.stdout
+        self._base_ns = time.time_ns() - time.perf_counter_ns()
+        self._period = period_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="radixshmem-xferlog", daemon=True)
+        self._thread.start()
+
+    def add(self, rec: tuple) -> None:
+        self._q.append(rec)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._period):
+            self.flush()
+
+    def flush(self) -> None:
+        lines = []
+        while True:
+            try:
+                submitted, issued, done, rank, kind, slots, ndesc, nbytes, state, inflight = self._q.popleft()
+            except IndexError:
+                break
+            us = max(done - issued, 1) / 1000
+            end = datetime.fromtimestamp((self._base_ns + done) / 1e9, timezone.utc)
+            lines.append(f"xfer {end.strftime('%Y-%m-%dT%H:%M:%S.%f')}Z peer={rank} kind={_kind_name(kind)} "
+                         f"slots={slots} desc={ndesc} bytes={nbytes} us={us:.1f} MBps={nbytes / us:.1f} "
+                         f"wait_us={(issued - submitted) / 1000:.1f} inflight={inflight}"
+                         f"{'' if not state else ' state=' + state}\n")
+        if lines:
+            self._out.write("".join(lines))
+            self._out.flush()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(2 * self._period + 1)
+        self.flush()
+        if self._own:
+            self._out.close()
+
+
+def _kind_name(kind: int) -> str:
+    try:
+        return ComponentType(kind).name
+    except Exception:  # noqa: BLE001
+        return str(kind)
 
 
 class RadixServer:
@@ -251,6 +318,7 @@ class RadixServer:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self.transfers = self.transfer_failures = self.transfer_bytes = 0
+        self._xlog: Optional[_TransferLog] = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -267,6 +335,8 @@ class RadixServer:
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
         }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
+        if self.cfg.transfer_log and self._xlog is None:
+            self._xlog = _TransferLog(self.cfg.transfer_log)
         try:
             self._preflight()
         except BaseException:
@@ -331,6 +401,9 @@ class RadixServer:
         if self._thread is not None:
             self._thread.join(2)
             self._thread = None
+        if self._xlog is not None:
+            self._xlog.close()
+            self._xlog = None
         if self._greg is not None:
             try:
                 self._greg.unpublish(self._node_key())
@@ -652,6 +725,8 @@ class RadixServer:
         from radixshmem import _data
 
         c = self.cfg
+        xlog = self._xlog
+        clock = time.perf_counter_ns
         inflight: List[tuple] = []
         last_gc = time.monotonic()
         while self._running:
@@ -663,6 +738,7 @@ class RadixServer:
                 for i, (rank, kind, remote, local) in enumerate(job.items):
                     if job.replies[i] is not None:
                         continue
+                    issued = clock() if xlog is not None else 0
                     try:
                         h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
                     except Exception as e:  # noqa: BLE001
@@ -671,13 +747,18 @@ class RadixServer:
                         self._peers.pop(rank, None)
                         self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
                     else:
-                        inflight.append((job, i, h, nd))
+                        inflight.append((job, i, h, nd, issued, len(inflight)))
             progressed, now, still = False, time.monotonic(), []
-            for job, i, h, nd in inflight:
+            for job, i, h, nd, issued, ahead in inflight:
                 st, done = self._xfer.poll(h)
                 if st == _data.XferState.PENDING and now < job.deadline:
-                    still.append((job, i, h, nd))
+                    still.append((job, i, h, nd, issued, ahead))
                     continue
+                if xlog is not None and done:
+                    rank, kind, _, local = job.items[i]
+                    xlog.add((job.submitted_ns, issued, clock(), rank, kind, len(local), int(nd), int(done),
+                              "" if st == _data.XferState.COMPLETED else
+                              ("TIMEOUT" if st == _data.XferState.PENDING else st.name), ahead))
                 if st == _data.XferState.PENDING:
                     st = _data.XferState.TIMEOUT
                 if self._xfer.release(h) == _data.XFER_EBUSY:

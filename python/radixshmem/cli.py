@@ -131,6 +131,9 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--rpc-workers", type=int, default=32,
                    help="gRPC threads; one blocks per client with jobs in flight (default: 32)")
     g.add_argument("--interval", type=int, default=5, help="stats interval in seconds, 0 = silent")
+    g.add_argument("--transfer-log", default="-",
+                   help="one line per transfer that moved data (time, bytes, bandwidth): '-' = stdout, "
+                        "a path appends there, '' = off (default: -)")
 
     g = p.add_argument_group("distributed (--expected-min-nodes or --num-rht-shards > 1)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
@@ -189,7 +192,7 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
         evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
-        cluster=cluster, **kw)
+        transfer_log=a.transfer_log, cluster=cluster, **kw)
 
 
 def _stats_line(srv: RadixServer) -> str:
@@ -249,6 +252,7 @@ def main(argv=None) -> None:
         sys.exit(f"Start FAILED: {e}")
     print("Waiting for a client's geometry (RadixClient(name, Geometry(...))) ...", flush=True)
     last, seen = 0.0, srv.mode
+    tty = sys.stdout.isatty()
     try:
         while not stop.wait(0.2):
             mode = srv.mode
@@ -264,7 +268,10 @@ def main(argv=None) -> None:
                           flush=True)
             if a.interval > 0 and mode == "ready" and time.monotonic() - last >= a.interval:
                 last = time.monotonic()
-                sys.stdout.write(f"\r{_stats_line(srv)}        ")
+                if tty:                 # a terminal: one line rewritten in place
+                    sys.stdout.write(f"\r{_stats_line(srv)}        ")
+                else:                   # a log file: timestamped lines between the transfer lines
+                    sys.stdout.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {_stats_line(srv)}\n")
                 sys.stdout.flush()
     finally:
         print("\nShutting down ...", flush=True)

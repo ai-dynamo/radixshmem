@@ -194,6 +194,8 @@ def test_cli_builds_the_server_config():
     assert c.name == "/x" and c.data_bytes == 64 << 20 and c.swa_ratio == 0.25
     assert c.transfer_devices == ["mlx5_0", "mlx5_1", "mlx5_2"] and not c.prefault and c.distributed
     assert cli.build_config(cli.parse_args([])).index_only
+    assert cli.build_config(cli.parse_args([])).transfer_log == "-"
+    assert cli.build_config(cli.parse_args(["--transfer-log", ""])).transfer_log == ""
     with pytest.raises(ValueError, match="--swa-ratio"):
         cli.build_config(cli.parse_args(["--swa-ratio", "0.1"]))
     with pytest.raises(ValueError, match="ratio"):
@@ -496,3 +498,44 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
     finally:
         srv._xfer = None            # the fake must not be released as a real SlotTransfer
         srv.close()
+
+
+def test_transfer_log_writes_one_line_per_transfer_that_moved_data(cfg, tmp_path):
+    import re
+
+    from radixshmem import _data
+
+    log = tmp_path / "xfer.log"
+    c = cfg(**data(data_bytes=1 << 20, max_inflight=4, transfer_log=str(log)))
+    srv = up(c, geometry())
+    try:
+        x = _Xfer(_data)
+        srv._xfer, srv._peers = x, {7: "peer"}
+        item = (7, 0, [1, 2], [3, 4])
+
+        def collect(t, timeout=2.0):
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                done = srv.wait_any([t], 500)["done"]
+                if done:
+                    return done[t]
+            raise AssertionError("job did not finish")
+
+        assert collect(srv.submit([item, item], 5000)) == [(True, 4096, 1, "")] * 2
+        x.reject = True                       # rejected reads move nothing: not logged
+        assert collect(srv.submit([item], 1000))[0][0] is False
+        x.reject = False
+        x.hang.add(x.n + 1)                   # a timeout with 0 bytes done: not logged
+        assert collect(srv.submit([item], 100))[0][0] is False
+    finally:
+        srv._xfer = None
+        srv.close()
+    lines = log.read_text().splitlines()
+    assert len(lines) == 2
+    pat = (r"xfer \d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z peer=7 kind=FULL slots=2 desc=1 bytes=4096 "
+           r"us=(\d+\.\d) MBps=(\d+\.\d) wait_us=\d+\.\d inflight=[01]$")
+    for line in lines:
+        m = re.match(pat, line)
+        assert m, line
+        assert abs(4096 / float(m.group(1)) - float(m.group(2))) <= 0.1 + 0.01 * float(m.group(2))
+
