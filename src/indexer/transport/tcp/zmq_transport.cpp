@@ -114,7 +114,7 @@ ZmqServerTransport::~ZmqServerTransport() {
 uint16_t ZmqServerTransport::bind() {
     ctx_      = zmq_ctx_new();
     rep_sock_ = zmq_socket(ctx_, ZMQ_REP);
-    cur_timeo_ = 50;   // poll cadence so rc_loop can observe rc_running_
+    cur_timeo_ = 50;   // poll cadence so the poller can observe stop()
     zmq_setsockopt(rep_sock_, ZMQ_RCVTIMEO, &cur_timeo_, sizeof(cur_timeo_));
     int linger = 0;
     zmq_setsockopt(rep_sock_, ZMQ_LINGER, &linger, sizeof(linger));

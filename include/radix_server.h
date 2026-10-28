@@ -37,7 +37,7 @@ class XrcRecvQp;
 class EtcdRegistry;
 struct PeerEntry;
 struct ShardMapMsg;
-struct RemoteOpReqHeader;
+class RemoteOpService;
 
 struct RemoteOpAddr {
     uint16_t port = 0;        // zmq: actual bound TCP port (0 = not zmq / off)
@@ -228,26 +228,16 @@ private:
     void xrc_listener_loop();
     void handle_client(int conn_fd);
 
-    // ---- remote-op control plane (remote_op_endpoint.cpp) ----
+    // ---- remote-op control plane (remote_op_service.cpp) ----
     std::unique_ptr<IRemoteOpServerTransport> rc_server_;
-    std::vector<std::thread> rc_threads_;   // one poller per lane
-    std::atomic<bool>    rc_running_{false};
+    std::unique_ptr<RemoteOpService> rc_service_;   // built by rc_spawn on svc_*
 
     // build_remote_op callback body: create the authoritative transport, return its address material.
     RemoteOpAddr rc_build_endpoint(uint32_t rot_auth, uint64_t dc_access_key,
                                    RdmaContext& ctx);
+    // Start serving once svc_* exist; rc_stop stops serving, then drops the service.
     void     rc_spawn();
     void     rc_stop();
-    // Poller for `lane`: recv → validate → dispatch in place → send.
-    void     rc_loop(int lane);
-    // op handlers — return serialized wire bytes for rc_loop to send.
-    std::vector<char> handle_insert(const RemoteOpReqHeader& req,
-                                    const uint64_t* hashes);
-    // FINALIZE / INSERT_RELEASE / QUERY_RELEASE, branched on req.op.
-    std::vector<char> handle_finalize_like(const RemoteOpReqHeader& req,
-                                           const uint64_t* hashes);
-    std::vector<char> handle_query(const RemoteOpReqHeader& req,
-                                   const uint64_t* hashes);
 #endif
 };
 

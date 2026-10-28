@@ -20,6 +20,7 @@
 #include "cluster_registry.h"
 #include "rdma_transport.hpp"
 #include "rht_endpoint.h"
+#include "remote_op_service.hpp"
 #include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path; self-guards on RADIXSHMEM_HAS_ETCD)
 
 #include <arpa/inet.h>
@@ -729,8 +730,8 @@ bool RadixServer::bootstrap() {
                     });
             }
             if (cfg_.enable_remote_insert) {
-                // No svc_client_mu_ here: handle_insert already holds it
-                // around allocate_slots, so locking would self-deadlock.
+                // No svc_client_mu_ here: RemoteOpService::allocate already
+                // holds it around allocate_slots, so locking would self-deadlock.
                 RadixClient* ec = svc_client_.get();
                 svc_tree_->tree().set_evict_callback(
                     [ec](const std::vector<EvictedNode>& evicted) {
