@@ -80,7 +80,8 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     grpc::Status Allocate(grpc::ServerContext* ctx, const pb::AllocateRequest* req,
                           pb::AllocateResponse* rep) override {
         return run(ctx, [&] {
-            AllocateReply r = svc->allocate(req->num_blocks(), ctx->deadline());
+            AllocateReply r = svc->allocate(req->num_blocks(), ctx->deadline(),
+                                            static_cast<ComponentType>(req->component()));
             if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
             rep->set_error(static_cast<pb::InsertError>(r.error));
             rep->mutable_slots()->Add(r.slots.begin(), r.slots.end());
@@ -108,7 +109,8 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
         return run(ctx, [&] {
             InsertResult r = svc->insert(
                 req->hashes().data(), req->hashes_size(), req->start(),
-                req->slots_size(), req->slots().data(), req->auto_recycle());
+                req->slots_size(), req->slots().data(), req->auto_recycle(),
+                static_cast<ComponentType>(req->component()));
             if (r.remote_status != RemoteStatus::OK)
                 return to_grpc_status(r.remote_status);
             rep->set_error(static_cast<pb::InsertError>(r.error));
@@ -122,7 +124,8 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
                          pb::RecycleResponse*) override {
         return run(ctx, [&] {
             RemoteStatus st = svc->recycle(req->slots().data(),
-                                           req->slots_size());
+                                           req->slots_size(),
+                                           static_cast<ComponentType>(req->component()));
             return st == RemoteStatus::OK ? grpc::Status::OK
                                           : to_grpc_status(st);
         });

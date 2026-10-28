@@ -24,13 +24,16 @@ public:
         : tree_(tree), client_(client), insert_mu_(insert_mu) {}
 
     // All-or-nothing: on a short pool, error = MEMPOOL_FULL and no slots.
-    AllocateReply allocate(int n, Deadline deadline = Deadline::max());
+    AllocateReply allocate(int n, Deadline deadline = Deadline::max(),
+                           ComponentType component = ComponentType::FULL);
     QueryReply    query(const uint64_t* hashes, int n, bool lock,
                         bool update_meta, Deadline deadline = Deadline::max());
     // slots[i] holds hashes[start + i]; invalid requests yield REMOTE_FAILED with remote_status = BAD_REQUEST.
     InsertResult  insert(const uint64_t* hashes, int n, int start, int length,
-                         const int32_t* slots, bool auto_recycle);
-    RemoteStatus  recycle(const int32_t* slots, int num_slots);
+                         const int32_t* slots, bool auto_recycle,
+                         ComponentType component = ComponentType::FULL);
+    RemoteStatus  recycle(const int32_t* slots, int num_slots,
+                          ComponentType component = ComponentType::FULL);
     // Drop a query(lock=true) pin over hashes[start, start + length).
     RemoteStatus  unlock(const uint64_t* hashes, int n, int start, int length,
                          int pin_end, const uint64_t* pin_tail, int pin_tail_n);

@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Write-back of background-evicted KV: a thread of the server process hands
-``WritebackTask`` batches to a ``WritebackHandler``."""
+``WritebackTask`` batches to a ``WritebackHandler``; ``PeerWriteback`` pushes
+them to the decode nodes."""
 
 from __future__ import annotations
 
@@ -14,13 +15,17 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
+from radixshmem._core import INVALID_COMPONENT_SLOT
+from radixshmem.client import MODE_READY, PushJob
+
 _STOP_WAIT_S = 5.0   # how long close() waits for a running write() before handler.stop()
 
 
 @dataclass
 class WritebackTask:
-    """An evicted leaf with its root path [0, end): [evicted_from, end) left the
-    tree, [0, evicted_from) is still in it, and no slot is recycled until done."""
+    """An evicted chain (a leaf and the ancestors it left childless) with its
+    root path [0, end): [evicted_from, end) left the tree, [0, evicted_from) is
+    still in it, and no slot is recycled until done."""
 
     task_id: int
     hashes: np.ndarray        # uint64[end]
@@ -56,6 +61,47 @@ class WritebackHandler:
 
     def stop(self) -> None:
         pass
+
+
+class PeerWriteback(WritebackHandler):
+    """Pushes each evicted path to a ready decode node with ``push_async``,
+    picked by the hash of its first block so that a prefix tree stays on one
+    node. On prefill nodes it extends them with the decode nodes' memory.
+    ``config``: ``timeout_ms`` (default 30000)."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.timeout_ms = int(config.get("timeout_ms", 30000))
+        self.client = None
+        self._window = 0
+
+    def start(self, client) -> None:
+        self.client = client
+        self._window = int(client.geometry["pools"].get("swa", {}).get("window_blocks", 0))
+
+    def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
+        nodes = self.client.nodes()
+        jobs = []
+        for t in tasks:
+            rank = self._choose_target(nodes, t)
+            if rank >= 0:
+                jobs.append(self._push(t, rank))
+        for job in jobs:
+            job.wait()
+        done([t.task_id for t in tasks])
+
+    def _choose_target(self, nodes: List[Dict[str, Any]], t: WritebackTask) -> int:
+        """A ready decode node other than this one, by ``t``'s first block hash; -1 if none."""
+        me = self.client.rank()
+        ranks = sorted(int(r["rank"]) for r in nodes if r.get("mode") == MODE_READY and r.get("data_plane")
+                       and r.get("role") == "decode" and int(r.get("rank", -1)) not in (-1, me))
+        return ranks[int(t.hashes[0]) % len(ranks)] if ranks else -1
+
+    def _push(self, t: WritebackTask, rank: int) -> PushJob:
+        swa = t.swa_slots[max(0, t.end - self._window):]
+        live = len(swa) > 0 and bool((swa != INVALID_COMPONENT_SLOT).all())
+        mamba = int(t.mamba_slots[-1]) if len(t.mamba_ends) and int(t.mamba_ends[-1]) == t.end else -1
+        return self.client.push_async(rank, t.hashes, t.full_slots, swa if live else None, mamba,
+                                      valid=t.valid, timeout_ms=self.timeout_ms)
 
 
 def load_handler(spec: str, config: Dict[str, Any]) -> WritebackHandler:

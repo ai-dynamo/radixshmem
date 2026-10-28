@@ -160,6 +160,11 @@ void test_roundtrip() {
     InsertResult bad = cli.insert(h.data(), 4, 2, 3, a.slots.data(), true);
     assert(bad.error == InsertError::REMOTE_FAILED &&
            bad.remote_status == RemoteStatus::BAD_REQUEST);
+    const auto bogus = static_cast<ComponentType>(NUM_COMPONENT_TYPES);
+    assert(cli.allocate(1, bogus).status == RemoteStatus::BAD_REQUEST);
+    assert(cli.insert(h.data(), n, 0, 1, a.slots.data(), true, bogus).remote_status ==
+           RemoteStatus::BAD_REQUEST);
+    assert(cli.recycle(a.slots.data(), 1, bogus) == RemoteStatus::BAD_REQUEST);
     assert(node.used() == (uint32_t)n);
     server.stop();
     TEST_PASS();

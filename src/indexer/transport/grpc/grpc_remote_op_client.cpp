@@ -91,11 +91,12 @@ GrpcRemoteOpClientTransport::GrpcRemoteOpClientTransport(
 
 GrpcRemoteOpClientTransport::~GrpcRemoteOpClientTransport() = default;
 
-AllocateReply GrpcRemoteOpClientTransport::allocate(int n) {
+AllocateReply GrpcRemoteOpClientTransport::allocate(int n, ComponentType component) {
     AllocateReply out;
     if (n < 0 || n > MAX_REMOTE_OP_BLOCKS) { out.status = RemoteStatus::BAD_REQUEST; return out; }
     pb::AllocateRequest req;
     req.set_num_blocks(n);
+    req.set_component(static_cast<pb::Component>(component));
     pb::AllocateResponse rep;
     grpc::ClientContext ctx;
     impl_->prepare(ctx);
@@ -139,7 +140,7 @@ QueryReply GrpcRemoteOpClientTransport::query(const uint64_t* hashes, int n,
 
 InsertResult GrpcRemoteOpClientTransport::insert(
         const uint64_t* hashes, int n, int start, int length,
-        const int32_t* slots, bool auto_recycle) {
+        const int32_t* slots, bool auto_recycle, ComponentType component) {
     InsertResult out;
     if (!copyable(hashes, n) || !copyable(slots, length)) {
         out.error = InsertError::REMOTE_FAILED;
@@ -151,6 +152,7 @@ InsertResult GrpcRemoteOpClientTransport::insert(
     req.mutable_slots()->Add(slots, slots + length);
     req.set_start(start);
     req.set_auto_recycle(auto_recycle);
+    req.set_component(static_cast<pb::Component>(component));
     pb::InsertResponse rep;
     grpc::ClientContext ctx;
     impl_->prepare(ctx);
@@ -170,10 +172,12 @@ InsertResult GrpcRemoteOpClientTransport::insert(
 }
 
 RemoteStatus GrpcRemoteOpClientTransport::recycle(const int32_t* slots,
-                                                  int num_slots) {
+                                                  int num_slots,
+                                                  ComponentType component) {
     if (!copyable(slots, num_slots)) return RemoteStatus::BAD_REQUEST;
     pb::RecycleRequest req;
     req.mutable_slots()->Add(slots, slots + num_slots);
+    req.set_component(static_cast<pb::Component>(component));
     pb::RecycleResponse rep;
     grpc::ClientContext ctx;
     impl_->prepare(ctx);

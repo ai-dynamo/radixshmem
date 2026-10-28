@@ -1032,14 +1032,11 @@ bool RadixShmemTree::is_in_leaf_list(uint32_t node_id) const {
 
 // ==================== Eviction internals ====================
 
-int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out,
-                               HeldEviction* hold) {
+int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out, bool hold) {
     TreeNode* node = nodes_.get(node_id);
     int n = (int)node->num_blocks;
     uint32_t parent_id = node->parent_id;
     uint64_t head_hash = data_.get_hashes(node->data_offset)[0];
-
-    if (hold) hold_path(node_id, *hold);   // before retire_swa clears the lane
 
     // Record (first_hash, node_id) for distributed RHT cleanup (flushed after unlock).
     if (evict_cb_)
@@ -1090,17 +1087,41 @@ int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out,
     return n;
 }
 
-void RadixShmemTree::hold_path(uint32_t node_id, HeldEviction& h) {
+int RadixShmemTree::evict_held_chain(uint32_t leaf, std::vector<int32_t>& out,
+                                     HeldEviction& h) {
+    const uint32_t root = header()->root_node_id;
+    uint32_t top = leaf;
+    for (uint32_t p = nodes_.get(leaf)->parent_id;
+         p != root && nodes_.get(p)->children_count == 1 && component_refs_zero(p);
+         p = nodes_.get(p)->parent_id)
+        top = p;
+    hold_path(leaf, top, h);   // before retire_swa clears the lanes
+    int freed = 0;
+    for (uint32_t id = leaf;;) {
+        const uint32_t parent = nodes_.get(id)->parent_id;
+        freed += evict_node(id, out, true);
+        if (id == top) break;
+        id = parent;
+    }
+    return freed;
+}
+
+void RadixShmemTree::hold_path(uint32_t leaf, uint32_t top, HeldEviction& h) {
     const uint32_t root = header()->root_node_id;
     std::vector<uint32_t> path;
-    for (uint32_t id = node_id; id != root && id != INVALID_NODE_ID;
+    for (uint32_t id = leaf; id != root && id != INVALID_NODE_ID;
          id = nodes_.get(id)->parent_id)
         path.push_back(id);
     std::reverse(path.begin(), path.end());
 
     h.generation = header()->reset_generation.load(std::memory_order_relaxed);
+    bool pin = true;
     for (uint32_t id : path) {
         TreeNode* nd = nodes_.get(id);
+        if (id == top) {
+            pin = false;
+            h.evicted_from = h.end();
+        }
         const int nb = (int)nd->num_blocks;
         const uint64_t* hs = data_.get_hashes(nd->data_offset);
         const int32_t* fs = data_.get_slots(nd->data_offset, nb);
@@ -1113,7 +1134,7 @@ void RadixShmemTree::hold_path(uint32_t node_id, HeldEviction& h) {
             h.mamba_ends.push_back((uint32_t)h.hashes.size());
             h.mamba_slots.push_back(nd->mamba_checkpoint_slot);
         }
-        if (id == node_id) break;
+        if (!pin) continue;
         nd->ref_count.fetch_add(1, std::memory_order_relaxed);
         if (has_aux_) {
             NodeComponentState* cs = nodes_.component_state(id);
@@ -1121,7 +1142,6 @@ void RadixShmemTree::hold_path(uint32_t node_id, HeldEviction& h) {
             if (ckpt) cs->mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
-    h.evicted_from = h.end() - nodes_.get(node_id)->num_blocks;
 }
 
 void HeldEviction::covered(uint64_t out[NUM_COMPONENT_TYPES]) const {
@@ -1154,9 +1174,13 @@ void RadixShmemTree::release_held(const std::vector<HeldEviction>& hs) {
             hdr->held_slots[(int)ComponentType::SWA].fetch_sub(
                 (uint32_t)swa.size(), std::memory_order_relaxed);
         }
-        if (!h.mamba_ends.empty() && h.mamba_ends.back() == end) {
-            mamba_mempool_.recycle(&h.mamba_slots.back(), 1);
-            hdr->held_slots[(int)ComponentType::MAMBA].fetch_sub(1, std::memory_order_relaxed);
+        // Checkpoints past evicted_from are the chain's own, held; the ones before are pinned.
+        const size_t k = std::upper_bound(h.mamba_ends.begin(), h.mamba_ends.end(), a) -
+                         h.mamba_ends.begin();
+        if (k < h.mamba_slots.size()) {
+            mamba_mempool_.recycle(h.mamba_slots.data() + k, (int)(h.mamba_slots.size() - k));
+            hdr->held_slots[(int)ComponentType::MAMBA].fetch_sub(
+                (uint32_t)(h.mamba_slots.size() - k), std::memory_order_relaxed);
         }
         if (a == 0) continue;
         // Re-walk by hash: a split copies Full/SWA refs to both halves, Mamba stays on the END.
@@ -1785,7 +1809,7 @@ int RadixShmemTree::evict_walk(int need, std::vector<HeldEviction>* held,
             if (cur != header()->root_node_id && component_refs_zero(cur)) {
                 if (held) {
                     held->emplace_back();
-                    freed += evict_node(cur, tmp, &held->back());
+                    freed += evict_held_chain(cur, tmp, held->back());
                     uint64_t c[NUM_COMPONENT_TYPES];
                     held->back().covered(c);
                     for (int k = 0; k < NUM_COMPONENT_TYPES; k++) covered[k] += c[k];

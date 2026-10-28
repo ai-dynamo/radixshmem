@@ -697,18 +697,19 @@ PYBIND11_MODULE(_core, m) {
            "0 = no limit; `truncated` reports a limit reached.")
 #ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
-        .def("remote_allocate", [](RadixClient& c, int rank, int n) {
+        .def("remote_allocate", [](RadixClient& c, int rank, int n,
+                                   ComponentType component) {
             AllocateReply rep;
-            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n); }
+            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n, component); }
             return rep;
-        }, py::arg("rank"), py::arg("n"),
-           "Phase 1: allocate `n` slots on `rank` (no hashes, no dedup).")
+        }, py::arg("rank"), py::arg("n"), py::arg("component") = ComponentType::FULL,
+           "Phase 1: allocate `n` slots from `rank`'s `component` pool (no hashes, no dedup).")
 
         .def("remote_insert", [](RadixClient& c, int rank,
                                    py::array_t<uint64_t> hashes,
                                    int start, int length,
                                    py::array_t<int32_t> slots,
-                                   bool auto_recycle) {
+                                   bool auto_recycle, ComponentType component) {
             auto [ptr, len] = npy_1d(hashes, "hashes");
             auto [sptr, slen] = npy_1d(slots, "slots");
             if (slen < length)
@@ -716,20 +717,20 @@ PYBIND11_MODULE(_core, m) {
             InsertResult res;
             { py::gil_scoped_release rel;
               res = c.remote_insert(rank, ptr, len, start, length, sptr,
-                                    auto_recycle); }
+                                    auto_recycle, component); }
             return res;
         }, py::arg("rank"), py::arg("hashes"), py::arg("start"),
            py::arg("length"), py::arg("slots"),
-           py::arg("auto_recycle") = true,
+           py::arg("auto_recycle") = true, py::arg("component") = ComponentType::FULL,
            "Phase 2: publish `slots` on `rank`; auto_recycle frees the unmatched surplus.")
 
         .def("remote_recycle", [](RadixClient& c, int rank,
-                                  py::array_t<int32_t> slots) {
+                                  py::array_t<int32_t> slots, ComponentType component) {
             auto [sptr, slen] = npy_1d(slots, "slots");
             RemoteStatus st;
-            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen); }
+            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen, component); }
             return st;
-        }, py::arg("rank"), py::arg("slots"),
+        }, py::arg("rank"), py::arg("slots"), py::arg("component") = ComponentType::FULL,
            "Return unpublished slots to `rank`'s pool (abort / surplus); returns RemoteStatus.")
 
         .def("remote_query", [](RadixClient& c, int rank,

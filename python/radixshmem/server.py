@@ -41,7 +41,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
-                             NodeInfo, RadixClient, TransferItem, TransferReply)
+                             XFER_READ, XFER_WRITE, NodeInfo, RadixClient, TransferItem, TransferReply)
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy
 from radixshmem.writeback import WritebackHandler, _Worker
 
@@ -317,6 +317,15 @@ class _ServerRegistry:
             pass
 
 
+def _parse_item(item) -> Tuple[int, int, List[int], List[int], str]:
+    """A TransferItem with its op made explicit (4-tuples are reads)."""
+    r, k, rs, ls = item[:4]
+    op = item[4] if len(item) > 4 else XFER_READ
+    if op not in (XFER_READ, XFER_WRITE):
+        raise ValueError(f"unknown transfer op {op!r}")
+    return int(r), int(k), [int(x) for x in rs], [int(x) for x in ls], op
+
+
 class _Job:
     __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters",
                  "submitted_ns")
@@ -341,8 +350,8 @@ class _TransferLog:
 
     Line: ``xfer <UTC end time> peer=<rank> kind=<pool> slots=<n> desc=<n>
     bytes=<n> us=<issue to completion> MBps=<bytes/us> wait_us=<submit to
-    issue> inflight=<batches already in flight at issue>`` plus ``state=<..>``
-    when the transfer did not complete."""
+    issue> inflight=<batches already in flight at issue>`` plus ``op=write``
+    for a write and ``state=<..>`` when the transfer did not complete."""
 
     def __init__(self, target: str, period_s: float = 1.0):
         self._q: Deque[tuple] = deque()
@@ -365,7 +374,7 @@ class _TransferLog:
         lines = []
         while True:
             try:
-                submitted, issued, done, rank, kind, slots, ndesc, nbytes, state, inflight = self._q.popleft()
+                submitted, issued, done, rank, kind, slots, ndesc, nbytes, state, inflight, op = self._q.popleft()
             except IndexError:
                 break
             us = max(done - issued, 1) / 1000
@@ -373,7 +382,7 @@ class _TransferLog:
             lines.append(f"xfer {end.strftime('%Y-%m-%dT%H:%M:%S.%f')}Z peer={rank} kind={_kind_name(kind)} "
                          f"slots={slots} desc={ndesc} bytes={nbytes} us={us:.1f} MBps={nbytes / us:.1f} "
                          f"wait_us={(issued - submitted) / 1000:.1f} inflight={inflight}"
-                         f"{'' if not state else ' state=' + state}\n")
+                         f"{' op=write' if op == XFER_WRITE else ''}{'' if not state else ' state=' + state}\n")
         if lines:
             self._out.write("".join(lines))
             self._out.flush()
@@ -836,9 +845,8 @@ class RadixServer:
             raise DataPlaneUnavailable("index-only server has no data plane")
         if self._xfer is None:
             raise DataPlaneUnavailable("standalone server has no peers")
-        job = _Job([(int(r), int(k), [int(x) for x in rs], [int(x) for x in ls])
-                    for r, k, rs, ls in items], time.monotonic() + timeout_ms / 1000)
-        for i, (rank, _, _, _) in enumerate(job.items):
+        job = _Job([_parse_item(it) for it in items], time.monotonic() + timeout_ms / 1000)
+        for i, (rank, _, _, _, _) in enumerate(job.items):
             try:
                 job.segs.append(self._peer(rank))
             except Exception as e:  # noqa: BLE001
@@ -918,17 +926,21 @@ class RadixServer:
                     job = self._queue.popleft() if self._queue else None
                 if job is None:
                     break
-                for i, (rank, kind, remote, local) in enumerate(job.items):
+                for i, (rank, kind, remote, local, op) in enumerate(job.items):
                     if job.replies[i] is not None:
                         continue
                     issued = clock() if xlog is not None else 0
                     try:
-                        h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
+                        if op == XFER_WRITE:
+                            h, nd = self._xfer.write(job.segs[i], local, remote, kind=ComponentType(kind))
+                        else:
+                            h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
                     except Exception as e:  # noqa: BLE001
                         h, nd = _data.INVALID_BATCH, str(e)
                     if h == _data.INVALID_BATCH:
                         self._peers.pop(rank, None)
-                        self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
+                        self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else
+                                               "write rejected" if op == XFER_WRITE else "read rejected"))
                     else:
                         inflight.append((job, i, h, nd, issued, len(inflight)))
             progressed, now, still = False, time.monotonic(), []
@@ -938,10 +950,10 @@ class RadixServer:
                     still.append((job, i, h, nd, issued, ahead))
                     continue
                 if xlog is not None and done:
-                    rank, kind, _, local = job.items[i]
+                    rank, kind, _, local, op = job.items[i]
                     xlog.add((job.submitted_ns, issued, clock(), rank, kind, len(local), int(nd), int(done),
                               "" if st == _data.XferState.COMPLETED else
-                              ("TIMEOUT" if st == _data.XferState.PENDING else st.name), ahead))
+                              ("TIMEOUT" if st == _data.XferState.PENDING else st.name), ahead, op))
                 if st == _data.XferState.PENDING:
                     st = _data.XferState.TIMEOUT
                 if self._xfer.release(h) == _data.XFER_EBUSY:

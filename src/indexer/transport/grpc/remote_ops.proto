@@ -27,9 +27,17 @@ enum InsertError {
   INSERT_ERROR_FULL_PATH_MISSING = 7;
 }
 
+// Mirrors radixshmem::ComponentType (component_kind.h); the pool an op works on.
+enum Component {
+  COMPONENT_FULL = 0;
+  COMPONENT_SWA = 1;
+  COMPONENT_MAMBA = 2;
+}
+
 // Reserve `num_blocks` slots; no hashes, no dedup. All-or-nothing.
 message AllocateRequest {
   int32 num_blocks = 1;
+  Component component = 2;
 }
 message AllocateResponse {
   InsertError error = 1;
@@ -54,6 +62,7 @@ message InsertRequest {
   repeated int32 slots = 2;
   int32 start = 3;
   bool auto_recycle = 4;  // target recycles the slots it did not consume
+  Component component = 5;
 }
 message InsertResponse {
   InsertError error = 1;
@@ -63,6 +72,7 @@ message InsertResponse {
 // Return slots that were allocated but never published.
 message RecycleRequest {
   repeated int32 slots = 1;
+  Component component = 2;
 }
 message RecycleResponse {}
 

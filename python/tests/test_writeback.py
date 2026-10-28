@@ -135,17 +135,17 @@ def test_handler_gets_whole_prefixes_with_intact_data(cfg):
     srv, cl = up(cfg(), rec)
     try:
         assert rec.client is not None and rec.client.store is not None
-        seqs = fill(cl, 10)                                  # 400 of 512: below the 25% free mark
+        seqs = fill(cl, 11)                                  # 440 of 512: two sequences to evict
         wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
         st = srv.stats()["writeback"]
         assert st["produced"] == st["completed"] == len(rec.tasks) > 1
         assert st["held_slots"] == (0, 0, 0) and st["inflight_slots"] == (0, 0, 0)
         for t, data, hit in zip(rec.tasks, rec.data, rec.hits):
-            assert t.end - t.evicted_from == 4 and t.end % 4 == 0
+            assert t.end == SEQ_BLOCKS and t.evicted_from == 0   # unshared: one chain, root to leaf
             owner = [h for h in seqs if np.array_equal(h[:t.end], t.hashes)]
             assert len(owner) == 1                           # a whole prefix of one sequence
             assert data == [struct.pack("<Q", int(x)) for x in t.hashes]
-            assert hit == t.evicted_from                     # the prefix was still in the tree
+            assert hit == t.evicted_from                     # [0, evicted_from) is still in the tree
             assert len(t.swa_slots) == 0 and len(t.mamba_ends) == 0
         assert all(rec.valid) and not rec.tasks[0].valid()   # valid until done
         rec.client.geometry["pools"] = None
@@ -167,7 +167,7 @@ def test_unfinished_writebacks_pause_background_eviction(cfg):
         st = srv.stats()["writeback"]
         # one task already covers SEQ_BLOCKS > LIMIT slots: nothing else is evicted
         assert st["produced"] == 1 and st["inflight_slots"][0] == SEQ_BLOCKS > LIMIT
-        assert st["held_slots"][0] == 4
+        assert st["held_slots"][0] == SEQ_BLOCKS
         free = cl.mempool_free()
         assert free == SLOTS - 10 * SEQ_BLOCKS               # held slots are not free
 
@@ -217,7 +217,7 @@ def test_base_exception_does_not_end_the_thread(cfg):
     rec = Recorder(fail=1, error=asyncio.CancelledError())
     srv, cl = up(cfg(), rec)
     try:
-        fill(cl, 10)
+        fill(cl, 11)
         wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
         st = srv.stats()["writeback"]
         assert st["failed"] == 1 and len(rec.tasks) > 0      # later batches were still written

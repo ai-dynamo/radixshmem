@@ -671,6 +671,7 @@ if(BUILD_PYTHON_MODULES)
         add_test(NAME py_test_cluster COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
         add_test(NAME py_test_p2p_pull COMMAND ${Python3_EXECUTABLE} tests/test_p2p_pull.py)
         add_test(NAME py_test_writeback_pull COMMAND ${Python3_EXECUTABLE} tests/test_writeback_pull.py)
+        add_test(NAME py_test_push COMMAND ${Python3_EXECUTABLE} tests/test_push.py)
         set(_stress_args --concurrency 8 --duration 10 --warmup-sec 2 --turns 3,6
             --isl-step 50,100 --osl 10,30 --max-blocks 200000 --max-nodes 200000
             --swa-max-blocks 50000 --mamba-max-slots 10000 --report-sec 5)
@@ -687,7 +688,7 @@ if(BUILD_PYTHON_MODULES)
                          --flush-after-insert)
         foreach(_t py_test_geometry py_test_server_rpc py_test_radixshmem py_test_geometry_registry
                    py_test_writeback py_test_monitor py_test_cluster py_test_p2p_pull py_test_writeback_pull
-                   py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)
+                   py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)
             set_tests_properties(${_t} PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
                 ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"

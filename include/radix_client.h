@@ -49,16 +49,19 @@ public:
     RemotePeer(const RemotePeer&) = delete;
     RemotePeer& operator=(const RemotePeer&) = delete;
 
-    AllocateReply allocate(int n);   // pure slot alloc; no hashes, no dedup
+    // pure slot alloc from the target's `component` pool; no hashes, no dedup
+    AllocateReply allocate(int n, ComponentType component = ComponentType::FULL);
 
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
-                        const int32_t* slots, bool auto_recycle = true);
+                        const int32_t* slots, bool auto_recycle = true,
+                        ComponentType component = ComponentType::FULL);
 
     QueryReply query(const uint64_t* hashes, int n, bool lock = false,
                      bool update_meta = true);
 
     // Both return the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
-    RemoteStatus recycle(const int32_t* slots, int num_slots);
+    RemoteStatus recycle(const int32_t* slots, int num_slots,
+                         ComponentType component = ComponentType::FULL);
     RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length,
                         int pin_end, const std::vector<uint64_t>& pin_tail);
 
@@ -166,16 +169,21 @@ public:
     // opens/reuses one cached session per rank internally. An illegal rank yields
     // BAD_TARGET / REMOTE_FAILED in the op result (never throws).
 
-    // Phase 1: allocate `n` slots on the peer (no hashes, no dedup).
-    AllocateReply remote_allocate(int rank, int n);
+    // Phase 1: allocate `n` slots from the peer's `component` pool (no hashes, no dedup).
+    AllocateReply remote_allocate(int rank, int n,
+                                  ComponentType component = ComponentType::FULL);
 
     // Phase 2: publish `slots` on the peer; dedup + surplus recycle happen here.
+    // FULL is the positional prefix insert; SWA / MAMBA follow the local insert's
+    // component contract (start == 0, slots cover the tail / the END).
     InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
                                int start, int length, const int32_t* slots,
-                               bool auto_recycle = true);
+                               bool auto_recycle = true,
+                               ComponentType component = ComponentType::FULL);
 
-    // Recycle unpublished slots on the peer (abort / auto_recycle=false surplus).
-    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots);
+    // Recycle unpublished slots into the peer's `component` pool (abort / surplus).
+    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                ComponentType component = ComponentType::FULL);
 
     QueryResult remote_query(int rank, const uint64_t* hashes, int n,
                              bool lock = false, bool update_meta = true);

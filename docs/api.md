@@ -107,7 +107,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 
 > **Concurrency and deadlines**: the gRPC service has no per-op admission limit; allocate and insert queue on the target's insert lock, query and unlock run in parallel. The server's gRPC threads are capped at `RADIXSHMEM_REMOTE_OP_MAX_THREADS` (default 256); past that cap a request is answered with `RESOURCE_EXHAUSTED` without running. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms); an allocate or query that waited until its deadline is not run and returns `TIMEOUT`, while insert, recycle and unlock always run. Clients send gRPC keepalive pings every 10 s, so a dead connection fails with `UNAVAILABLE` instead of waiting for each op's deadline.
 
-> **Deployment**: remote ops use gRPC only, and an RDMA build needs gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin). The manifest and cluster protocol versions are 12; the former remote-op transport and DCT fields are reserved. All nodes and clients must run the same build; mixed-version rolling upgrades are not supported. RHT and peer-index XRC/DC transport choices are unaffected.
+> **Deployment**: remote ops use gRPC only, and an RDMA build needs gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin). The manifest and cluster protocol versions are 13 (13: remote ops carry the component pool); the former remote-op transport and DCT fields are reserved. All nodes and clients must run the same build; mixed-version rolling upgrades are not supported. RHT and peer-index XRC/DC transport choices are unaffected.
 
 > **Note**: `RadixServer::bootstrap()` **writes** `cfg.register_chunk_tokens` into `cfg.shm.register_chunk_tokens`, so you do not need to mirror it manually. `world_size` / `rank` flow in the opposite direction: after etcd determines them during rendezvous they are **written back into `cfg`**, and together with the identity fields they are stamped into the shm header (`my_rank` / `is_distributed` / `node_name` / `registry` / `cluster_id`).
 
@@ -245,7 +245,7 @@ void   WritebackQueue::drop_all();
 WritebackStats WritebackQueue::stats() const;
 ```
 
-With `writeback_enabled`, each leaf the background evictor removes becomes a `WritebackTask{id, HeldEviction h}` covering the whole root path `[0, h.end())`: `hashes`, `full_slots`, `swa_slots` (`INVALID_COMPONENT_SLOT` where none), `mamba_ends` / `mamba_slots` (the path's checkpoints), `evicted_from`, `generation` (`reset_generation` at eviction). `[evicted_from, end)` has left the tree, but its FULL slots, SWA lane and END checkpoint are not recycled; `[0, evicted_from)` stays in the tree with FULL refs (plus SWA refs, and Mamba refs on nodes with a checkpoint) on its nodes, so it is neither evicted nor merged. `complete()` / `drop_all()` recycle the held slots and drop those refs; destroying the queue releases nothing (the tree is destroyed with it). Foreground eviction (inside `insert` / `allocate_slots`) recycles at once and never produces tasks.
+With `writeback_enabled`, the background evictor removes a leaf together with every ancestor it leaves childless and unpinned; each such chain becomes a `WritebackTask{id, HeldEviction h}` covering the whole root path `[0, h.end())`: `hashes`, `full_slots`, `swa_slots` (`INVALID_COMPONENT_SLOT` where none), `mamba_ends` / `mamba_slots` (the path's checkpoints), `evicted_from`, `generation` (`reset_generation` at eviction). `[evicted_from, end)` (the chain) has left the tree, but its FULL slots, SWA lanes and checkpoints are not recycled; `[0, evicted_from)` stays in the tree with FULL refs (plus SWA refs, and Mamba refs on nodes with a checkpoint) on its nodes, so it is neither evicted nor merged. `complete()` / `drop_all()` recycle the held slots and drop those refs; destroying the queue releases nothing (the tree is destroyed with it). Foreground eviction (inside `insert` / `allocate_slots`) recycles at once and never produces tasks.
 
 The evictor runs when the existing pressure triggers fire **and** every pool's slots covered by queued + unfinished tasks (prefixes included) are below `writeback_max_held_ratio`; held slots do not count as free. A batch stops at the first task that uses up a pool's remaining share, so a pool can exceed `writeback_max_held_ratio` by the slots of that task. `ShmHeader::held_slots[3]` counts the slots held per pool; `reset()` zeroes it and bumps `reset_generation`, after which older tasks release nothing and are no longer returned by `pop()`. `reset()` frees the slots of tasks already popped too, so a reader of a task's slots compares `RadixShmemTree::reset_generation()` with `h.generation` after the read and stores the data only if they are equal.
 
@@ -525,7 +525,8 @@ client.insert(hashes, n, m.data(), 1,
 ### `remote_allocate`
 
 ```cpp
-AllocateReply remote_allocate(int rank, int n);
+AllocateReply remote_allocate(int rank, int n,
+                              ComponentType component = ComponentType::FULL);
 ```
 
 **Phase 1** of the two-phase remote write: asks the peer to allocate `n` slots from **its own** mempool as a pure allocation (**no hashes, no server-side dedup, tree unchanged, nothing published, no pin**), and returns the target-local slot ids (so the caller can move KV there). Deduplication has moved to phase-2 `remote_insert` (the local insert only consumes the missed tail segment and the surplus is reclaimed automatically).
@@ -537,6 +538,7 @@ AllocateReply remote_allocate(int rank, int n);
 | ------ | ----- | ------------------------------------------- |
 | `rank` | `int` | Target peer (invalid → `status = BAD_TARGET`; not registered → `UNAVAILABLE`). |
 | `n`    | `int` | Number of slots to allocate, **≤ 512** (over the limit returns `BAD_REQUEST`; not split). |
+| `component` | `ComponentType` | Pool to allocate from. |
 
 
 
@@ -560,7 +562,8 @@ AllocateReply remote_allocate(int rank, int n);
 ```cpp
 InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
                            int start, int length, const int32_t* slots,
-                           bool auto_recycle = true);
+                           bool auto_recycle = true,
+                           ComponentType component = ComponentType::FULL);
 ```
 
 **Phase 2** of the two-phase remote write: the target runs a real `insert(hashes, slots)` with the phase-1 slots carried in the request, publishing into its tree + RHT (hits are possible immediately after publishing). **Deduplication happens here**: prefixes that the local insert already hits do not consume slots; by default (`auto_recycle=true`) the target reclaims surplus slots in place, and with `auto_recycle=false` they stay allocated and the caller reclaims them explicitly with `remote_recycle`. A new prefix typically passes `start=0, length=n`.
@@ -575,6 +578,7 @@ InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
 | `start` / `length`    | `int`                    | Publish range; a new prefix uses `start=0, length=n`. The request carries `length` entries of `slots` (slots follow the hashes).                       |
 | `slots`               | `const int32_t*`         | The slots returned by phase-1 `remote_allocate`.                                                   |
 | `auto_recycle`        | `bool`                   | `true`: the target reclaims the dedup surplus in place; `false`: the surplus stays allocated and the caller reclaims it explicitly with `remote_recycle`.                             |
+| `component`           | `ComponentType`          | `FULL`: as above. `SWA` / `MAMBA`: the local [component contract](#component-semantics-of-insert) (`start = 0`, on a path the target holds). |
 
 
 
@@ -590,7 +594,8 @@ Same `InsertResult` (`{error, unused_slots}`) as local `[insert](#insert)`: `unu
 ### `remote_recycle`
 
 ```cpp
-RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots);
+RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots,
+                            ComponentType component = ComponentType::FULL);
 ```
 
 Returns slots obtained from `remote_allocate` but **not published** to the target mempool (when the whole operation is aborted, or the surplus under `auto_recycle=false`). The target only runs `recycle_slots` and does not touch the tree.
@@ -602,6 +607,7 @@ Returns slots obtained from `remote_allocate` but **not published** to the targe
 | --------------------- | ------------------------ | --------------------------------------------- |
 | `rank`                | `int`                    | Target peer (invalid → `BAD_TARGET`; not registered → `UNAVAILABLE`). |
 | `slots` / `num_slots` | `const int32_t*` / `int` | Slots to return and their count (null pointer / `0` → `BAD_REQUEST`).     |
+| `component`           | `ComponentType`          | Pool the slots were allocated from.                |
 
 
 
@@ -981,9 +987,11 @@ enum class ComponentType : uint32_t { FULL = 0, SWA = 1, MAMBA = 2 };  // Identi
 
 ## 5. Python binding differences
 
-The public surface of the Python package is two pure-Python classes: `radixshmem.RadixServer` (one process per node, holding the index, SlotStore, transfer engine, and gRPC service; started with the operator parameters `ServerConfig`, it starts in `waiting`, and the geometry is sent by a client) and `radixshmem.RadixClient` (can be constructed before the server is ready; `RadixClient(name, Geometry)` also hands the geometry to the server; `status()` / `configure()` do not block, `wait_ready()` blocks; the index and SlotStore are attached on the first index / data call, raising `ServerNotReady` if not ready; index operations pass through to the underlying `_core.RadixClient`, plus `pull_async()`: query, hand the transfer to the server, publish locally on completion, and `PullJob.wait()` returns local slots). The classes aligned with C++ described below live in the pybind modules `radixshmem._core` (index surface) and `radixshmem._data` (SlotStore / transfer surface), for tests and advanced users to use directly.
+The public surface of the Python package is two pure-Python classes: `radixshmem.RadixServer` (one process per node, holding the index, SlotStore, transfer engine, and gRPC service; started with the operator parameters `ServerConfig`, it starts in `waiting`, and the geometry is sent by a client) and `radixshmem.RadixClient` (can be constructed before the server is ready; `RadixClient(name, Geometry)` also hands the geometry to the server; `status()` / `configure()` do not block, `wait_ready()` blocks; the index and SlotStore are attached on the first index / data call, raising `ServerNotReady` if not ready; index operations pass through to the underlying `_core.RadixClient`, plus `pull_async()`: query, hand the transfer to the server, publish locally on completion, and `PullJob.wait()` returns local slots; `push_async()` is the reverse). The classes aligned with C++ described below live in the pybind modules `radixshmem._core` (index surface) and `radixshmem._data` (SlotStore / transfer surface), for tests and advanced users to use directly.
 
-**Write-back** ([2.6](#26-write-back-of-background-eviction)): `ServerConfig(writeback=True, writeback_max_held_ratio=0.05)` together with `RadixServer(cfg, writeback=handler)`, where `handler` is a `radixshmem.WritebackHandler` with `start(client)` / `write(tasks, done)` / `stop()`. A thread of the server process pops batches of `radixshmem.WritebackTask` (numpy arrays: `hashes`, `full_slots`, `swa_slots`, `mamba_ends`, `mamba_slots`; `evicted_from`, `generation`, `end`) and calls `write`; `done(task_ids)` releases them, from any thread; an exception gives up the batch's open tasks. Data read from a task's slots may be stored only if `task.valid()` is still True after the read: it turns False after a `reset()` and once the task is done or given up. `start(client)` runs once the server is ready; `client` is an in-process `RadixClient` that uses the server's own index client and SlotStore (`query`, `pull_async`, `slot_view`), with no second attach. `close()` stops the thread and calls `stop()` before anything else, so `stop()` can still pull; it waits at most 5 s for a running `write()`, and tasks not done by then are dropped with the index. `radix-server --writeback-handler module:factory [--writeback-config JSON|path] [--writeback-max-held 0.05]` loads `factory(config)`. `server.stats()["writeback"]` and `_core.RadixServer.writeback_stats()` report queued / popped / produced / completed / dropped, `inflight_slots` and `held_slots`; `_core.RadixServer.pop_writeback` / `complete_writeback` / `drop_writeback` are the underlying calls.
+**Push**: `client.push_async(rank, hashes, full_slots, swa_slots=None, mamba_slot=-1, *, valid=None, timeout_ms=30000, block=True) → PushJob` is the reverse of `pull_async`: it writes a path from local slots to peer `rank` and publishes it there (`swa_slots` / `mamba_slot`: the SWA window and Mamba checkpoint at its end). The target keeps the prefix it already holds and dedups; `valid`, if given, is checked after the write and False publishes nothing. Keep the local slots until the job is done. `PushJob.wait()` returns `PushResult(common_hit, remote_hit, remote_blocks, remote_bytes, complete)` and never raises.
+
+**Write-back** ([2.6](#26-write-back-of-background-eviction)): `ServerConfig(writeback=True, writeback_max_held_ratio=0.05)` together with `RadixServer(cfg, writeback=handler)`, where `handler` is a `radixshmem.WritebackHandler` with `start(client)` / `write(tasks, done)` / `stop()`. A thread of the server process pops batches of `radixshmem.WritebackTask` (numpy arrays: `hashes`, `full_slots`, `swa_slots`, `mamba_ends`, `mamba_slots`; `evicted_from`, `generation`, `end`) and calls `write`; `done(task_ids)` releases them, from any thread; an exception gives up the batch's open tasks. Data read from a task's slots may be stored only if `task.valid()` is still True after the read: it turns False after a `reset()` and once the task is done or given up. `start(client)` runs once the server is ready; `client` is an in-process `RadixClient` that uses the server's own index client and SlotStore (`query`, `pull_async`, `slot_view`), with no second attach. `close()` stops the thread and calls `stop()` before anything else, so `stop()` can still pull; it waits at most 5 s for a running `write()`, and tasks not done by then are dropped with the index. `radix-server --writeback-handler module:factory [--writeback-config JSON|path] [--writeback-max-held 0.05]` loads `factory(config)`. `radixshmem.writeback:PeerWriteback` pushes each task to a decode node (`--decode`), picked by the hash of its first block so that a prefix tree stays on one node. `server.stats()["writeback"]` and `_core.RadixServer.writeback_stats()` report queued / popped / produced / completed / dropped, `inflight_slots` and `held_slots`; `_core.RadixServer.pop_writeback` / `complete_writeback` / `drop_writeback` are the underlying calls.
 
 `radixshmem._core` matches the C++ API names and signatures nearly one to one. Differences:
 
@@ -1000,9 +1008,9 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 **Remote operations ([§3.2](#32-datapath-insert--query--remote-ops)) are all exported to Python** (only when a remote-op backend is compiled in), with signatures matching C++:
 
 - **Always rank-first, no handles**: the client opens and caches sessions per rank internally and lazily. The normal automatic cross-node walk goes through `client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL, local_only=False)`; when the one-sided RDMA continuation fails, the local incumbent is kept (observer returns an empty hit).
-- `client.remote_allocate(rank, n) → AllocateReply` (phase 1, allocation only)
-- `client.remote_insert(rank, hashes, start, length, slots, auto_recycle=True) → InsertResult` (phase 2, publish + dedup)
-- `client.remote_recycle(rank, slots) → RemoteStatus` (return unpublished allocations)
+- `client.remote_allocate(rank, n, component=FULL) → AllocateReply` (phase 1, allocation only)
+- `client.remote_insert(rank, hashes, start, length, slots, auto_recycle=True, component=FULL) → InsertResult` (phase 2, publish + dedup)
+- `client.remote_recycle(rank, slots, component=FULL) → RemoteStatus` (return unpublished allocations)
 - `client.remote_query(rank, hashes, lock=False, update_meta=True) → QueryResult` (remote operation, 1 RTT)
 - New types exposed readonly: `AllocateReply` (`status`/`error`/`slots`); enum `radixshmem.RemoteStatus` (10 values); `InsertResult.remote_status`. `RemotePeer` is no longer in Python (sessions are managed inside the client).
 - The `finalize` closure of `remote_query(lock=True)` holds the session it was queried on, not the `RadixClient`.

@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""RadixClient: index maintenance plus ``pull_async``, the one call that also
-moves bytes. It attaches the index (and, in data mode, the SlotStore) its
-RadixServer published; the server runs the transfers, this side stages local
-slots, submits, and publishes the result once the server reports completion.
+"""RadixClient: index maintenance plus ``pull_async`` and ``push_async``, the
+calls that also move bytes. It attaches the index (and, in data mode, the
+SlotStore) its RadixServer published; the server runs the transfers, this side
+stages the slots they land in, submits, and publishes the result once the
+server reports completion.
 
 A client can be built before its server is ready. ``RadixClient(name,
 geometry)`` hands the server the geometry (the Configure RPC) and returns at
@@ -38,8 +39,10 @@ MODE_CLOSED = "closed"
 
 _ATTACH_TIMEOUT_MS = 30000          # a ready server's SlotStore is complete; attach never spins long
 
-# (peer_rank, kind, remote_slots, local_slots) -> (ok, bytes, descriptors, error)
+# (peer_rank, kind, remote_slots, local_slots[, op]) -> (ok, bytes, descriptors, error).
+# op is XFER_READ ("r", the default: peer -> local) or XFER_WRITE ("w": local -> peer).
 TransferItem = Tuple[int, int, List[int], List[int]]
+XFER_READ, XFER_WRITE = "r", "w"
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -127,6 +130,47 @@ class PullJob:
         self._client.cancel(self)
 
 
+@dataclass
+class PushResult:
+    """The target holds [0, common_hit), ``remote_hit`` of it from before;
+    ``complete``: everything given was published there."""
+
+    common_hit: int
+    remote_hit: int
+    remote_blocks: int
+    remote_bytes: int
+    complete: bool
+
+
+class PushJob:
+    """Handle of one push_async(); ``wait()`` returns its PushResult and never raises."""
+
+    def __init__(self, job_id: int, client: "RadixClient", rank: int, hashes: np.ndarray):
+        self.job_id = job_id
+        self._client = client
+        self._f: concurrent.futures.Future = concurrent.futures.Future()
+        self._rank = rank
+        self._hashes = hashes
+        self._q = None                  # remote_query(lock=True): the target's pin on its hit
+        self._hit = 0
+        self._want: List[ComponentType] = []
+        self._items: List[TransferItem] = []
+        self._reserved: Dict[ComponentType, np.ndarray] = {}
+        self._valid: Optional[Callable[[], bool]] = None
+        self._ticket = -1
+
+    def done(self) -> bool:
+        return self._f.done()
+
+    def wait(self, timeout: Optional[float] = None) -> PushResult:
+        try:
+            r = self._f.result(timeout)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"job {self.job_id} still running") from None
+        self._client._jobs.pop(self.job_id, None)
+        return r
+
+
 def _empty() -> np.ndarray:
     return np.empty(0, dtype=np.int32)
 
@@ -149,8 +193,8 @@ class _Rpc:
         return self._stub.call("Nodes", timeout=30)["nodes"]
 
     def submit(self, items, timeout_ms) -> int:
-        req = {"items": [[int(r), int(k), [int(x) for x in rs], [int(x) for x in ls]]
-                         for r, k, rs, ls in items], "timeout_ms": int(timeout_ms)}
+        req = {"items": [[int(it[0]), int(it[1]), [int(x) for x in it[2]], [int(x) for x in it[3]],
+                          *it[4:5]] for it in items], "timeout_ms": int(timeout_ms)}
         return int(self._stub.call("Submit", req, timeout=30)["ticket"])
 
     def wait_any(self, tickets, timeout_ms) -> Dict[str, Any]:
@@ -187,8 +231,7 @@ class _LocalTransport:
         return self._s.nodes()
 
     def submit(self, items, timeout_ms) -> int:
-        return self._s.submit([(int(r), int(k), [int(x) for x in rs], [int(x) for x in ls])
-                               for r, k, rs, ls in items], int(timeout_ms))
+        return self._s.submit(items, int(timeout_ms))
 
     def wait_any(self, tickets, timeout_ms) -> Dict[str, Any]:
         r = self._s.wait_any([int(t) for t in tickets], int(timeout_ms))
@@ -216,13 +259,14 @@ class RadixClient:
     size and bytes against it. Index methods (query, insert, allocate_slots,
     recycle_slots, flush, reset, check_health, stats) are those of the
     underlying index client. ``max_outstanding`` bounds the jobs in flight;
-    ``pull_async`` blocks while it is reached.
+    ``pull_async`` and ``push_async`` block while it is reached.
 
     ``local_read_only=True`` is the light form for processes that only read: it
     attaches the index and the SlotStore, never joins the cluster (no etcd,
     RDMA or RHT plane) and does not start a completer thread. ``query()`` is
-    always local, ``is_distributed()`` is False, and ``pull_async`` / ``insert``
-    / ``allocate_slots`` / ``recycle_slots`` / ``reset`` raise ``RuntimeError``;
+    always local, ``is_distributed()`` is False, and ``pull_async`` /
+    ``push_async`` / ``insert`` / ``allocate_slots`` / ``recycle_slots`` /
+    ``reset`` raise ``RuntimeError``;
     ``info`` still carries the server's rank and world size."""
 
     def __init__(self, name: str, geometry=None, *, endpoint: Optional[str] = None,
@@ -255,8 +299,8 @@ class RadixClient:
         self.promotion_shortfalls = 0
         self.saturated = 0
         self._mu = threading.Lock()
-        self._jobs: Dict[int, PullJob] = {}
-        self._pending: Dict[int, PullJob] = {}
+        self._jobs: Dict[int, Union[PullJob, PushJob]] = {}
+        self._pending: Dict[int, Union[PullJob, PushJob]] = {}
         self._next_id = 1
         self._slots = threading.Semaphore(max_outstanding)
         self._work = threading.Event()
@@ -345,7 +389,7 @@ class RadixClient:
         self._index = None
         self._t.close()
 
-    # ------------------------------------------------------------ pull_async
+    # ----------------------------------------------- pull_async / push_async
 
     def pull_async(self, hashes, mask: int = COMPONENT_MASK_FULL, *, lock: bool = True,
                    timeout_ms: int = 30000, block: bool = True) -> PullJob:
@@ -370,30 +414,44 @@ class RadixClient:
         job.planned_hit = job._hit
         if not job._items:
             self._complete(job, [])
-            return job
-        if block:
-            self._slots.acquire()
-        elif not self._slots.acquire(blocking=False):
-            self.saturated += 1
-            self._complete(job, [(False, 0, 0, "client saturated")] * len(job._items))
-            return job
-        try:
-            job._ticket = self._t.submit(job._items, timeout_ms)
-        except Exception as e:  # noqa: BLE001 - busy or unreachable server: local hit only
-            self._slots.release()
-            self._complete(job, [(False, 0, 0, str(e))] * len(job._items))
-            return job
-        with self._mu:
-            self._pending[job._ticket] = job
-            if self._completer is None:
-                self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
-                                                   daemon=True)
-                self._completer.start()
-        self._work.set()
+        else:
+            self._submit(job, timeout_ms, block)
         return job
 
-    def wait(self, job: Union[PullJob, int], timeout: Optional[float] = None) -> PullResult:
-        return (job if isinstance(job, PullJob) else self._jobs[job]).wait(timeout)
+    def push_async(self, rank: int, hashes, full_slots, swa_slots=None, mamba_slot: int = -1, *,
+                   valid: Optional[Callable[[], bool]] = None, timeout_ms: int = 30000,
+                   block: bool = True) -> PushJob:
+        """Reverse of ``pull_async``: write a path from local slots to peer
+        ``rank`` and publish it there. ``swa_slots`` / ``mamba_slot``: the SWA
+        window and Mamba checkpoint at its end (None / -1: none). The target's
+        hit stays pinned while the rest is written; ``valid``, if given, is
+        checked after the write and False publishes nothing. Keep the local
+        slots until the job is done."""
+        if self.local_read_only:
+            raise RuntimeError("local_read_only client: push_async needs the cluster plane")
+        self.store
+        h = np.ascontiguousarray(hashes, dtype=np.uint64)
+        full = np.ascontiguousarray(full_slots, dtype=np.int32)
+        if len(full) != len(h):
+            raise ValueError(f"{len(full)} FULL slots for {len(h)} hashes")
+        with self._mu:
+            job = PushJob(self._next_id, self, int(rank), h)
+            self._next_id += 1
+            self._jobs[job.job_id] = job
+        job._valid = valid
+        job._q = q = self._index.remote_query(job._rank, h, lock=True, update_meta=False)
+        if int(q.status) == 0:
+            job._hit = int(q.total_hit_length)
+            self._reserve(job, full, swa_slots, mamba_slot)
+        if not job._items:
+            self._complete_push(job, [])
+        else:
+            self._submit(job, timeout_ms, block)
+        return job
+
+    def wait(self, job: Union[PullJob, PushJob, int],
+             timeout: Optional[float] = None) -> Union[PullResult, PushResult]:
+        return (self._jobs[job] if isinstance(job, int) else job).wait(timeout)
 
     def cancel(self, job: Union[PullJob, int]) -> None:
         """See ``PullJob.cancel``. Under ``_mu`` so that a result set by the
@@ -407,7 +465,8 @@ class RadixClient:
         if r is not None:
             r.finalize()
 
-    def wait_any(self, jobs: Sequence[PullJob], timeout: Optional[float] = None) -> List[PullJob]:
+    def wait_any(self, jobs: Sequence[Union[PullJob, PushJob]],
+                 timeout: Optional[float] = None) -> List[Union[PullJob, PushJob]]:
         concurrent.futures.wait([j._f for j in jobs], timeout,
                                 return_when=concurrent.futures.FIRST_COMPLETED)
         return [j for j in jobs if j.done()]
@@ -432,11 +491,75 @@ class RadixClient:
                     continue
                 replies = rep["done"].get(ticket) or [(False, 0, 0, lost)] * len(job._items)
                 try:
-                    self._complete(job, replies)
+                    self._complete_any(job, replies)
                 except Exception as e:  # noqa: BLE001
                     job._q.finalize()
                     job._f.set_exception(e)
                 self._slots.release()
+
+    def _submit(self, job: Union[PullJob, PushJob], timeout_ms: int, block: bool) -> None:
+        """Hand ``job._items`` to the server; a refusal completes the job at once."""
+        if block:
+            self._slots.acquire()
+        elif not self._slots.acquire(blocking=False):
+            self.saturated += 1
+            self._complete_any(job, [(False, 0, 0, "client saturated")] * len(job._items))
+            return
+        try:
+            job._ticket = self._t.submit(job._items, timeout_ms)
+        except Exception as e:  # noqa: BLE001 - busy or unreachable server: nothing moves
+            self._slots.release()
+            self._complete_any(job, [(False, 0, 0, str(e))] * len(job._items))
+            return
+        with self._mu:
+            self._pending[job._ticket] = job
+            if self._completer is None:
+                self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
+                                                   daemon=True)
+                self._completer.start()
+        self._work.set()
+
+    def _complete_any(self, job: Union[PullJob, PushJob], replies: Sequence[TransferReply]) -> None:
+        (self._complete_push if isinstance(job, PushJob) else self._complete)(job, replies)
+
+    def _reserve(self, job: PushJob, full: np.ndarray, swa_slots, mamba_slot) -> None:
+        """Allocate the target's slots, FULL first: nothing else lands without the path."""
+        m = job._hit
+        pieces = [(FULL, full[m:])] if m < len(full) else []
+        if swa_slots is not None and len(swa_slots):
+            pieces.append((SWA, np.ascontiguousarray(swa_slots, dtype=np.int32)))
+        if mamba_slot is not None and int(mamba_slot) >= 0:
+            pieces.append((MAMBA, np.asarray([int(mamba_slot)], dtype=np.int32)))
+        job._want = [kind for kind, _ in pieces]
+        for kind, local in pieces:
+            remote = np.asarray(self._index.remote_allocate(job._rank, len(local), kind).slots, dtype=np.int32)
+            if len(remote) != len(local):       # refused or MEMPOOL_FULL: no slots
+                if kind == FULL:
+                    return
+                continue
+            job._items.append((job._rank, int(kind), remote.tolist(), local.tolist(), XFER_WRITE))
+            job._reserved[kind] = remote
+
+    def _complete_push(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
+        ok = {ComponentType(it[1]): rep[0] for it, rep in zip(job._items, replies)}
+        self.transfer_failures += sum(not v for v in ok.values())
+        if ok and job._valid is not None and not job._valid():
+            ok = dict.fromkeys(ok, False)
+        idx, rank, h = self._index, job._rank, job._hashes
+        n, hit, landed, nbytes = len(h), job._hit, [], 0
+        for kind, remote in job._reserved.items():
+            if not ok[kind] or (kind != FULL and hit < n):
+                idx.remote_recycle(rank, remote, kind)
+                continue
+            res = idx.remote_insert(rank, h, hit if kind == FULL else 0, len(remote), remote, True, kind)
+            if res.error != _core.InsertError.OK:
+                continue
+            landed.append(kind)
+            nbytes += len(remote) * int(self._store.pool(kind).slot_bytes)
+            hit = n if kind == FULL else hit
+        job._q.finalize()   # after the inserts: the pin's release covers a node they split
+        job._f.set_result(PushResult(hit, job._hit, sum(len(job._reserved[k]) for k in landed), nbytes,
+                                     hit == n and all(k in landed for k in job._want)))
 
     def _stage(self, job: PullJob, hit: int) -> int:
         q, me = job._q, int(self._index.rank())

@@ -34,12 +34,14 @@ public:
     GrpcRemoteOpClientTransport(const GrpcRemoteOpClientTransport&) = delete;
     GrpcRemoteOpClientTransport& operator=(const GrpcRemoteOpClientTransport&) = delete;
 
-    AllocateReply allocate(int n) override;
+    AllocateReply allocate(int n, ComponentType component = ComponentType::FULL) override;
     QueryReply query(const uint64_t* hashes, int n, bool lock,
                      bool update_meta) override;
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
-                        const int32_t* slots, bool auto_recycle) override;
-    RemoteStatus recycle(const int32_t* slots, int num_slots) override;
+                        const int32_t* slots, bool auto_recycle,
+                        ComponentType component = ComponentType::FULL) override;
+    RemoteStatus recycle(const int32_t* slots, int num_slots,
+                         ComponentType component = ComponentType::FULL) override;
     RemoteStatus unlock(const uint64_t* hashes, int n, int start,
                         int length, int pin_end,
                         const std::vector<uint64_t>& pin_tail) override;

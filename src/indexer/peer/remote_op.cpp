@@ -23,12 +23,14 @@ RemotePeer::~RemotePeer() = default;
 RemotePeer::RemotePeer(RemotePeer&&) noexcept = default;
 RemotePeer& RemotePeer::operator=(RemotePeer&&) noexcept = default;
 
-AllocateReply RemotePeer::allocate(int n) { return transport_->allocate(n); }
+AllocateReply RemotePeer::allocate(int n, ComponentType component) {
+    return transport_->allocate(n, component);
+}
 
 InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
                                 int start, int length, const int32_t* slots,
-                                bool auto_recycle) {
-    return transport_->insert(hashes, n, start, length, slots, auto_recycle);
+                                bool auto_recycle, ComponentType component) {
+    return transport_->insert(hashes, n, start, length, slots, auto_recycle, component);
 }
 
 QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
@@ -36,8 +38,9 @@ QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
     return transport_->query(hashes, n, lock, update_meta);
 }
 
-RemoteStatus RemotePeer::recycle(const int32_t* slots, int num_slots) {
-    return transport_->recycle(slots, num_slots);
+RemoteStatus RemotePeer::recycle(const int32_t* slots, int num_slots,
+                                 ComponentType component) {
+    return transport_->recycle(slots, num_slots, component);
 }
 
 RemoteStatus RemotePeer::unlock(const uint64_t* hashes, int n, int start,
