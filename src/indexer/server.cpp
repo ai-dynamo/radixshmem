@@ -140,7 +140,20 @@ namespace {
 
 // Local remote-op transport cfg string → manifest enum.
 uint32_t rot_from_cfg(const std::string& s) {
-    return (s == "dc") ? REMOTE_OP_TRANSPORT_DC : REMOTE_OP_TRANSPORT_ZMQ;
+    if (s == "grpc") return REMOTE_OP_TRANSPORT_GRPC;
+    if (s == "zmq")  return REMOTE_OP_TRANSPORT_ZMQ;
+    if (s == "dc")   return REMOTE_OP_TRANSPORT_DC;
+    throw std::runtime_error("RadixServer: remote_op_transport '" + s +
+                             "' is not one of grpc / zmq / dc");
+}
+
+const char* rot_name(uint32_t rot) {
+    switch (rot) {
+    case REMOTE_OP_TRANSPORT_GRPC: return "grpc";
+    case REMOTE_OP_TRANSPORT_ZMQ:  return "zmq";
+    case REMOTE_OP_TRANSPORT_DC:   return "dc";
+    default:                       return "unknown";
+    }
 }
 
 bool send_all(int fd, const void* data, size_t len) {
@@ -375,14 +388,14 @@ void RadixServer::setup_remote_op(PeerEntry& e) {
     if (!(cfg_.enable_remote_insert || cfg_.enable_remote_query)) return;
 
     RemoteOpAddr a = rc_build_endpoint(remote_op_transport_, dc_access_key_, *ctx_);
-    e.zmq_listen_port = a.port;
+    e.remote_op_listen_port = a.port;
     e.rc_dct_num     = a.dctns[0];
     for (int i = 1; i < 4; ++i) e.rc_dct_num_extra[i - 1] = a.dctns[i];
     rc_lane0_dctn_ = a.dctns[0];   // setup_dct (runs after us) may reuse as read target
     fprintf(stderr, "[RadixServer rank %d] remote-op endpoint up: %s "
             "(port=%u rc_dctn=%u/%u/%u/%u)\n", cfg_.rank,
-            remote_op_transport_ == REMOTE_OP_TRANSPORT_DC ? "dc" : "zmq",
-            e.zmq_listen_port, e.rc_dct_num, e.rc_dct_num_extra[0],
+            rot_name(remote_op_transport_),
+            e.remote_op_listen_port, e.rc_dct_num, e.rc_dct_num_extra[0],
             e.rc_dct_num_extra[1], e.rc_dct_num_extra[2]);
 }
 
@@ -677,8 +690,18 @@ bool RadixServer::bootstrap() {
             cfg_.remote_op_transport == "xrc") {
             throw std::runtime_error(
                 "RadixServer: the xrc/rdma control-plane backend was "
-                "removed — use remote_op_transport = dc (RDMA) or zmq "
-                "(TCP fallback)");
+                "removed — use remote_op_transport = grpc, dc (RDMA) or "
+                "zmq");
+        }
+        (void)rot_from_cfg(cfg_.remote_op_transport);   // unknown name → throw
+        // zmq_listen_port is the old name of remote_op_listen_port.
+        if (cfg_.zmq_listen_port != 0) {
+            if (cfg_.remote_op_listen_port != 0 &&
+                cfg_.remote_op_listen_port != cfg_.zmq_listen_port)
+                throw std::runtime_error(
+                    "RadixServer: remote_op_listen_port and its deprecated "
+                    "alias zmq_listen_port are both set and differ");
+            cfg_.remote_op_listen_port = cfg_.zmq_listen_port;
         }
 
         if (!cluster_bootstrap()) {

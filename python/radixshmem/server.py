@@ -50,7 +50,7 @@ _CLUSTER_FIELDS = (
     "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec", "rht_transport",
     "peer_index_transport", "num_rht_shards", "rht_shard_holders", "rht_slots_per_bucket",
     "enable_remote_insert",
-    "enable_remote_query", "zmq_listen_port", "remote_op_transport")
+    "enable_remote_query", "remote_op_listen_port", "zmq_listen_port", "remote_op_transport")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
@@ -84,8 +84,9 @@ class ClusterConfig:
     rht_slots_per_bucket: int = 4
     enable_remote_insert: bool = False
     enable_remote_query: bool = False
-    zmq_listen_port: int = 0
-    remote_op_transport: str = "zmq"
+    remote_op_listen_port: int = 0    # remote-op TCP port (grpc / zmq), 0 = OS-assigned
+    zmq_listen_port: int = 0          # deprecated alias of remote_op_listen_port
+    remote_op_transport: str = "grpc" # "grpc" | "zmq" | "dc"
 
     @property
     def distributed(self) -> bool:

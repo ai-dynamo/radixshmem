@@ -491,13 +491,24 @@ if(ENABLE_RDMA)
     add_executable(test_remote_api tests/indexer/test_remote_api.cpp)
     target_link_libraries(test_remote_api PRIVATE radixshmem)
 
-    # Two-variant matrix: base = zmq control × xrc data (zmq-gated); _dcd = both planes DC (superset).
+    # Control × data matrix: base = zmq × xrc (zmq-gated); _dcd = both planes DC;
+    # _grpc / _grpc_dcd = grpc control over xrc / dc data planes (grpc-gated).
     if(RADIXSHMEM_ZMQ_FOUND)
         add_test(NAME test_remote_api COMMAND test_remote_api)
+        set_tests_properties(test_remote_api PROPERTIES
+            ENVIRONMENT "RADIXSHMEM_REMOTE_OP_TRANSPORT=zmq")
     endif()
     add_test(NAME test_remote_api_dcd COMMAND test_remote_api)
     set_tests_properties(test_remote_api_dcd PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_REMOTE_OP_TRANSPORT=dc")
+    if(RADIXSHMEM_GRPC_FOUND)
+        add_test(NAME test_remote_api_grpc COMMAND test_remote_api)
+        set_tests_properties(test_remote_api_grpc PROPERTIES
+            ENVIRONMENT "RADIXSHMEM_REMOTE_OP_TRANSPORT=grpc")
+        add_test(NAME test_remote_api_grpc_dcd COMMAND test_remote_api)
+        set_tests_properties(test_remote_api_grpc_dcd PROPERTIES
+            ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_REMOTE_OP_TRANSPORT=grpc")
+    endif()
 endif()
 
 # gRPC remote-op backend over loopback: a real single-node tree behind the
@@ -530,7 +541,7 @@ endif()
 # register code so ctest shows "Skipped". The cluster tests fork a private etcd
 # (the sole bootstrap backend) and SKIP when no etcd binary is available.
 set(_skippable_tests
-    test_remote_api test_remote_api_dcd
+    test_remote_api test_remote_api_dcd test_remote_api_grpc test_remote_api_grpc_dcd
     test_cluster test_cluster_dc test_cluster_dc_rht_nic test_cluster_w4
     test_cluster_rht_dc_peer_xrc test_cluster_rht_xrc_peer_dc
     test_cluster_node_join

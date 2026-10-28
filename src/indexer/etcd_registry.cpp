@@ -147,8 +147,10 @@ bool EtcdRegistry::attach_cluster_lease() {
 bool EtcdRegistry::adopt_config(const std::string& cfg_val) {
     ShardMapMsg sm{};
     if (!etcd::decode_shardmap(cfg_val, sm)) {
-        fprintf(stderr, "[EtcdRegistry %s] bad shard-map blob\n",
-                node_name_.c_str());
+        fprintf(stderr, "[EtcdRegistry %s] bad shard-map blob: corrupt, or "
+                "written by a build of another cluster protocol version "
+                "(this build: v%u)\n",
+                node_name_.c_str(), CLUSTER_PROTOCOL_VERSION);
         return false;
     }
     if (!attach_cluster_lease()) return false;

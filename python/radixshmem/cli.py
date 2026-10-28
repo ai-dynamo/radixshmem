@@ -162,8 +162,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--rht-slots", type=int, default=4, choices=[1, 2, 4, 8])
     g.add_argument("--enable-remote-insert", action="store_true")
     g.add_argument("--enable-remote-query", action="store_true")
-    g.add_argument("--zmq-listen-port", type=int, default=0)
-    g.add_argument("--remote-op-transport", default="zmq", choices=["zmq", "dc"])
+    g.add_argument("--remote-op-listen-port", type=int, default=0)
+    g.add_argument("--zmq-listen-port", type=int, default=0,
+                   help="deprecated alias of --remote-op-listen-port")
+    g.add_argument("--remote-op-transport", default="grpc", choices=["grpc", "zmq", "dc"])
     return p.parse_args(argv)
 
 
@@ -187,7 +189,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         peer_index_transport=a.peer_index_transport, num_rht_shards=a.num_rht_shards,
         rht_shard_holders=[int(x) for x in a.rht_shard_holders.split(",") if x.strip()],
         rht_slots_per_bucket=a.rht_slots, enable_remote_insert=a.enable_remote_insert,
-        enable_remote_query=a.enable_remote_query, zmq_listen_port=a.zmq_listen_port,
+        enable_remote_query=a.enable_remote_query,
+        remote_op_listen_port=a.remote_op_listen_port, zmq_listen_port=a.zmq_listen_port,
         remote_op_transport=a.remote_op_transport)
     return ServerConfig(
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,

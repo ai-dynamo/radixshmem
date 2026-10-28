@@ -81,10 +81,11 @@ struct RadixServerConfig {
 
     bool              enable_remote_insert = false;   // remote-insert control plane
     bool              enable_remote_query = false;    // remote-query control plane
-    uint16_t          zmq_listen_port = 0;            // remote-op endpoint TCP port
+    uint16_t          remote_op_listen_port = 0;      // remote-op endpoint TCP port (grpc / zmq)
+    uint16_t          zmq_listen_port = 0;            // deprecated alias of remote_op_listen_port
 
-    // Control-plane backend: "zmq" | "dc" ("dc" needs world_size>1 + mlx5). rank 0 authoritative.
-    std::string       remote_op_transport = "zmq";
+    // Control-plane backend: "grpc" | "zmq" | "dc" ("dc" needs world_size>1 + mlx5). rank 0 authoritative.
+    std::string       remote_op_transport = "grpc";
 
     // Cluster bootstrap registry: "etcd://host:port" (etcd dynamic discovery).
     std::string       registry   = "etcd://127.0.0.1:2379";

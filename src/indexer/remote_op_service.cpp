@@ -18,7 +18,10 @@
 #include "dc_bilateral.hpp"                 // DcServerTransport
 #endif
 #ifdef RADIXSHMEM_HAS_ZMQ
-#include "zmq_transport.hpp"                // ZmqServerTransport (fallback)
+#include "zmq_transport.hpp"                // ZmqServerTransport
+#endif
+#ifdef RADIXSHMEM_HAS_GRPC
+#include "grpc_remote_op.hpp"               // GrpcRemoteOpServer
 #endif
 
 #include <algorithm>
@@ -149,15 +152,27 @@ RemoteOpAddr RadixServer::rc_build_endpoint(uint32_t rot_auth,
             "has no RDMA control-plane backend");
 #endif
     }
+    if (rot_auth == REMOTE_OP_TRANSPORT_GRPC) {
+#ifdef RADIXSHMEM_HAS_GRPC
+        auto g = std::make_unique<GrpcRemoteOpServer>(cfg_.remote_op_listen_port);
+        addr.port = g->port();   // actual bound port (throws on failure)
+        rc_server_ = std::move(g);
+        return addr;
+#else
+        throw std::runtime_error(
+            "remote-op: cluster authoritative transport is grpc but gRPC is "
+            "not compiled into this build");
+#endif
+    }
     if (rot_auth != REMOTE_OP_TRANSPORT_ZMQ) {
         throw std::runtime_error(
             "remote-op: cluster authoritative transport enum " +
             std::to_string(rot_auth) + " is not served by this build "
             "(removed xrc/rdma backend?) — redeploy rank 0 with "
-            "remote_op_transport = dc or zmq");
+            "remote_op_transport = grpc, dc or zmq");
     }
 #ifdef RADIXSHMEM_HAS_ZMQ
-    auto z = std::make_unique<ZmqServerTransport>(cfg_.zmq_listen_port);
+    auto z = std::make_unique<ZmqServerTransport>(cfg_.remote_op_listen_port);
     addr.port = z->bind();   // actual bound port (throws on failure)
     rc_server_ = std::move(z);
     return addr;
