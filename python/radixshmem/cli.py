@@ -130,6 +130,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="gRPC endpoint clients connect to (default: unix:///dev/shm/<name>.sock)")
     g.add_argument("--rpc-workers", type=int, default=32,
                    help="gRPC threads; one blocks per client with jobs in flight (default: 32)")
+    g.add_argument("--decode", action="store_true",
+                   help="PD disaggregation: this node serves decode (default: prefill)")
     g.add_argument("--interval", type=int, default=5, help="stats interval in seconds, 0 = silent")
     g.add_argument("--transfer-log", default="-",
                    help="one line per transfer that moved data (time, bytes, bandwidth): '-' = stdout, "
@@ -192,7 +194,7 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
         evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
-        transfer_log=a.transfer_log, cluster=cluster, **kw)
+        transfer_log=a.transfer_log, role="decode" if a.decode else "prefill", cluster=cluster, **kw)
 
 
 def _stats_line(srv: RadixServer) -> str:
@@ -238,6 +240,7 @@ def main(argv=None) -> None:
     print(f"Starting radix-server ({'index only' if cfg.index_only else 'index + data plane'})")
     print(f"  Name:           {cfg.name}")
     print(f"  Endpoint:       {cfg.resolved_endpoint}")
+    print(f"  Role:           {cfg.role}")
     if not cfg.index_only:
         print(f"  Data name:      {cfg.resolved_data_name}")
         print(f"  Data budget:    {fmt_size(cfg.data_bytes)}  (swa {cfg.swa_ratio:g}, "

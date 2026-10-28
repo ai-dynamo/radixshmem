@@ -228,7 +228,7 @@ def start_etcd(workdir: str):
     raise RuntimeError("etcd did not come up")
 
 
-def server_cmd(i, n, registry, cluster_id, workdir, index_dev, gid_idx, transports):
+def server_cmd(i, n, registry, cluster_id, workdir, index_dev, gid_idx, transports, decode=None):
     cmd = [
         sys.executable, "-m", "radixshmem.cli",
         "--name", SHM_PREFIX,
@@ -247,6 +247,8 @@ def server_cmd(i, n, registry, cluster_id, workdir, index_dev, gid_idx, transpor
     ]
     if index_dev:
         cmd += ["--index-dev", index_dev]
+    if decode if decode is not None else i == n - 1:      # the last node serves decode
+        cmd.append("--decode")
     return cmd
 
 
@@ -288,6 +290,20 @@ def wait_banner(procs, logs, needle, timeout, marks=None):
     if pending:
         raise RuntimeError(f"timeout waiting for {needle!r} on servers " + str(sorted(pending))
                            + "; log:\n" + tail(logs[sorted(pending)[0]]))
+
+
+def roles(n):
+    return {f"node{i}": "decode" if i == n - 1 else "prefill" for i in range(n)}
+
+
+def nodes_of(workdir, i):
+    import radixshmem
+
+    cl = radixshmem.RadixClient(SHM_PREFIX, endpoint=endpoint(workdir, i))
+    try:
+        return cl.nodes()
+    finally:
+        cl.close()
 
 
 def configure_all(n, workdir):
@@ -383,6 +399,11 @@ def orchestrate(args) -> int:
                                       workdir, args.index_dev, args.gid_idx,
                                       (args.rht_transport, args.peer_index_transport))
         wait_banner(servers, logs, "Waiting for a client's geometry", args.timeout)
+        for i in range(args.nodes):
+            ns = nodes_of(workdir, i)
+            check({r["node_name"]: r["role"] for r in ns} == roles(args.nodes)
+                  and all(r["rank"] == -1 and r["mode"] == "waiting" for r in ns),
+                  f"node{i} lists every node's role before any geometry")
         configure_all(args.nodes, workdir)
         wait_banner(servers, logs, "Cluster ready", args.timeout)
 
@@ -401,6 +422,16 @@ def orchestrate(args) -> int:
                   f"node{i} publishes the client's counts and its rank")
         check(sorted(ranks) == list(range(args.nodes)),
               f"etcd handed out dense ranks {sorted(ranks)}")
+        deadline = time.time() + 5            # the record is rewritten right after the banner
+        while True:
+            ns = nodes_of(workdir, 0)
+            if all(r["mode"] == "ready" for r in ns) or time.time() > deadline:
+                break
+            time.sleep(0.2)
+        check([(r["node_name"], r["rank"], r["role"], r["mode"]) for r in ns]
+              == sorted([(f"node{i}", ranks[i], roles(args.nodes)[f"node{i}"], "ready")
+                         for i in range(args.nodes)], key=lambda t: t[1]),
+              "nodes() lists every node ready, in rank order, with its role")
         try:
             radixshmem.RadixClient(SHM_PREFIX, radixshmem.Geometry(block_size=BLOCK_SIZE, full_slots=MAX_BLOCKS),
                                  endpoint=endpoint(workdir, 1))
@@ -468,9 +499,12 @@ def orchestrate(args) -> int:
             os.unlink(stale)
         mark = len(read(logs[v]))
         servers[v] = launch(server_cmd(v, args.nodes, registry, cluster_id, workdir, args.index_dev,
-                                       args.gid_idx, (args.rht_transport, args.peer_index_transport)),
+                                       args.gid_idx, (args.rht_transport, args.peer_index_transport),
+                                       decode=False),
                             logs[v])
         wait_banner([servers[v]], [logs[v]], "Waiting for a client's geometry", args.timeout, [mark])
+        check({r["node_name"]: r["role"] for r in nodes_of(workdir, 0)}[f"node{v}"] == "prefill",
+              f"node{v} restarted as prefill and its record says so at once")
         configure_one(workdir, v)
         wait_banner([servers[v]], [logs[v]], "Cluster ready", args.timeout, [mark])
         text = read(logs[v])[mark:]
@@ -511,6 +545,8 @@ def orchestrate(args) -> int:
 
         print(f"\n[8] node{v}'s lease expires; nothing waits for it")
         time.sleep(LEASE_TTL + 3)
+        check(f"node{v}" not in {r["node_name"] for r in nodes_of(workdir, 0)},
+              f"node{v}'s record left with its lease")
         t0 = time.time()
         r = run_client("publish9700", f"{SHM_PREFIX}_node0")
         check(r["insert_error"] == "InsertError.OK" and time.time() - t0 < 10,

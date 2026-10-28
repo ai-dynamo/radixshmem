@@ -58,6 +58,7 @@ class NodeInfo:
     last_error: str = ""            # why the last configuration failed; "" when none did
     swa_ratio: float = 0.0
     mamba_ratio: float = 0.0
+    role: str = "prefill"           # PD disaggregation role: "prefill" | "decode"
 
 
 @dataclass
@@ -142,6 +143,9 @@ class _Rpc:
 
     def configure(self, spec: Dict[str, Any]) -> NodeInfo:
         return NodeInfo(**self._stub.call("Configure", {"geometry": spec}, timeout=30))
+
+    def nodes(self) -> List[Dict[str, Any]]:
+        return self._stub.call("Nodes", timeout=30)["nodes"]
 
     def submit(self, items, timeout_ms) -> int:
         req = {"items": [[int(r), int(k), [int(x) for x in rs], [int(x) for x in ls]]
@@ -230,6 +234,13 @@ class RadixClient:
         server's ``last_error``) when its configuration failed."""
         self.info = self._t.wait_ready(timeout_s)
         return self.info
+
+    def nodes(self) -> List[Dict[str, Any]]:
+        """Every live server of the cluster as the server reads them from etcd:
+        dicts with node_name, role, rank (-1 before the rendezvous), mode,
+        data_plane, endpoint; ranked nodes first in rank order. A standalone
+        server returns only itself. Works in any server mode."""
+        return self._t.nodes()
 
     def _attach(self):
         """The index client, attached on first use once the server is ready."""

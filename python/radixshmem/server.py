@@ -53,7 +53,9 @@ _CLUSTER_FIELDS = (
     "enable_remote_query", "zmq_listen_port", "remote_op_transport")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
-_LEASE_TTL_S = 10    # etcd lease of the geometry key; kept alive while the server runs
+_LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
+
+ROLES = ("prefill", "decode")
 
 
 @dataclass
@@ -126,6 +128,7 @@ class ServerConfig:
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     rpc_workers: int = 32            # one blocks per client with jobs in flight
+    role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
 
     def __post_init__(self) -> None:
@@ -146,6 +149,8 @@ class ServerConfig:
             raise ValueError(f"unknown evict_policy {self.evict_policy!r}")
         if self.transfer_backend not in ("mooncake", "nixl"):
             raise ValueError(f"unknown transfer_backend {self.transfer_backend!r}")
+        if self.role not in ROLES:
+            raise ValueError(f"unknown role {self.role!r}")
 
     @property
     def index_only(self) -> bool:
@@ -183,33 +188,54 @@ def _nic_ip(ifname: str) -> str:
     return socket.inet_ntoa(packed[20:24])
 
 
-class _GeometryRegistry:
-    """``radix/<cluster_id>/geometry/<node>``: the uniform part of a node's
-    geometry as JSON. Published when the node accepts a geometry, before its
-    rendezvous (the peers it waits for at the membership gate may be waiting
-    for exactly this key), on a lease this server keeps alive for its
-    lifetime, so the key goes away with the process."""
+class _ServerRegistry:
+    """The server's own keys under ``radix/<cluster_id>/``, as JSON, on one
+    lease this server keeps alive for its lifetime, so they go away with the
+    process.
+
+    ``geometry/<node>``: the uniform part of a node's geometry. Published when
+    the node accepts a geometry, before its rendezvous (the peers it waits for
+    at the membership gate may be waiting for exactly this key).
+
+    ``nodes/<node>``: the node's record (role, rank, mode, ...). Published at
+    start and rewritten on every mode change."""
 
     def __init__(self, registry: str, cluster_id: str):
         self._kv = _core.EtcdKv(registry)
-        self._prefix = f"radix/{cluster_id}/geometry/"
+        self._base = f"radix/{cluster_id}/"
         self.lease = self._kv.grant_lease(_LEASE_TTL_S)
         self._kv.keep_alive(self.lease)
 
-    def list(self) -> List[Tuple[str, Dict[str, Any]]]:
+    def _list(self, sub: str) -> List[Tuple[str, Dict[str, Any]]]:
+        prefix = self._base + sub
         out = []
-        for key, value in self._kv.get_prefix(self._prefix):
+        for key, value in self._kv.get_prefix(prefix):
             try:
-                out.append((key[len(self._prefix):], json.loads(value)))
+                out.append((key[len(prefix):], json.loads(value)))
             except ValueError:
                 continue
         return out
 
+    def _put(self, key: str, value: Dict[str, Any]) -> None:
+        self._kv.put(self._base + key, json.dumps(value, sort_keys=True), self.lease)
+
+    def list(self) -> List[Tuple[str, Dict[str, Any]]]:
+        return self._list("geometry/")
+
     def publish(self, node: str, uniform: Dict[str, Any]) -> None:
-        self._kv.put(self._prefix + node, json.dumps(uniform, sort_keys=True), self.lease)
+        self._put("geometry/" + node, uniform)
 
     def unpublish(self, node: str) -> None:
-        self._kv.delete(self._prefix + node)
+        self._kv.delete(self._base + "geometry/" + node)
+
+    def list_nodes(self) -> List[Dict[str, Any]]:
+        return [rec for _, rec in self._list("nodes/")]
+
+    def publish_node(self, node: str, record: Dict[str, Any]) -> None:
+        self._put("nodes/" + node, record)
+
+    def unpublish_node(self, node: str) -> None:
+        self._kv.delete(self._base + "nodes/" + node)
 
     def close(self) -> None:
         try:
@@ -302,7 +328,7 @@ class RadixServer:
         self._cv = threading.Condition(threading.RLock())
         self._mode = MODE_STARTING
         self._index = self._iclient = self._store = self._backend = self._xfer = self._dreg = None
-        self._greg: Optional[_GeometryRegistry] = None
+        self._greg: Optional[_ServerRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
         self._zombies: List[int] = []
@@ -334,6 +360,7 @@ class RadixServer:
             "Submit": lambda r: {"ticket": self.submit(r["items"], r["timeout_ms"])},
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
+            "Nodes": lambda _: {"nodes": self.nodes()},
         }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
         if self.cfg.transfer_log and self._xlog is None:
             self._xlog = _TransferLog(self.cfg.transfer_log)
@@ -349,6 +376,7 @@ class RadixServer:
         with self._cv:
             self._mode = MODE_WAITING
             self._cv.notify_all()
+        self._publish_node()
         if self._greg is not None and not self.cfg.index_only:
             self._poller = threading.Thread(target=self._follow_cluster, name="radixshmem-geometry",
                                             daemon=True)
@@ -365,7 +393,7 @@ class RadixServer:
             raise ValueError("distributed mode requires cluster.rpc_address or cluster.rpc_interface")
         if not hasattr(_core, "EtcdKv"):
             raise RuntimeError("radixshmem was built without etcd; a cluster needs it")
-        self._greg = _GeometryRegistry(c.cluster.registry, c.cluster.cluster_id)
+        self._greg = _ServerRegistry(c.cluster.registry, c.cluster.cluster_id)
         if not c.index_only:
             self._backend = self._make_backend()
 
@@ -405,10 +433,11 @@ class RadixServer:
             self._xlog.close()
             self._xlog = None
         if self._greg is not None:
-            try:
-                self._greg.unpublish(self._node_key())
-            except Exception:  # noqa: BLE001
-                pass
+            for unpublish in (self._greg.unpublish, self._greg.unpublish_node):
+                try:
+                    unpublish(self._node_key())
+                except Exception:  # noqa: BLE001
+                    pass
             self._greg.close()
         self._teardown_regions()
         self._backend = self._greg = None
@@ -474,7 +503,30 @@ class RadixServer:
                 data_bytes=c.data_bytes,
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
-                mamba_ratio=float(c.mamba_ratio))
+                mamba_ratio=float(c.mamba_ratio),
+                role=c.role)
+
+    def _node_record(self) -> Dict[str, Any]:
+        info = self.describe()
+        return {"node_name": self._node_key() if self.cfg.distributed else info.node_name,
+                "role": info.role, "rank": info.rank, "mode": info.mode,
+                "data_plane": info.data_plane, "endpoint": self.cfg.resolved_endpoint}
+
+    def _publish_node(self) -> None:
+        if self._greg is None:
+            return
+        try:
+            self._greg.publish_node(self._node_key(), self._node_record())
+        except Exception as e:  # noqa: BLE001 - etcd hiccup; the next mode change rewrites it
+            print(f"radixshmem: publishing nodes/{self._node_key()} failed: {e}", file=sys.stderr)
+
+    def nodes(self) -> List[Dict[str, Any]]:
+        """Every live server's record in this cluster (``nodes/`` in etcd),
+        ranked nodes first in rank order; a standalone server only has its own."""
+        if self._greg is None:
+            return [self._node_record()]
+        recs = self._greg.list_nodes()
+        return sorted(recs, key=lambda r: (r.get("rank", -1) < 0, r.get("rank", -1), r.get("node_name", "")))
 
     def configure(self, geometry) -> NodeInfo:
         """Take a client's geometry: validate it, plan the pools, check it
@@ -522,6 +574,7 @@ class RadixServer:
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
+            self._publish_node()
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:
@@ -535,6 +588,7 @@ class RadixServer:
                 self._geometry = None
                 self._mode = MODE_WAITING
                 self._cv.notify_all()
+            self._publish_node()
 
     def _follow_cluster(self) -> None:
         """Data-mode cluster node: adopt the geometry a peer published. A
