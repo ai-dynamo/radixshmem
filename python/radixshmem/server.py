@@ -10,7 +10,7 @@ identity and cluster, the SlotStore budget (``data_bytes``, 0 = index-only)
 and its split between the pools (``swa_ratio`` / ``mamba_ratio``; FULL takes
 the rest), memory, transfer-engine and index tuning. What a slot looks like
 comes from a client: ``configure(Geometry)`` (the Configure RPC) or, in a
-cluster, the geometry another node's server already published in etcd.
+cluster, the geometry another node's server already created in etcd.
 Until then the server is ``waiting``. ``configure`` validates and plans
 synchronously and returns; a thread then creates the regions and joins the
 cluster (``configuring`` -> ``ready``, or back to ``waiting`` with
@@ -36,7 +36,7 @@ import time
 from collections import deque
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import ComponentType, EvictPolicy
@@ -189,22 +189,30 @@ def _nic_ip(ifname: str) -> str:
 
 
 class _ServerRegistry:
-    """The server's own keys under ``radix/<cluster_id>/``, as JSON, on one
-    lease this server keeps alive for its lifetime, so they go away with the
-    process.
+    """The server's keys under ``radix/<cluster_id>/``, as JSON.
 
-    ``geometry/<node>``: the uniform part of a node's geometry. Published when
-    the node accepts a geometry, before its rendezvous (the peers it waits for
-    at the membership gate may be waiting for exactly this key).
+    ``geometry``: the uniform part of the cluster's geometry, ``{"geometry",
+    "lease", "node"}``. The first node to accept a geometry creates it
+    (put-if-absent, so concurrent configures cannot both win), before its
+    rendezvous (the peers it waits for at the membership gate may be waiting
+    for exactly this key). It lives on a lease every node that accepted it
+    renews, so it goes away TTL after the last of them stops.
 
-    ``nodes/<node>``: the node's record (role, rank, mode, ...). Published at
-    start and rewritten on every mode change."""
+    ``nodes/<node>``: the node's record (role, rank, mode, ...), on this
+    server's own lease. Published at start and rewritten on every mode change."""
+
+    _HOLD_ATTEMPTS = 10
+    # The Go wrapper keeps one renewal per lease id per process; servers of one
+    # process that hold the same geometry lease share it by count.
+    _renewals: Dict[int, int] = {}
+    _renewals_mu = threading.Lock()
 
     def __init__(self, registry: str, cluster_id: str):
         self._kv = _core.EtcdKv(registry)
         self._base = f"radix/{cluster_id}/"
         self.lease = self._kv.grant_lease(_LEASE_TTL_S)
         self._kv.keep_alive(self.lease)
+        self.geometry_lease = 0          # the shared lease this server renews, 0 = none
 
     def _list(self, sub: str) -> List[Tuple[str, Dict[str, Any]]]:
         prefix = self._base + sub
@@ -219,14 +227,67 @@ class _ServerRegistry:
     def _put(self, key: str, value: Dict[str, Any]) -> None:
         self._kv.put(self._base + key, json.dumps(value, sort_keys=True), self.lease)
 
-    def list(self) -> List[Tuple[str, Dict[str, Any]]]:
-        return self._list("geometry/")
+    def geometry(self) -> Optional[Dict[str, Any]]:
+        """The published record, or None."""
+        raw = self._kv.get(self._base + "geometry")
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
 
-    def publish(self, node: str, uniform: Dict[str, Any]) -> None:
-        self._put("geometry/" + node, uniform)
+    def hold_geometry(self, uniform: Dict[str, Any], node: str,
+                      compare: Callable[[Dict[str, Any]], List[str]]) -> None:
+        """Create the cluster's geometry from ``uniform``, or join the one
+        already there when ``compare(published)`` finds no difference
+        (``GeometryMismatch`` otherwise); either way renew its lease."""
+        key = self._base + "geometry"
+        for _ in range(self._HOLD_ATTEMPTS):
+            raw = self._kv.get(key)
+            if raw is None:
+                lease = self._kv.grant_lease(_LEASE_TTL_S)
+                value = json.dumps({"geometry": uniform, "lease": lease, "node": node}, sort_keys=True)
+                if self._kv.create(key, value, lease):
+                    self._renew(lease)
+                    return
+                self._kv.revoke(lease)
+                continue
+            rec = json.loads(raw)
+            diffs = compare(rec["geometry"])
+            if diffs:
+                raise GeometryMismatch(
+                    f"geometry differs from the cluster's (created by {rec.get('node', '?')}): "
+                    + "; ".join(diffs) + "; use another cluster_id or stop every node of the cluster")
+            self._renew(int(rec["lease"]))
+            if self._kv.get(key) == raw:
+                return
+            self.release_geometry()     # the lease expired between the two reads
+        raise RuntimeError(f"{key} kept changing over {self._HOLD_ATTEMPTS} attempts")
 
-    def unpublish(self, node: str) -> None:
-        self._kv.delete(self._base + "geometry/" + node)
+    def _renew(self, lease: int) -> None:
+        if lease == self.geometry_lease:
+            return
+        self.release_geometry()
+        with self._renewals_mu:
+            n = self._renewals.get(lease, 0)
+            if n == 0:
+                self._kv.keep_alive(lease)
+            self._renewals[lease] = n + 1
+        self.geometry_lease = lease
+
+    def release_geometry(self) -> None:
+        """Stop renewing the geometry's lease without revoking it: other
+        nodes may still hold it."""
+        lease, self.geometry_lease = self.geometry_lease, 0
+        if not lease:
+            return
+        with self._renewals_mu:
+            n = self._renewals.pop(lease, 1) - 1
+            if n > 0:
+                self._renewals[lease] = n
+            else:
+                self._kv.keep_alive_stop(lease)
 
     def list_nodes(self) -> List[Dict[str, Any]]:
         return [rec for _, rec in self._list("nodes/")]
@@ -433,11 +494,11 @@ class RadixServer:
             self._xlog.close()
             self._xlog = None
         if self._greg is not None:
-            for unpublish in (self._greg.unpublish, self._greg.unpublish_node):
-                try:
-                    unpublish(self._node_key())
-                except Exception:  # noqa: BLE001
-                    pass
+            self._greg.release_geometry()
+            try:
+                self._greg.unpublish_node(self._node_key())
+            except Exception:  # noqa: BLE001
+                pass
             self._greg.close()
         self._teardown_regions()
         self._backend = self._greg = None
@@ -547,11 +608,9 @@ class RadixServer:
                     raise GeometryMismatch("server serves another geometry: " + "; ".join(diffs))
                 return self.describe()
             if self._greg is not None:
-                for node, published in self._greg.list():
-                    diffs = _geometry.diff_geometry(planned, published, counts=False)
-                    if diffs:
-                        raise GeometryMismatch(f"geometry differs from node {node}'s: " + "; ".join(diffs))
-                self._greg.publish(self._node_key(), _geometry.uniform_fields(planned))
+                self._greg.hold_geometry(
+                    _geometry.uniform_fields(planned), self._node_key(),
+                    lambda published: _geometry.diff_geometry(planned, published, counts=False))
             self._geometry, self.last_error = planned, ""
             self._mode = MODE_CONFIGURING
             self._worker = threading.Thread(target=self._configure_thread, name="radixshmem-configure",
@@ -561,7 +620,7 @@ class RadixServer:
             return self.describe()
 
     def _node_key(self) -> str:
-        """This node's name under geometry/: the configured node_name, else the
+        """This node's name under nodes/: the configured node_name, else the
         one the index derives from its bind IP (node<ip>)."""
         c = self.cfg.cluster
         if c.node_name:
@@ -578,10 +637,7 @@ class RadixServer:
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:
-                try:
-                    self._greg.unpublish(self._node_key())
-                except Exception:  # noqa: BLE001
-                    pass
+                self._greg.release_geometry()
             with self._cv:
                 self.last_error = f"{type(e).__name__}: {e}"
                 self._rejected = _geometry.uniform_fields(self._geometry)
@@ -599,12 +655,12 @@ class RadixServer:
                 if self._mode != MODE_WAITING:
                     continue
             try:
-                entries = self._greg.list()
+                rec = self._greg.geometry()
             except Exception:  # noqa: BLE001 - etcd hiccup, try again next round
                 continue
-            if not entries:
+            if rec is None:
                 continue
-            node, published = entries[0]
+            node, published = rec.get("node", "?"), rec["geometry"]
             if self._rejected is not None and not _geometry.diff_geometry(published, self._rejected,
                                                                           counts=False):
                 continue
