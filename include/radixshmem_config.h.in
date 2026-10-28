@@ -13,6 +13,9 @@
 // libzmq present: the ZMQ remote-op backend (fallback transport) compiles in.
 #cmakedefine RADIXSHMEM_HAS_ZMQ 1
 
+// grpc++ / protobuf present: the gRPC remote-op backend compiles in.
+#cmakedefine RADIXSHMEM_HAS_GRPC 1
+
 // etcd present (Go client wrapper libradix_etcd.so): the etcd-based cluster
 // bootstrap registry compiles in. The sole cluster bootstrap path in RDMA builds.
 #cmakedefine RADIXSHMEM_HAS_ETCD 1

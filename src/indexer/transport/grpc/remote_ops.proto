@@ -1,0 +1,77 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+// Remote-op control plane: one unary RPC per op against the target rank's
+// local tree. KV data never travels here. Request-level failures (bad
+// arguments, not serving, admission limit) are gRPC status codes; a business
+// failure (e.g. an exhausted slot pool) is an OK call carrying `error`.
+// Field numbers are fixed: retire a field by reserving its number.
+
+syntax = "proto3";
+
+package radixshmem.remoteops.v1;
+
+service RemoteOps {
+  rpc Allocate(AllocateRequest) returns (AllocateResponse);
+  rpc Query(QueryRequest) returns (QueryResponse);
+  rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc Recycle(RecycleRequest) returns (RecycleResponse);
+  rpc Unlock(UnlockRequest) returns (UnlockResponse);
+}
+
+// Mirrors radixshmem::InsertError (types.h); values are the same.
+enum InsertError {
+  INSERT_ERROR_OK = 0;
+  INSERT_ERROR_NODE_POOL_FULL = 1;
+  INSERT_ERROR_DATA_POOL_FULL = 2;
+  INSERT_ERROR_HT_POOL_FULL = 3;
+  INSERT_ERROR_MEMPOOL_FULL = 4;
+  INSERT_ERROR_REMOTE_FAILED = 5;
+  INSERT_ERROR_BAD_REQUEST = 6;
+  INSERT_ERROR_FULL_PATH_MISSING = 7;
+}
+
+// Reserve `num_blocks` slots; no hashes, no dedup. All-or-nothing.
+message AllocateRequest {
+  int32 num_blocks = 1;
+}
+message AllocateResponse {
+  InsertError error = 1;
+  repeated int32 slots = 2;  // num_blocks entries when error is OK, else empty
+}
+
+message QueryRequest {
+  repeated fixed64 hashes = 1;
+  bool lock = 2;          // pin the matched prefix until Unlock
+  bool update_meta = 3;   // bump LRU on the target
+}
+message QueryResponse {
+  int32 hit_length = 1;
+  repeated int32 slots = 2;  // hit_length entries
+}
+
+// Publish slots[i] for hashes[start + i] after the KV transfer completed.
+message InsertRequest {
+  repeated fixed64 hashes = 1;
+  repeated int32 slots = 2;
+  int32 start = 3;
+  bool auto_recycle = 4;  // target recycles the slots it did not consume
+}
+message InsertResponse {
+  InsertError error = 1;
+  repeated int32 unused_slots = 2;
+}
+
+// Return slots that were allocated but never published.
+message RecycleRequest {
+  repeated int32 slots = 1;
+}
+message RecycleResponse {}
+
+// Drop a Query(lock) pin over hashes[start, start + length).
+message UnlockRequest {
+  repeated fixed64 hashes = 1;
+  int32 start = 2;
+  int32 length = 3;
+}
+message UnlockResponse {}
