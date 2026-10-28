@@ -14,7 +14,7 @@
 
 namespace radixshmem {
 
-constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 11;  // lockstep with manifest v11
+constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 12;  // lockstep with manifest v12
 constexpr uint32_t CLUSTER_HELLO_MAGIC = 0x52584348; // "RXCH"
 constexpr uint32_t CLUSTER_REPLY_MAGIC = 0x52584352; // "RXCR"
 constexpr uint32_t CLUSTER_SHARDMAP_MAGIC = 0x52584d50; // "RXMP"

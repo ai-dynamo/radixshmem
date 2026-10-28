@@ -22,6 +22,10 @@ with an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-pe
 cd python && pip install -e .
 ```
 
+The cross-node remote ops use gRPC by default, which needs the grpc++ and protobuf development packages
+(Ubuntu: `apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc`). Without
+them the gRPC backend is left out of the build, and a cluster must choose `--remote-op-transport dc` or `zmq`.
+
 The optional data-plane backends are built separately; see [Transfer backends](#transfer-backends).
 
 ### Start the server

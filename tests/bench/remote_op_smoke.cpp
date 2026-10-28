@@ -223,13 +223,20 @@ int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--index-dev") && i + 1 < argc) g_index_dev = argv[++i];
         else if (!std::strcmp(argv[i], "--gid-idx") && i + 1 < argc) g_gid_idx = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "zmq") || !std::strcmp(argv[i], "dc")) rots.push_back(argv[i]);
+        else if (!std::strcmp(argv[i], "grpc") || !std::strcmp(argv[i], "zmq") ||
+                 !std::strcmp(argv[i], "dc")) rots.push_back(argv[i]);
         else {
-            fprintf(stderr, "usage: remote_op_smoke [--index-dev DEV] [--gid-idx G] [zmq] [dc]\n");
+            fprintf(stderr, "usage: remote_op_smoke [--index-dev DEV] [--gid-idx G] [grpc] [zmq] [dc]\n");
             return 2;
         }
     }
-    if (rots.empty()) rots = {"zmq", "dc"};
+    if (rots.empty()) {
+#ifdef RADIXSHMEM_HAS_GRPC
+        rots.push_back("grpc");
+#endif
+        rots.push_back("zmq");
+        rots.push_back("dc");
+    }
 
     int worst = 0;
     for (const auto& rot : rots) {

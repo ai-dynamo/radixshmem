@@ -13,7 +13,7 @@
 
 namespace radixshmem {
 
-static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 11; // 11: rht / peer-index transports split
+static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 12; // 12: grpc remote-op transport
 static constexpr uint32_t CLUSTER_MANIFEST_HOST_LEN = 64;
 static constexpr uint32_t CLUSTER_MANIFEST_ENTRY_SIZE = 352;
 static constexpr uint32_t CLUSTER_RHT_NAME_LEN = 64;
@@ -60,6 +60,7 @@ enum RemoteOpTransport : uint32_t {
     REMOTE_OP_TRANSPORT_ZMQ  = 0,
     REMOTE_OP_TRANSPORT_RDMA = 1,   // removed backend — reserved, rejected on read
     REMOTE_OP_TRANSPORT_DC   = 2,   // DCI/DCT
+    REMOTE_OP_TRANSPORT_GRPC = 3,   // gRPC over TCP
 };
 
 // One entry per rank (each server fills its own; master broadcasts the union).
@@ -71,8 +72,8 @@ struct PeerEntry {
     // Reachability — TCP bootstrap endpoint for this rank's XRC listener
     char     host[CLUSTER_MANIFEST_HOST_LEN];
     uint16_t xrc_listen_port;
-    // Remote-op endpoint port: zmq REP TCP port (0 = disabled); 0 under dc (rc_dct_num addresses)
-    uint16_t zmq_listen_port;
+    // Remote-op endpoint TCP port, grpc server or zmq REP (0 = disabled); 0 under dc (rc_dct_num addresses)
+    uint16_t remote_op_listen_port;
     uint32_t _pad2;
 
     // Shared memory layout (this peer's local shm region)

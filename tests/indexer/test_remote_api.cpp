@@ -463,10 +463,15 @@ int run_full_dedup() {
     }
 }
 
-// ---- #2 + #3: target unresponsive → TIMEOUT; cached session stays safe ----
+// ---- #2 + #3: target dead → TIMEOUT or UNAVAILABLE; cached session stays safe ----
 // The two sync fds are passed by number on the re-exec'd child's argv; they
 // survive execv (not CLOEXEC).
 int g_to_parent_fd = -1, g_from_parent_fd = -1;
+// A dead target is a deadline expiry (zmq/dc) or a refused connection (grpc).
+bool target_down(radixshmem::RemoteStatus st) {
+    return st == radixshmem::RemoteStatus::TIMEOUT ||
+           st == radixshmem::RemoteStatus::UNAVAILABLE;
+}
 int run_timeout_and_rebuild() {
     try {
         radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
@@ -478,20 +483,21 @@ int run_timeout_and_rebuild() {
         if (::write(g_to_parent_fd, &b, 1) != 1) return 181;
         if (::read(g_from_parent_fd, &b, 1) != 1) return 182;   // B is dead now
 
-        // #2: TIMEOUT reported in status, no hang, no throw.
+        // #2: the failure is reported in status, no hang, no throw.
         auto r = cli.remote_query(kTargetRank, h.data(), 4);
-        if (r.status != radixshmem::RemoteStatus::TIMEOUT) {
-            fprintf(stderr, "[timeout] status=%d expected TIMEOUT\n",
+        if (!target_down(r.status)) {
+            fprintf(stderr, "[timeout] status=%d expected TIMEOUT/UNAVAILABLE\n",
                     (int)r.status);
             return 183;
         }
-        // #3: the cached session survives; repeated ops keep reporting TIMEOUT,
-        // never crash (no per-call handle to invalidate).
+        // #3: the cached session survives; repeated ops keep reporting the
+        // failure, never crash (no per-call handle to invalidate).
         auto q = cli.remote_query(kTargetRank, h.data(), 4);
-        if (q.status != radixshmem::RemoteStatus::TIMEOUT) return 184;
+        if (!target_down(q.status)) return 184;
         auto rep = cli.remote_allocate(kTargetRank, 4);
-        if (rep.status != radixshmem::RemoteStatus::TIMEOUT) return 185;
-        fprintf(stderr, "[timeout] OK TIMEOUT + cached session safe\n");
+        if (!target_down(rep.status)) return 185;
+        fprintf(stderr, "[timeout] OK status=%d + cached session safe\n",
+                (int)r.status);
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[timeout] exception: %s\n", e.what());

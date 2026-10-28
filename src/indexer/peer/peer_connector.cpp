@@ -13,6 +13,9 @@
 #ifdef RADIXSHMEM_REMOTE_OP_RDMA
 #include "dc_bilateral.hpp"
 #endif
+#ifdef RADIXSHMEM_HAS_GRPC
+#include "grpc_remote_op.hpp"
+#endif
 
 #include <algorithm>
 #include <climits>
@@ -349,19 +352,34 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(
 #endif
     }
 
-    if (p.zmq_listen_port == 0)
+    if (p.remote_op_listen_port == 0)
         throw std::runtime_error(
             "open_remote: peer rank " + std::to_string(rank) +
             " has remote ops disabled (remote-op listen port == 0)");
-    std::string ep = "tcp://" + std::string(p.host) + ":" +
-                     std::to_string(p.zmq_listen_port);
+    std::string hostport = std::string(p.host) + ":" +
+                           std::to_string(p.remote_op_listen_port);
 
-    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_RDMA) {
+    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_GRPC) {
+#ifdef RADIXSHMEM_HAS_GRPC
+        auto t = std::make_unique<GrpcRemoteOpClientTransport>(
+            hostport, grpc_remote_op_timeout_ms());
+        auto rc = std::make_shared<RemotePeer>(std::move(t), "grpc://" + hostport);
+        rc->set_peer_rank(rank);
+        return rc;
+#else
         throw std::runtime_error(
-            "open_remote: cluster advertises the removed xrc/rdma "
-            "control-plane backend — redeploy rank 0 with remote_op_transport "
-            "= dc (or zmq)");
+            "open_remote: cluster remote-op transport is grpc but "
+            "gRPC is not compiled into this build");
+#endif
     }
+    if (cfg_.remote_op_transport != REMOTE_OP_TRANSPORT_ZMQ) {
+        throw std::runtime_error(
+            "open_remote: cluster advertises remote-op transport enum " +
+            std::to_string(cfg_.remote_op_transport) + ", which this build "
+            "does not serve (removed xrc/rdma backend?) — redeploy rank 0 "
+            "with remote_op_transport = grpc, dc or zmq");
+    }
+    std::string ep = "tcp://" + hostport;
 #ifdef RADIXSHMEM_HAS_ZMQ
     auto rc = std::make_shared<RemotePeer>(ep);
     rc->set_peer_rank(rank);
