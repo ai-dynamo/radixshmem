@@ -5,10 +5,12 @@
 
 #include "cluster_protocol.h"   // RemoteStatus
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace radixshmem {
@@ -75,17 +77,45 @@ struct ReplyContext {
     uint8_t  link_layer = 0;    // IBV_LINK_LAYER_* (drives AH is_global)
 };
 
-// Pure recv/reply; endpoint creation/publication done by rc_build_endpoint.
+class RemoteOpService;
+
+// Serving lifecycle of one backend; endpoint creation/publication is done by
+// rc_build_endpoint. stop() must run before destruction.
 class IRemoteOpServerTransport {
 public:
     virtual ~IRemoteOpServerTransport() = default;
 
+    // Serve `svc` until stop(); `svc` must outlive stop().
+    virtual void start(RemoteOpService& svc) = 0;
+    // Stop admitting ops and wait for in-flight handlers. Idempotent.
+    virtual void stop() = 0;
+};
+
+// DC/ZMQ: one poller per lane decodes the binary protocol, runs the op on
+// the service and sends the encoded reply over a recv/reply byte transport.
+class LegacyRemoteOpServerTransport : public IRemoteOpServerTransport {
+public:
+    void start(RemoteOpService& svc) override;
+    void stop() override;
+
+protected:
     virtual int lanes() const { return 1; }
     virtual int recv_request(std::vector<char>& buf, ReplyContext& ctx_out,
                              int timeout_ms, int lane = 0) = 0;
 
     virtual void send_reply(const ReplyContext& ctx,
                             const void* data, size_t len) = 0;
+
+private:
+    // Poller for `lane` — the sole thread that polls it: recv → validate →
+    // dispatch in place → send.
+    void loop(int lane);
+    std::vector<char> dispatch(const RemoteOpReqHeader& req,
+                               const uint64_t* hashes);
+
+    RemoteOpService*         svc_ = nullptr;
+    std::vector<std::thread> threads_;
+    std::atomic<bool>        running_{false};
 };
 
 } // namespace radixshmem

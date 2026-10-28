@@ -8,7 +8,7 @@
 #ifdef RADIXSHMEM_HAS_ZMQ
 
 #include "cluster_protocol.h"      // RemoteStatus
-#include "bilateral_transport.h"   // LegacyRemoteOpClientTransport, IRemoteOpServerTransport
+#include "bilateral_transport.h"   // LegacyRemoteOp{Client,Server}Transport
 
 #include <cstddef>
 #include <cstdint>
@@ -41,7 +41,7 @@ private:
     int         max_retry_       = 3;
 };
 
-class ZmqServerTransport : public IRemoteOpServerTransport {
+class ZmqServerTransport : public LegacyRemoteOpServerTransport {
 public:
     explicit ZmqServerTransport(uint16_t listen_port) : listen_port_(listen_port) {}
     ~ZmqServerTransport() override;
@@ -54,6 +54,7 @@ public:
     // the concrete type by rc_build_endpoint, which publishes the port.
     uint16_t bind();
 
+protected:
     int recv_request(std::vector<char>& buf, ReplyContext& ctx_out,
                      int timeout_ms, int lane = 0) override;
 

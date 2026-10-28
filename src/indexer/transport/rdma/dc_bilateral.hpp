@@ -5,7 +5,7 @@
 
 #include "cluster_protocol.h"     // RemoteStatus, RemoteOp* headers
 #include "rdma_transport.hpp"        // DcInitiator, DcTarget, dc_create_ah
-#include "bilateral_transport.h"   // LegacyRemoteOpClientTransport, IRemoteOpServerTransport
+#include "bilateral_transport.h"   // LegacyRemoteOp{Client,Server}Transport
 
 #include <array>
 #include <atomic>
@@ -82,7 +82,7 @@ private:
 
 // ---- server side: stateless; owns its lane pairs outright ----
 
-class DcServerTransport : public IRemoteOpServerTransport {
+class DcServerTransport : public LegacyRemoteOpServerTransport {
 public:
     DcServerTransport(RdmaContext& ctx, uint64_t dc_access_key, int lanes,
                       int k_pool = 64);
@@ -95,6 +95,7 @@ public:
     // Lane's DCT dctn (lane 0 → rc_dct_num, lanes 1..3 → rc_dct_num_extra).
     uint32_t dct_num(int lane) const;
 
+protected:
     int  recv_request(std::vector<char>& buf, ReplyContext& ctx_out,
                       int timeout_ms, int lane = 0) override;
 
