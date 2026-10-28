@@ -297,7 +297,8 @@ static int resolve_rc_client_rank(int default_rank) {
     return client_rank;
 }
 
-std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
+std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(
+        int rank, std::shared_ptr<std::mutex> stack_mu) {
     PeerEntry p;
     {
         std::shared_lock<std::shared_mutex> lk(peers_.mutex());
@@ -334,7 +335,8 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
                 "open_remote: ibv_create_ah to rank " +
                 std::to_string(rank) + " failed");
         auto t = std::make_unique<DcClientTransport>(
-            *dc_rc_ini_, *dc_rc_tgt_, ah, dctn, client_rank);
+            *dc_rc_ini_, *dc_rc_tgt_, ah, dctn, client_rank,
+            std::move(stack_mu));
         std::string dep = "dc://" + std::string(p.host) + "#" +
                           std::to_string(dctn);
         auto rc = std::make_shared<RemotePeer>(std::move(t), std::move(dep));
@@ -379,23 +381,16 @@ std::shared_ptr<RemotePeer> PeerConnector::open_remote(int rank) {
     std::lock_guard<std::mutex> g(rc_open_mu_);
     if (rc_client_rank_ < 0)
         rc_client_rank_ = resolve_rc_client_rank(peers_.my_rank());
-    const bool is_zmq = cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_ZMQ;
+    // DC sessions share one initiator+target stack; ZMQ sessions own theirs.
     std::shared_ptr<std::mutex> mu;
-    if (is_zmq) {
-        mu = std::make_shared<std::mutex>();
-    } else {
+    std::unique_lock<std::mutex> opg;
+    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_DC) {
         if (!rc_stack_op_mu_)
             rc_stack_op_mu_ = std::make_shared<std::mutex>();
         mu = rc_stack_op_mu_;
+        opg = std::unique_lock<std::mutex>(*mu);
     }
-    std::shared_ptr<RemotePeer> rc;
-    {
-        std::unique_lock<std::mutex> opg;
-        if (!is_zmq) opg = std::unique_lock<std::mutex>(*mu);
-        rc = build_rc_session(rank);
-    }
-    rc->set_op_mu(std::move(mu));
-    return rc;
+    return build_rc_session(rank, std::move(mu));
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA

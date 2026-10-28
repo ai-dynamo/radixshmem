@@ -89,7 +89,8 @@ class PeerConnector {
     void fault(int rank, const char* op, const std::exception& e,
                std::chrono::steady_clock::time_point t0);
 #ifndef RADIXSHMEM_NO_RDMA
-    std::shared_ptr<RemotePeer> build_rc_session(int rank);
+    std::shared_ptr<RemotePeer> build_rc_session(
+        int rank, std::shared_ptr<std::mutex> stack_mu);
 #endif
 
     PeerRegistry&        peers_;

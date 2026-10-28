@@ -923,17 +923,19 @@ InsertResult RadixClient::remote_insert(int rank,
                                         const int32_t* slots, bool auto_recycle) {
     InsertResult out;
     RemotePeer* p = peer_for(rank);
-    if (!p) { out.error = InsertError::REMOTE_FAILED; return out; }
+    if (!p) {
+        out.error = InsertError::REMOTE_FAILED;
+        out.remote_status = RemoteStatus::BAD_TARGET;
+        return out;
+    }
     return p->insert(hashes, n, start, length, slots, auto_recycle);
 }
 
 RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
-    // slots discriminate RemotePeer::release; null would fall into QUERY_RELEASE.
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
     RemotePeer* p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
-    return p->release(/*hashes=*/nullptr, /*n=*/0, /*start=*/0,
-                      /*length=*/num_slots, slots);
+    return p->recycle(slots, num_slots);
 }
 
 QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
@@ -965,7 +967,7 @@ RemoteStatus RadixClient::remote_unlock(int rank, const uint64_t* hashes, int n,
                                 int hit_length) {
     RemotePeer* p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
-    return p->release(hashes, n, 0, hit_length, /*slots=*/nullptr);
+    return p->unlock(hashes, n, 0, hit_length);
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA

@@ -94,6 +94,8 @@ enum class RemoteStatus : uint16_t {
     BAD_REPLY     = 5,  // reply received but magic/version/req_id check failed
     BAD_TARGET    = 6,  // remote_* target out of range / == own rank (client synthesized)
     INTERNAL      = 7,
+    UNAVAILABLE   = 8,  // target unreachable or not serving (may still have executed the op)
+    RESOURCE_EXHAUSTED = 9,  // target refused the op: concurrent admission limit reached
 };
 
 struct QueryResult {
@@ -376,6 +378,8 @@ struct QueryInternalDetail {
 
 struct InsertResult {
     InsertError error = InsertError::OK;
+    // remote_insert only: the comms status behind error == REMOTE_FAILED.
+    RemoteStatus remote_status = RemoteStatus::OK;
     // Slots not consumed (leading redundant prefix + unlanded suffix, merged).
     // Always populated; auto-recycled inside insert when auto_recycle=true.
     std::vector<int32_t> unused_slots;

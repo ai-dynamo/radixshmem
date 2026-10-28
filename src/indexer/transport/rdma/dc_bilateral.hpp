@@ -5,7 +5,7 @@
 
 #include "cluster_protocol.h"     // RemoteStatus, RemoteOp* headers
 #include "rdma_transport.hpp"        // DcInitiator, DcTarget, dc_create_ah
-#include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
+#include "bilateral_transport.h"   // LegacyRemoteOpClientTransport, IRemoteOpServerTransport
 
 #include <array>
 #include <atomic>
@@ -43,15 +43,19 @@ constexpr uint32_t kDcCtrlMaxReplyWire = sizeof(DcCtrlHeader) + REMOTE_OP_MAX_RE
 
 // ---- client side: shared initiator+target, per-session reply DCT ----
 
-class DcClientTransport : public IRemoteOpClientTransport {
+// `stack_mu` guards the shared initiator+target; the caller holds it across
+// construction (open_dct), and the dtor takes it around close_dct.
+class DcClientTransport : public LegacyRemoteOpClientTransport {
 public:
     DcClientTransport(DcInitiator& ini, DcTarget& tgt, ibv_ah* server_ah,
-                      uint32_t server_dctn, int client_rank, int max_retry = 3);
+                      uint32_t server_dctn, int client_rank,
+                      std::shared_ptr<std::mutex> stack_mu, int max_retry = 3);
     ~DcClientTransport() override;
 
     DcClientTransport(const DcClientTransport&) = delete;
     DcClientTransport& operator=(const DcClientTransport&) = delete;
 
+protected:
     RemoteStatus send_request(const void* req, size_t len, uint64_t req_id,
                               std::vector<char>& reply_out) override;
 

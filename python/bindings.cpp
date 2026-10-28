@@ -90,7 +90,9 @@ PYBIND11_MODULE(_core, m) {
         .value("TIMEOUT", RemoteStatus::TIMEOUT)
         .value("BAD_REPLY", RemoteStatus::BAD_REPLY)
         .value("BAD_TARGET", RemoteStatus::BAD_TARGET)
-        .value("INTERNAL", RemoteStatus::INTERNAL);
+        .value("INTERNAL", RemoteStatus::INTERNAL)
+        .value("UNAVAILABLE", RemoteStatus::UNAVAILABLE)
+        .value("RESOURCE_EXHAUSTED", RemoteStatus::RESOURCE_EXHAUSTED);
 
 
     m.attr("MAX_REMOTE_OP_BLOCKS") = MAX_REMOTE_OP_BLOCKS;
@@ -316,6 +318,7 @@ PYBIND11_MODULE(_core, m) {
 
     py::class_<InsertResult>(m, "InsertResult")
         .def_readonly("error", &InsertResult::error)
+        .def_readonly("remote_status", &InsertResult::remote_status)
         .def_property_readonly("unused_slots", [](const InsertResult& r) {
             return vec_to_npy_i32(r.unused_slots);
         });
@@ -661,6 +664,7 @@ PYBIND11_MODULE(_core, m) {
 
     py::class_<AllocateReply>(m, "AllocateReply")
         .def_readonly("status", &AllocateReply::status)
+        .def_readonly("error", &AllocateReply::error)
         .def_property_readonly("slots", [](const AllocateReply& r) {
             return vec_to_npy_i32(r.slots);
         });
