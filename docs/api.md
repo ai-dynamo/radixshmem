@@ -107,7 +107,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 
 > **Distributed criterion**: `want_cluster()` = `expected_min_nodes > 1 || num_rht_shards > 1 || world_size > 1`. If any of the three holds, etcd + RDMA bootstrap is used, and in that case **one of** `rpc_address` / `rpc_interface` **must be given**; otherwise `bootstrap()` throws `std::runtime_error`.
 
-> **Lane count**: the remote-op service lane count P (one poller thread per lane; at most 4 for the dc backend, always 1 for zmq) is not a config field. It is controlled only by env `RADIXSHMEM_RC_LANES` (default 1; must be set before bootstrap). The grpc backend has no lanes: it runs at most `RADIXSHMEM_GRPC_MAX_INFLIGHT` ops at once (default 32) and answers the excess with `RESOURCE_EXHAUSTED`. Each grpc op has a deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000) on the client side.
+> **Lane count**: the remote-op service lane count P (one poller thread per lane; at most 4 for the dc backend, always 1 for zmq) is not a config field. It is controlled only by env `RADIXSHMEM_RC_LANES` (default 1; must be set before bootstrap). The grpc backend has no lanes: it runs at most 32 ops at once and answers the excess with `RESOURCE_EXHAUSTED`. Each grpc op has a deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000) on the client side.
 
 > **Switching or rolling back the remote-op backend**: set `remote_op_transport` on rank 0 and restart every node. All nodes and clients of a cluster must run the same build: the manifest and the shard map carry a version, and a node of another version is rejected at bootstrap (`bad shard-map blob ... another cluster protocol version`). Mixed-version rolling upgrades are not supported.
 

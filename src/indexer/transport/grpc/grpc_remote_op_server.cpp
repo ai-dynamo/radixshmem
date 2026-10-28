@@ -17,9 +17,6 @@
 
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
-#include <cstdio>
-#include <cstdlib>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
@@ -35,15 +32,6 @@ constexpr int kMaxMessageBytes = 64 * 1024;
 constexpr int kNumCqs     = 4;
 constexpr int kMinPollers = 4;   // per CQ
 constexpr int kMaxPollers = 8;   // per CQ
-
-int resolve_max_inflight(int requested) {
-    if (requested > 0) return requested;
-    if (const char* e = ::getenv("RADIXSHMEM_GRPC_MAX_INFLIGHT")) {
-        int v = std::atoi(e);
-        if (v > 0) return v;
-    }
-    return 32;
-}
 
 // A service-level reject: BAD_REQUEST is the caller's fault, the rest ours.
 grpc::Status to_grpc_status(RemoteStatus st) {
@@ -61,62 +49,36 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     int port = 0;
     int max_inflight = 0;
 
-    RemoteOpService*        svc = nullptr;
-    std::atomic<bool>       ready{false};
-    std::atomic<int>        inflight{0};
-    std::mutex              drain_mu;
-    std::condition_variable drained;
-    std::once_flag          stopped;
+    RemoteOpService*  svc = nullptr;
+    std::atomic<bool> ready{false};
+    std::atomic<int>  inflight{0};
+    std::once_flag    stopped;
 
-    // Admission: ready gate, then the in-flight bound. The gate is re-read
-    // after the increment so stop() never misses a handler it must wait for.
-    grpc::Status enter() {
+    // Ready gate, then the in-flight bound; run `op` (which fills the
+    // response) and map a throw to INTERNAL.
+    template <typename Op>
+    grpc::Status run(Op&& op) {
         if (!ready.load())
             return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                                 "remote-op: server not serving");
+        grpc::Status st;
         if (inflight.fetch_add(1) >= max_inflight) {
-            leave();
-            return grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
-                                "remote-op: too many ops in flight");
+            st = grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                              "remote-op: too many ops in flight");
+        } else {
+            try {
+                st = op();
+            } catch (const std::exception& e) {
+                st = grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+            }
         }
-        if (!ready.load()) {
-            leave();
-            return grpc::Status(grpc::StatusCode::UNAVAILABLE,
-                                "remote-op: server not serving");
-        }
-        return grpc::Status::OK;
-    }
-
-    void leave() {
-        if (inflight.fetch_sub(1) == 1) {
-            std::lock_guard<std::mutex> g(drain_mu);
-            drained.notify_all();
-        }
-    }
-
-    // Admit, run `op` (which fills the response), map a throw to INTERNAL.
-    template <typename Op>
-    grpc::Status run(const char* name, Op&& op) {
-        grpc::Status st = enter();
-        if (!st.ok()) return st;
-        try {
-            st = op();
-        } catch (const std::exception& e) {
-            static std::atomic<uint64_t> thrown{0};
-            uint64_t k = thrown.fetch_add(1, std::memory_order_relaxed);
-            if (k < 8 || (k & 1023) == 0)
-                fprintf(stderr, "[RadixServer] grpc %s handler threw "
-                        "(occ %llu): %s\n", name,
-                        (unsigned long long)(k + 1), e.what());
-            st = grpc::Status(grpc::StatusCode::INTERNAL, e.what());
-        }
-        leave();
+        inflight.fetch_sub(1);
         return st;
     }
 
     grpc::Status Allocate(grpc::ServerContext*, const pb::AllocateRequest* req,
                           pb::AllocateResponse* rep) override {
-        return run("Allocate", [&] {
+        return run([&] {
             AllocateReply r = svc->allocate(req->num_blocks());
             if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
             rep->set_error(static_cast<pb::InsertError>(r.error));
@@ -127,7 +89,7 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
 
     grpc::Status Query(grpc::ServerContext*, const pb::QueryRequest* req,
                        pb::QueryResponse* rep) override {
-        return run("Query", [&] {
+        return run([&] {
             QueryReply r = svc->query(req->hashes().data(), req->hashes_size(),
                                       req->lock(), req->update_meta());
             if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
@@ -139,7 +101,7 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
 
     grpc::Status Insert(grpc::ServerContext*, const pb::InsertRequest* req,
                         pb::InsertResponse* rep) override {
-        return run("Insert", [&] {
+        return run([&] {
             InsertResult r = svc->insert(
                 req->hashes().data(), req->hashes_size(), req->start(),
                 req->slots().data(), req->slots_size(), req->auto_recycle());
@@ -154,7 +116,7 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
 
     grpc::Status Recycle(grpc::ServerContext*, const pb::RecycleRequest* req,
                          pb::RecycleResponse*) override {
-        return run("Recycle", [&] {
+        return run([&] {
             RemoteStatus st = svc->recycle(req->slots().data(),
                                            req->slots_size());
             return st == RemoteStatus::OK ? grpc::Status::OK
@@ -164,7 +126,7 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
 
     grpc::Status Unlock(grpc::ServerContext*, const pb::UnlockRequest* req,
                         pb::UnlockResponse*) override {
-        return run("Unlock", [&] {
+        return run([&] {
             RemoteStatus st = svc->unlock(req->hashes().data(),
                                           req->hashes_size(), req->start(),
                                           req->length());
@@ -176,7 +138,7 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
 
 GrpcRemoteOpServer::GrpcRemoteOpServer(uint16_t listen_port, int max_inflight)
     : impl_(std::make_unique<Impl>()) {
-    impl_->max_inflight = resolve_max_inflight(max_inflight);
+    impl_->max_inflight = max_inflight > 0 ? max_inflight : 32;
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort("0.0.0.0:" + std::to_string(listen_port),
@@ -213,13 +175,10 @@ void GrpcRemoteOpServer::start(RemoteOpService& svc) {
 
 void GrpcRemoteOpServer::stop() {
     std::call_once(impl_->stopped, [this] {
-        // Close the gate, wait out the handlers already running (they hold
-        // the service), then stop the server.
+        // Close the gate; Shutdown returns only after the handlers already
+        // running (they hold the service) have returned. Calls still open
+        // at the deadline are cancelled on the wire.
         impl_->ready.store(false);
-        {
-            std::unique_lock<std::mutex> g(impl_->drain_mu);
-            impl_->drained.wait(g, [this] { return impl_->inflight.load() == 0; });
-        }
         impl_->server->Shutdown(std::chrono::system_clock::now() +
                                 std::chrono::seconds(1));
         impl_->server->Wait();

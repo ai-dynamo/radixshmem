@@ -8,7 +8,6 @@
 #ifdef RADIXSHMEM_HAS_GRPC
 
 #include "radix_client.h"       // AllocateReply, QueryReply
-#include "cluster_protocol.h"   // MAX_REMOTE_OP_BLOCKS
 #include "remote_ops.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>
@@ -46,7 +45,8 @@ bool to_insert_error(pb::InsertError e, InsertError& out) {
     return true;
 }
 
-bool valid_count(int n) { return n >= 0 && n <= MAX_REMOTE_OP_BLOCKS; }
+// The array can be copied into a request; range checks are the server's.
+bool copyable(const void* p, int n) { return n >= 0 && (n == 0 || p); }
 
 }  // namespace
 
@@ -85,7 +85,6 @@ GrpcRemoteOpClientTransport::~GrpcRemoteOpClientTransport() = default;
 
 AllocateReply GrpcRemoteOpClientTransport::allocate(int n) {
     AllocateReply out;
-    if (!valid_count(n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
     pb::AllocateRequest req;
     req.set_num_blocks(n);
     pb::AllocateResponse rep;
@@ -106,10 +105,7 @@ AllocateReply GrpcRemoteOpClientTransport::allocate(int n) {
 QueryReply GrpcRemoteOpClientTransport::query(const uint64_t* hashes, int n,
                                               bool lock, bool update_meta) {
     QueryReply out;
-    if (!valid_count(n) || (n > 0 && !hashes)) {
-        out.status = RemoteStatus::BAD_REQUEST;
-        return out;
-    }
+    if (!copyable(hashes, n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
     pb::QueryRequest req;
     req.mutable_hashes()->Add(hashes, hashes + n);
     req.set_lock(lock);
@@ -133,8 +129,7 @@ InsertResult GrpcRemoteOpClientTransport::insert(
         const uint64_t* hashes, int n, int start, int length,
         const int32_t* slots, bool auto_recycle) {
     InsertResult out;
-    if (!valid_count(n) || length < 0 || start < 0 || start > n - length ||
-        (n > 0 && !hashes) || (length > 0 && !slots)) {
+    if (!copyable(hashes, n) || !copyable(slots, length)) {
         out.error = InsertError::REMOTE_FAILED;
         out.remote_status = RemoteStatus::BAD_REQUEST;
         return out;
@@ -164,8 +159,7 @@ InsertResult GrpcRemoteOpClientTransport::insert(
 
 RemoteStatus GrpcRemoteOpClientTransport::recycle(const int32_t* slots,
                                                   int num_slots) {
-    if (!valid_count(num_slots) || (num_slots > 0 && !slots))
-        return RemoteStatus::BAD_REQUEST;
+    if (!copyable(slots, num_slots)) return RemoteStatus::BAD_REQUEST;
     pb::RecycleRequest req;
     req.mutable_slots()->Add(slots, slots + num_slots);
     pb::RecycleResponse rep;
@@ -176,9 +170,7 @@ RemoteStatus GrpcRemoteOpClientTransport::recycle(const int32_t* slots,
 
 RemoteStatus GrpcRemoteOpClientTransport::unlock(const uint64_t* hashes, int n,
                                                  int start, int length) {
-    if (!valid_count(n) || length < 0 || start < 0 || start > n - length ||
-        (n > 0 && !hashes))
-        return RemoteStatus::BAD_REQUEST;
+    if (!copyable(hashes, n)) return RemoteStatus::BAD_REQUEST;
     pb::UnlockRequest req;
     req.mutable_hashes()->Add(hashes, hashes + n);
     req.set_start(start);
