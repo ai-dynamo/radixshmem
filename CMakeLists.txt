@@ -21,6 +21,9 @@ option(ENABLE_RDMA "Build RDMA-dependent sources (requires libibverbs)" ON)
 # ZeroMQ (libzmq) is optional — powers the zmq remote-op control plane backend.
 option(ENABLE_ZMQ "Build ZeroMQ-dependent remote-insert sources (requires libzmq)" ON)
 
+# gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin) — the default remote-op control plane backend.
+option(ENABLE_GRPC "Build the gRPC remote-op backend (requires grpc++ and protobuf)" ON)
+
 option(ENABLE_ETCD "Build the etcd cluster-bootstrap registry (requires Go toolchain)" ON)
 
 # Mooncake TransferEngine backs the data plane's transfer backend (src/transfer).
@@ -147,6 +150,64 @@ if(ENABLE_ZMQ AND ENABLE_RDMA)
     endif()
 else()
     message(STATUS "ZeroMQ disabled (ENABLE_ZMQ=${ENABLE_ZMQ}, ENABLE_RDMA=${ENABLE_RDMA})")
+endif()
+
+# ==================== gRPC (remote-op control plane) ====================
+# grpc++ / protobuf via pkg-config plus protoc and grpc_cpp_plugin. The generated
+# code lives in its own static library under the build tree; only the backend
+# sources (src/indexer/transport/grpc) see it.
+set(RADIXSHMEM_GRPC_FOUND OFF)
+if(ENABLE_GRPC AND ENABLE_RDMA)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(GRPCPP QUIET grpc++)
+        pkg_check_modules(PROTOBUF QUIET protobuf)
+    endif()
+    find_program(PROTOC_EXECUTABLE protoc)
+    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin)
+    if(GRPCPP_FOUND AND PROTOBUF_FOUND AND PROTOC_EXECUTABLE AND GRPC_CPP_PLUGIN)
+        set(_grpc_proto_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+        set(_grpc_gen_dir   ${CMAKE_BINARY_DIR}/generated/grpc)
+        set(_grpc_gen_srcs
+            ${_grpc_gen_dir}/remote_ops.pb.cc
+            ${_grpc_gen_dir}/remote_ops.grpc.pb.cc)
+        file(MAKE_DIRECTORY ${_grpc_gen_dir})
+        add_custom_command(
+            OUTPUT ${_grpc_gen_srcs}
+                   ${_grpc_gen_dir}/remote_ops.pb.h
+                   ${_grpc_gen_dir}/remote_ops.grpc.pb.h
+            COMMAND ${PROTOC_EXECUTABLE}
+                    --proto_path=${_grpc_proto_dir}
+                    --cpp_out=${_grpc_gen_dir}
+                    --grpc_out=${_grpc_gen_dir}
+                    --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
+                    ${_grpc_proto_dir}/remote_ops.proto
+            DEPENDS ${_grpc_proto_dir}/remote_ops.proto
+            COMMENT "Generating remote-op gRPC code (remote_ops.proto)"
+            VERBATIM)
+        add_library(radixshmem_grpc_proto STATIC ${_grpc_gen_srcs})
+        set_property(TARGET radixshmem_grpc_proto PROPERTY POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(radixshmem_grpc_proto PUBLIC
+            ${_grpc_gen_dir} ${GRPCPP_INCLUDE_DIRS} ${PROTOBUF_INCLUDE_DIRS})
+        target_link_directories(radixshmem_grpc_proto PUBLIC
+            ${GRPCPP_LIBRARY_DIRS} ${PROTOBUF_LIBRARY_DIRS})
+        target_link_libraries(radixshmem_grpc_proto PUBLIC
+            ${GRPCPP_LIBRARIES} ${PROTOBUF_LIBRARIES})
+
+        target_sources(radixshmem PRIVATE
+            src/indexer/transport/grpc/grpc_remote_op_client.cpp
+            src/indexer/transport/grpc/grpc_remote_op_server.cpp)
+        target_include_directories(radixshmem PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+        target_link_libraries(radixshmem PRIVATE radixshmem_grpc_proto)
+        set(RADIXSHMEM_GRPC_FOUND ON)
+        set(RADIXSHMEM_HAS_GRPC ON)
+        message(STATUS "gRPC found (grpc++ ${GRPCPP_VERSION}, protobuf ${PROTOBUF_VERSION}) — grpc remote-op backend enabled")
+    else()
+        message(STATUS "gRPC not found (grpc++/protobuf via pkg-config, protoc, grpc_cpp_plugin) — grpc remote-op backend disabled")
+    endif()
+else()
+    message(STATUS "gRPC disabled (ENABLE_GRPC=${ENABLE_GRPC}, ENABLE_RDMA=${ENABLE_RDMA})")
 endif()
 
 # ==================== radixshmem_registry: the etcd plane (Go client wrapper) ====================
@@ -437,6 +498,17 @@ if(ENABLE_RDMA)
     add_test(NAME test_remote_api_dcd COMMAND test_remote_api)
     set_tests_properties(test_remote_api_dcd PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_REMOTE_OP_TRANSPORT=dc")
+endif()
+
+# gRPC remote-op backend over loopback: a real single-node tree behind the
+# server, no RDMA device or etcd needed.
+if(RADIXSHMEM_GRPC_FOUND)
+    add_executable(test_remote_op_grpc tests/indexer/test_remote_op_grpc.cpp)
+    target_link_libraries(test_remote_op_grpc PRIVATE radixshmem radixshmem_grpc_proto)
+    target_include_directories(test_remote_op_grpc PRIVATE
+        ${CMAKE_SOURCE_DIR}/tests/indexer ${CMAKE_SOURCE_DIR}/src/indexer)
+    radixshmem_enable_asserts(test_remote_op_grpc)
+    add_test(NAME test_remote_op_grpc COMMAND test_remote_op_grpc)
 endif()
 
 # Data-plane geometry in the shared etcd registry. Needs an etcd binary but no
