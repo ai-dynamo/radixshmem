@@ -196,10 +196,30 @@ def test_cli_builds_the_server_config():
     assert cli.build_config(cli.parse_args([])).index_only
     assert cli.build_config(cli.parse_args([])).transfer_log == "-"
     assert cli.build_config(cli.parse_args(["--transfer-log", ""])).transfer_log == ""
+    assert cli.build_config(cli.parse_args([])).role == "prefill"
+    assert cli.build_config(cli.parse_args(["--decode"])).role == "decode"
     with pytest.raises(ValueError, match="--swa-ratio"):
         cli.build_config(cli.parse_args(["--swa-ratio", "0.1"]))
     with pytest.raises(ValueError, match="ratio"):
         cli.build_config(cli.parse_args(["--data-bytes", "1M", "--swa-ratio", "0.6", "--mamba-ratio", "0.5"]))
+
+
+def test_role_in_node_info_and_nodes(cfg):
+    with pytest.raises(ValueError, match="role"):
+        cfg(role="mixed")
+    for role in ("prefill", "decode"):
+        c = cfg(role=role) if role == "decode" else cfg()
+        srv = RadixServer(c).start()
+        try:
+            cl = client(c)
+            assert cl.info.role == role
+            nodes = cl.nodes()
+            assert len(nodes) == 1 and nodes[0]["role"] == role
+            assert nodes[0]["rank"] == -1 and nodes[0]["mode"] == "waiting"
+            assert nodes[0]["endpoint"] == c.endpoint
+            cl.close()
+        finally:
+            srv.close()
 
 
 def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):

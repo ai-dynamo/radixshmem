@@ -7,7 +7,8 @@
 Methods: Describe() -> NodeInfo; WaitReady({"timeout_ms"}) -> NodeInfo;
 Configure({"geometry"}) -> NodeInfo; Submit({"items", "timeout_ms"}) ->
 {"ticket"}; WaitAny({"tickets", "timeout_ms"}) -> {"done": {ticket: [[ok,
-bytes, descriptors, error], ...]}, "unknown": [ticket, ...]}; Stats() -> dict.
+bytes, descriptors, error], ...]}, "unknown": [ticket, ...]}; Stats() -> dict;
+Nodes() -> {"nodes": [node record, ...]}.
 The slot geometry is what a client configured (or a peer published);
 Describe publishes it and clients adopt it.
 """
