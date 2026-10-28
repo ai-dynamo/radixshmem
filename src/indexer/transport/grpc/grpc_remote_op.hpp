@@ -45,12 +45,12 @@ private:
 
 // Named-RPC server. The ctor binds and starts accepting; every op fails
 // UNAVAILABLE until start(svc) opens the ready gate. At most `max_inflight`
-// ops run at once, the rest fail RESOURCE_EXHAUSTED. stop() closes the gate,
-// waits for running handlers, then shuts the server down.
+// ops run at once, the rest fail RESOURCE_EXHAUSTED. stop() closes the gate
+// and shuts the server down once the running handlers have returned.
 class GrpcRemoteOpServer : public IRemoteOpServerTransport {
 public:
-    // listen_port 0 = OS-assigned; max_inflight <= 0 =
-    // RADIXSHMEM_GRPC_MAX_INFLIGHT, else 32. Throws when the bind fails.
+    // listen_port 0 = OS-assigned; max_inflight <= 0 = 32. Throws when the
+    // bind fails.
     explicit GrpcRemoteOpServer(uint16_t listen_port, int max_inflight = 0);
     ~GrpcRemoteOpServer() override;
 
