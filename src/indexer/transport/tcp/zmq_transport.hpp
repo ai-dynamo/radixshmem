@@ -8,7 +8,7 @@
 #ifdef RADIXSHMEM_HAS_ZMQ
 
 #include "cluster_protocol.h"      // RemoteStatus
-#include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
+#include "bilateral_transport.h"   // LegacyRemoteOpClientTransport, IRemoteOpServerTransport
 
 #include <cstddef>
 #include <cstdint>
@@ -17,7 +17,7 @@
 
 namespace radixshmem {
 
-class ZmqClientTransport : public IRemoteOpClientTransport {
+class ZmqClientTransport : public LegacyRemoteOpClientTransport {
 public:
     explicit ZmqClientTransport(const std::string& endpoint,
                                 int recv_timeout_ms = 5000, int max_retry = 3);
@@ -26,6 +26,7 @@ public:
     ZmqClientTransport(const ZmqClientTransport&) = delete;
     ZmqClientTransport& operator=(const ZmqClientTransport&) = delete;
 
+protected:
     RemoteStatus send_request(const void* req, size_t len, uint64_t req_id,
                               std::vector<char>& reply_out) override;
 

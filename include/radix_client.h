@@ -38,6 +38,7 @@ class IRemoteOpClientTransport;
 
 struct AllocateReply {
     RemoteStatus status = RemoteStatus::OK;
+    InsertError  error  = InsertError::OK;   // MEMPOOL_FULL when status is OK but nothing was allocated
     std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
 };
 
@@ -72,9 +73,9 @@ public:
     QueryReply query(const uint64_t* hashes, int n, bool lock = false,
                      bool update_meta = true);
 
-    // Returns the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
-    RemoteStatus release(const uint64_t* hashes, int n, int start, int length,
-                 const int32_t* slots = nullptr);
+    // Both return the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
+    RemoteStatus recycle(const int32_t* slots, int num_slots);
+    RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length);
 
     const std::string& endpoint() const { return endpoint_; }
 
@@ -82,26 +83,9 @@ public:
     int  peer_rank() const { return peer_rank_; }
     void set_peer_rank(int r) { peer_rank_ = r; }
 
-    void set_op_mu(std::shared_ptr<std::mutex> mu) { op_mu_ = std::move(mu); }
-
 private:
-
-    RemoteStatus request(const void* req, size_t req_len,
-                         std::vector<char>& reply_out);
-
-    RemoteStatus send_ack_op(uint16_t op, const uint64_t* hashes, int n,
-                     int start, int length, const int32_t* slots,
-                     uint16_t flags = 0);
-
-    std::unique_lock<std::mutex> guard() const {
-        return op_mu_ ? std::unique_lock<std::mutex>(*op_mu_)
-                      : std::unique_lock<std::mutex>();
-    }
-
     std::unique_ptr<IRemoteOpClientTransport> transport_;
     std::string endpoint_;
-    uint64_t    next_req_id_  = 0;
-    std::shared_ptr<std::mutex> op_mu_;
     int         peer_rank_    = -1;
 };
 

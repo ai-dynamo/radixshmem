@@ -32,8 +32,10 @@ uint64_t make_incarnation() {
 
 DcClientTransport::DcClientTransport(DcInitiator& ini, DcTarget& tgt,
                                      ibv_ah* server_ah, uint32_t server_dctn,
-                                     int client_rank, int max_retry)
-    : ini_(ini), tgt_(tgt), server_ah_(server_ah), server_dctn_(server_dctn),
+                                     int client_rank,
+                                     std::shared_ptr<std::mutex> stack_mu,
+                                     int max_retry)
+    : LegacyRemoteOpClientTransport(std::move(stack_mu)), ini_(ini), tgt_(tgt), server_ah_(server_ah), server_dctn_(server_dctn),
       client_rank_(client_rank), max_retry_(max_retry),
       incarnation_(make_incarnation()), reply_dctn_(tgt.open_dct()) {
     try {
@@ -59,6 +61,7 @@ DcClientTransport::DcClientTransport(DcInitiator& ini, DcTarget& tgt,
 }
 
 DcClientTransport::~DcClientTransport() {
+    auto g = guard();
     if (server_ah_) ibv_destroy_ah(server_ah_);
     tgt_.close_dct(reply_dctn_);
 }

@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Client half of the remote-op plane: RemotePeer, a request/reply session to a
-// peer's local tree. Server half lives in remote_op_service.cpp.
+// peer's local tree, and the legacy binary protocol behind the DC/ZMQ
+// transports. Server half lives in remote_op_service.cpp.
 #include "radix_client.h"          // RemotePeer decl + reply structs
 
 #ifndef RADIXSHMEM_NO_RDMA
 
 #include "cluster_protocol.h"       // remote-op wire structs
-#include "bilateral_transport.h"    // IRemoteOpClientTransport
+#include "bilateral_transport.h"    // IRemoteOpClientTransport, LegacyRemoteOpClientTransport
 
 #include <cstdint>
 #include <cstring>
@@ -51,24 +52,11 @@ bool read_slots(const std::vector<char>& reply, int num_slots,
 
 }  // namespace
 
-RemotePeer::RemotePeer(
-    std::unique_ptr<IRemoteOpClientTransport> transport, std::string endpoint)
-    : transport_(std::move(transport)), endpoint_(std::move(endpoint)) {}
+LegacyRemoteOpClientTransport::LegacyRemoteOpClientTransport(
+    std::shared_ptr<std::mutex> op_mu)
+    : op_mu_(op_mu ? std::move(op_mu) : std::make_shared<std::mutex>()) {}
 
-RemotePeer::~RemotePeer() {
-    auto g = guard();
-    transport_.reset();
-}
-RemotePeer::RemotePeer(RemotePeer&&) noexcept = default;
-RemotePeer& RemotePeer::operator=(RemotePeer&&) noexcept = default;
-
-RemoteStatus RemotePeer::request(const void* req, size_t req_len,
-                                     std::vector<char>& reply_out) {
-    // next_req_id_ was just stamped into the request header by the caller.
-    return transport_->send_request(req, req_len, next_req_id_, reply_out);
-}
-
-AllocateReply RemotePeer::allocate(int n) {
+AllocateReply LegacyRemoteOpClientTransport::allocate(int n) {
     auto g = guard();
     AllocateReply out;
     // ALLOCATE carries no hashes: n is the slot count, request is header-only.
@@ -87,21 +75,21 @@ AllocateReply RemotePeer::allocate(int n) {
     // flags stays 0: bit0 is reserved.
 
     std::vector<char> reply;
-    RemoteStatus st = request(req.data(), req.size(), reply);
+    RemoteStatus st = send_request(req.data(), req.size(), next_req_id_, reply);
     if (st != RemoteStatus::OK) { out.status = st; return out; }
 
     auto* r = reinterpret_cast<RemoteOpReplyHeader*>(reply.data());
     out.status = static_cast<RemoteStatus>(r->status);
     if (out.status != RemoteStatus::OK) return out;   // BAD_REQUEST / UNKNOWN_OP
+    out.error = static_cast<InsertError>(r->error);
     if (!read_slots(reply, r->u.reserve.num_slots, out.slots))
         out.status = RemoteStatus::BAD_REPLY;
     return out;
 }
 
-RemoteStatus RemotePeer::send_ack_op(uint16_t op, const uint64_t* hashes, int n,
-                                 int start, int length,
-                                 const int32_t* slots,
-                                 uint16_t flags) {
+RemoteStatus LegacyRemoteOpClientTransport::send_ack_op(
+        uint16_t op, const uint64_t* hashes, int n, int start, int length,
+        const int32_t* slots) {
     auto g = guard();
     // Only the two RELEASE ops route here now. INSERT_RELEASE carries a slot
     // count; QUERY_RELEASE length is a hash range (<=n).
@@ -118,12 +106,11 @@ RemoteStatus RemotePeer::send_ack_op(uint16_t op, const uint64_t* hashes, int n,
         std::memcpy(req.data() + off, slots, (size_t)length * sizeof(int32_t));
     }
     ++next_req_id_;
-    h->flags           = flags;
     h->u.insert.start  = start;
     h->u.insert.length = length;
 
     std::vector<char> reply;
-    RemoteStatus st = request(req.data(), req.size(), reply);
+    RemoteStatus st = send_request(req.data(), req.size(), next_req_id_, reply);
     if (st != RemoteStatus::OK) return st;
     auto* r = reinterpret_cast<RemoteOpReplyHeader*>(reply.data());
     RemoteStatus rst = static_cast<RemoteStatus>(r->status);
@@ -131,19 +118,24 @@ RemoteStatus RemotePeer::send_ack_op(uint16_t op, const uint64_t* hashes, int n,
     return r->error == 0 ? RemoteStatus::OK : RemoteStatus::INTERNAL;
 }
 
-InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
-                                int start, int length, const int32_t* slots,
-                                bool auto_recycle) {
+InsertResult LegacyRemoteOpClientTransport::insert(
+        const uint64_t* hashes, int n, int start, int length,
+        const int32_t* slots, bool auto_recycle) {
     auto g = guard();
     InsertResult out;
     if (length < 0 || length > MAX_REMOTE_OP_BLOCKS ||
         (length > 0 && !slots)) {              // slots are the payload now
         out.error = InsertError::REMOTE_FAILED;
+        out.remote_status = RemoteStatus::BAD_REQUEST;
         return out;
     }
     RemoteOpReqHeader* h = nullptr;
     auto req = build_req(REMOTE_OP_INSERT, hashes, n, next_req_id_ + 1, h);
-    if (!h) { out.error = InsertError::REMOTE_FAILED; return out; }
+    if (!h) {
+        out.error = InsertError::REMOTE_FAILED;
+        out.remote_status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
     if (slots && length > 0) {
         size_t off = req.size();
         req.resize(off + (size_t)length * sizeof(int32_t));
@@ -157,12 +149,17 @@ InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
     h->u.insert.length = length;
 
     std::vector<char> reply;
-    RemoteStatus st = request(req.data(), req.size(), reply);
-    if (st != RemoteStatus::OK) { out.error = InsertError::REMOTE_FAILED; return out; }
+    RemoteStatus st = send_request(req.data(), req.size(), next_req_id_, reply);
+    if (st != RemoteStatus::OK) {
+        out.error = InsertError::REMOTE_FAILED;
+        out.remote_status = st;
+        return out;
+    }
 
     auto* r = reinterpret_cast<RemoteOpReplyHeader*>(reply.data());
     if (static_cast<RemoteStatus>(r->status) != RemoteStatus::OK) {
         out.error = InsertError::REMOTE_FAILED;   // request-level reject (BAD_REQUEST / UNKNOWN_OP)
+        out.remote_status = static_cast<RemoteStatus>(r->status);
         return out;
     }
     out.error = static_cast<InsertError>(r->error);
@@ -170,16 +167,21 @@ InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
     return out;
 }
 
-RemoteStatus RemotePeer::release(const uint64_t* hashes, int n,
-                             int start, int length, const int32_t* slots) {
-    // slots present → insert abort (recycle); absent → query pin release.
-    return send_ack_op(slots ? REMOTE_OP_INSERT_RELEASE
-                             : REMOTE_OP_QUERY_RELEASE,
-                       hashes, n, start, length, slots);
+RemoteStatus LegacyRemoteOpClientTransport::recycle(const int32_t* slots,
+                                                    int num_slots) {
+    return send_ack_op(REMOTE_OP_INSERT_RELEASE, nullptr, 0, 0, num_slots,
+                       slots);
 }
 
-QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
-                             bool update_meta) {
+RemoteStatus LegacyRemoteOpClientTransport::unlock(const uint64_t* hashes,
+                                                   int n, int start,
+                                                   int length) {
+    return send_ack_op(REMOTE_OP_QUERY_RELEASE, hashes, n, start, length,
+                       nullptr);
+}
+
+QueryReply LegacyRemoteOpClientTransport::query(const uint64_t* hashes, int n,
+                                                bool lock, bool update_meta) {
     auto g = guard();
     QueryReply out;
     RemoteOpReqHeader* h = nullptr;
@@ -191,7 +193,7 @@ QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
     h->u.query.update_meta = update_meta ? 1 : 0;
 
     std::vector<char> reply;
-    RemoteStatus st = request(req.data(), req.size(), reply);
+    RemoteStatus st = send_request(req.data(), req.size(), next_req_id_, reply);
     if (st != RemoteStatus::OK) { out.status = st; return out; }
 
     auto* r = reinterpret_cast<RemoteOpReplyHeader*>(reply.data());
@@ -201,6 +203,36 @@ QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
     if (!read_slots(reply, r->u.query.num_slots, out.slots))
         out.status = RemoteStatus::BAD_REPLY;
     return out;
+}
+
+RemotePeer::RemotePeer(
+    std::unique_ptr<IRemoteOpClientTransport> transport, std::string endpoint)
+    : transport_(std::move(transport)), endpoint_(std::move(endpoint)) {}
+
+RemotePeer::~RemotePeer() = default;
+RemotePeer::RemotePeer(RemotePeer&&) noexcept = default;
+RemotePeer& RemotePeer::operator=(RemotePeer&&) noexcept = default;
+
+AllocateReply RemotePeer::allocate(int n) { return transport_->allocate(n); }
+
+InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
+                                int start, int length, const int32_t* slots,
+                                bool auto_recycle) {
+    return transport_->insert(hashes, n, start, length, slots, auto_recycle);
+}
+
+QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
+                             bool update_meta) {
+    return transport_->query(hashes, n, lock, update_meta);
+}
+
+RemoteStatus RemotePeer::recycle(const int32_t* slots, int num_slots) {
+    return transport_->recycle(slots, num_slots);
+}
+
+RemoteStatus RemotePeer::unlock(const uint64_t* hashes, int n, int start,
+                                int length) {
+    return transport_->unlock(hashes, n, start, length);
 }
 
 }  // namespace radixshmem
