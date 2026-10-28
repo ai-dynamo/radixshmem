@@ -424,7 +424,7 @@ PYBIND11_MODULE(_core, m) {
     // ==================== EtcdKv ====================
     // Plain key/value access to the cluster's etcd, sharing the process-global
     // connection with RadixServer / DataPlaneRegistry. Values are text (JSON,
-    // base64). Used by radixshmem.server for radix/<cluster_id>/geometry/<node>.
+    // base64). Used by radixshmem.server for radix/<cluster_id>/geometry and nodes/<node>.
 
     py::class_<etcd::Client>(m, "EtcdKv")
         .def(py::init([](const std::string& registry) {
@@ -467,6 +467,9 @@ PYBIND11_MODULE(_core, m) {
              py::arg("ttl_s"), py::call_guard<py::gil_scoped_release>())
         .def("keep_alive", [](etcd::Client& c, int64_t lease) { c.keep_alive(lease); },
              py::arg("lease"), py::call_guard<py::gil_scoped_release>())
+        .def("keep_alive_stop", [](etcd::Client& c, int64_t lease) { c.keep_alive_stop(lease); },
+             py::arg("lease"), py::call_guard<py::gil_scoped_release>(),
+             "Stop renewing without revoking; the keys live on while another holder renews.")
         .def("revoke", [](etcd::Client& c, int64_t lease) { c.revoke(lease); },
              py::arg("lease"), py::call_guard<py::gil_scoped_release>());
 #endif

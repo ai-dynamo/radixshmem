@@ -422,6 +422,12 @@ def orchestrate(args) -> int:
                   f"node{i} publishes the client's counts and its rank")
         check(sorted(ranks) == list(range(args.nodes)),
               f"etcd handed out dense ranks {sorted(ranks)}")
+        kv = radixshmem._core.EtcdKv(registry)
+        geo_key = f"radix/{cluster_id}/geometry"
+        geo = kv.get(geo_key)
+        check(geo is not None and json.loads(geo)["node"] in roles(args.nodes)
+              and not kv.get_prefix(geo_key + "/"),
+              "one cluster-wide geometry key, created by one of the nodes")
         deadline = time.time() + 5            # the record is rewritten right after the banner
         while True:
             ns = nodes_of(workdir, 0)
@@ -497,6 +503,7 @@ def orchestrate(args) -> int:
         servers[v].wait(timeout=15)
         for stale in glob.glob(f"/dev/shm{SHM_PREFIX}_node{v}*"):
             os.unlink(stale)
+        check(kv.get(geo_key) == geo, "the geometry key outlives a killed holder unchanged")
         mark = len(read(logs[v]))
         servers[v] = launch(server_cmd(v, args.nodes, registry, cluster_id, workdir, args.index_dev,
                                        args.gid_idx, (args.rht_transport, args.peer_index_transport),
@@ -555,6 +562,18 @@ def orchestrate(args) -> int:
         check(r["total_hit_length"] == PREFIX_LEN and r["secs"] < 1,
               "the long-lived node0 client still works")
         session.close()
+
+        print("\n[9] every server stops; the geometry key expires with the last holder")
+        for p in servers:
+            if p.poll() is None:
+                p.send_signal(signal.SIGINT)
+        for p in servers:
+            p.wait(timeout=30)
+        check(not kv.get_prefix(f"radix/{cluster_id}/nodes/"), "every node record is gone at once")
+        deadline = time.time() + 15
+        while kv.get(geo_key) is not None and time.time() < deadline:
+            time.sleep(0.5)
+        check(kv.get(geo_key) is None, "the geometry key is gone")
 
         print("\nPASS")
         return 0
