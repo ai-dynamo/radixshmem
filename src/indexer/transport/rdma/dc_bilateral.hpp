@@ -5,7 +5,7 @@
 
 #include "cluster_protocol.h"     // RemoteStatus, RemoteOp* headers
 #include "rdma_transport.hpp"        // DcInitiator, DcTarget, dc_create_ah
-#include "legacy_remote_op.hpp"   // LegacyRemoteOp{Client,Server}Transport
+#include "transport/remote_op_wire.hpp"   // WireRemoteOp{Client,Server}Transport
 
 #include <array>
 #include <atomic>
@@ -45,7 +45,7 @@ constexpr uint32_t kDcCtrlMaxReplyWire = sizeof(DcCtrlHeader) + REMOTE_OP_MAX_RE
 
 // `stack_mu` guards the shared initiator+target; the caller holds it across
 // construction (open_dct), and the dtor takes it around close_dct.
-class DcClientTransport : public LegacyRemoteOpClientTransport {
+class DcClientTransport : public WireRemoteOpClientTransport {
 public:
     DcClientTransport(DcInitiator& ini, DcTarget& tgt, ibv_ah* server_ah,
                       uint32_t server_dctn, int client_rank,
@@ -82,7 +82,7 @@ private:
 
 // ---- server side: stateless; owns its lane pairs outright ----
 
-class DcServerTransport : public LegacyRemoteOpServerTransport {
+class DcServerTransport : public WireRemoteOpServerTransport {
 public:
     DcServerTransport(RdmaContext& ctx, uint64_t dc_access_key, int lanes,
                       int k_pool = 64);

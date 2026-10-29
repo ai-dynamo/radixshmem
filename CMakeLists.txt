@@ -85,11 +85,11 @@ if(ENABLE_RDMA)
         # filed by protocol: DC under rdma/ (alongside the one-sided plane), ZMQ under tcp/.
         src/indexer/transport/rdma/dc_bilateral.cpp
         # Server-side remote-op service (RemoteOpService + RadixServer::rc_*),
-        # the backend factory and the legacy DC/ZMQ protocol; needed even without ZMQ.
+        # the backend factory and the DC/ZMQ binary protocol; needed even without ZMQ.
         src/indexer/remote_op_service.cpp
         src/indexer/transport/remote_op_factory.cpp
-        src/indexer/transport/legacy/legacy_remote_op_client.cpp
-        src/indexer/transport/legacy/legacy_remote_op_server.cpp
+        src/indexer/transport/remote_op_wire_client.cpp
+        src/indexer/transport/remote_op_wire_server.cpp
         # TCP backend (libzmq REQ/REP); self-guarded on RADIXSHMEM_HAS_ZMQ (empty TU when absent).
         src/indexer/transport/tcp/zmq_transport.cpp
     )
@@ -117,8 +117,6 @@ target_include_directories(radixshmem PUBLIC
 target_include_directories(radixshmem PRIVATE
     # remote_op_service.hpp, shared by the remote-op server backends
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer
-    # legacy_remote_op.hpp, the DC/ZMQ binary protocol bases
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/legacy
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/component
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/rht
 )

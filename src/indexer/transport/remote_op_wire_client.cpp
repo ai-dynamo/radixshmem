@@ -1,14 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Client half of the legacy (DC/ZMQ) remote-op backends: encode the binary
-// protocol, send it over the subclass byte transport, decode the reply.
-// Server half lives in legacy_remote_op_server.cpp.
+// Client half of the binary remote-op protocol shared by the DC and ZMQ
+// backends: encode the request, send it over the subclass byte transport,
+// decode the reply. Server half lives in remote_op_wire_server.cpp.
 #include "radixshmem_config.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-#include "legacy_remote_op.hpp"
+#include "remote_op_wire.hpp"
 #include "cluster_protocol.h"       // remote-op wire structs
 
 #include <cstdint>
@@ -51,11 +51,11 @@ bool read_slots(const std::vector<char>& reply, int num_slots,
 
 }  // namespace
 
-LegacyRemoteOpClientTransport::LegacyRemoteOpClientTransport(
+WireRemoteOpClientTransport::WireRemoteOpClientTransport(
     std::shared_ptr<std::mutex> op_mu)
     : op_mu_(op_mu ? std::move(op_mu) : std::make_shared<std::mutex>()) {}
 
-AllocateReply LegacyRemoteOpClientTransport::allocate(int n) {
+AllocateReply WireRemoteOpClientTransport::allocate(int n) {
     auto g = guard();
     AllocateReply out;
     // ALLOCATE carries no hashes: n is the slot count, request is header-only.
@@ -86,7 +86,7 @@ AllocateReply LegacyRemoteOpClientTransport::allocate(int n) {
     return out;
 }
 
-RemoteStatus LegacyRemoteOpClientTransport::send_ack_op(
+RemoteStatus WireRemoteOpClientTransport::send_ack_op(
         uint16_t op, const uint64_t* hashes, int n, int start, int length,
         const int32_t* slots) {
     auto g = guard();
@@ -117,7 +117,7 @@ RemoteStatus LegacyRemoteOpClientTransport::send_ack_op(
     return r->error == 0 ? RemoteStatus::OK : RemoteStatus::INTERNAL;
 }
 
-InsertResult LegacyRemoteOpClientTransport::insert(
+InsertResult WireRemoteOpClientTransport::insert(
         const uint64_t* hashes, int n, int start, int length,
         const int32_t* slots, bool auto_recycle) {
     auto g = guard();
@@ -166,20 +166,20 @@ InsertResult LegacyRemoteOpClientTransport::insert(
     return out;
 }
 
-RemoteStatus LegacyRemoteOpClientTransport::recycle(const int32_t* slots,
+RemoteStatus WireRemoteOpClientTransport::recycle(const int32_t* slots,
                                                     int num_slots) {
     return send_ack_op(REMOTE_OP_INSERT_RELEASE, nullptr, 0, 0, num_slots,
                        slots);
 }
 
-RemoteStatus LegacyRemoteOpClientTransport::unlock(const uint64_t* hashes,
+RemoteStatus WireRemoteOpClientTransport::unlock(const uint64_t* hashes,
                                                    int n, int start,
                                                    int length) {
     return send_ack_op(REMOTE_OP_QUERY_RELEASE, hashes, n, start, length,
                        nullptr);
 }
 
-QueryReply LegacyRemoteOpClientTransport::query(const uint64_t* hashes, int n,
+QueryReply WireRemoteOpClientTransport::query(const uint64_t* hashes, int n,
                                                 bool lock, bool update_meta) {
     auto g = guard();
     QueryReply out;
