@@ -106,7 +106,7 @@ std::vector<char> LegacyRemoteOpServerTransport::dispatch(
         const auto& f = req.u.insert;
         const int32_t* slots = reinterpret_cast<const int32_t*>(hashes + req.n);
         bool ar = !(req.flags & REMOTE_OP_FLAG_NO_AUTO_RECYCLE);
-        InsertResult r = svc_->insert(hashes, req.n, f.start, slots, f.length, ar);
+        InsertResult r = svc_->insert(hashes, req.n, f.start, f.length, slots, ar);
         if (r.remote_status != RemoteStatus::OK)
             return make_status_reply(req, r.remote_status);
         auto buf = make_slots_reply(req, static_cast<uint16_t>(r.error),
