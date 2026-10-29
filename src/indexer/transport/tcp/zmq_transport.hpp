@@ -8,7 +8,7 @@
 #ifdef RADIXSHMEM_HAS_ZMQ
 
 #include "cluster_protocol.h"      // RemoteStatus
-#include "transport/remote_op_wire.hpp"   // WireRemoteOp{Client,Server}Transport
+#include "remote_op_wire.hpp"   // WireRemoteOp{Client,Server}Transport
 
 #include <cstddef>
 #include <cstdint>

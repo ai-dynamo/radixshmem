@@ -18,7 +18,6 @@ namespace radixshmem {
 class RdmaContext;
 class DcClientStack;
 struct PeerEntry;
-struct RemoteOpAddr;
 
 // The only place that names concrete remote-op backends; `rot` is a REMOTE_OP_TRANSPORT_* value.
 

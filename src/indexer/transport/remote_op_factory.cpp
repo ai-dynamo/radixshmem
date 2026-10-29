@@ -6,7 +6,6 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-#include "radix_server.h"        // RemoteOpAddr
 #include "cluster_manifest.h"    // PeerEntry, REMOTE_OP_TRANSPORT_*
 #ifdef RADIXSHMEM_REMOTE_OP_RDMA
 #include "dc_bilateral.hpp"                 // DcClientStack, make_dc_server_transport

@@ -13,7 +13,7 @@
 #include "radix_client.h"          // RadixClient (svc_client_)
 #include "cluster_protocol.h"      // MAX_REMOTE_OP_BLOCKS
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "transport/remote_op_factory.hpp"   // make_remote_op_server
+#include "remote_op_factory.hpp"   // make_remote_op_server
 
 #include <algorithm>
 #include <cstdint>
