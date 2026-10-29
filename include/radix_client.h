@@ -254,7 +254,8 @@ private:
                              int start, bool auto_recycle);
     void         dist_flush();
     // Cached per-rank session; nullptr on illegal rank (self/oob/negative).
-    RemotePeer*  peer_for(int rank);
+    std::shared_ptr<RemotePeer> peer_for(int rank);
+    void drop_peer_session(int rank);
 
     // RHT probe from the deepest position not past the incumbent, with the
     // chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.

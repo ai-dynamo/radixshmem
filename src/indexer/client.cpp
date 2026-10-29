@@ -85,6 +85,7 @@ bool RadixClient::wait_for_ready() {
 
 void RadixClient::admit_peer(const PeerEntry& e) {
     if (!peer_reg_->admit(e) || e.rank == peer_reg_->my_rank()) return;
+    drop_peer_session(e.rank);
     if (rht_conn_) rht_conn_->holder_changed(e);
     if (!peer_conn_) return;
     peer_conn_->peer_changed(e.rank);
@@ -426,19 +427,24 @@ void RadixClient::reset_owned_rht_shard() {
 // Lazily open (and cache) the per-rank session. Returns nullptr on any illegal
 // rank (single-node, self, out of range, remote ops disabled) — callers map that
 // to BAD_TARGET / REMOTE_FAILED, never a throw.
-RemotePeer* RadixClient::peer_for(int rank) {
+std::shared_ptr<RemotePeer> RadixClient::peer_for(int rank) {
     if (!distributed_ || !peer_conn_) return nullptr;
     std::lock_guard<std::mutex> g(peer_cache_mu_);
     auto it = peer_cache_.find(rank);
-    if (it != peer_cache_.end()) return it->second.get();
+    if (it != peer_cache_.end()) return it->second;
     try {
         auto rc = peer_conn_->open_remote(rank);
-        RemotePeer* raw = rc.get();
-        peer_cache_.emplace(rank, std::move(rc));
-        return raw;
+        peer_cache_.emplace(rank, rc);
+        return rc;
     } catch (const std::exception&) {
         return nullptr;   // self / oob / disabled peer
     }
+}
+
+// The rank re-registered with a new entry: the next op reopens from it; in-flight ops keep the old session alive.
+void RadixClient::drop_peer_session(int rank) {
+    std::lock_guard<std::mutex> g(peer_cache_mu_);
+    peer_cache_.erase(rank);
 }
 
 
@@ -912,7 +918,7 @@ void RadixClient::dec_ref_remote(int remote_node, const uint64_t* hashes,
 AllocateReply RadixClient::remote_allocate(int rank, int n) {
     AllocateReply out;
     if (n <= 0) return out;                       // nothing to allocate, status OK
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
     return p->allocate(n);            // serializes + caps internally
 }
@@ -922,7 +928,7 @@ InsertResult RadixClient::remote_insert(int rank,
                                         int start, int length,
                                         const int32_t* slots, bool auto_recycle) {
     InsertResult out;
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) {
         out.error = InsertError::REMOTE_FAILED;
         out.remote_status = RemoteStatus::BAD_TARGET;
@@ -933,7 +939,7 @@ InsertResult RadixClient::remote_insert(int rank,
 
 RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
     return p->recycle(slots, num_slots);
 }
@@ -942,7 +948,7 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
                                       bool lock, bool update_meta) {
     QueryResult out;
     if (n <= 0) return out;                       // empty input, status OK
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
     QueryReply rep = p->query(hashes, n, lock, update_meta);
 
@@ -965,7 +971,7 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
 
 RemoteStatus RadixClient::remote_unlock(int rank, const uint64_t* hashes, int n,
                                 int hit_length) {
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
     return p->unlock(hashes, n, 0, hit_length);
 }
