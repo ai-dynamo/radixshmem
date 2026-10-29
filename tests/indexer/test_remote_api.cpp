@@ -496,6 +496,22 @@ int run_timeout_and_rebuild() {
         if (!target_down(rep.status)) return 185;
         fprintf(stderr, "[timeout] OK status=%d + cached session safe\n",
                 (int)r.status);
+
+        // #10: B restarts on a new endpoint; the same client reopens its session from the new /peers entry.
+        if (::write(g_to_parent_fd, &b, 1) != 1) return 187;
+        if (::read(g_from_parent_fd, &b, 1) != 1 || b != 1) return 188;   // B is back
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        radixshmem::RemoteStatus st;
+        do {
+            st = cli.remote_query(kTargetRank, h.data(), 4).status;
+            if (st == radixshmem::RemoteStatus::OK) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } while (std::chrono::steady_clock::now() < deadline);
+        if (st != radixshmem::RemoteStatus::OK) {
+            fprintf(stderr, "[rebuild] restarted B unreachable, status=%d\n", (int)st);
+            return 189;
+        }
+        fprintf(stderr, "[rebuild] OK old client reached restarted B\n");
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[timeout] exception: %s\n", e.what());
@@ -590,7 +606,7 @@ int main(int argc, char** argv) {
     run_case("release_abort");     // #8
     run_case("full_dedup");        // #9
 
-    // #2/#3 last: pipe-synchronized kill of B (nothing runs after it). The child
+    // #2/#3/#10 last: pipe-synchronized kill and restart of B (nothing runs after it). The child
     // is re-exec'd; the two sync-pipe fd numbers ride on its argv (not CLOEXEC).
     {
         int to_parent[2], from_parent[2];
@@ -611,6 +627,15 @@ int main(int argc, char** argv) {
                     server_pids[kTargetRank] = -1;
                     char ack = 1;
                     if (::write(from_parent[1], &ack, 1) != 1) { /* child sees EOF */ }
+                }
+                // #10: restart B (port 0 and a fresh DCT give it a new endpoint), then release the child.
+                if (::read(to_parent[0], &b, 1) == 1) {
+                    ::shm_unlink(shm_name_for(kTargetRank).c_str());
+                    server_pids[kTargetRank] = spawn({argv[0], "--server",
+                        node_name_for(kTargetRank), registry, cluster_id});
+                    char up = server_pids[kTargetRank] > 0 &&
+                              wait_shm_ready(shm_name_for(kTargetRank), kBootstrapTO);
+                    if (::write(from_parent[1], &up, 1) != 1) { /* child sees EOF */ }
                 }
                 int rc = wait_one(p, "timeout_rebuild");
                 fprintf(stderr, "[case] %-18s rc=%d\n", "timeout_rebuild", rc);
