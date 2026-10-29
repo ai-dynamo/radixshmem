@@ -8,7 +8,7 @@
 #ifdef RADIXSHMEM_HAS_ZMQ
 
 #include "cluster_protocol.h"      // RemoteStatus
-#include "legacy_remote_op.hpp"   // LegacyRemoteOp{Client,Server}Transport
+#include "transport/remote_op_wire.hpp"   // WireRemoteOp{Client,Server}Transport
 
 #include <cstddef>
 #include <cstdint>
@@ -17,7 +17,7 @@
 
 namespace radixshmem {
 
-class ZmqClientTransport : public LegacyRemoteOpClientTransport {
+class ZmqClientTransport : public WireRemoteOpClientTransport {
 public:
     explicit ZmqClientTransport(const std::string& endpoint,
                                 int recv_timeout_ms = 5000, int max_retry = 3);
@@ -41,7 +41,7 @@ private:
     int         max_retry_       = 3;
 };
 
-class ZmqServerTransport : public LegacyRemoteOpServerTransport {
+class ZmqServerTransport : public WireRemoteOpServerTransport {
 public:
     explicit ZmqServerTransport(uint16_t listen_port) : listen_port_(listen_port) {}
     ~ZmqServerTransport() override;

@@ -35,7 +35,7 @@ DcClientTransport::DcClientTransport(DcInitiator& ini, DcTarget& tgt,
                                      int client_rank,
                                      std::shared_ptr<std::mutex> stack_mu,
                                      int max_retry)
-    : LegacyRemoteOpClientTransport(std::move(stack_mu)), ini_(ini), tgt_(tgt), server_ah_(server_ah), server_dctn_(server_dctn),
+    : WireRemoteOpClientTransport(std::move(stack_mu)), ini_(ini), tgt_(tgt), server_ah_(server_ah), server_dctn_(server_dctn),
       client_rank_(client_rank), max_retry_(max_retry),
       incarnation_(make_incarnation()), reply_dctn_(tgt.open_dct()) {
     try {

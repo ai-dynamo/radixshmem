@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Server half of the legacy (DC/ZMQ) remote-op backends: lane pollers that
-// decode the binary protocol, run the op on RemoteOpService and send the
-// encoded reply. Client half lives in legacy_remote_op_client.cpp.
+// Server half of the binary remote-op protocol shared by the DC and ZMQ
+// backends: lane pollers that decode the request, run the op on
+// RemoteOpService and send the encoded reply. Client half lives in
+// remote_op_wire_client.cpp.
 #include "radixshmem_config.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-#include "legacy_remote_op.hpp"
+#include "remote_op_wire.hpp"
 #include "cluster_protocol.h"
 #include "remote_op_service.hpp"
 
@@ -59,16 +60,16 @@ std::vector<char> make_slots_reply(const RemoteOpReqHeader& req, uint16_t error,
 
 }  // namespace
 
-void LegacyRemoteOpServerTransport::start(RemoteOpService& svc) {
+void WireRemoteOpServerTransport::start(RemoteOpService& svc) {
     svc_ = &svc;
     running_.store(true);
     int n = lanes();
     threads_.reserve(n);
     for (int i = 0; i < n; ++i)
-        threads_.emplace_back(&LegacyRemoteOpServerTransport::loop, this, i);
+        threads_.emplace_back(&WireRemoteOpServerTransport::loop, this, i);
 }
 
-void LegacyRemoteOpServerTransport::stop() {
+void WireRemoteOpServerTransport::stop() {
     // The pollers exit on running_ == false; nothing else to wake.
     running_.store(false);
     for (auto& t : threads_)
@@ -76,7 +77,7 @@ void LegacyRemoteOpServerTransport::stop() {
     threads_.clear();
 }
 
-std::vector<char> LegacyRemoteOpServerTransport::dispatch(
+std::vector<char> WireRemoteOpServerTransport::dispatch(
         const RemoteOpReqHeader& req, const uint64_t* hashes) {
     RemoteOpReplyHeader* rep = nullptr;
     switch (req.op) {
@@ -127,7 +128,7 @@ std::vector<char> LegacyRemoteOpServerTransport::dispatch(
     }
 }
 
-void LegacyRemoteOpServerTransport::loop(int lane) {
+void WireRemoteOpServerTransport::loop(int lane) {
     std::vector<char> rbuf(REMOTE_OP_MAX_REQ_BYTES);
 
     int idle = 0;                 // consecutive no-progress iterations
