@@ -9,7 +9,7 @@
 #include "cluster_protocol.h"
 #ifndef RADIXSHMEM_NO_RDMA
 #include "radix_client.h"
-#include "transport/remote_op_factory.hpp"
+#include "remote_op_factory.hpp"
 #endif
 
 #include <algorithm>

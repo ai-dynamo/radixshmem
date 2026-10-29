@@ -39,11 +39,6 @@ class EtcdRegistry;
 struct PeerEntry;
 struct ShardMapMsg;
 class RemoteOpService;
-
-struct RemoteOpAddr {
-    uint16_t port = 0;        // zmq: actual bound TCP port (0 = not zmq / off)
-    uint32_t dctns[4] = {};   // dc: lane DCT numbers, lane 0 first, 0-padded
-};
 #endif
 
 struct RadixServerConfig {

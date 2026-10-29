@@ -117,6 +117,8 @@ target_include_directories(radixshmem PUBLIC
 target_include_directories(radixshmem PRIVATE
     # remote_op_service.hpp, shared by the remote-op server backends
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer
+    # remote_op_factory.hpp and remote_op_wire.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/component
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/rht
 )

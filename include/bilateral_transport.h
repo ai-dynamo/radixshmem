@@ -24,6 +24,12 @@ public:
                                 int length) = 0;
 };
 
+// What peers need to reach a server: its TCP port (grpc/zmq) or lane DCT numbers (dc).
+struct RemoteOpAddr {
+    uint16_t port = 0;        // grpc/zmq: actual bound TCP port (0 = dc / off)
+    uint32_t dctns[4] = {};   // dc: lane DCT numbers, lane 0 first, 0-padded
+};
+
 class RemoteOpService;
 
 // Serving lifecycle of one backend; endpoint creation/publication is done by
