@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include "cluster_protocol.h"   // RemoteStatus
+#include "cluster_protocol.h"   // RemoteOpReqHeader
+#include "types.h"              // AllocateReply, QueryReply, InsertResult
 
 #include <atomic>
 #include <cstddef>
@@ -14,10 +15,6 @@
 #include <vector>
 
 namespace radixshmem {
-
-struct AllocateReply;
-struct QueryReply;
-struct InsertResult;
 
 // One typed method per remote op; each backend owns its own wire encoding.
 class IRemoteOpClientTransport {

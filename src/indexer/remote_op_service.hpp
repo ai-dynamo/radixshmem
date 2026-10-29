@@ -3,7 +3,7 @@
 
 #pragma once
 
-#include "radix_client.h"   // AllocateReply, QueryReply, InsertResult, RemoteStatus
+#include "radix_client.h"   // RadixClient
 
 #include <cstdint>
 #include <mutex>
@@ -29,9 +29,8 @@ public:
                         bool update_meta);
     // slots[i] holds hashes[start + i]. A rejected request reports
     // error = REMOTE_FAILED with remote_status = BAD_REQUEST.
-    InsertResult  insert(const uint64_t* hashes, int n, int start,
-                         const int32_t* slots, int num_slots,
-                         bool auto_recycle);
+    InsertResult  insert(const uint64_t* hashes, int n, int start, int length,
+                         const int32_t* slots, bool auto_recycle);
     RemoteStatus  recycle(const int32_t* slots, int num_slots);
     // Drop a query(lock=true) pin over hashes[start, start + length).
     RemoteStatus  unlock(const uint64_t* hashes, int n, int start, int length);

@@ -7,7 +7,6 @@
 
 #ifdef RADIXSHMEM_HAS_GRPC
 
-#include "radix_client.h"       // AllocateReply, QueryReply
 #include "remote_ops.grpc.pb.h"
 
 #include <grpcpp/grpcpp.h>

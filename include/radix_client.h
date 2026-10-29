@@ -36,18 +36,6 @@ struct ShardMapMsg;
 
 class IRemoteOpClientTransport;
 
-struct AllocateReply {
-    RemoteStatus status = RemoteStatus::OK;
-    InsertError  error  = InsertError::OK;   // MEMPOOL_FULL when status is OK but nothing was allocated
-    std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
-};
-
-struct QueryReply {
-    RemoteStatus status = RemoteStatus::OK;
-    int hit_length       = 0;   // B local-tree total matched blocks
-    std::vector<int32_t> slots; // target-local physical slot ids (len == hit_length)
-};
-
 class RemotePeer {
 public:
 #ifdef RADIXSHMEM_HAS_ZMQ

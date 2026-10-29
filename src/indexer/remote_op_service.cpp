@@ -90,19 +90,19 @@ QueryReply RemoteOpService::query(const uint64_t* hashes, int n, bool lock,
 }
 
 InsertResult RemoteOpService::insert(const uint64_t* hashes, int n, int start,
-                                     const int32_t* slots, int num_slots,
+                                     int length, const int32_t* slots,
                                      bool auto_recycle) {
     InsertResult out;
-    if (!valid_count(n) || !valid_range(start, num_slots, n) ||
-        (n > 0 && !hashes) || (num_slots > 0 && !slots)) {
+    if (!valid_count(n) || !valid_range(start, length, n) ||
+        (n > 0 && !hashes) || (length > 0 && !slots)) {
         out.error = InsertError::REMOTE_FAILED;
         out.remote_status = RemoteStatus::BAD_REQUEST;
         return out;
     }
-    if (num_slots == 0) return out;
+    if (length == 0) return out;
     std::lock_guard<std::mutex> g(insert_mu_);
     // auto_recycle: the target recycles the surplus; else the initiator does.
-    return client_.insert(hashes, n, slots, num_slots, start, auto_recycle);
+    return client_.insert(hashes, n, slots, length, start, auto_recycle);
 }
 
 RemoteStatus RemoteOpService::recycle(const int32_t* slots, int num_slots) {

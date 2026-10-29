@@ -104,7 +104,7 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
         return run([&] {
             InsertResult r = svc->insert(
                 req->hashes().data(), req->hashes_size(), req->start(),
-                req->slots().data(), req->slots_size(), req->auto_recycle());
+                req->slots_size(), req->slots().data(), req->auto_recycle());
             if (r.remote_status != RemoteStatus::OK)
                 return to_grpc_status(r.remote_status);
             rep->set_error(static_cast<pb::InsertError>(r.error));
