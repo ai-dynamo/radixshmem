@@ -1,8 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Client half of the gRPC remote-op backend: method arguments → protobuf,
-// one unary call per op, response checks, gRPC status → RemoteStatus.
+// gRPC client: encode arguments, issue unary calls, validate replies and map statuses to RemoteStatus.
 #include "grpc_remote_op.hpp"
 
 #ifdef RADIXSHMEM_HAS_GRPC

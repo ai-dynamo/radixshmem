@@ -47,8 +47,7 @@ constexpr uint32_t kDcCtrlMaxReplyWire = sizeof(DcCtrlHeader) + REMOTE_OP_MAX_RE
 
 // ---- client side: shared initiator+target, per-session reply DCT ----
 
-// `stack_mu` guards the shared initiator+target; the caller holds it across
-// construction (open_dct), and the dtor takes it around close_dct.
+// stack_mu guards the shared initiator+target: caller locks for open_dct construction; dtor locks for close_dct.
 class DcClientTransport : public WireRemoteOpClientTransport {
 public:
     DcClientTransport(DcInitiator& ini, DcTarget& tgt, ibv_ah* server_ah,
@@ -138,8 +137,7 @@ public:
     DcClientStack(const DcClientStack&) = delete;
     DcClientStack& operator=(const DcClientStack&) = delete;
 
-    // Session to `p` on the lane picked by `client_rank`; `endpoint` gets its name.
-    // Throws when the peer serves no DC remote ops.
+    // Session to `p` on the lane picked by `client_rank`; `endpoint` gets its name; throws if `p` serves no DC remote ops.
     std::unique_ptr<DcClientTransport> open(const PeerEntry& p, int client_rank,
                                             std::string& endpoint);
 

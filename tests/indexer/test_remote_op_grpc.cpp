@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// test_remote_op_grpc — loopback gate for the gRPC remote-op backend: a
-// GrpcRemoteOpServer over a real single-node tree, driven by a
-// GrpcRemoteOpClientTransport on 127.0.0.1. Needs no RDMA device or etcd.
-// Covers the five ops, business vs request-level errors, deadlines,
-// admission, the server lifecycle, and reply checks.
+// Loopback gRPC tests on a real tree: five ops, errors, deadlines, admission, lifecycle and replies; no RDMA/etcd.
 
 #include "test_utils.h"
 #include "grpc_remote_op.hpp"
@@ -41,8 +37,7 @@ std::vector<uint64_t> make_hashes(int64_t base, int n) {
     return RadixClient::compute_hashes(tok.data(), n, 1);
 }
 
-// A single-node tree plus the service the gRPC server runs on it. Tests
-// hold `insert_mu` to park allocate/insert handlers inside the service.
+// Single-node tree/service fixture; holding insert_mu parks allocate/insert handlers.
 struct Node {
     std::string name;
     std::unique_ptr<RadixServer> srv;

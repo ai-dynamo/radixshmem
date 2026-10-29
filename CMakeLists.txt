@@ -84,8 +84,7 @@ if(ENABLE_RDMA)
         # Bilateral (two-sided SEND/RECV) transport backends behind IRemoteOp*Transport,
         # filed by protocol: DC under rdma/ (alongside the one-sided plane), ZMQ under tcp/.
         src/indexer/transport/rdma/dc_bilateral.cpp
-        # Server-side remote-op service (RemoteOpService + RadixServer::rc_*),
-        # the backend factory and the DC/ZMQ binary protocol; needed even without ZMQ.
+        # Remote-op service, backend factory and DC/ZMQ binary protocol; required even without ZMQ.
         src/indexer/remote_op_service.cpp
         src/indexer/transport/remote_op_factory.cpp
         src/indexer/transport/remote_op_wire_client.cpp
@@ -157,9 +156,7 @@ else()
 endif()
 
 # ==================== gRPC (remote-op control plane) ====================
-# grpc++ / protobuf via pkg-config plus protoc and grpc_cpp_plugin. The generated
-# code lives in its own static library under the build tree; only the backend
-# sources (src/indexer/transport/grpc) see it.
+# grpc++/protobuf via pkg-config plus protoc/grpc_cpp_plugin; the generated code is a static library only transport/grpc sees.
 set(RADIXSHMEM_GRPC_FOUND OFF)
 if(ENABLE_GRPC AND ENABLE_RDMA)
     find_package(PkgConfig QUIET)
@@ -495,8 +492,7 @@ if(ENABLE_RDMA)
     add_executable(test_remote_api tests/indexer/test_remote_api.cpp)
     target_link_libraries(test_remote_api PRIVATE radixshmem)
 
-    # Control × data matrix: base = zmq × xrc (zmq-gated); _dcd = both planes DC;
-    # _grpc / _grpc_dcd = grpc control over xrc / dc data planes (grpc-gated).
+    # Control × data: base = zmq × xrc; _dcd = dc × dc; _grpc / _grpc_dcd = grpc × xrc / dc.
     if(RADIXSHMEM_ZMQ_FOUND)
         add_test(NAME test_remote_api COMMAND test_remote_api)
         set_tests_properties(test_remote_api PROPERTIES
@@ -515,8 +511,7 @@ if(ENABLE_RDMA)
     endif()
 endif()
 
-# gRPC remote-op backend over loopback: a real single-node tree behind the
-# server, no RDMA device or etcd needed.
+# Loopback gRPC tests use a real single-node tree without RDMA or etcd.
 if(RADIXSHMEM_GRPC_FOUND)
     add_executable(test_remote_op_grpc tests/indexer/test_remote_op_grpc.cpp)
     target_link_libraries(test_remote_op_grpc PRIVATE radixshmem radixshmem_grpc_proto)

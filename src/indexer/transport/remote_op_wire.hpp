@@ -16,9 +16,7 @@
 
 namespace radixshmem {
 
-// DC/ZMQ: the binary remote-op protocol over a request/reply byte transport.
-// `op_mu` serializes every op (and the subclass dtor) of sessions sharing one
-// transport stack; null gives this session a private mutex.
+// DC/ZMQ byte transport; op_mu serializes ops/destruction on shared stacks (null = private mutex).
 class WireRemoteOpClientTransport : public IRemoteOpClientTransport {
 public:
     explicit WireRemoteOpClientTransport(
@@ -59,8 +57,7 @@ struct ReplyContext {
     uint8_t  link_layer = 0;    // IBV_LINK_LAYER_* (drives AH is_global)
 };
 
-// DC/ZMQ: one poller per lane decodes the binary protocol, runs the op on
-// the service and sends the encoded reply over a recv/reply byte transport.
+// DC/ZMQ: one poller per lane decodes requests, calls the service and encodes replies.
 class WireRemoteOpServerTransport : public IRemoteOpServerTransport {
 public:
     void start(RemoteOpService& svc) override;
@@ -75,8 +72,7 @@ protected:
                             const void* data, size_t len) = 0;
 
 private:
-    // Poller for `lane` — the sole thread that polls it: recv → validate →
-    // dispatch in place → send.
+    // Sole poller for `lane`: recv → validate → dispatch in place → send.
     void loop(int lane);
     std::vector<char> dispatch(const RemoteOpReqHeader& req,
                                const uint64_t* hashes);

@@ -753,8 +753,7 @@ bool RadixServer::bootstrap() {
                     });
             }
             if (cfg_.enable_remote_insert) {
-                // No svc_client_mu_ here: RemoteOpService::allocate already
-                // holds it around allocate_slots, so locking would self-deadlock.
+                // RemoteOpService::allocate holds svc_client_mu_; relocking here would self-deadlock.
                 RadixClient* ec = svc_client_.get();
                 svc_tree_->tree().set_evict_callback(
                     [ec](const std::vector<EvictedNode>& evicted) {

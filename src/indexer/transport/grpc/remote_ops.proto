@@ -1,11 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Remote-op control plane: one unary RPC per op against the target rank's
-// local tree. KV data never travels here. Request-level failures (bad
-// arguments, not serving, admission limit) are gRPC status codes; a business
-// failure (e.g. an exhausted slot pool) is an OK call carrying `error`.
-// Field numbers are fixed: retire a field by reserving its number.
+// Unary control RPCs, no KV data; request failures use gRPC status, business failures use error; reserve retired field numbers.
 
 syntax = "proto3";
 

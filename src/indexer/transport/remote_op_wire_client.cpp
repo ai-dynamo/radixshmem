@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Client half of the binary remote-op protocol shared by the DC and ZMQ
-// backends: encode the request, send it over the subclass byte transport,
-// decode the reply. Server half lives in remote_op_wire_server.cpp.
+// DC/ZMQ binary protocol client half: encode requests, send them over the subclass byte transport, decode replies; the server half is remote_op_wire_server.cpp.
 #include "radixshmem_config.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
@@ -90,8 +88,7 @@ RemoteStatus WireRemoteOpClientTransport::send_ack_op(
         uint16_t op, const uint64_t* hashes, int n, int start, int length,
         const int32_t* slots) {
     auto g = guard();
-    // Only the two RELEASE ops route here now. INSERT_RELEASE carries a slot
-    // count; QUERY_RELEASE length is a hash range (<=n).
+    // Only the two RELEASE ops route here: INSERT_RELEASE length counts slots, QUERY_RELEASE length is a hash range (<= n).
     const bool slot_op = (op == REMOTE_OP_INSERT_RELEASE);
     if (length < 0 || (slot_op ? length > MAX_REMOTE_OP_BLOCKS
                                : length > n)) return RemoteStatus::BAD_REQUEST;
