@@ -6,8 +6,12 @@
 
 #include "dc_bilateral.hpp"
 
+#include "cluster_manifest.h"   // PeerEntry
+
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -274,6 +278,79 @@ void DcServerTransport::send_reply(const ReplyContext& ctx,
     } catch (const std::exception&) {
         replies_dropped_.fetch_add(1, std::memory_order_relaxed);
     }
+}
+
+// ==================== construction ====================
+
+namespace {
+
+int rc_resolve_lanes() {
+    int lanes = 1;
+    if (const char* e = ::getenv("RADIXSHMEM_RC_LANES")) {
+        int v = std::atoi(e);
+        if (v >= 1 && v <= 8) lanes = v;
+    }
+    return lanes;
+}
+
+}  // namespace
+
+DcClientStack::DcClientStack(RdmaContext& ctx, uint64_t dc_access_key)
+    : ctx_(ctx), dc_access_key_(dc_access_key) {}
+
+DcClientStack::~DcClientStack() {
+    if (stack_mu_.use_count() > 1) {
+        fprintf(stderr,
+                "[PeerConnector] WARNING: %ld dc remote-op session(s) (or "
+                "retained lock=true results) outlive this client — their "
+                "destruction is use-after-free. Drop all RemotePeer handles AND "
+                "locked QueryResults before the RadixClient.\n",
+                (long)(stack_mu_.use_count() - 1));
+    }
+    ini_.reset();
+    tgt_.reset();
+}
+
+std::unique_ptr<DcClientTransport> DcClientStack::open(const PeerEntry& p,
+                                                     int client_rank,
+                                                     std::string& endpoint) {
+    if (p.rc_dct_num == 0)
+        throw std::runtime_error(
+            "open_remote: peer rank " + std::to_string(p.rank) +
+            " has remote ops disabled (rc_dct_num == 0)");
+    std::lock_guard<std::mutex> g(*stack_mu_);
+    if (!tgt_) {
+        auto tgt = std::make_unique<DcTarget>(
+            ctx_, dc_access_key_, /*srq_max_wr=*/16);
+        auto ini = std::make_unique<DcInitiator>(ctx_, dc_access_key_);
+        tgt_ = std::move(tgt);
+        ini_ = std::move(ini);
+    }
+    int p_eff = 1;
+    for (int i = 0; i < 3 && p.rc_dct_num_extra[i] != 0; ++i) ++p_eff;
+    int lane = (int)((unsigned)client_rank % (unsigned)p_eff);
+    uint32_t dctn = lane == 0 ? p.rc_dct_num : p.rc_dct_num_extra[lane - 1];
+    ibv_gid dgid;
+    std::memcpy(&dgid, p.gid_raw, 16);
+    ibv_ah* ah = dc_create_ah(ctx_, dgid, p.lid, p.link_layer);
+    if (!ah)
+        throw std::runtime_error(
+            "open_remote: ibv_create_ah to rank " +
+            std::to_string(p.rank) + " failed");
+    endpoint = "dc://" + std::string(p.host) + "#" + std::to_string(dctn);
+    return std::make_unique<DcClientTransport>(
+        *ini_, *tgt_, ah, dctn, client_rank, stack_mu_);
+}
+
+std::unique_ptr<DcServerTransport> make_dc_server_transport(RdmaContext& ctx,
+                                                            uint64_t dc_access_key) {
+    int k_pool = 64;
+    if (const char* e = ::getenv("RADIXSHMEM_RC_KPOOL")) {
+        int v = std::atoi(e);
+        if (v >= 1 && v <= 4096) k_pool = v;
+    }
+    return std::make_unique<DcServerTransport>(
+        ctx, dc_access_key, std::min(rc_resolve_lanes(), 4), k_pool);
 }
 
 } // namespace radixshmem

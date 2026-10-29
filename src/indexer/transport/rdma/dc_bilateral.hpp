@@ -12,9 +12,13 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <string>
 #include <vector>
 
 namespace radixshmem {
+
+struct PeerEntry;
 
 // ---- wire ctrl header (48B, 8B-aligned, all fields naturally aligned) ----
 constexpr uint32_t DC_CTRL_MAGIC      = 0xDCC0DE01;
@@ -122,5 +126,33 @@ private:
     std::atomic<uint64_t> replies_dropped_{0};    // no AH / SEND failed
     std::atomic<uint64_t> hdrs_dropped_{0};  // malformed request ctrl header
 };
+
+// ---- construction: what the remote-op factory calls ----
+
+// One connector's DC sessions: they share this initiator+target and serialize on its mutex.
+class DcClientStack {
+public:
+    DcClientStack(RdmaContext& ctx, uint64_t dc_access_key);
+    ~DcClientStack();
+
+    DcClientStack(const DcClientStack&) = delete;
+    DcClientStack& operator=(const DcClientStack&) = delete;
+
+    // Session to `p` on the lane picked by `client_rank`; `endpoint` gets its name.
+    // Throws when the peer serves no DC remote ops.
+    std::unique_ptr<DcClientTransport> open(const PeerEntry& p, int client_rank,
+                                            std::string& endpoint);
+
+private:
+    RdmaContext& ctx_;
+    uint64_t     dc_access_key_;
+    std::unique_ptr<DcInitiator> ini_;
+    std::unique_ptr<DcTarget>    tgt_;
+    std::shared_ptr<std::mutex>  stack_mu_ = std::make_shared<std::mutex>();
+};
+
+// Server with RADIXSHMEM_RC_LANES lanes (at most 4) and RADIXSHMEM_RC_KPOOL receive buffers per lane.
+std::unique_ptr<DcServerTransport> make_dc_server_transport(RdmaContext& ctx,
+                                                            uint64_t dc_access_key);
 
 } // namespace radixshmem
