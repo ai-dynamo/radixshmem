@@ -11,14 +11,12 @@
 
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <string>
 
 namespace radixshmem {
 
 class RdmaContext;
-class DcInitiator;
-class DcTarget;
+class DcClientStack;
 struct PeerEntry;
 struct RemoteOpAddr;
 
@@ -29,7 +27,7 @@ std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
     uint32_t rot, uint16_t listen_port, RdmaContext& ctx,
     uint64_t dc_access_key, RemoteOpAddr& addr);
 
-// Client sessions of one connector; owns the DC initiator/target stack its DC sessions share.
+// Client sessions of one connector; holds per-connector backend state (the DC stack).
 class RemoteOpClientFactory {
 public:
     RemoteOpClientFactory(uint32_t rot, RdmaContext& ctx, uint64_t dc_access_key);
@@ -47,9 +45,7 @@ private:
     uint32_t     rot_;
     RdmaContext& ctx_;
     uint64_t     dc_access_key_;
-    std::unique_ptr<DcInitiator> dc_ini_;
-    std::unique_ptr<DcTarget>    dc_tgt_;
-    std::shared_ptr<std::mutex>  dc_stack_mu_;
+    std::unique_ptr<DcClientStack> dc_;   // created on the first DC session
 };
 
 }  // namespace radixshmem
