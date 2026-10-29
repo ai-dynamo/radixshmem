@@ -12,10 +12,7 @@ namespace radixshmem {
 
 class LocalTreeConnector;
 
-// Server-side business of the remote-op plane, shared by every backend.
-// Validates the op's arguments (BAD_REQUEST on failure) and runs it against
-// the local tree; knows nothing about wire formats. Methods may throw; the
-// backend maps a throw to INTERNAL.
+// Wire-agnostic local-tree ops: invalid arguments yield BAD_REQUEST; backends map exceptions to INTERNAL.
 class RemoteOpService {
 public:
     // `insert_mu` serializes allocate and insert (the svc client's RHT publish).
@@ -27,8 +24,7 @@ public:
     AllocateReply allocate(int n);
     QueryReply    query(const uint64_t* hashes, int n, bool lock,
                         bool update_meta);
-    // slots[i] holds hashes[start + i]. A rejected request reports
-    // error = REMOTE_FAILED with remote_status = BAD_REQUEST.
+    // slots[i] holds hashes[start + i]; invalid requests yield REMOTE_FAILED with remote_status = BAD_REQUEST.
     InsertResult  insert(const uint64_t* hashes, int n, int start, int length,
                          const int32_t* slots, bool auto_recycle);
     RemoteStatus  recycle(const int32_t* slots, int num_slots);

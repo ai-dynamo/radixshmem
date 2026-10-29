@@ -32,8 +32,7 @@ struct RemoteOpAddr {
 
 class RemoteOpService;
 
-// Serving lifecycle of one backend; endpoint creation/publication is done by
-// rc_build_endpoint. stop() must run before destruction.
+// Backend lifecycle: rc_build_endpoint publishes the endpoint; call stop() before destruction.
 class IRemoteOpServerTransport {
 public:
     virtual ~IRemoteOpServerTransport() = default;

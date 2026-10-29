@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Server half of the gRPC remote-op backend: one handler per named RPC,
-// guarded by a ready gate and a bounded in-flight count, calling
-// RemoteOpService. Business results go in the response; request-level
-// failures are gRPC status codes.
+// Gated, bounded RemoteOpService RPCs: business results in replies, request failures in gRPC status codes.
 #include "grpc_remote_op.hpp"
 
 #ifdef RADIXSHMEM_HAS_GRPC
@@ -54,8 +51,7 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     std::atomic<int>  inflight{0};
     std::once_flag    stopped;
 
-    // Ready gate, then the in-flight bound; run `op` (which fills the
-    // response) and map a throw to INTERNAL.
+    // Check readiness and admission, run `op` to fill the response, and map exceptions to INTERNAL.
     template <typename Op>
     grpc::Status run(Op&& op) {
         if (!ready.load())
@@ -148,9 +144,7 @@ GrpcRemoteOpServer::GrpcRemoteOpServer(uint16_t listen_port, int max_inflight)
     builder.SetMaxSendMessageSize(kMaxMessageBytes);
     // A second server on a taken port must fail, not share it.
     builder.AddChannelArgument(GRPC_ARG_ALLOW_REUSEPORT, 0);
-    // The default single CQ with 1-2 pollers hands every call to another
-    // thread; 4 CQs with 4-8 pollers each cut that cost (measured: 3.5x the
-    // query throughput, 40% less CPU per op).
+    // Four CQs with 4-8 pollers each cut per-call thread handoffs (measured: 3.5x query throughput, 40% less CPU per op).
     builder.SetSyncServerOption(grpc::ServerBuilder::NUM_CQS, kNumCqs);
     builder.SetSyncServerOption(grpc::ServerBuilder::MIN_POLLERS, kMinPollers);
     builder.SetSyncServerOption(grpc::ServerBuilder::MAX_POLLERS, kMaxPollers);
@@ -175,9 +169,7 @@ void GrpcRemoteOpServer::start(RemoteOpService& svc) {
 
 void GrpcRemoteOpServer::stop() {
     std::call_once(impl_->stopped, [this] {
-        // Close the gate; Shutdown returns only after the handlers already
-        // running (they hold the service) have returned. Calls still open
-        // at the deadline are cancelled on the wire.
+        // Close admission and drain service-holding handlers; deadline expiry cancels pending calls on the wire.
         impl_->ready.store(false);
         impl_->server->Shutdown(std::chrono::system_clock::now() +
                                 std::chrono::seconds(1));

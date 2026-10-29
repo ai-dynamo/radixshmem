@@ -18,8 +18,7 @@ namespace radixshmem {
 // Default per-op deadline (RADIXSHMEM_REMOTE_OP_TIMEOUT_MS, else 5000 ms).
 int grpc_remote_op_timeout_ms();
 
-// One channel per target; ops may be in flight concurrently. No retries: a
-// TIMEOUT / UNAVAILABLE result does not mean the target skipped the op.
+// Concurrent per-target channel, no retries: TIMEOUT/UNAVAILABLE does not imply the op was skipped.
 class GrpcRemoteOpClientTransport : public IRemoteOpClientTransport {
 public:
     // `target` is "host:port"; the channel connects lazily.
@@ -43,14 +42,10 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Named-RPC server. The ctor binds and starts accepting; every op fails
-// UNAVAILABLE until start(svc) opens the ready gate. At most `max_inflight`
-// ops run at once, the rest fail RESOURCE_EXHAUSTED. stop() closes the gate
-// and shuts the server down once the running handlers have returned.
+// Binds on construction; UNAVAILABLE until start(svc), RESOURCE_EXHAUSTED at max_inflight; stop() drains handlers.
 class GrpcRemoteOpServer : public IRemoteOpServerTransport {
 public:
-    // listen_port 0 = OS-assigned; max_inflight <= 0 = 32. Throws when the
-    // bind fails.
+    // listen_port 0 = OS-assigned; max_inflight <= 0 = 32; bind failure throws.
     explicit GrpcRemoteOpServer(uint16_t listen_port, int max_inflight = 0);
     ~GrpcRemoteOpServer() override;
 

@@ -464,8 +464,7 @@ int run_full_dedup() {
 }
 
 // ---- #2 + #3: target dead → TIMEOUT or UNAVAILABLE; cached session stays safe ----
-// The two sync fds are passed by number on the re-exec'd child's argv; they
-// survive execv (not CLOEXEC).
+// The two sync fds reach the re-exec'd child as argv numbers; they survive execv (not CLOEXEC).
 int g_to_parent_fd = -1, g_from_parent_fd = -1;
 // A dead target is a deadline expiry (zmq/dc) or a refused connection (grpc).
 bool target_down(radixshmem::RemoteStatus st) {
@@ -490,8 +489,7 @@ int run_timeout_and_rebuild() {
                     (int)r.status);
             return 183;
         }
-        // #3: the cached session survives; repeated ops keep reporting the
-        // failure, never crash (no per-call handle to invalidate).
+        // #3: the cached session survives; repeated ops keep reporting the failure, never crash (no per-call handle to invalidate).
         auto q = cli.remote_query(kTargetRank, h.data(), 4);
         if (!target_down(q.status)) return 184;
         auto rep = cli.remote_allocate(kTargetRank, 4);

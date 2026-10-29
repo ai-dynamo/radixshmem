@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Server half of the binary remote-op protocol shared by the DC and ZMQ
-// backends: lane pollers that decode the request, run the op on
-// RemoteOpService and send the encoded reply. Client half lives in
-// remote_op_wire_client.cpp.
+// DC/ZMQ binary protocol server half: lane pollers decode requests, call RemoteOpService and encode replies; the client half is remote_op_wire_client.cpp.
 #include "radixshmem_config.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
@@ -151,14 +148,12 @@ void WireRemoteOpServerTransport::loop(int lane) {
                               h->version == REMOTE_OP_PROTOCOL_VERSION &&
                               h->n >= 0 && h->n <= MAX_REMOTE_OP_BLOCKS;
                     if (ok) {
-                        // RESERVE carries no hashes (h->n is the alloc count);
-                        // every other op is preceded by n hashes.
+                        // RESERVE uses h->n as the slot count; other ops carry n hashes.
                         size_t want = sizeof(RemoteOpReqHeader) +
                             (h->op == REMOTE_OP_INSERT_RESERVE
                                  ? 0
                                  : (size_t)h->n * sizeof(uint64_t));
-                        // INSERT / INSERT_RELEASE carry the phase-1 slots
-                        // behind the hashes (u.insert.length int32s).
+                        // INSERT / INSERT_RELEASE append u.insert.length int32 phase-1 slots after the hashes.
                         if (h->op == REMOTE_OP_INSERT ||
                             h->op == REMOTE_OP_INSERT_RELEASE) {
                             int ns = h->u.insert.length;
@@ -174,8 +169,7 @@ void WireRemoteOpServerTransport::loop(int lane) {
                         auto reply = make_status_reply(*h, RemoteStatus::BAD_REQUEST);
                         send_reply(ctx, reply.data(), reply.size());
                     } else {
-                        // Dispatch + reply in place. hashes point into rbuf —
-                        // valid for the duration of the handler, no copy needed.
+                        // Dispatch/reply in place; hashes borrow rbuf for the handler's lifetime.
                         const uint64_t* hashes =
                             reinterpret_cast<const uint64_t*>(h + 1);
                         std::vector<char> reply;

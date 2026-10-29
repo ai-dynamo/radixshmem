@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Server half of the remote-op plane: RemoteOpService (the ops against our
-// local tree) and RadixServer::rc_* (endpoint + serving lifecycle). Backends
-// are chosen in transport/remote_op_factory.cpp.
+// RemoteOpService local-tree operations and RadixServer::rc_* endpoint/serving lifecycle; backends are chosen in transport/remote_op_factory.cpp.
 #include "radix_server.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
@@ -42,8 +40,7 @@ bool valid_range(int start, int length, int n) {
 // ==================== RemoteOpService ====================
 
 AllocateReply RemoteOpService::allocate(int n) {
-    // Pure slot alloc (no hashes, no dedup); dedup happens in insert, whose
-    // local insert consumes only the unmatched tail.
+    // Allocate without hashes or dedup; insert consumes only the unmatched tail.
     AllocateReply out;
     if (!valid_count(n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
     if (n == 0) return out;
@@ -100,8 +97,7 @@ RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, int start,
         (n > 0 && !hashes))
         return RemoteStatus::BAD_REQUEST;
     if (length == 0) return RemoteStatus::OK;
-    // Rebuild the fully-inside record from the wire range and release
-    // through the component pair.
+    // Rebuild the fully-inside record from the wire range and release through the component pair.
     PinRecord pin;
     pin.full = {(uint32_t)start, (uint32_t)(start + length)};
     (void)tree_.tree().dec_ref(hashes, n, std::move(pin));
