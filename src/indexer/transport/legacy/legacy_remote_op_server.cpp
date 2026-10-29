@@ -3,12 +3,12 @@
 
 // Server half of the legacy (DC/ZMQ) remote-op backends: lane pollers that
 // decode the binary protocol, run the op on RemoteOpService and send the
-// encoded reply. Client half lives in peer/remote_op.cpp.
+// encoded reply. Client half lives in legacy_remote_op_client.cpp.
 #include "radixshmem_config.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-#include "bilateral_transport.h"
+#include "legacy_remote_op.hpp"
 #include "cluster_protocol.h"
 #include "remote_op_service.hpp"
 

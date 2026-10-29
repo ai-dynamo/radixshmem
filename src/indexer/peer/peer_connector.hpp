@@ -26,8 +26,7 @@ class PeerRegistry;
 class RdmaTransportClient;
 #ifndef RADIXSHMEM_NO_RDMA
 class RemotePeer;
-class DcInitiator;
-class DcTarget;
+class RemoteOpClientFactory;
 #endif
 
 struct PeerConnectorConfig {
@@ -78,7 +77,7 @@ class PeerConnector {
     void peer_left(int rank);
 
 #ifndef RADIXSHMEM_NO_RDMA
-    // Fresh remote-op session to `rank` (ZMQ or DC); caller owns the handle.
+    // Fresh remote-op session to `rank` (gRPC, ZMQ or DC); caller owns the handle.
     std::shared_ptr<RemotePeer> open_remote(int rank);
 #endif
 
@@ -89,8 +88,7 @@ class PeerConnector {
     void fault(int rank, const char* op, const std::exception& e,
                std::chrono::steady_clock::time_point t0);
 #ifndef RADIXSHMEM_NO_RDMA
-    std::shared_ptr<RemotePeer> build_rc_session(
-        int rank, std::shared_ptr<std::mutex> stack_mu);
+    std::shared_ptr<RemotePeer> build_rc_session(int rank);
 #endif
 
     PeerRegistry&        peers_;
@@ -110,10 +108,8 @@ class PeerConnector {
     std::unique_ptr<PeerBreaker> breaker_;
 
 #ifndef RADIXSHMEM_NO_RDMA
-    std::unique_ptr<DcInitiator> dc_rc_ini_;
-    std::unique_ptr<DcTarget>    dc_rc_tgt_;
+    std::unique_ptr<RemoteOpClientFactory> rc_factory_;
     std::mutex rc_open_mu_;
-    std::shared_ptr<std::mutex> rc_stack_op_mu_;
     int rc_client_rank_ = -1;
 #endif
 };

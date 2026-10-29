@@ -9,12 +9,7 @@
 #include "cluster_protocol.h"
 #ifndef RADIXSHMEM_NO_RDMA
 #include "radix_client.h"
-#endif
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-#include "dc_bilateral.hpp"
-#endif
-#ifdef RADIXSHMEM_HAS_GRPC
-#include "grpc_remote_op.hpp"
+#include "transport/remote_op_factory.hpp"
 #endif
 
 #include <algorithm>
@@ -38,17 +33,8 @@ static double secs_since(std::chrono::steady_clock::time_point t0) {
 }
 
 PeerConnector::~PeerConnector() {
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-    if (rc_stack_op_mu_ && rc_stack_op_mu_.use_count() > 1) {
-        fprintf(stderr,
-                "[PeerConnector] WARNING: %ld dc remote-op session(s) (or "
-                "retained lock=true results) outlive this client — their "
-                "destruction is use-after-free. Drop all RemotePeer handles AND "
-                "locked QueryResults before the RadixClient.\n",
-                (long)(rc_stack_op_mu_.use_count() - 1));
-    }
-    dc_rc_ini_.reset();
-    dc_rc_tgt_.reset();
+#ifndef RADIXSHMEM_NO_RDMA
+    rc_factory_.reset();
 #endif
     slots_.clear();
 }
@@ -300,8 +286,7 @@ static int resolve_rc_client_rank(int default_rank) {
     return client_rank;
 }
 
-std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(
-        int rank, std::shared_ptr<std::mutex> stack_mu) {
+std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
     PeerEntry p;
     {
         std::shared_lock<std::shared_mutex> lk(peers_.mutex());
@@ -312,83 +297,14 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(
     if (p.rank != rank)
         throw std::runtime_error("open_remote: peer rank " + std::to_string(rank) +
                                  " is not registered (node down)");
-    int client_rank = rc_client_rank_;
-    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_DC) {
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-        if (p.rc_dct_num == 0)
-            throw std::runtime_error(
-                "open_remote: peer rank " + std::to_string(rank) +
-                " has remote ops disabled (rc_dct_num == 0)");
-        if (!dc_rc_tgt_) {
-            auto tgt = std::make_unique<DcTarget>(
-                tx_.ctx(), cfg_.dc_access_key, /*srq_max_wr=*/16);
-            auto ini = std::make_unique<DcInitiator>(tx_.ctx(), cfg_.dc_access_key);
-            dc_rc_tgt_ = std::move(tgt);
-            dc_rc_ini_ = std::move(ini);
-        }
-        int p_eff = 1;
-        for (int i = 0; i < 3 && p.rc_dct_num_extra[i] != 0; ++i) ++p_eff;
-        int lane = (int)((unsigned)client_rank % (unsigned)p_eff);
-        uint32_t dctn = lane == 0 ? p.rc_dct_num : p.rc_dct_num_extra[lane - 1];
-        ibv_gid dgid;
-        std::memcpy(&dgid, p.gid_raw, 16);
-        ibv_ah* ah = dc_create_ah(tx_.ctx(), dgid, p.lid, p.link_layer);
-        if (!ah)
-            throw std::runtime_error(
-                "open_remote: ibv_create_ah to rank " +
-                std::to_string(rank) + " failed");
-        auto t = std::make_unique<DcClientTransport>(
-            *dc_rc_ini_, *dc_rc_tgt_, ah, dctn, client_rank,
-            std::move(stack_mu));
-        std::string dep = "dc://" + std::string(p.host) + "#" +
-                          std::to_string(dctn);
-        auto rc = std::make_shared<RemotePeer>(std::move(t), std::move(dep));
-        rc->set_peer_rank(rank);
-        return rc;
-#else
-        throw std::runtime_error(
-            "open_remote: cluster remote-op transport is dc but "
-            "this build has no RDMA control-plane backend");
-#endif
-    }
-
-    if (p.remote_op_listen_port == 0)
-        throw std::runtime_error(
-            "open_remote: peer rank " + std::to_string(rank) +
-            " has remote ops disabled (remote-op listen port == 0)");
-    std::string hostport = std::string(p.host) + ":" +
-                           std::to_string(p.remote_op_listen_port);
-
-    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_GRPC) {
-#ifdef RADIXSHMEM_HAS_GRPC
-        auto t = std::make_unique<GrpcRemoteOpClientTransport>(
-            hostport, grpc_remote_op_timeout_ms());
-        auto rc = std::make_shared<RemotePeer>(std::move(t), "grpc://" + hostport);
-        rc->set_peer_rank(rank);
-        return rc;
-#else
-        throw std::runtime_error(
-            "open_remote: cluster remote-op transport is grpc but "
-            "gRPC is not compiled into this build");
-#endif
-    }
-    if (cfg_.remote_op_transport != REMOTE_OP_TRANSPORT_ZMQ) {
-        throw std::runtime_error(
-            "open_remote: cluster advertises remote-op transport enum " +
-            std::to_string(cfg_.remote_op_transport) + ", which this build "
-            "does not serve (removed xrc/rdma backend?) — redeploy rank 0 "
-            "with remote_op_transport = grpc, dc or zmq");
-    }
-    std::string ep = "tcp://" + hostport;
-#ifdef RADIXSHMEM_HAS_ZMQ
-    auto rc = std::make_shared<RemotePeer>(ep);
+    if (!rc_factory_)
+        rc_factory_ = std::make_unique<RemoteOpClientFactory>(
+            cfg_.remote_op_transport, tx_.ctx(), cfg_.dc_access_key);
+    std::string endpoint;
+    auto t = rc_factory_->open(p, rc_client_rank_, endpoint);
+    auto rc = std::make_shared<RemotePeer>(std::move(t), std::move(endpoint));
     rc->set_peer_rank(rank);
     return rc;
-#else
-    throw std::runtime_error(
-        "open_remote: cluster remote-op transport is zmq but "
-        "ZMQ is not compiled into this build");
-#endif
 }
 
 std::shared_ptr<RemotePeer> PeerConnector::open_remote(int rank) {
@@ -399,16 +315,7 @@ std::shared_ptr<RemotePeer> PeerConnector::open_remote(int rank) {
     std::lock_guard<std::mutex> g(rc_open_mu_);
     if (rc_client_rank_ < 0)
         rc_client_rank_ = resolve_rc_client_rank(peers_.my_rank());
-    // DC sessions share one initiator+target stack; ZMQ sessions own theirs.
-    std::shared_ptr<std::mutex> mu;
-    std::unique_lock<std::mutex> opg;
-    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_DC) {
-        if (!rc_stack_op_mu_)
-            rc_stack_op_mu_ = std::make_shared<std::mutex>();
-        mu = rc_stack_op_mu_;
-        opg = std::unique_lock<std::mutex>(*mu);
-    }
-    return build_rc_session(rank, std::move(mu));
+    return build_rc_session(rank);
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA
