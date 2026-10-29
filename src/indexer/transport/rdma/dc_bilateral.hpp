@@ -5,7 +5,7 @@
 
 #include "cluster_protocol.h"     // RemoteStatus, RemoteOp* headers
 #include "rdma_transport.hpp"        // DcInitiator, DcTarget, dc_create_ah
-#include "bilateral_transport.h"   // LegacyRemoteOp{Client,Server}Transport
+#include "legacy_remote_op.hpp"   // LegacyRemoteOp{Client,Server}Transport
 
 #include <array>
 #include <atomic>

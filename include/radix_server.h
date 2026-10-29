@@ -17,6 +17,7 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
+#include "cluster_protocol.h"      // ibv_cq, CLUSTER_TRANSPORT_*, REMOTE_OP_TRANSPORT_*
 #include <unordered_map>
 #endif
 

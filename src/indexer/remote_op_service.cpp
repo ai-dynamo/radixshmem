@@ -3,7 +3,7 @@
 
 // Server half of the remote-op plane: RemoteOpService (the ops against our
 // local tree) and RadixServer::rc_* (endpoint + serving lifecycle). Backends
-// live under transport/; the client half (RemotePeer) in peer/remote_op.cpp.
+// are chosen in transport/remote_op_factory.cpp.
 #include "radix_server.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
@@ -13,16 +13,7 @@
 #include "radix_client.h"          // RadixClient (svc_client_)
 #include "cluster_protocol.h"      // MAX_REMOTE_OP_BLOCKS
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "cluster_manifest.h"      // REMOTE_OP_TRANSPORT_*
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-#include "dc_bilateral.hpp"                 // DcServerTransport
-#endif
-#ifdef RADIXSHMEM_HAS_ZMQ
-#include "zmq_transport.hpp"                // ZmqServerTransport
-#endif
-#ifdef RADIXSHMEM_HAS_GRPC
-#include "grpc_remote_op.hpp"               // GrpcRemoteOpServer
-#endif
+#include "transport/remote_op_factory.hpp"   // make_remote_op_server
 
 #include <algorithm>
 #include <cstdint>
@@ -38,15 +29,6 @@
 namespace radixshmem {
 
 namespace {
-
-int rc_resolve_lanes() {
-    int lanes = 1;
-    if (const char* e = ::getenv("RADIXSHMEM_RC_LANES")) {
-        int v = std::atoi(e);
-        if (v >= 1 && v <= 8) lanes = v;
-    }
-    return lanes;
-}
 
 bool valid_count(int n) { return n >= 0 && n <= MAX_REMOTE_OP_BLOCKS; }
 
@@ -133,54 +115,9 @@ RemoteOpAddr RadixServer::rc_build_endpoint(uint32_t rot_auth,
                                             RdmaContext& ctx) {
     // Body of the build_remote_op callback.
     RemoteOpAddr addr{};
-    if (rot_auth == REMOTE_OP_TRANSPORT_DC) {
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-        int k_pool = 64;
-        if (const char* e = ::getenv("RADIXSHMEM_RC_KPOOL")) {
-            int v = std::atoi(e);
-            if (v >= 1 && v <= 4096) k_pool = v;
-        }
-        auto t = std::make_unique<DcServerTransport>(
-            ctx, dc_access_key, std::min(rc_resolve_lanes(), 4), k_pool);
-        for (int i = 0; i < t->lanes() && i < 4; ++i)
-            addr.dctns[i] = t->dct_num(i);
-        rc_server_ = std::move(t);
-        return addr;   // addr.port stays 0 — DC has no TCP endpoint
-#else
-        throw std::runtime_error(
-            "remote-op: cluster authoritative transport is dc but this build "
-            "has no RDMA control-plane backend");
-#endif
-    }
-    if (rot_auth == REMOTE_OP_TRANSPORT_GRPC) {
-#ifdef RADIXSHMEM_HAS_GRPC
-        auto g = std::make_unique<GrpcRemoteOpServer>(cfg_.remote_op_listen_port);
-        addr.port = g->port();   // actual bound port (throws on failure)
-        rc_server_ = std::move(g);
-        return addr;
-#else
-        throw std::runtime_error(
-            "remote-op: cluster authoritative transport is grpc but gRPC is "
-            "not compiled into this build");
-#endif
-    }
-    if (rot_auth != REMOTE_OP_TRANSPORT_ZMQ) {
-        throw std::runtime_error(
-            "remote-op: cluster authoritative transport enum " +
-            std::to_string(rot_auth) + " is not served by this build "
-            "(removed xrc/rdma backend?) — redeploy rank 0 with "
-            "remote_op_transport = grpc, dc or zmq");
-    }
-#ifdef RADIXSHMEM_HAS_ZMQ
-    auto z = std::make_unique<ZmqServerTransport>(cfg_.remote_op_listen_port);
-    addr.port = z->bind();   // actual bound port (throws on failure)
-    rc_server_ = std::move(z);
+    rc_server_ = make_remote_op_server(rot_auth, cfg_.remote_op_listen_port,
+                                       ctx, dc_access_key, addr);
     return addr;
-#else
-    throw std::runtime_error(
-        "remote-op: cluster authoritative transport is zmq but ZMQ is not "
-        "compiled into this build");
-#endif
 }
 
 void RadixServer::rc_spawn() {

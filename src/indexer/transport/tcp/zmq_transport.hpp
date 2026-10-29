@@ -8,7 +8,7 @@
 #ifdef RADIXSHMEM_HAS_ZMQ
 
 #include "cluster_protocol.h"      // RemoteStatus
-#include "bilateral_transport.h"   // LegacyRemoteOp{Client,Server}Transport
+#include "legacy_remote_op.hpp"   // LegacyRemoteOp{Client,Server}Transport
 
 #include <cstddef>
 #include <cstdint>
