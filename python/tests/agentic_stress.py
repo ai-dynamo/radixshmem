@@ -96,6 +96,7 @@ class Config:
     slow_us: float = 0.0              # log every request slower than this (query or insert)
     rht_slots: int = 4                # RHT slots per bucket (W)
     flush_after_insert: bool = False  # drain async RHT writes before DONE
+    writeback_delay_ms: float = -1.0  # >= 0: background eviction writes back, done after this delay
     # internal (filled by the launcher)
     run_id: str = ""
     etcd_port: int = 0
@@ -156,6 +157,9 @@ def parse_args():
                    default=d.flush_after_insert,
                    help="client.flush() after insert so RHT routes land before DONE")
     # internal
+    p.add_argument("--writeback-delay-ms", type=float, default=d.writeback_delay_ms,
+                   help=">= 0 enables write-back with a handler that stores nothing and calls "
+                        "done after this delay (default: off)")
     p.add_argument("--role", choices=["launcher", "worker"], default="launcher")
     p.add_argument("--rank", type=int, default=-1)
     p.add_argument("--config-json", default="")
@@ -203,7 +207,23 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
         swa_ratio=swa_bytes / data_bytes if data_bytes else 0.0,
         mamba_ratio=mamba_bytes / data_bytes if data_bytes else 0.0,
         slot_align=64, transfer_devices=dev, max_nodes=cfg.max_nodes,
-        data_pool_ratio=cfg.data_pool_ratio, cluster=cluster)
+        data_pool_ratio=cfg.data_pool_ratio, writeback=cfg.writeback_delay_ms >= 0, cluster=cluster)
+
+
+class DelayedWriteback(radixshmem.WritebackHandler):
+    """Writes nothing: hands the tasks back after a fixed delay."""
+
+    def __init__(self, delay_ms: float):
+        self.delay = delay_ms / 1000
+
+    def write(self, tasks, done):
+        ids = [t.task_id for t in tasks]
+        if self.delay <= 0:
+            done(ids)
+            return
+        t = threading.Timer(self.delay, done, args=(ids,))
+        t.daemon = True
+        t.start()
 
 
 def geometry(cfg: Config) -> radixshmem.Geometry:
@@ -286,17 +306,19 @@ def create_node(cfg: Config, rank: int):
     """The engine's bootstrap: start the node's server, build the client with
     the geometry (handed to the server at once), wait for the cluster."""
     sc = server_config(cfg, rank)
-    server = radixshmem.RadixServer(sc).start()
+    handler = DelayedWriteback(cfg.writeback_delay_ms) if cfg.writeback_delay_ms >= 0 else None
+    server = radixshmem.RadixServer(sc, writeback=handler).start()
     client = radixshmem.RadixClient(sc.name, geometry(cfg))
     client.wait_ready(cfg.bootstrap_timeout + 120)
     return server, client
 
 
 class Worker:
-    def __init__(self, cfg: Config, rank: int, client):
+    def __init__(self, cfg: Config, rank: int, client, server):
         self.cfg = cfg
         self.rank = rank
         self.client = client
+        self.server = server
         self.own = int(client.rank()) if client.is_distributed() else 0
         self.mask = query_mask(cfg)
         self.think = cfg.think_ms / 1000.0
@@ -510,8 +532,19 @@ class Worker:
                 break
             send_msg(sock, MSG_DONE, item)
 
+    def drain_writeback(self, timeout: float = 30.0) -> Optional[dict]:
+        if self.cfg.writeback_delay_ms < 0:
+            return None
+        deadline, quiet = time.monotonic() + timeout, 0
+        while time.monotonic() < deadline and quiet < 3:
+            wb = self.server.stats()["writeback"]
+            quiet = quiet + 1 if wb["queued"] == 0 and wb["popped"] == 0 else 0
+            time.sleep(0.1)
+        return self.server.stats()["writeback"]
+
     def stats(self) -> dict:
         c = self.client
+        wb = self.drain_writeback()   # held slots would show as leaks in the audit
         return {
             "worker": self.rank, "own_rank": self.own,
             "total_blocks": int(c.total_blocks()),
@@ -528,6 +561,7 @@ class Worker:
             # end-of-run leak audit (locks / slots / pins); 0 == clean
             "health": int(c.check_health()),
             "health_report": c.health_report().describe().strip(),
+            "writeback": wb,
         }
 
 
@@ -547,7 +581,7 @@ def run_worker(cfg: Config, rank: int) -> int:
     conn, _ = ls.accept()
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    w = Worker(cfg, rank, client)
+    w = Worker(cfg, rank, client, server)
     threads = [threading.Thread(target=w.recv_loop, args=(conn,), daemon=True),
                threading.Thread(target=w.send_loop, args=(conn,), daemon=True)]
     execs = [threading.Thread(target=w.exec_loop, daemon=True)
@@ -972,6 +1006,10 @@ def print_report(rep: dict):
                   f"staging_short={s.get('staging_shortfalls', 0)}  "
                   f"promo_short={s.get('promotion_shortfalls', 0)}  "
                   f"health={'ok' if s.get('health', 0) == 0 else f'0x{s["health"]:x}'}")
+            if s.get("writeback"):
+                wb = s["writeback"]
+                print(f"      write-back: tasks {wb['produced']} produced, {wb['completed']} completed, "
+                      f"{wb['dropped']} dropped, {wb['failed']} failed; held {wb['held_slots']}")
             if s.get("health", 0):
                 for line in s["health_report"].splitlines():
                     print(f"      {line}")

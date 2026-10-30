@@ -17,6 +17,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
   - [1.3](#13-radixclientconfig--client-discovery-config) `RadixClientConfig` [— client discovery config](#13-radixclientconfig--client-discovery-config)
 - [2.](#2-radixserver) `RadixServer`
   - [2.5 Health check `check_health`](#25-health-check-check_health)
+  - [2.6 Write-back of background eviction](#26-write-back-of-background-eviction)
 - [3.](#3-radixclient) `RadixClient`
   - [3.1 Construction and lifecycle](#31-construction-and-lifecycle)
   - [3.2 datapath: insert / query / remote ops](#32-datapath-insert--query--remote-ops)
@@ -102,6 +103,8 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 | `enable_remote_query`   | `bool`             | `false`                   | Allow peers to query this server's tree remotely (`[remote_query](#remote_query)`; `lock=true` can pin the matched prefix). |
 | `zmq_listen_port`       | `uint16_t`         | `0`                       | TCP port of the remote-op endpoint (shared by insert/query; used only by the zmq backend as the REP socket; dc has no TCP endpoint, so this value is always 0). `0` = assigned by the OS (the real port is read back and published to etcd `/peers`). |
 | `remote_op_transport`   | `std::string`      | `"zmq"`                   | remote-op transport: `"zmq"` (TCP REQ/REP) or `"dc"` (DCI/DCT). rank0 is authoritative. Can be overridden by env `RADIXSHMEM_REMOTE_OP_TRANSPORT`. ("rdma"/"xrc" are the removed XRC backend; bootstrap reports an error.) |
+| `writeback_enabled`     | `bool`             | `false`                   | Background eviction holds the evicted slots for write-back instead of recycling them; see [2.6](#26-write-back-of-background-eviction). |
+| `writeback_max_held_ratio` | `float`         | `0.05`                    | Background eviction runs only while the slots covered by unfinished write-backs stay below this share of every pool. |
 
 
 > **Distributed criterion**: `want_cluster()` = `expected_min_nodes > 1 || num_rht_shards > 1 || world_size > 1`. If any of the three holds, etcd + RDMA bootstrap is used, and in that case **one of** `rpc_address` / `rpc_interface` **must be given**; otherwise `bootstrap()` throws `std::runtime_error`.
@@ -233,6 +236,20 @@ int check_health(HealthReport* report = nullptr) const;
 ```
 
 **The same audit** as [`RadixClient::check_health`](#38-health-check-check_health), but applied to the tree held by the server itself; returns `HEALTH_NOT_ATTACHED` before `bootstrap()`. Checks, return values, `HealthReport` fields, and caveats are all in §3.8. Use this entry point in unit tests that have only a server and no client; when a client exists the two are equivalent (same shm).
+
+### 2.6 Write-back of background eviction
+
+```cpp
+WritebackQueue* writeback();   // nullptr unless writeback_enabled
+std::vector<WritebackTask> WritebackQueue::pop(size_t max_tasks, int timeout_ms);
+size_t WritebackQueue::complete(const std::vector<uint64_t>& ids);
+void   WritebackQueue::drop_all();
+WritebackStats WritebackQueue::stats() const;
+```
+
+With `writeback_enabled`, each leaf the background evictor removes becomes a `WritebackTask{id, HeldEviction h}` covering the whole root path `[0, h.end())`: `hashes`, `full_slots`, `swa_slots` (`INVALID_COMPONENT_SLOT` where none), `mamba_ends` / `mamba_slots` (the path's checkpoints), `evicted_from`. `[evicted_from, end)` has left the tree, but its FULL slots, SWA lane and END checkpoint are not recycled; `[0, evicted_from)` stays in the tree with FULL refs (plus SWA refs, and Mamba refs on nodes with a checkpoint) on its nodes, so it is neither evicted nor merged. `complete()` / `drop_all()` recycle the held slots and drop those refs. Foreground eviction (inside `insert` / `allocate_slots`) recycles at once and never produces tasks.
+
+The evictor runs when the existing pressure triggers fire **and** every pool's slots covered by queued + unfinished tasks (prefixes included) are below `writeback_max_held_ratio`; held slots do not count as free. One eviction may overshoot that mark by one task. `ShmHeader::held_slots[3]` counts the slots held per pool; `reset()` zeroes it and bumps `reset_generation`, after which older tasks release nothing and are no longer returned by `pop()`.
 
 
 ---
@@ -903,7 +920,7 @@ The slot audit counts each component pool separately; if any item is non-zero, t
 #### Notes
 
 - **Acquires no lock and does not write shm**: lock state is read directly from the internal fields of glibc `pthread_rwlock_t` / `pthread_mutex_t`, `rdma_rwlock` is an atomic load, and tree traversal is plain memory reads. So even if another process is stuck holding a lock, it still returns normally and reports the lock holder.
-- Designed for the **quiescent state** (test finished, all client operations have returned). Calling it on a live tree with concurrent writers does not block or crash (the traversal has out-of-range and cycle protection), but it sees a torn snapshot and may report false positives.
+- Designed for the **quiescent state** (test finished, all client operations have returned, no write-back unfinished: held slots count as leaked and the refs on their prefixes as `HEALTH_REF_LEAK`; `HealthPoolReport.held` shows them). Calling it on a live tree with concurrent writers does not block or crash (the traversal has out-of-range and cycle protection), but it sees a torn snapshot and may report false positives.
 - The background eviction thread only briefly takes the write lock with `try_write_lock` when the watermark triggers, and touches no lock when idle, so it does not affect the quiescent-state result.
 - Only audits the **local** tree: in distributed mode each rank calls it separately; a remote reader that forgot to release shows up as `HEALTH_RDMA_LOCK_HELD` on the **node being read**.
 - Complexity O(number of nodes + total slots across pools); a pool with tens of millions of slots takes about tens of milliseconds. Do not put it on the datapath hot path.
@@ -985,6 +1002,8 @@ enum class ComponentType : uint32_t { FULL = 0, SWA = 1, MAMBA = 2 };  // Identi
 ## 5. Python binding differences
 
 The public surface of the Python package is two pure-Python classes: `radixshmem.RadixServer` (one process per node, holding the index, SlotStore, transfer engine, and gRPC service; started with the operator parameters `ServerConfig`, it starts in `waiting`, and the geometry is sent by a client) and `radixshmem.RadixClient` (can be constructed before the server is ready; `RadixClient(name, Geometry)` also hands the geometry to the server; `status()` / `configure()` do not block, `wait_ready()` blocks; the index and SlotStore are attached on the first index / data call, raising `ServerNotReady` if not ready; index operations pass through to the underlying `_core.RadixClient`, plus `pull_async()`: query, hand the transfer to the server, publish locally on completion, and `PullJob.wait()` returns local slots). The classes aligned with C++ described below live in the pybind modules `radixshmem._core` (index surface) and `radixshmem._data` (SlotStore / transfer surface), for tests and advanced users to use directly.
+
+**Write-back** ([2.6](#26-write-back-of-background-eviction)): `ServerConfig(writeback=True, writeback_max_held_ratio=0.05)` together with `RadixServer(cfg, writeback=handler)`, where `handler` is a `radixshmem.WritebackHandler` with `start(client)` / `write(tasks, done)` / `stop()`. A thread of the server process pops batches of `radixshmem.WritebackTask` (numpy arrays: `hashes`, `full_slots`, `swa_slots`, `mamba_ends`, `mamba_slots`; `evicted_from`, `end`) and calls `write`; `done(task_ids)` releases them, from any thread; an exception gives up the batch's open tasks. `client` is an in-process `RadixClient` that uses the server's own index client and SlotStore (`query`, `pull_async`, `slot_view`), with no second attach. `close()` stops the thread, calls `stop()` and releases what is left. `radix-server --writeback-handler module:factory [--writeback-config JSON|path] [--writeback-max-held 0.05]` loads `factory(config)`. `server.stats()["writeback"]` and `_core.RadixServer.writeback_stats()` report queued / popped / produced / completed / dropped, `inflight_slots` and `held_slots`; `_core.RadixServer.pop_writeback` / `complete_writeback` / `drop_writeback` are the underlying calls.
 
 `radixshmem._core` matches the C++ API names and signatures nearly one to one. Differences:
 

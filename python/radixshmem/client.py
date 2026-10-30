@@ -162,6 +162,37 @@ class _Rpc:
         self._stub.close()
 
 
+class _LocalTransport:
+    """``_Rpc`` without gRPC, for a client inside the server's process."""
+
+    def __init__(self, server):
+        self._s = server
+
+    def describe(self) -> NodeInfo:
+        return self._s.describe()
+
+    def wait_ready(self, timeout_s) -> NodeInfo:
+        return self._s.wait_ready(timeout_s)
+
+    def configure(self, spec: Dict[str, Any]) -> NodeInfo:
+        return self._s.configure(spec)
+
+    def nodes(self) -> List[Dict[str, Any]]:
+        return self._s.nodes()
+
+    def submit(self, items, timeout_ms) -> int:
+        return self._s.submit([(int(r), int(k), [int(x) for x in rs], [int(x) for x in ls])
+                               for r, k, rs, ls in items], int(timeout_ms))
+
+    def wait_any(self, tickets, timeout_ms) -> Dict[str, Any]:
+        r = self._s.wait_any([int(t) for t in tickets], int(timeout_ms))
+        return {"done": {int(t): [tuple(x) for x in v] for t, v in r["done"].items()},
+                "unknown": [int(t) for t in r["unknown"]]}
+
+    def close(self) -> None:
+        pass
+
+
 class RadixClient:
     """``RadixClient(name)`` connects to the server started as ``--name <name>``
     on this node (socket ``unix:///dev/shm/<name>.sock``; ``endpoint`` overrides
@@ -190,18 +221,29 @@ class RadixClient:
 
     def __init__(self, name: str, geometry=None, *, endpoint: Optional[str] = None,
                  max_outstanding: int = 256, local_read_only: bool = False):
-        self.name = name
-        self.local_read_only = local_read_only
-        self._index = None
-        self._store = None
-        self._attach_mu = threading.Lock()
-        self._t = _Rpc(endpoint or rpc.endpoint_for(name))
+        self._init(name, _Rpc(endpoint or rpc.endpoint_for(name)), max_outstanding, local_read_only)
         try:
             self.info = (self._t.configure(_geometry.as_spec(geometry)) if geometry is not None
                          else self._t.describe())
         except Exception:
             self._t.close()
             raise
+
+    @classmethod
+    def _in_process(cls, server, max_outstanding: int = 256) -> "RadixClient":
+        self = cls.__new__(cls)
+        self._init(server.cfg.name, _LocalTransport(server), max_outstanding, False)
+        self.info = server.describe()
+        self._index, self._store = server._iclient, server._store
+        return self
+
+    def _init(self, name: str, transport, max_outstanding: int, local_read_only: bool) -> None:
+        self.name = name
+        self.local_read_only = local_read_only
+        self._index = None
+        self._store = None
+        self._attach_mu = threading.Lock()
+        self._t = transport
         self.transfer_failures = 0
         self.staging_shortfalls = 0
         self.promotion_shortfalls = 0

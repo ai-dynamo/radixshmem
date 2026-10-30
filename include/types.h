@@ -22,7 +22,7 @@ using HashType = uint64_t;
 static constexpr uint32_t INVALID_NODE_ID = UINT32_MAX;
 static constexpr uint64_t INVALID_OFFSET = UINT64_MAX;
 static constexpr uint64_t SHM_MAGIC = 0x534852444958ULL;
-static constexpr uint32_t SHM_VERSION = 26;   // 26: peer fault counters
+static constexpr uint32_t SHM_VERSION = 27;   // 27: write-back held slots, reset generation
 // cluster_ready_magic sentinel — same-host clients spin on it as a local ready flag.
 static constexpr uint64_t CLUSTER_MANIFEST_MAGIC = 0x434c5354524d4644ULL; // "CLSTRMFD"
 static constexpr size_t HUGEPAGE_SIZE = 2ULL * 1024 * 1024;
@@ -253,6 +253,11 @@ struct ShmHeader {
     uint64_t mamba_lru_offset;             // SlotLruEntry[mamba_mempool_total_blocks]
     AuxListAnchors swa_list;               // slot ids
     AuxListAnchors mamba_list;
+
+    // Slots held for write-back; reset() zeroes them and bumps reset_generation.
+    std::atomic<uint32_t> held_slots[NUM_COMPONENT_TYPES];
+    uint32_t _held_pad;
+    std::atomic<uint64_t> reset_generation;
 
     alignas(64) std::atomic<int64_t> rdma_write_flag{0};
     char _rwf_pad[56];

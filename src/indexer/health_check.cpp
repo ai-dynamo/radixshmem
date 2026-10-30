@@ -131,6 +131,9 @@ public:
             stack.insert(stack.end(), children.begin(), children.end());
         }
 
+        r.full.held  = hdr->held_slots[(int)ComponentType::FULL].load(std::memory_order_relaxed);
+        r.swa.held   = hdr->held_slots[(int)ComponentType::SWA].load(std::memory_order_relaxed);
+        r.mamba.held = hdr->held_slots[(int)ComponentType::MAMBA].load(std::memory_order_relaxed);
         full.finish(r, HEALTH_FULL_SLOT_LEAK);
         swa.finish(r, HEALTH_SWA_SLOT_LEAK);
         mamba.finish(r, HEALTH_MAMBA_SLOT_LEAK);
@@ -172,9 +175,9 @@ std::string HealthReport::describe() const {
     };
     for (const auto& e : pools)
         if (flags & e.f)
-            line("%s slots: used=%u in_tree=%u leaked=%u dangling=%u duplicate=%u (total=%u%s)",
+            line("%s slots: used=%u in_tree=%u leaked=%u dangling=%u duplicate=%u held=%u (total=%u%s)",
                  e.name, e.p.used, e.p.in_tree, e.p.leaked, e.p.dangling,
-                 e.p.duplicate, e.p.total, e.p.enabled ? "" : ", pool absent");
+                 e.p.duplicate, e.p.held, e.p.total, e.p.enabled ? "" : ", pool absent");
     if (flags & HEALTH_REF_LEAK)
         line("refs: %u node(s) pinned, ref_total=%lld", nodes_with_refs,
              (long long)ref_total);
