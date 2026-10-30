@@ -244,10 +244,14 @@ def main(argv=None) -> None:
     a = parse_args(argv)
     try:
         cfg = build_config(a)
-        handler = (load_handler(a.writeback_handler, writeback_config(a.writeback_config))
-                   if a.writeback_handler else None)
-    except (ValueError, TypeError, OSError, ImportError, AttributeError) as e:
+    except (ValueError, TypeError) as e:
         sys.exit(f"ERROR: {e}")
+    handler = None
+    if a.writeback_handler:
+        try:
+            handler = load_handler(a.writeback_handler, writeback_config(a.writeback_config))
+        except Exception as e:  # noqa: BLE001 - whatever the operator's factory raises
+            sys.exit(f"ERROR: write-back handler {a.writeback_handler}: {type(e).__name__}: {e}")
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())

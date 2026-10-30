@@ -391,6 +391,7 @@ class RadixServer:
         self.cfg = cfg
         self._wb_handler = writeback
         self._wb: Optional[_Worker] = None
+        self._wb_closed = False
         self._geometry: Optional[Dict[str, Any]] = None
         self.last_error = ""
         self._cv = threading.Condition(threading.RLock())
@@ -483,6 +484,7 @@ class RadixServer:
         return backend
 
     def close(self) -> None:
+        self._stop_writeback(closing=True)   # first: its handler may still pull while it stops
         self._stop.set()
         if self._poller is not None:
             self._poller.join(2)
@@ -492,11 +494,12 @@ class RadixServer:
             self._rpc = None
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(self.cfg.cluster.bootstrap_timeout_sec + 30)
-        self._running = False
+        with self._jobs_mu:
+            self._running = False
+            thread, self._thread = self._thread, None
         self._wake.set()
-        if self._thread is not None:
-            self._thread.join(2)
-            self._thread = None
+        if thread is not None:
+            thread.join(2)
         if self._xlog is not None:
             self._xlog.close()
             self._xlog = None
@@ -513,20 +516,35 @@ class RadixServer:
             self._mode = MODE_CLOSED
             self._cv.notify_all()
 
+    def _start_writeback(self) -> None:
+        if self._wb_handler is None:
+            return
+        worker = _Worker(self._index, self._wb_handler, RadixClient._in_process(self))
+        with self._cv:
+            closed = self._wb_closed
+            if not closed:
+                self._wb = worker
+        if closed:
+            worker.stop()
+        else:
+            worker.start()
+
+    def _stop_writeback(self, closing: bool = False) -> None:
+        with self._cv:
+            wb, self._wb = self._wb, None
+            self._wb_closed |= closing
+        if wb is not None:
+            wb.stop()
+
     def _teardown_regions(self) -> None:
         """Drop the index, the SlotStore and the data-plane entry; the transfer
         engine and the etcd connection stay (they are the server's, not the
         geometry's)."""
-        with self._cv:
-            wb, self._wb = self._wb, None
-        if wb is not None:
-            wb.stop()
+        self._stop_writeback()
         with self._cv:
             index, store, dreg = self._index, self._store, self._dreg
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
             self._peers = {}
-        if index is not None and self.cfg.writeback:
-            index.drop_writeback()
         if dreg is not None and index is not None:
             try:
                 dreg.unpublish(index.node_name())
@@ -647,6 +665,7 @@ class RadixServer:
                 self._mode = MODE_READY
                 self._cv.notify_all()
             self._publish_node()
+            self._start_writeback()
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:
@@ -706,8 +725,9 @@ class RadixServer:
             out = {"mode": self._mode, "transfers": self.transfers,
                    "transfer_failures": self.transfer_failures, "transfer_bytes": self.transfer_bytes,
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
+        wb = self._wb
         if idx is not None and self.cfg.writeback:
-            out["writeback"] = dict(idx.writeback_stats(), failed=self._wb.failed if self._wb else 0)
+            out["writeback"] = dict(idx.writeback_stats(), failed=wb.failed if wb else 0)
         if idx is not None:
             out.update(rank=idx.rank(), world_size=idx.world_size(),
                        total_radix_nodes=idx.total_radix_nodes(), total_blocks=idx.total_blocks(),
@@ -755,16 +775,6 @@ class RadixServer:
             self._index, self._iclient, self._store = index, iclient, store
         if store is not None and index.is_distributed():
             self._data_plane_up(index, store)
-        if self._wb_handler is not None:
-            client = RadixClient._in_process(self)
-            worker = _Worker(index, self._wb_handler, client)
-            try:
-                worker.start()
-            except BaseException:
-                client.close()
-                raise
-            with self._cv:
-                self._wb = worker
 
     def _data_plane_up(self, index, store) -> None:
         from radixshmem import _data
@@ -802,6 +812,8 @@ class RadixServer:
                 job.replies[i] = (False, 0, 0, str(e))
                 job.left -= 1
         with self._jobs_mu:
+            if self._stop.is_set():   # close() has stopped, or is stopping, the transfer loop
+                raise DataPlaneUnavailable("server is closing")
             if len(self._jobs) >= self.cfg.max_pending_jobs:
                 raise ServerBusy(f"{len(self._jobs)} jobs pending")
             job.ticket = self._next_ticket

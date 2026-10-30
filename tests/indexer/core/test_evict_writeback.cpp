@@ -160,7 +160,8 @@ static void test_budget_and_shared_prefix() {
     insert_fresh(t, b, 16, 8);
 
     std::vector<HeldEviction> held;
-    assert(t.try_evict_batch(100, &held, /*budget=*/1) > 0);
+    const uint64_t one[NUM_COMPONENT_TYPES] = {1, UINT64_MAX, UINT64_MAX};
+    assert(t.try_evict_batch(100, &held, one) > 0);
     assert(held.size() == 1);                      // the first leaf already exceeded the budget
     assert(t.try_evict_batch(100, &held) > 0);
     assert(held.size() == 2);                      // the sibling; the pinned parent stays
@@ -217,6 +218,28 @@ static void test_aux_held_and_pinned() {
     expect_healthy(t);
     assert(t.try_evict_component_batch(ComponentType::SWA, 100) == 4);
     assert(t.try_evict_component_batch(ComponentType::MAMBA, 100) == 1);
+    expect_healthy(t);
+    t.destroy();
+    TEST_PASS();
+}
+
+static void test_mamba_budget() {
+    TEST_BEGIN("hold: the Mamba budget stops a batch too");
+    const char* name = "/tewb_mbudget";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, aux_cfg());
+    auto a = seq(0xA000, 8), b = seq(0xB000, 8);
+    for (const auto* h : {&a, &b}) {
+        insert_fresh(t, *h, 8);                    // nodes [0, 4) and [4, 8)
+        publish(t, *h, 4, ComponentType::MAMBA, 1);
+        publish(t, *h, 8, ComponentType::MAMBA, 1);
+    }
+    const uint64_t one[NUM_COMPONENT_TYPES] = {UINT64_MAX, UINT64_MAX, 1};
+    std::vector<HeldEviction> held;
+    assert(t.try_evict_batch(100, &held, one) == 4);
+    assert(held.size() == 1 && held[0].mamba_slots.size() == 2);   // FULL alone takes both leaves
+    assert(t.try_evict_batch(100, &held) == 4 && held.size() == 2);
+    t.release_held(held);
     expect_healthy(t);
     t.destroy();
     TEST_PASS();
@@ -302,6 +325,7 @@ int main() {
     test_split_of_pinned_ancestor();
     test_budget_and_shared_prefix();
     test_aux_held_and_pinned();
+    test_mamba_budget();
     test_release_after_reset();
     test_queue();
     return tests_report();

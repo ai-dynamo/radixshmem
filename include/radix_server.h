@@ -151,7 +151,7 @@ private:
     std::string shm_name_;
     std::thread evictor_thread_;
     std::atomic<bool> evictor_running_{false};
-    std::unique_ptr<WritebackQueue> writeback_;   // releases into tree_: reset before it
+    std::unique_ptr<WritebackQueue> writeback_;   // refers to *tree_: reset before it
 
     void start_evictor();
     void stop_evictor();
