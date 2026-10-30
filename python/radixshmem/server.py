@@ -41,8 +41,9 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
-                             NodeInfo, TransferItem, TransferReply)
+                             NodeInfo, RadixClient, TransferItem, TransferReply)
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy
+from radixshmem.writeback import WritebackHandler, _Worker
 
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
@@ -125,6 +126,8 @@ class ServerConfig:
     background_evict_ratio: float = 0.05
     data_pool_ratio: float = 4.0     # DataPool bytes = full_slots x ratio x (12 | 16 with SWA)
     evict_policy: str = "lru"
+    writeback: bool = False              # needs RadixServer(cfg, writeback=handler)
+    writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     rpc_workers: int = 32            # one blocks per client with jobs in flight
@@ -151,6 +154,10 @@ class ServerConfig:
             raise ValueError(f"unknown transfer_backend {self.transfer_backend!r}")
         if self.role not in ROLES:
             raise ValueError(f"unknown role {self.role!r}")
+        if not 0.0 < self.writeback_max_held_ratio <= 1.0:
+            raise ValueError("writeback_max_held_ratio must be in (0, 1]")
+        if self.writeback and self.background_evict_ratio <= 0:
+            raise ValueError("writeback needs background eviction (background_evict_ratio > 0)")
 
     @property
     def index_only(self) -> bool:
@@ -382,8 +389,12 @@ def _kind_name(kind: int) -> str:
 
 
 class RadixServer:
-    def __init__(self, cfg: ServerConfig):
+    def __init__(self, cfg: ServerConfig, writeback: Optional[WritebackHandler] = None):
+        if cfg.writeback != (writeback is not None):
+            raise ValueError("ServerConfig.writeback and a WritebackHandler go together")
         self.cfg = cfg
+        self._wb_handler = writeback
+        self._wb: Optional[_Worker] = None
         self._geometry: Optional[Dict[str, Any]] = None
         self.last_error = ""
         self._cv = threading.Condition(threading.RLock())
@@ -511,9 +522,15 @@ class RadixServer:
         engine and the etcd connection stay (they are the server's, not the
         geometry's)."""
         with self._cv:
+            wb, self._wb = self._wb, None
+        if wb is not None:
+            wb.stop()
+        with self._cv:
             index, store, dreg = self._index, self._store, self._dreg
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
             self._peers = {}
+        if index is not None and self.cfg.writeback:
+            index.drop_writeback()
         if dreg is not None and index is not None:
             try:
                 dreg.unpublish(index.node_name())
@@ -693,6 +710,8 @@ class RadixServer:
             out = {"mode": self._mode, "transfers": self.transfers,
                    "transfer_failures": self.transfer_failures, "transfer_bytes": self.transfer_bytes,
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
+        if idx is not None and self.cfg.writeback:
+            out["writeback"] = dict(idx.writeback_stats(), failed=self._wb.failed if self._wb else 0)
         if idx is not None:
             out.update(rank=idx.rank(), world_size=idx.world_size(),
                        total_radix_nodes=idx.total_radix_nodes(), total_blocks=idx.total_blocks(),
@@ -710,6 +729,8 @@ class RadixServer:
         cc = _core.RadixServerConfig()
         cc.name, cc.shm = self.cfg.name, shm
         cc.register_chunk_tokens = int(g["register_chunk_tokens"])
+        cc.writeback_enabled = self.cfg.writeback
+        cc.writeback_max_held_ratio = float(self.cfg.writeback_max_held_ratio)
         for k in _CLUSTER_FIELDS:
             setattr(cc, k, getattr(self.cfg.cluster, k))
         return cc
@@ -738,6 +759,16 @@ class RadixServer:
             self._index, self._iclient, self._store = index, iclient, store
         if store is not None and index.is_distributed():
             self._data_plane_up(index, store)
+        if self._wb_handler is not None:
+            client = RadixClient._in_process(self)
+            worker = _Worker(index, self._wb_handler, client)
+            try:
+                worker.start()
+            except BaseException:
+                client.close()
+                raise
+            with self._cv:
+                self._wb = worker
 
     def _data_plane_up(self, index, store) -> None:
         from radixshmem import _data

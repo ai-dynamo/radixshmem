@@ -6,6 +6,7 @@
 #include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "health_check.h"
 #include "types.h"
+#include "writeback.h"
 
 #include <cstdint>
 #include <memory>
@@ -51,6 +52,9 @@ struct RadixServerConfig {
 
     // Shm sizing / eviction policy.
     ShmConfig shm;
+
+    bool  writeback_enabled = false;         // background eviction holds slots for write-back
+    float writeback_max_held_ratio = 0.05f;  // it pauses at this in-flight share of a pool
 
     // rank: etcd-assigned dense rank, filled after bootstrap.
     int          rank        = 0;
@@ -131,7 +135,9 @@ public:
     uint32_t mempool_free() const;
     uint32_t mempool_used() const;
     uint32_t swa_mempool_total() const;
+    uint32_t swa_mempool_free() const;
     uint32_t mamba_mempool_total() const;
+    uint32_t mamba_mempool_free() const;
     ComponentConfig component_config() const;
 
     uint64_t insert_success_count() const;
@@ -144,6 +150,8 @@ public:
     // Lock-free leak audit of the owned tree (see RadixClient::check_health).
     int check_health(HealthReport* report = nullptr) const;
 
+    WritebackQueue* writeback() { return writeback_.get(); }
+
 private:
     RadixServerConfig cfg_;
 
@@ -152,6 +160,7 @@ private:
     std::string shm_name_;
     std::thread evictor_thread_;
     std::atomic<bool> evictor_running_{false};
+    std::unique_ptr<WritebackQueue> writeback_;   // releases into tree_: reset before it
 
     void start_evictor();
     void stop_evictor();

@@ -29,6 +29,22 @@ static py::array_t<int32_t> vec_to_npy_i32(const std::vector<int32_t>& v) {
 }
 
 
+static py::tuple writeback_task_tuple(const WritebackTask& t) {
+    const HeldEviction& h = t.h;
+    py::array_t<uint64_t> hashes(static_cast<py::ssize_t>(h.hashes.size()));
+    std::memcpy(hashes.mutable_data(), h.hashes.data(), h.hashes.size() * sizeof(uint64_t));
+    py::array_t<uint32_t> ends(static_cast<py::ssize_t>(h.mamba_ends.size()));
+    std::memcpy(ends.mutable_data(), h.mamba_ends.data(), h.mamba_ends.size() * sizeof(uint32_t));
+    return py::make_tuple(t.id, hashes, vec_to_npy_i32(h.full_slots), vec_to_npy_i32(h.swa_slots),
+                          ends, vec_to_npy_i32(h.mamba_slots), h.evicted_from);
+}
+
+static WritebackQueue& writeback_of(RadixServer& s) {
+    WritebackQueue* q = s.writeback();
+    if (!q) throw std::runtime_error("write-back is not enabled on this server");
+    return *q;
+}
+
 static py::dict peer_fault_dict(const PeerFaultCounters* c) {
     auto v = [&](const std::atomic<uint64_t> PeerFaultCounters::*f) {
         return c ? (c->*f).load(std::memory_order_relaxed) : 0;
@@ -241,7 +257,9 @@ PYBIND11_MODULE(_core, m) {
                        &RadixServerConfig::remote_op_transport)
         .def_property("zmq_listen_port",
                       [](const RadixServerConfig& c) { return (int)c.zmq_listen_port; },
-                      [](RadixServerConfig& c, int v) { c.zmq_listen_port = (uint16_t)v; });
+                      [](RadixServerConfig& c, int v) { c.zmq_listen_port = (uint16_t)v; })
+        .def_readwrite("writeback_enabled", &RadixServerConfig::writeback_enabled)
+        .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
 
     // ==================== Result types ====================
 
@@ -344,6 +362,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("leaked",    &HealthReport::Pool::leaked)
         .def_readonly("dangling",  &HealthReport::Pool::dangling)
         .def_readonly("duplicate", &HealthReport::Pool::duplicate)
+        .def_readonly("held",      &HealthReport::Pool::held)
         .def("ok", &HealthReport::Pool::ok)
         .def("__repr__", [](const HealthReport::Pool& p) {
             return "HealthPoolReport(enabled=" + std::to_string(p.enabled) +
@@ -405,7 +424,9 @@ PYBIND11_MODULE(_core, m) {
         .def("mempool_free", &RadixServer::mempool_free)
         .def("mempool_used", &RadixServer::mempool_used)
         .def("swa_mempool_total", &RadixServer::swa_mempool_total)
+        .def("swa_mempool_free", &RadixServer::swa_mempool_free)
         .def("mamba_mempool_total", &RadixServer::mamba_mempool_total)
+        .def("mamba_mempool_free", &RadixServer::mamba_mempool_free)
         .def_property_readonly("component_config", &RadixServer::component_config)
         .def("insert_success_count", &RadixServer::insert_success_count)
         .def("peer_fault_counts",
@@ -418,7 +439,46 @@ PYBIND11_MODULE(_core, m) {
              "Lock-free leak audit; returns HealthFlag bits (0 == healthy).")
         .def("health_report", [](const RadixServer& s) {
             HealthReport r; s.check_health(&r); return r;
-        }, "Lock-free leak audit; returns the full HealthReport.");
+        }, "Lock-free leak audit; returns the full HealthReport.")
+        .def("pop_writeback", [](RadixServer& s, size_t max_tasks, int timeout_ms) {
+            WritebackQueue& q = writeback_of(s);
+            std::vector<WritebackTask> ts;
+            {
+                py::gil_scoped_release nogil;
+                ts = q.pop(max_tasks, timeout_ms);
+            }
+            py::list out;
+            for (const WritebackTask& t : ts) out.append(writeback_task_tuple(t));
+            return out;
+        }, py::arg("max_tasks") = 64, py::arg("timeout_ms") = 200)
+        .def("complete_writeback", [](RadixServer& s, const std::vector<uint64_t>& ids) {
+            WritebackQueue& q = writeback_of(s);
+            py::gil_scoped_release nogil;
+            return q.complete(ids);
+        }, py::arg("task_ids"))
+        .def("drop_writeback", [](RadixServer& s) {
+            WritebackQueue& q = writeback_of(s);
+            py::gil_scoped_release nogil;
+            q.drop_all();
+        })
+        .def("writeback_stats", [](RadixServer& s) -> py::object {
+            WritebackQueue* q = s.writeback();
+            if (!q) return py::none();
+            WritebackStats st = q->stats();
+            const RadixShmemTree& t = s.tree();
+            py::dict d;
+            d["queued"] = st.queued;
+            d["popped"] = st.popped;
+            d["produced"] = st.produced;
+            d["completed"] = st.completed;
+            d["dropped"] = st.dropped;
+            d["inflight_slots"] = py::make_tuple(st.inflight_slots[0], st.inflight_slots[1],
+                                                 st.inflight_slots[2]);
+            d["held_slots"] = py::make_tuple(t.held_slots(ComponentType::FULL),
+                                             t.held_slots(ComponentType::SWA),
+                                             t.held_slots(ComponentType::MAMBA));
+            return d;
+        });
 
 #ifdef RADIXSHMEM_HAS_ETCD
     // ==================== EtcdKv ====================

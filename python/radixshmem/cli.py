@@ -30,6 +30,7 @@ the slot shape may not (the servers cross-check it through etcd).
 from __future__ import annotations
 
 import argparse
+import json
 import signal
 import sys
 import threading
@@ -37,6 +38,7 @@ import time
 
 from radixshmem import _geometry
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
+from radixshmem.writeback import load_handler
 
 _SIZE = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 
@@ -137,6 +139,15 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="one line per transfer that moved data (time, bytes, bandwidth): '-' = stdout, "
                         "a path appends there, '' = off (default: -)")
 
+    g = p.add_argument_group("write-back of background-evicted KV")
+    g.add_argument("--writeback-handler", default="", metavar="MODULE:FACTORY",
+                   help="enables write-back: FACTORY(config) returns the WritebackHandler")
+    g.add_argument("--writeback-config", default="{}",
+                   help="config passed to the factory: a JSON object, or a path to a JSON file")
+    g.add_argument("--writeback-max-held", type=float, default=0.05,
+                   help="background eviction pauses while unfinished write-backs cover this "
+                        "share of a pool (default: 0.05)")
+
     g = p.add_argument_group("distributed (--expected-min-nodes or --num-rht-shards > 1)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
@@ -194,7 +205,16 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
         evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
-        transfer_log=a.transfer_log, role="decode" if a.decode else "prefill", cluster=cluster, **kw)
+        transfer_log=a.transfer_log, role="decode" if a.decode else "prefill",
+        writeback=bool(a.writeback_handler), writeback_max_held_ratio=a.writeback_max_held,
+        cluster=cluster, **kw)
+
+
+def writeback_config(text: str) -> dict:
+    if text.lstrip().startswith("{"):
+        return json.loads(text)
+    with open(text) as f:
+        return json.load(f)
 
 
 def _stats_line(srv: RadixServer) -> str:
@@ -229,18 +249,23 @@ def main(argv=None) -> None:
     a = parse_args(argv)
     try:
         cfg = build_config(a)
-    except (ValueError, TypeError) as e:
+        handler = (load_handler(a.writeback_handler, writeback_config(a.writeback_config))
+                   if a.writeback_handler else None)
+    except (ValueError, TypeError, OSError, ImportError, AttributeError) as e:
         sys.exit(f"ERROR: {e}")
 
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
-    srv = RadixServer(cfg)
+    srv = RadixServer(cfg, writeback=handler)
     print(f"Starting radix-server ({'index only' if cfg.index_only else 'index + data plane'})")
     print(f"  Name:           {cfg.name}")
     print(f"  Endpoint:       {cfg.resolved_endpoint}")
     print(f"  Role:           {cfg.role}")
+    if handler is not None:
+        print(f"  Write-back:     {a.writeback_handler}  (pause at {cfg.writeback_max_held_ratio:g} "
+              f"of a pool in flight)")
     if not cfg.index_only:
         print(f"  Data name:      {cfg.resolved_data_name}")
         print(f"  Data budget:    {fmt_size(cfg.data_bytes)}  (swa {cfg.swa_ratio:g}, "

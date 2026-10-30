@@ -70,6 +70,8 @@ uint32_t RadixServer::mempool_free()  const { return tree_->mempool_free();  }
 uint32_t RadixServer::mempool_used()  const { return tree_->mempool_used();  }
 uint32_t RadixServer::swa_mempool_total()   const { return tree_->swa_mempool_total();   }
 uint32_t RadixServer::mamba_mempool_total() const { return tree_->mamba_mempool_total(); }
+uint32_t RadixServer::swa_mempool_free()    const { return tree_->swa_mempool_free();    }
+uint32_t RadixServer::mamba_mempool_free()  const { return tree_->mamba_mempool_free();  }
 ComponentConfig RadixServer::component_config() const { return tree_->component_config(); }
 
 uint64_t RadixServer::insert_success_count() const { return tree_->insert_success_count(); }
@@ -113,6 +115,17 @@ void RadixServer::evictor_loop() {
     static constexpr float DP_HIGH_WATERMARK = 0.90f;
     static constexpr int LOCK_BATCH = 50;
 
+    uint64_t wb_limit[NUM_COMPONENT_TYPES] = {};   // 0 = pool absent
+    if (writeback_) {
+        const uint32_t totals[NUM_COMPONENT_TYPES] = {
+            mp_total, tree_->swa_mempool_total(), tree_->mamba_mempool_total()};
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            if (totals[k] > 0)
+                wb_limit[k] = std::max<uint64_t>(
+                    1, (uint64_t)(totals[k] * cfg_.writeback_max_held_ratio));
+    }
+    std::vector<HeldEviction> held;
+
     while (evictor_running_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
 
@@ -123,9 +136,27 @@ void RadixServer::evictor_loop() {
             need_evict = true;
         if (tree_->node_pool_free() < np_threshold)
             need_evict = true;
-
-        if (need_evict)
+        if (!need_evict)
+            continue;
+        if (!writeback_) {
             tree_->try_evict_batch(LOCK_BATCH);
+            continue;
+        }
+
+        // Held slots are not free: the in-flight watermark bounds the eviction.
+        uint64_t inflight[NUM_COMPONENT_TYPES];
+        writeback_->inflight_slots(inflight);
+        bool paused = false;
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            paused |= wb_limit[k] > 0 && inflight[k] >= wb_limit[k];
+        if (paused)
+            continue;
+        const int full = (int)ComponentType::FULL;
+        held.clear();
+        tree_->try_evict_batch(LOCK_BATCH, &held,
+                               wb_limit[full] > 0 ? wb_limit[full] - inflight[full] : UINT64_MAX);
+        if (!held.empty())
+            writeback_->push(std::move(held));
     }
 }
 
@@ -588,6 +619,7 @@ RadixServer::~RadixServer() {
 #endif
     // Stop the evictor before anything that touches tree_ is torn down.
     stop_evictor();
+    writeback_.reset();
 #ifndef RADIXSHMEM_NO_RDMA
     // Release the eviction-service client (its evict callback touches tree_).
     svc_client_.reset();   // releases (not frees) the borrowed svc_tree_
@@ -649,6 +681,8 @@ bool RadixServer::bootstrap() {
     // Bring up the shm region + evictor.
     tree_ = std::make_unique<RadixShmemTree>(RadixShmemTree::create(shm_name, shm));
     shm_name_        = shm_name;
+    if (cfg_.writeback_enabled)
+        writeback_ = std::make_unique<WritebackQueue>(*tree_);
     start_evictor();
 
 #ifndef RADIXSHMEM_NO_RDMA
@@ -683,6 +717,7 @@ bool RadixServer::bootstrap() {
         if (!cluster_bootstrap()) {
             rc_stop();   // endpoint lives on ctx_ — destroy BEFORE tree_/ctx_
             stop_evictor();
+            writeback_.reset();
             if (tree_) { tree_->destroy(); tree_.reset(); }
             return false;
         }
@@ -712,6 +747,7 @@ bool RadixServer::bootstrap() {
                 svc_tree_.reset();
                 rc_stop();
                 stop_evictor();
+                writeback_.reset();
                 if (tree_) { tree_->destroy(); tree_.reset(); }
                 return false;
             }

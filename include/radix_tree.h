@@ -28,6 +28,21 @@ struct EvictedNode {
     uint32_t tree_node_id;
 };
 
+// A background-evicted leaf with its root path [0, end): [evicted_from, end)
+// left the tree with its slots held, [0, evicted_from) stays pinned.
+struct HeldEviction {
+    std::vector<uint64_t> hashes;       // [0, end)
+    std::vector<int32_t>  full_slots;   // [0, end)
+    std::vector<int32_t>  swa_slots;    // [0, end), INVALID_COMPONENT_SLOT where none; empty without SWA
+    std::vector<uint32_t> mamba_ends;   // END positions of the path's checkpoints, ascending
+    std::vector<int32_t>  mamba_slots;  // parallel to mamba_ends
+    uint32_t evicted_from = 0;
+    uint64_t generation = 0;            // ShmHeader::reset_generation at eviction
+
+    uint32_t end() const { return (uint32_t)hashes.size(); }
+    void covered(uint64_t out[NUM_COMPONENT_TYPES]) const;
+};
+
 // Result of one merge_leaf_into_parent() call.
 struct MergeOutcome {
     bool     merged        = false;
@@ -83,7 +98,11 @@ public:
 
     // Background eviction: non-blocking write_lock, evict up to target_blocks.
     // Returns blocks freed (0 if lock was busy).
-    int try_evict_batch(int target_blocks);
+    int try_evict_batch(int target_blocks, std::vector<HeldEviction>* held = nullptr,
+                        uint64_t budget = UINT64_MAX);
+    void release_held(const std::vector<HeldEviction>& hs);
+    uint32_t held_slots(ComponentType component) const;
+    uint64_t reset_generation() const;
 
     int try_evict_component_batch(ComponentType component, int target_slots);
 
@@ -262,10 +281,13 @@ private:
     // ---- Eviction internals ----
     // Pin-eligibility: full/swa/mamba ref classes on the node are all zero.
     bool component_refs_zero(uint32_t node_id) const;
-    int  evict_node(uint32_t node_id, std::vector<int32_t>& out);
+    int  evict_node(uint32_t node_id, std::vector<int32_t>& out,
+                    HeldEviction* hold = nullptr);
+    void hold_path(uint32_t node_id, HeldEviction& h);
     // protect: node to pin for the walk (INVALID_NODE_ID = none).
     int  evict(int need, uint32_t protect = INVALID_NODE_ID);
-    int  evict_walk(int need);
+    int  evict_walk(int need, std::vector<HeldEviction>* held = nullptr,
+                    uint64_t budget = UINT64_MAX);
     void post_evict_fixup(uint32_t parent_id);
     void touch_node(uint32_t node_id);
 

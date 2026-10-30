@@ -45,6 +45,7 @@ struct HealthReport {
         uint32_t leaked    = 0;      // marked used in the pool, not referenced by any node
         uint32_t dangling  = 0;      // referenced by a node but free / out of range in the pool
         uint32_t duplicate = 0;      // referenced by more than one node position
+        uint32_t held      = 0;      // held for write-back; also counted as leaked
         bool ok() const { return !leaked && !dangling && !duplicate && used == in_tree; }
     };
     Pool full, swa, mamba;
