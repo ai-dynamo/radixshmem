@@ -466,7 +466,7 @@ int run_full_dedup() {
 // ---- #2 + #3: target dead → TIMEOUT or UNAVAILABLE; cached session stays safe ----
 // The two sync fds reach the re-exec'd child as argv numbers; they survive execv (not CLOEXEC).
 int g_to_parent_fd = -1, g_from_parent_fd = -1;
-// A dead target is a deadline expiry (zmq/dc) or a refused connection (grpc).
+// A dead target can return a deadline expiry or a refused gRPC connection.
 bool target_down(radixshmem::RemoteStatus st) {
     return st == radixshmem::RemoteStatus::TIMEOUT ||
            st == radixshmem::RemoteStatus::UNAVAILABLE;

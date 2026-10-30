@@ -38,11 +38,6 @@ class IRemoteOpClientTransport;
 
 class RemotePeer {
 public:
-#ifdef RADIXSHMEM_HAS_ZMQ
-    explicit RemotePeer(const std::string& endpoint,
-                        int recv_timeout_ms = 5000,
-                        int max_retry = 3);
-#endif
     RemotePeer(std::unique_ptr<IRemoteOpClientTransport> transport,
                std::string endpoint);
 
@@ -277,7 +272,6 @@ private:
     std::unique_ptr<Impl> etcd_;
 
     std::unique_ptr<PeerRegistry> peer_reg_;
-    uint32_t remote_op_transport_ = 0;   // authoritative control-plane transport (/config)
     int      rdma_sl_ = 5;
     int      rdma_tc_ = 160;
     int      cluster_cs_ = 0;

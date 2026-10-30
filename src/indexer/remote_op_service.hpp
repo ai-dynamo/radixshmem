@@ -12,7 +12,7 @@ namespace radixshmem {
 
 class LocalTreeConnector;
 
-// Wire-agnostic local-tree ops: invalid arguments yield BAD_REQUEST; backends map exceptions to INTERNAL.
+// Local-tree ops return BAD_REQUEST for invalid input; gRPC maps exceptions to INTERNAL.
 class RemoteOpService {
 public:
     // `insert_mu` serializes allocate and insert (the svc client's RHT publish).

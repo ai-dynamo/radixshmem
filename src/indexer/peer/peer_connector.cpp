@@ -13,9 +13,7 @@
 #endif
 
 #include <algorithm>
-#include <climits>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <shared_mutex>
 
@@ -33,9 +31,6 @@ static double secs_since(std::chrono::steady_clock::time_point t0) {
 }
 
 PeerConnector::~PeerConnector() {
-#ifndef RADIXSHMEM_NO_RDMA
-    rc_factory_.reset();
-#endif
     slots_.clear();
 }
 
@@ -272,20 +267,6 @@ bool PeerConnector::dec_ref_components_remote(int remote,
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-static int resolve_rc_client_rank(int default_rank) {
-    int client_rank = default_rank;
-    if (const char* e = ::getenv("RADIXSHMEM_RC_CLIENT_RANK")) {
-        char* end = nullptr;
-        long v = std::strtol(e, &end, 10);
-        if (end != e && *end == '\0' && v >= 0 && v <= INT_MAX)
-            client_rank = (int)v;
-        else
-            fprintf(stderr, "[PeerConnector] ignoring invalid "
-                    "RADIXSHMEM_RC_CLIENT_RANK='%s'\n", e);
-    }
-    return client_rank;
-}
-
 std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
     PeerEntry p;
     {
@@ -297,11 +278,8 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
     if (p.rank != rank)
         throw std::runtime_error("open_remote: peer rank " + std::to_string(rank) +
                                  " is not registered (node down)");
-    if (!rc_factory_)
-        rc_factory_ = std::make_unique<RemoteOpClientFactory>(
-            cfg_.remote_op_transport, tx_.ctx(), cfg_.dc_access_key);
     std::string endpoint;
-    auto t = rc_factory_->open(p, rc_client_rank_, endpoint);
+    auto t = make_remote_op_client(p, endpoint);
     auto rc = std::make_shared<RemotePeer>(std::move(t), std::move(endpoint));
     rc->set_peer_rank(rank);
     return rc;
@@ -313,8 +291,6 @@ std::shared_ptr<RemotePeer> PeerConnector::open_remote(int rank) {
             "open_remote: target is this client's own rank — "
             "talking to yourself is query()'s job");
     std::lock_guard<std::mutex> g(rc_open_mu_);
-    if (rc_client_rank_ < 0)
-        rc_client_rank_ = resolve_rc_client_rank(peers_.my_rank());
     return build_rc_session(rank);
 }
 

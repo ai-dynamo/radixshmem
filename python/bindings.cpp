@@ -238,15 +238,11 @@ PYBIND11_MODULE(_core, m) {
                        &RadixServerConfig::enable_remote_insert)
         .def_readwrite("enable_remote_query",
                        &RadixServerConfig::enable_remote_query)
-        // Control-plane transport backend: "zmq" or "dc"; rank 0 authoritative.
         .def_readwrite("remote_op_transport",
                        &RadixServerConfig::remote_op_transport)
         .def_property("remote_op_listen_port",
                       [](const RadixServerConfig& c) { return (int)c.remote_op_listen_port; },
-                      [](RadixServerConfig& c, int v) { c.remote_op_listen_port = (uint16_t)v; })
-        .def_property("zmq_listen_port",
-                      [](const RadixServerConfig& c) { return (int)c.zmq_listen_port; },
-                      [](RadixServerConfig& c, int v) { c.zmq_listen_port = (uint16_t)v; });
+                      [](RadixServerConfig& c, int v) { c.remote_op_listen_port = (uint16_t)v; });
 
     // ==================== Result types ====================
 

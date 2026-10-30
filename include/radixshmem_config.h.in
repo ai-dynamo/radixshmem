@@ -7,12 +7,6 @@
 // Built without RDMA (libibverbs): every distributed feature compiles out.
 #cmakedefine RADIXSHMEM_NO_RDMA 1
 
-// RDMA present: the DC (DCI/DCT) remote-op control-plane backend compiles in.
-#cmakedefine RADIXSHMEM_REMOTE_OP_RDMA 1
-
-// libzmq present: the ZMQ remote-op backend (fallback transport) compiles in.
-#cmakedefine RADIXSHMEM_HAS_ZMQ 1
-
 // grpc++ / protobuf present: the gRPC remote-op backend compiles in.
 #cmakedefine RADIXSHMEM_HAS_GRPC 1
 

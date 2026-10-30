@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// RemoteOpService local-tree operations and RadixServer::rc_* endpoint/serving lifecycle; backends are chosen in transport/remote_op_factory.cpp.
+// Local-tree remote ops and endpoint lifecycle; transport creation stays in the factory.
 #include "radix_server.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
@@ -106,13 +106,10 @@ RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, int start,
 
 // ==================== RadixServer remote-op endpoint ====================
 
-RemoteOpAddr RadixServer::rc_build_endpoint(uint32_t rot_auth,
-                                            uint64_t dc_access_key,
-                                            RdmaContext& ctx) {
+RemoteOpAddr RadixServer::rc_build_endpoint() {
     // Body of the build_remote_op callback.
     RemoteOpAddr addr{};
-    rc_server_ = make_remote_op_server(rot_auth, cfg_.remote_op_listen_port,
-                                       ctx, dc_access_key, addr);
+    rc_server_ = make_remote_op_server(cfg_.remote_op_listen_port, addr);
     return addr;
 }
 

@@ -57,9 +57,6 @@ enum ClusterTransport : uint32_t {
 };
 
 enum RemoteOpTransport : uint32_t {
-    REMOTE_OP_TRANSPORT_ZMQ  = 0,
-    REMOTE_OP_TRANSPORT_RDMA = 1,   // removed backend — reserved, rejected on read
-    REMOTE_OP_TRANSPORT_DC   = 2,   // DCI/DCT
     REMOTE_OP_TRANSPORT_GRPC = 3,   // gRPC over TCP
 };
 
@@ -72,7 +69,7 @@ struct PeerEntry {
     // Reachability — TCP bootstrap endpoint for this rank's XRC listener
     char     host[CLUSTER_MANIFEST_HOST_LEN];
     uint16_t xrc_listen_port;
-    // Remote-op endpoint TCP port, grpc server or zmq REP (0 = disabled); 0 under dc (rc_dct_num addresses)
+    // gRPC remote-op TCP port (0 = disabled).
     uint16_t remote_op_listen_port;
     uint32_t _pad2;
 
@@ -108,14 +105,12 @@ struct PeerEntry {
     // XRC bootstrap-time hints
     uint32_t srq_num;                          // peer's SRQ number
     uint32_t dct_num;                          // DC target for RHT / peer-index reads (0 when neither plane is DC)
-    // Remote-op DCT number under DC; 0 = remote ops disabled
-    uint32_t rc_dct_num;
+    uint32_t reserved_remote_op_dct;
 
     // RDMA device name (client's local entry picks the same device)
     char     index_dev[32];
 
-    // DC control-plane lanes 1..3 (lane 0 = rc_dct_num above)
-    uint32_t rc_dct_num_extra[3];
+    uint32_t reserved_remote_op_dct_extra[3];
 
     // Component ABI (from ShmHeader at bootstrap); layout sizes are
     // binary-generation-gated, so peers validate values, not layout.

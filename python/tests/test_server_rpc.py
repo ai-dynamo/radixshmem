@@ -222,6 +222,26 @@ def test_role_in_node_info_and_nodes(cfg):
             srv.close()
 
 
+def test_grpc_is_the_only_remote_op_transport():
+    from radixshmem import cli
+    from radixshmem.server import ClusterConfig
+
+    config = cli.build_config(cli.parse_args([
+        "--remote-op-transport", "grpc", "--remote-op-listen-port", "31001",
+        "--rht-transport", "dc", "--peer-index-transport", "dc"]))
+    assert config.cluster.remote_op_transport == "grpc"
+    assert config.cluster.remote_op_listen_port == 31001
+    assert config.cluster.rht_transport == config.cluster.peer_index_transport == "dc"
+    for transport in ("zmq", "dc", "rdma", "xrc", "unknown"):
+        with pytest.raises(SystemExit):
+            cli.parse_args(["--remote-op-transport", transport])
+        with pytest.raises(ValueError, match="only grpc"):
+            ClusterConfig(remote_op_transport=transport)
+    with pytest.raises(SystemExit):
+        cli.parse_args(["--zmq-listen-port", "31001"])
+    assert not hasattr(radixshmem._core.RadixServerConfig(), "zmq_listen_port")
+
+
 def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):
     c = cfg(**data())
     srv = up(c, geometry())
@@ -558,4 +578,3 @@ def test_transfer_log_writes_one_line_per_transfer_that_moved_data(cfg, tmp_path
         m = re.match(pat, line)
         assert m, line
         assert abs(4096 / float(m.group(1)) - float(m.group(2))) <= 0.1 + 0.01 * float(m.group(2))
-

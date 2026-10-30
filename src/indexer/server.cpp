@@ -138,24 +138,6 @@ void RadixServer::evictor_loop() {
 
 namespace {
 
-// Local remote-op transport cfg string → manifest enum.
-uint32_t rot_from_cfg(const std::string& s) {
-    if (s == "grpc") return REMOTE_OP_TRANSPORT_GRPC;
-    if (s == "zmq")  return REMOTE_OP_TRANSPORT_ZMQ;
-    if (s == "dc")   return REMOTE_OP_TRANSPORT_DC;
-    throw std::runtime_error("RadixServer: remote_op_transport '" + s +
-                             "' is not one of grpc / zmq / dc");
-}
-
-const char* rot_name(uint32_t rot) {
-    switch (rot) {
-    case REMOTE_OP_TRANSPORT_GRPC: return "grpc";
-    case REMOTE_OP_TRANSPORT_ZMQ:  return "zmq";
-    case REMOTE_OP_TRANSPORT_DC:   return "dc";
-    default:                       return "unknown";
-    }
-}
-
 bool send_all(int fd, const void* data, size_t len) {
     const char* p = static_cast<const char*>(data);
     while (len > 0) {
@@ -307,9 +289,6 @@ void RadixServer::resolve_shard_map(int n_obs) {
                                 ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
     dc_access_key_ = 0xD0C0ACCE5500F00DULL;
 
-    // Authoritative remote-op control-plane transport (rank 0's cfg).
-    remote_op_transport_ = rot_from_cfg(cfg_.remote_op_transport);
-
     // Authoritative RHT slots-per-bucket (W). Validate ∈ {1,2,4,8}; default 4.
     int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 4;
     if (W != 1 && W != 2 && W != 4 && W != 8) {
@@ -322,6 +301,8 @@ void RadixServer::resolve_shard_map(int n_obs) {
 }
 
 void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
+    if (sm.remote_op_transport != REMOTE_OP_TRANSPORT_GRPC)
+        throw std::runtime_error("RadixServer: cluster remote-op transport is not grpc; redeploy the cluster with grpc");
     // Follower path: install the leader's authoritative shard map + QoS. Mirrors
     // what resolve_shard_map() computes on the leader, but from the wire message.
     num_shards_   = (int)sm.num_shards;
@@ -332,7 +313,6 @@ void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
     peer_index_transport_ = sm.peer_index_transport;
     rht_slots_     = sm.rht_slots ? sm.rht_slots : 4;
     dc_access_key_ = sm.dc_access_key;
-    remote_op_transport_ = sm.remote_op_transport;
     ctx_->set_qos(rdma_sl_, rdma_tc_);   // adopt authoritative QoS before QPs connect
     holder_of_shard_.assign(num_shards_, 0);
     my_local_shard_ = -1;
@@ -369,14 +349,6 @@ void RadixServer::setup_dct(PeerEntry& e) {
     if (rht_transport_ != CLUSTER_TRANSPORT_DC &&
         peer_index_transport_ != CLUSTER_TRANSPORT_DC)
         return;   // both planes XRC: no DCT
-    // One read target per node. Reuse the remote-op lane-0 DCT if it exists
-    // (setup_remote_op ran first): one dctn serves both planes.
-    if (rc_lane0_dctn_ != 0) {
-        e.dct_num = rc_lane0_dctn_;
-        fprintf(stderr, "[RadixServer rank %d] DC target: reusing ctrl "
-                "lane-0 DCT dctn=%u\n", cfg_.rank, e.dct_num);
-        return;
-    }
     dct_ = std::make_unique<DcTarget>(*ctx_, dc_access_key_, /*srq_max_wr=*/1);
     e.dct_num = dct_->open_dct();
     fprintf(stderr, "[RadixServer rank %d] DC target up: dctn=%u\n",
@@ -387,16 +359,9 @@ void RadixServer::setup_remote_op(PeerEntry& e) {
     // Remote ops off for this rank unless the control plane was requested.
     if (!(cfg_.enable_remote_insert || cfg_.enable_remote_query)) return;
 
-    RemoteOpAddr a = rc_build_endpoint(remote_op_transport_, dc_access_key_, *ctx_);
-    e.remote_op_listen_port = a.port;
-    e.rc_dct_num     = a.dctns[0];
-    for (int i = 1; i < 4; ++i) e.rc_dct_num_extra[i - 1] = a.dctns[i];
-    rc_lane0_dctn_ = a.dctns[0];   // setup_dct (runs after us) may reuse as read target
-    fprintf(stderr, "[RadixServer rank %d] remote-op endpoint up: %s "
-            "(port=%u rc_dctn=%u/%u/%u/%u)\n", cfg_.rank,
-            rot_name(remote_op_transport_),
-            e.remote_op_listen_port, e.rc_dct_num, e.rc_dct_num_extra[0],
-            e.rc_dct_num_extra[1], e.rc_dct_num_extra[2]);
+    e.remote_op_listen_port = rc_build_endpoint().port;
+    fprintf(stderr, "[RadixServer rank %d] remote-op endpoint up: grpc (port=%u)\n",
+            cfg_.rank, e.remote_op_listen_port);
 }
 
 std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
@@ -423,8 +388,6 @@ std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
         return "rht_transport differs from local " + cfg_.rht_transport;
     if (sm.peer_index_transport != (uint32_t)tp(cfg_.peer_index_transport))
         return "peer_index_transport differs from local " + cfg_.peer_index_transport;
-    if (sm.remote_op_transport != rot_from_cfg(cfg_.remote_op_transport))
-        return "remote_op_transport differs from local " + cfg_.remote_op_transport;
     int cs = register_chunk_size();
     if (sm.register_chunk_size && cs > 0 && (int)sm.register_chunk_size != cs)
         return diff("register_chunk_size", sm.register_chunk_size, cs);
@@ -597,7 +560,7 @@ RadixServer::RadixServer(const std::string& name, const ShmConfig& shm) {
 
 RadixServer::~RadixServer() {
 #ifndef RADIXSHMEM_NO_RDMA
-    // Stop remote-op serving thread FIRST (holds refs to svc_* + REP socket).
+    // Stop remote-op serving before tearing down svc_*.
     rc_stop();
 #endif
     // Stop the evictor before anything that touches tree_ is torn down.
@@ -636,6 +599,13 @@ RadixServer::~RadixServer() {
 
 bool RadixServer::bootstrap() {
     const bool distributed = want_cluster(cfg_);
+    if (distributed) {
+        if (const char* transport = ::getenv("RADIXSHMEM_REMOTE_OP_TRANSPORT"))
+            cfg_.remote_op_transport = transport;
+    }
+    if (cfg_.remote_op_transport != "grpc")
+        throw std::runtime_error("RadixServer: remote_op_transport '" +
+                                 cfg_.remote_op_transport + "' is unsupported; only grpc is supported");
 
     ShmConfig shm = cfg_.shm;
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;
@@ -676,33 +646,12 @@ bool RadixServer::bootstrap() {
             cfg_.peer_index_transport = t;
         if (const char* w = ::getenv("RADIXSHMEM_RHT_SLOTS"))
             cfg_.rht_slots_per_bucket = atoi(w);
-        if (const char* rot = ::getenv("RADIXSHMEM_REMOTE_OP_TRANSPORT"))
-            cfg_.remote_op_transport = rot;
         if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))
             cfg_.registry = r;
         if (const char* c = ::getenv("RADIXSHMEM_CLUSTER_ID"))
             cfg_.cluster_id = c;
         if (const char* n = ::getenv("RADIXSHMEM_NODE_NAME"))
             cfg_.node_name = n;
-
-        // Removed backend: fail loud rather than remap to zmq.
-        if (cfg_.remote_op_transport == "rdma" ||
-            cfg_.remote_op_transport == "xrc") {
-            throw std::runtime_error(
-                "RadixServer: the xrc/rdma control-plane backend was "
-                "removed — use remote_op_transport = grpc, dc (RDMA) or "
-                "zmq");
-        }
-        (void)rot_from_cfg(cfg_.remote_op_transport);   // unknown name → throw
-        // zmq_listen_port is the old name of remote_op_listen_port.
-        if (cfg_.zmq_listen_port != 0) {
-            if (cfg_.remote_op_listen_port != 0 &&
-                cfg_.remote_op_listen_port != cfg_.zmq_listen_port)
-                throw std::runtime_error(
-                    "RadixServer: remote_op_listen_port and its deprecated "
-                    "alias zmq_listen_port are both set and differ");
-            cfg_.remote_op_listen_port = cfg_.zmq_listen_port;
-        }
 
         if (!cluster_bootstrap()) {
             rc_stop();   // endpoint lives on ctx_ — destroy BEFORE tree_/ctx_
