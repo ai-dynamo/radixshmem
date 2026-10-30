@@ -22,6 +22,15 @@ with an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-pe
 cd python && pip install -e .
 ```
 
+Cross-node remote ops use gRPC exclusively and need the grpc++ and protobuf development packages
+(Ubuntu: `apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc`).
+An RDMA build with `ENABLE_GRPC=ON` fails configuration if these dependencies are missing; use
+`-DENABLE_GRPC=OFF` only when remote ops are not needed. There is no ZMQ/DC remote-op fallback.
+The RHT and peer-index planes still support one-sided XRC/DC RDMA independently.
+
+C++ local-only builds (`-DENABLE_RDMA=OFF`) retain `RadixClient`, the standalone
+`radix_server`, and local tests; distributed client/server entry points are rejected.
+
 The optional data-plane backends are built separately; see [Transfer backends](#transfer-backends).
 
 ### Start the server

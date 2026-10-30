@@ -75,7 +75,7 @@ bool wait_for_cluster_ready(const std::string& shm_name, int timeout_sec) {
     return ok;
 }
 
-int run_server(int rank, int master_port, const std::string& rot) {
+int run_server(int rank, int master_port) {
     ::signal(SIGTERM, on_term);
     RadixServerConfig cfg;
     cfg.name        = kShmPrefix;
@@ -90,7 +90,6 @@ int run_server(int rank, int master_port, const std::string& rot) {
     cfg.index_dev    = g_index_dev;
     cfg.gid_idx     = g_gid_idx;
     cfg.bootstrap_timeout_sec = 30;
-    cfg.remote_op_transport = rot;
     cfg.enable_remote_insert = (rank == 0);   // rank 0 = target
     cfg.enable_remote_query  = (rank == 0);
     try {
@@ -111,7 +110,7 @@ int run_server(int rank, int master_port, const std::string& rot) {
     } while (0)
 
 // The actual checks, from a client attached to rank 1 targeting rank 0 (rank-first).
-int run_checks(const std::string& rot, int64_t seed) {
+int run_checks(int64_t seed) {
     RadixClient cli(shm_name_for(1));
     if (!cli.is_distributed()) { fprintf(stderr, "  FAIL: not distributed\n"); return 1; }
     const int T = 0;   // target rank
@@ -168,9 +167,8 @@ int run_checks(const std::string& rot, int64_t seed) {
     return 0;
 }
 
-// Fresh cluster per transport (remote_op_transport is fixed at bootstrap).
-int run_one_transport(const std::string& rot) {
-    printf("=== remote_op_smoke: transport=%s ===\n", rot.c_str());
+int run_grpc() {
+    printf("=== remote_op_smoke: transport=grpc ===\n");
     fflush(stdout);   // forked children inherit the stdio buffer — drain it
     int master_port = 27950 + (int)(::getpid() % 40);
     for (int r = 0; r < kWorldSize; r++) ::shm_unlink(shm_name_for(r).c_str());
@@ -179,7 +177,7 @@ int run_one_transport(const std::string& rot) {
     for (int r = 0; r < kWorldSize; r++) {
         pid_t p = ::fork();
         if (p < 0) { perror("fork"); return 2; }
-        if (p == 0) _exit(run_server(r, master_port, rot));
+        if (p == 0) _exit(run_server(r, master_port));
         pids[r] = p;
     }
     auto teardown = [&]() {
@@ -200,7 +198,7 @@ int run_one_transport(const std::string& rot) {
         pid_t c = ::fork();
         if (c < 0) { perror("fork"); rc = 2; }
         else if (c == 0) {
-            int crc = run_checks(rot, 7'000'000);
+            int crc = run_checks(7'000'000);
             fflush(stdout); fflush(stderr);   // _exit skips stdio flush
             _exit(crc);
         }
@@ -211,7 +209,7 @@ int run_one_transport(const std::string& rot) {
         }
     }
     teardown();
-    printf("%s: transport=%s\n\n", rc == 0 ? "PASS" : "FAIL", rot.c_str());
+    printf("%s: transport=grpc\n\n", rc == 0 ? "PASS" : "FAIL");
     fflush(stdout);
     return rc;
 }
@@ -219,24 +217,16 @@ int run_one_transport(const std::string& rot) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::vector<std::string> rots;
     for (int i = 1; i < argc; i++) {
         if (!std::strcmp(argv[i], "--index-dev") && i + 1 < argc) g_index_dev = argv[++i];
         else if (!std::strcmp(argv[i], "--gid-idx") && i + 1 < argc) g_gid_idx = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "zmq") || !std::strcmp(argv[i], "dc")) rots.push_back(argv[i]);
+        else if (!std::strcmp(argv[i], "grpc")) continue;
         else {
-            fprintf(stderr, "usage: remote_op_smoke [--index-dev DEV] [--gid-idx G] [zmq] [dc]\n");
+            fprintf(stderr, "usage: remote_op_smoke [--index-dev DEV] [--gid-idx G] [grpc]\n");
             return 2;
         }
     }
-    if (rots.empty()) rots = {"zmq", "dc"};
-
-    int worst = 0;
-    for (const auto& rot : rots) {
-        int rc = run_one_transport(rot);
-        if (rc != 0) worst = rc;
-    }
-    return worst;
+    return run_grpc();
 }
 
 #endif  // RADIXSHMEM_NO_RDMA

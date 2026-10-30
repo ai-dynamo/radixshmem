@@ -36,24 +36,8 @@ struct ShardMapMsg;
 
 class IRemoteOpClientTransport;
 
-struct AllocateReply {
-    RemoteStatus status = RemoteStatus::OK;
-    std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
-};
-
-struct QueryReply {
-    RemoteStatus status = RemoteStatus::OK;
-    int hit_length       = 0;   // B local-tree total matched blocks
-    std::vector<int32_t> slots; // target-local physical slot ids (len == hit_length)
-};
-
 class RemotePeer {
 public:
-#ifdef RADIXSHMEM_HAS_ZMQ
-    explicit RemotePeer(const std::string& endpoint,
-                        int recv_timeout_ms = 5000,
-                        int max_retry = 3);
-#endif
     RemotePeer(std::unique_ptr<IRemoteOpClientTransport> transport,
                std::string endpoint);
 
@@ -72,9 +56,9 @@ public:
     QueryReply query(const uint64_t* hashes, int n, bool lock = false,
                      bool update_meta = true);
 
-    // Returns the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
-    RemoteStatus release(const uint64_t* hashes, int n, int start, int length,
-                 const int32_t* slots = nullptr);
+    // Both return the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
+    RemoteStatus recycle(const int32_t* slots, int num_slots);
+    RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length);
 
     const std::string& endpoint() const { return endpoint_; }
 
@@ -82,26 +66,9 @@ public:
     int  peer_rank() const { return peer_rank_; }
     void set_peer_rank(int r) { peer_rank_ = r; }
 
-    void set_op_mu(std::shared_ptr<std::mutex> mu) { op_mu_ = std::move(mu); }
-
 private:
-
-    RemoteStatus request(const void* req, size_t req_len,
-                         std::vector<char>& reply_out);
-
-    RemoteStatus send_ack_op(uint16_t op, const uint64_t* hashes, int n,
-                     int start, int length, const int32_t* slots,
-                     uint16_t flags = 0);
-
-    std::unique_lock<std::mutex> guard() const {
-        return op_mu_ ? std::unique_lock<std::mutex>(*op_mu_)
-                      : std::unique_lock<std::mutex>();
-    }
-
     std::unique_ptr<IRemoteOpClientTransport> transport_;
     std::string endpoint_;
-    uint64_t    next_req_id_  = 0;
-    std::shared_ptr<std::mutex> op_mu_;
     int         peer_rank_    = -1;
 };
 
@@ -282,7 +249,8 @@ private:
                              int start, bool auto_recycle);
     void         dist_flush();
     // Cached per-rank session; nullptr on illegal rank (self/oob/negative).
-    RemotePeer*  peer_for(int rank);
+    std::shared_ptr<RemotePeer> peer_for(int rank);
+    void drop_peer_session(int rank);
 
     // RHT probe from the deepest position not past the incumbent, with the
     // chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
@@ -304,7 +272,6 @@ private:
     std::unique_ptr<Impl> etcd_;
 
     std::unique_ptr<PeerRegistry> peer_reg_;
-    uint32_t remote_op_transport_ = 0;   // authoritative control-plane transport (/config)
     int      rdma_sl_ = 5;
     int      rdma_tc_ = 160;
     int      cluster_cs_ = 0;

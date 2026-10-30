@@ -147,8 +147,10 @@ bool EtcdRegistry::attach_cluster_lease() {
 bool EtcdRegistry::adopt_config(const std::string& cfg_val) {
     ShardMapMsg sm{};
     if (!etcd::decode_shardmap(cfg_val, sm)) {
-        fprintf(stderr, "[EtcdRegistry %s] bad shard-map blob\n",
-                node_name_.c_str());
+        fprintf(stderr, "[EtcdRegistry %s] bad shard-map blob: corrupt, or "
+                "written by a build of another cluster protocol version "
+                "(this build: v%u)\n",
+                node_name_.c_str(), CLUSTER_PROTOCOL_VERSION);
         return false;
     }
     if (!attach_cluster_lease()) return false;
@@ -280,7 +282,7 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     sm.peer_index_transport = rs_.peer_index_transport_;
     sm.rht_slots     = rs_.rht_slots_;
     sm.dc_access_key = rs_.dc_access_key_;
-    sm.remote_op_transport = rs_.remote_op_transport_;
+    sm.remote_op_transport = REMOTE_OP_TRANSPORT_GRPC;
     sm.register_chunk_size = (uint32_t)rs_.register_chunk_size();
     for (int s = 0; s < rs_.num_shards_; s++)
         sm.holder_rank[s] = (uint32_t)rs_.holder_of_shard_[s];

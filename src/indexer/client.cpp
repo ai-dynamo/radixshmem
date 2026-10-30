@@ -5,6 +5,7 @@
 #include "radix_server.h"       // RadixClient(RadixServer&) ctor
 
 #include "local.h"
+#ifndef RADIXSHMEM_NO_RDMA
 #include "cluster_protocol.h"
 #include "cluster_manifest.h"
 #include "rht_endpoint.h"        // RhtConsumer / RhtTopology (+ rht_types.h)
@@ -18,6 +19,7 @@
 #ifdef RADIXSHMEM_HAS_ETCD
 #include "etcd_client.hpp"
 #include "registry_client.hpp"
+#endif
 #endif
 
 #include <algorithm>
@@ -36,6 +38,7 @@
 
 namespace radixshmem {
 
+#ifndef RADIXSHMEM_NO_RDMA
 #ifdef RADIXSHMEM_HAS_ETCD
 struct RadixClient::Impl {
     std::unique_ptr<RegistryClient> reg;
@@ -52,12 +55,9 @@ void RadixClient::teardown_cluster() {
 #ifdef RADIXSHMEM_HAS_ETCD
     if (etcd_ && etcd_->reg) etcd_->reg->stop_watch();
 #endif
-    // Cached per-rank sessions hold DC AHs + reference the connector's shared
-    // DCI/DCT, so they must die before the connector.
+    // Release cached gRPC sessions before tearing down the peer connector.
     { std::lock_guard<std::mutex> g(peer_cache_mu_); peer_cache_.clear(); }
-    // Connector (data-plane endpoints + DC control stack) before the RHT plane,
-    // then the RHT plane, then the transport. DcReaders reference the shared DCI
-    // + AHs the transport frees in its dtor, so the transport must outlive them.
+    // Destroy peer and RHT readers before the transport that owns their DCI/AHs.
     peer_conn_.reset();
     rht_conn_.reset();
     rht_holder_qps_.clear();
@@ -85,6 +85,7 @@ bool RadixClient::wait_for_ready() {
 
 void RadixClient::admit_peer(const PeerEntry& e) {
     if (!peer_reg_->admit(e) || e.rank == peer_reg_->my_rank()) return;
+    drop_peer_session(e.rank);
     if (rht_conn_) rht_conn_->holder_changed(e);
     if (!peer_conn_) return;
     peer_conn_->peer_changed(e.rank);
@@ -120,10 +121,11 @@ void RadixClient::read_topology() {
     ClusterTopology t = etcd_->reg->read_topology();
 
     const ShardMapMsg& sm = t.sm;
+    if (sm.remote_op_transport != REMOTE_OP_TRANSPORT_GRPC)
+        throw std::runtime_error("RadixClient: cluster remote-op transport is not grpc; redeploy the cluster with grpc");
     rht_transport_        = sm.rht_transport;
     peer_index_transport_ = sm.peer_index_transport;
     dc_access_key_       = sm.dc_access_key;
-    remote_op_transport_ = sm.remote_op_transport;
     rdma_sl_             = sm.rdma_sl;
     rdma_tc_             = sm.rdma_tc;
     cluster_cs_          = (int)sm.register_chunk_size;
@@ -262,7 +264,6 @@ void RadixClient::bootstrap_cluster() {
     // the peer table via the registry grow hook.
     PeerConnectorConfig pcfg;
     pcfg.transport            = peer_index_transport_;
-    pcfg.remote_op_transport  = remote_op_transport_;
     pcfg.dc_access_key        = dc_access_key_;
     pcfg.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
     pcfg.faults               = peer_faults();
@@ -426,22 +427,26 @@ void RadixClient::reset_owned_rht_shard() {
 // Lazily open (and cache) the per-rank session. Returns nullptr on any illegal
 // rank (single-node, self, out of range, remote ops disabled) — callers map that
 // to BAD_TARGET / REMOTE_FAILED, never a throw.
-RemotePeer* RadixClient::peer_for(int rank) {
+std::shared_ptr<RemotePeer> RadixClient::peer_for(int rank) {
     if (!distributed_ || !peer_conn_) return nullptr;
     std::lock_guard<std::mutex> g(peer_cache_mu_);
     auto it = peer_cache_.find(rank);
-    if (it != peer_cache_.end()) return it->second.get();
+    if (it != peer_cache_.end()) return it->second;
     try {
         auto rc = peer_conn_->open_remote(rank);
-        RemotePeer* raw = rc.get();
-        peer_cache_.emplace(rank, std::move(rc));
-        return raw;
+        peer_cache_.emplace(rank, rc);
+        return rc;
     } catch (const std::exception&) {
         return nullptr;   // self / oob / disabled peer
     }
 }
 
-
+// The rank re-registered with a new entry: the next op reopens from it; in-flight ops keep the old session alive.
+void RadixClient::drop_peer_session(int rank) {
+    std::lock_guard<std::mutex> g(peer_cache_mu_);
+    peer_cache_.erase(rank);
+}
+#endif
 
 // =====================================================================
 // RadixClient
@@ -451,14 +456,17 @@ RadixClient::RadixClient(const std::string& name, bool local_read_only)
     : local_(std::make_unique<LocalTreeConnector>(name)),
       local_read_only_(local_read_only) {
     if (local_read_only_) return;   // tree only; the cluster plane is never built
+    auto* hdr = static_cast<ShmHeader*>(local_->tree().shm_base());
 #ifndef RADIXSHMEM_NO_RDMA
     // The shm header carries the cluster identity; bootstrap_cluster reads
     // is_distributed and either sets distributed_ or returns single-node.
-    auto* hdr = static_cast<ShmHeader*>(local_->tree().shm_base());
     cfg_.registry   = hdr->registry;
     cfg_.cluster_id = hdr->cluster_id;
     cfg_.node_name  = hdr->node_name;
     bootstrap_cluster();
+#else
+    if (hdr->is_distributed)
+        throw std::runtime_error("RadixClient: writable cluster attach requires RDMA support");
 #endif
 }
 
@@ -487,7 +495,11 @@ std::string resolve_shm_name(const RadixClientConfig& cfg) {
 } // namespace
 
 RadixClient::RadixClient(const RadixClientConfig& cfg)
-#ifdef RADIXSHMEM_HAS_ETCD
+#ifdef RADIXSHMEM_NO_RDMA
+{
+    throw std::runtime_error("RadixClient: distributed config requires RDMA support");
+}
+#elif defined(RADIXSHMEM_HAS_ETCD)
     : cfg_(cfg)
 {
     // Observer (no local server): skip the shm attach, join the cluster as a
@@ -513,11 +525,17 @@ RadixClient::RadixClient(RadixServer& server)
 }
 
 RadixClient::RadixClient(const RadixClientConfig& cfg, LocalTreeConnector* borrowed)
+#ifndef RADIXSHMEM_NO_RDMA
     : local_(borrowed), owns_local_(false), cfg_(cfg) {
     // Borrow the caller's already-attached tree; build the RHT plane only.
     cfg_.rht_only = true;
     bootstrap_cluster();
 }
+#else
+{
+    throw std::runtime_error("RadixClient: embedded cluster service requires RDMA support");
+}
+#endif
 
 RadixClient::~RadixClient() {
 #ifndef RADIXSHMEM_NO_RDMA
@@ -549,6 +567,7 @@ InsertResult RadixClient::insert(const uint64_t* hashes, int n,
     return result;
 }
 
+#ifndef RADIXSHMEM_NO_RDMA
 // Probes local node boundaries + cs-aligned positions (the latter flagged
 // for the gap early-stop); scored from the deepest probe not past incumbent,
 // then the winner's route chain is followed to its end (rht_chain.h).
@@ -726,6 +745,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
     hits_out = std::move(remote_hits);
     return best_remote_node;
 }
+#endif
 
 // Tree-level → public mapping; the Full run stays uncropped at [0, f) so a
 // remote fold can cut it at c — the component query exit crops to common_hit.
@@ -912,7 +932,7 @@ void RadixClient::dec_ref_remote(int remote_node, const uint64_t* hashes,
 AllocateReply RadixClient::remote_allocate(int rank, int n) {
     AllocateReply out;
     if (n <= 0) return out;                       // nothing to allocate, status OK
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
     return p->allocate(n);            // serializes + caps internally
 }
@@ -922,25 +942,27 @@ InsertResult RadixClient::remote_insert(int rank,
                                         int start, int length,
                                         const int32_t* slots, bool auto_recycle) {
     InsertResult out;
-    RemotePeer* p = peer_for(rank);
-    if (!p) { out.error = InsertError::REMOTE_FAILED; return out; }
+    auto p = peer_for(rank);
+    if (!p) {
+        out.error = InsertError::REMOTE_FAILED;
+        out.remote_status = RemoteStatus::BAD_TARGET;
+        return out;
+    }
     return p->insert(hashes, n, start, length, slots, auto_recycle);
 }
 
 RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
-    // slots discriminate RemotePeer::release; null would fall into QUERY_RELEASE.
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
-    return p->release(/*hashes=*/nullptr, /*n=*/0, /*start=*/0,
-                      /*length=*/num_slots, slots);
+    return p->recycle(slots, num_slots);
 }
 
 QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
                                       bool lock, bool update_meta) {
     QueryResult out;
     if (n <= 0) return out;                       // empty input, status OK
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
     QueryReply rep = p->query(hashes, n, lock, update_meta);
 
@@ -963,9 +985,9 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
 
 RemoteStatus RadixClient::remote_unlock(int rank, const uint64_t* hashes, int n,
                                 int hit_length) {
-    RemotePeer* p = peer_for(rank);
+    auto p = peer_for(rank);
     if (!p) return RemoteStatus::BAD_TARGET;
-    return p->release(hashes, n, 0, hit_length, /*slots=*/nullptr);
+    return p->unlock(hashes, n, 0, hit_length);
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA

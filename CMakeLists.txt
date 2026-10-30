@@ -18,8 +18,8 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # RDMA support (libibverbs) is optional; disable on hosts without IB headers.
 option(ENABLE_RDMA "Build RDMA-dependent sources (requires libibverbs)" ON)
 
-# ZeroMQ (libzmq) is optional — powers the zmq remote-op control plane backend.
-option(ENABLE_ZMQ "Build ZeroMQ-dependent remote-insert sources (requires libzmq)" ON)
+# gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin) is the only remote-op control plane backend.
+option(ENABLE_GRPC "Build the gRPC remote-op backend (requires grpc++ and protobuf)" ON)
 
 option(ENABLE_ETCD "Build the etcd cluster-bootstrap registry (requires Go toolchain)" ON)
 
@@ -56,6 +56,7 @@ set(_radixshmem_sources
     # RDMA use; must compile in both RDMA and non-RDMA builds.
     src/indexer/server.cpp
     src/indexer/local.cpp
+    src/indexer/client.cpp
     # Lock-free leak audit (check_health); friend of RadixShmemTree, no other coupling.
     src/indexer/health_check.cpp)
 if(ENABLE_RDMA)
@@ -69,7 +70,6 @@ if(ENABLE_RDMA)
         src/indexer/transport/rdma/rc_endpoint.cpp
         src/indexer/transport/rdma/xrc.cpp
         src/indexer/transport/rdma/dc_oneside.cpp
-        src/indexer/client.cpp
         # Peer-facing plane: lazy data-plane endpoints + remote-walk executor +
         # remote-op session factory + client-side remote-op protocol (RemotePeer).
         src/indexer/peer/peer_connector.cpp
@@ -78,14 +78,8 @@ if(ENABLE_RDMA)
         src/indexer/peer/remote_op.cpp
         # etcd cluster rendezvous; indexer-side (holds a RadixServer&).
         src/indexer/etcd_registry.cpp
-        # Bilateral (two-sided SEND/RECV) transport backends behind IRemoteOp*Transport,
-        # filed by protocol: DC under rdma/ (alongside the one-sided plane), ZMQ under tcp/.
-        src/indexer/transport/rdma/dc_bilateral.cpp
-        # Server-side remote-op service (RadixServer::rc_* pollers + handlers);
-        # needed by the RDMA backend even without ZMQ.
         src/indexer/remote_op_service.cpp
-        # TCP backend (libzmq REQ/REP); self-guarded on RADIXSHMEM_HAS_ZMQ (empty TU when absent).
-        src/indexer/transport/tcp/zmq_transport.cpp
+        src/indexer/transport/remote_op_factory.cpp
     )
 endif()
 add_library(radixshmem STATIC ${_radixshmem_sources})
@@ -96,19 +90,18 @@ target_include_directories(radixshmem PUBLIC
     # core internal headers (node_pool.hpp etc.) live under src/indexer/core; radix_tree.h
     # (public) embeds these pools, so consumers must resolve the .hpp names too.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/core
-    # transport-plane headers (rdma_transport.hpp, dc_oneside/dc_bilateral, xrc ...)
-    # live under src/indexer/transport/rdma; public cluster headers embed transport members,
-    # so consumers resolve these too.
+    # Public cluster headers require the one-sided RDMA transport headers.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/rdma
-    # TCP/ZMQ bilateral backend header is private under src/indexer/transport/tcp;
-    # consumers include it as "zmq_transport.hpp".
-    ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/tcp
     # peer-plane headers (peer_connector.hpp, peer_registry.hpp, xrc_connect.hpp,
     # net_util.hpp) are private under src/indexer/peer.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/peer
 )
 
 target_include_directories(radixshmem PRIVATE
+    # remote_op_service.hpp, shared by the remote-op server backends
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer
+    # remote_op_factory.hpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/component
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/rht
 )
@@ -116,34 +109,65 @@ target_include_directories(radixshmem PRIVATE
 set(_radixshmem_link_libs xxhash rt pthread)
 if(ENABLE_RDMA)
     list(APPEND _radixshmem_link_libs ibverbs mlx5)   # mlx5 for DC (Direct Verbs)
-    # CMake-side switches consumed by configure_file() into radixshmem_config.h.
-    set(RADIXSHMEM_REMOTE_OP_RDMA ON)
 else()
     set(RADIXSHMEM_NO_RDMA ON)
 endif()
 target_link_libraries(radixshmem PUBLIC ${_radixshmem_link_libs})
 
-# ==================== ZeroMQ (remote-insert control plane) ====================
-# Probe libzmq via pkg-config; on success the ZMQ backend compiles in. RDMA is a prerequisite.
-set(RADIXSHMEM_ZMQ_FOUND OFF)
-if(ENABLE_ZMQ AND ENABLE_RDMA)
+# ==================== gRPC (remote-op control plane) ====================
+# grpc++/protobuf via pkg-config plus protoc/grpc_cpp_plugin; the generated code is a static library only transport/grpc sees.
+set(RADIXSHMEM_GRPC_FOUND OFF)
+if(ENABLE_GRPC AND ENABLE_RDMA)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
-        pkg_check_modules(ZMQ QUIET libzmq)
+        pkg_check_modules(GRPCPP QUIET grpc++)
+        pkg_check_modules(PROTOBUF QUIET protobuf)
     endif()
-    if(ZMQ_FOUND)
-        set(RADIXSHMEM_ZMQ_FOUND ON)
-        # ZMQ sources already compiled via _radixshmem_sources (RDMA block), self-guarded.
-        target_include_directories(radixshmem PUBLIC ${ZMQ_INCLUDE_DIRS})
-        target_link_libraries(radixshmem PUBLIC ${ZMQ_LIBRARIES})
-        target_link_directories(radixshmem PUBLIC ${ZMQ_LIBRARY_DIRS})
-        set(RADIXSHMEM_HAS_ZMQ ON)
-        message(STATUS "ZeroMQ found (${ZMQ_VERSION}) — remote-insert enabled")
+    find_program(PROTOC_EXECUTABLE protoc)
+    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin)
+    if(GRPCPP_FOUND AND PROTOBUF_FOUND AND PROTOC_EXECUTABLE AND GRPC_CPP_PLUGIN)
+        set(_grpc_proto_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+        set(_grpc_gen_dir   ${CMAKE_BINARY_DIR}/generated/grpc)
+        set(_grpc_gen_srcs
+            ${_grpc_gen_dir}/remote_ops.pb.cc
+            ${_grpc_gen_dir}/remote_ops.grpc.pb.cc)
+        file(MAKE_DIRECTORY ${_grpc_gen_dir})
+        add_custom_command(
+            OUTPUT ${_grpc_gen_srcs}
+                   ${_grpc_gen_dir}/remote_ops.pb.h
+                   ${_grpc_gen_dir}/remote_ops.grpc.pb.h
+            COMMAND ${PROTOC_EXECUTABLE}
+                    --proto_path=${_grpc_proto_dir}
+                    --cpp_out=${_grpc_gen_dir}
+                    --grpc_out=${_grpc_gen_dir}
+                    --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
+                    ${_grpc_proto_dir}/remote_ops.proto
+            DEPENDS ${_grpc_proto_dir}/remote_ops.proto
+            COMMENT "Generating remote-op gRPC code (remote_ops.proto)"
+            VERBATIM)
+        add_library(radixshmem_grpc_proto STATIC ${_grpc_gen_srcs})
+        set_property(TARGET radixshmem_grpc_proto PROPERTY POSITION_INDEPENDENT_CODE ON)
+        target_include_directories(radixshmem_grpc_proto PUBLIC
+            ${_grpc_gen_dir} ${GRPCPP_INCLUDE_DIRS} ${PROTOBUF_INCLUDE_DIRS})
+        target_link_directories(radixshmem_grpc_proto PUBLIC
+            ${GRPCPP_LIBRARY_DIRS} ${PROTOBUF_LIBRARY_DIRS})
+        target_link_libraries(radixshmem_grpc_proto PUBLIC
+            ${GRPCPP_LIBRARIES} ${PROTOBUF_LIBRARIES})
+
+        target_sources(radixshmem PRIVATE
+            src/indexer/transport/grpc/grpc_remote_op_client.cpp
+            src/indexer/transport/grpc/grpc_remote_op_server.cpp)
+        target_include_directories(radixshmem PUBLIC
+            ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+        target_link_libraries(radixshmem PRIVATE radixshmem_grpc_proto)
+        set(RADIXSHMEM_GRPC_FOUND ON)
+        set(RADIXSHMEM_HAS_GRPC ON)
+        message(STATUS "gRPC found (grpc++ ${GRPCPP_VERSION}, protobuf ${PROTOBUF_VERSION}) — grpc remote-op backend enabled")
     else()
-        message(STATUS "ZeroMQ not found — remote-insert (zmq backend) disabled")
+        message(FATAL_ERROR "gRPC requires grpc++/protobuf via pkg-config, protoc and grpc_cpp_plugin. Install them, or set ENABLE_GRPC=OFF to build without remote ops; no alternate backend is available.")
     endif()
 else()
-    message(STATUS "ZeroMQ disabled (ENABLE_ZMQ=${ENABLE_ZMQ}, ENABLE_RDMA=${ENABLE_RDMA})")
+    message(STATUS "gRPC disabled (ENABLE_GRPC=${ENABLE_GRPC}, ENABLE_RDMA=${ENABLE_RDMA})")
 endif()
 
 # ==================== radixshmem_registry: the etcd plane (Go client wrapper) ====================
@@ -301,10 +325,8 @@ configure_file(include/radixshmem_config.h.in
 target_include_directories(radixshmem PUBLIC ${CMAKE_BINARY_DIR}/include)
 
 # ==================== radix_server tool (launched by ServerLauncher) ====================
-if(ENABLE_RDMA)
-    add_executable(radix_server tools/server_main.cpp)
-    target_link_libraries(radix_server PRIVATE radixshmem)
-endif()
+add_executable(radix_server tools/server_main.cpp)
+target_link_libraries(radix_server PRIVATE radixshmem)
 
 # ==================== Unit tests ====================
 # Keep assert() live in test TUs under Release (trailing -UNDEBUG overrides -DNDEBUG).
@@ -342,9 +364,7 @@ foreach(_t ${_core_unit_tests})
     target_include_directories(${_t} PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer
                                              ${CMAKE_SOURCE_DIR}/src/indexer/rht)
     radixshmem_enable_asserts(${_t})
-    if(ENABLE_RDMA)
-        add_dependencies(${_t} radix_server)
-    endif()
+    add_dependencies(${_t} radix_server)
     add_test(NAME ${_t} COMMAND ${_t})
 endforeach()
 
@@ -427,13 +447,25 @@ if(ENABLE_RDMA)
     add_executable(test_remote_api tests/indexer/test_remote_api.cpp)
     target_link_libraries(test_remote_api PRIVATE radixshmem)
 
-    # Two-variant matrix: base = zmq control × xrc data (zmq-gated); _dcd = both planes DC (superset).
-    if(RADIXSHMEM_ZMQ_FOUND)
-        add_test(NAME test_remote_api COMMAND test_remote_api)
+    if(RADIXSHMEM_GRPC_FOUND)
+        add_test(NAME test_remote_api_grpc COMMAND test_remote_api)
+        set_tests_properties(test_remote_api_grpc PROPERTIES
+            ENVIRONMENT "RADIXSHMEM_REMOTE_OP_TRANSPORT=grpc")
+        add_test(NAME test_remote_api_grpc_dcd COMMAND test_remote_api)
+        set_tests_properties(test_remote_api_grpc_dcd PROPERTIES
+            ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_REMOTE_OP_TRANSPORT=grpc")
     endif()
-    add_test(NAME test_remote_api_dcd COMMAND test_remote_api)
-    set_tests_properties(test_remote_api_dcd PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_REMOTE_OP_TRANSPORT=dc")
+endif()
+
+# Loopback gRPC tests use a real single-node tree without RDMA or etcd.
+if(RADIXSHMEM_GRPC_FOUND)
+    add_executable(test_remote_op_grpc tests/indexer/test_remote_op_grpc.cpp)
+    target_link_libraries(test_remote_op_grpc PRIVATE radixshmem radixshmem_grpc_proto)
+    target_include_directories(test_remote_op_grpc PRIVATE
+        ${CMAKE_SOURCE_DIR}/tests/indexer ${CMAKE_SOURCE_DIR}/src/indexer
+        ${CMAKE_SOURCE_DIR}/src/indexer/transport)
+    radixshmem_enable_asserts(test_remote_op_grpc)
+    add_test(NAME test_remote_op_grpc COMMAND test_remote_op_grpc)
 endif()
 
 # Data-plane geometry in the shared etcd registry. Needs an etcd binary but no
@@ -455,7 +487,7 @@ endif()
 # register code so ctest shows "Skipped". The cluster tests fork a private etcd
 # (the sole bootstrap backend) and SKIP when no etcd binary is available.
 set(_skippable_tests
-    test_remote_api test_remote_api_dcd
+    test_remote_api_grpc test_remote_api_grpc_dcd
     test_cluster test_cluster_dc test_cluster_dc_rht_nic test_cluster_w4
     test_cluster_rht_dc_peer_xrc test_cluster_rht_xrc_peer_dc
     test_cluster_node_join
@@ -485,9 +517,7 @@ foreach(_b ${_benches})
     target_link_libraries(${_b} PRIVATE radixshmem)
     # bench/* may include test_utils.h, now under tests/indexer/.
     target_include_directories(${_b} PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
-    if(ENABLE_RDMA)
-        add_dependencies(${_b} radix_server)
-    endif()
+    add_dependencies(${_b} radix_server)
 endforeach()
 
 # Remote-op correctness smoke on a 2-rank cluster; manual quick check (needs RDMA device, not in ctest).

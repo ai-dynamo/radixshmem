@@ -9,15 +9,11 @@
 #include "cluster_protocol.h"
 #ifndef RADIXSHMEM_NO_RDMA
 #include "radix_client.h"
-#endif
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-#include "dc_bilateral.hpp"
+#include "remote_op_factory.hpp"
 #endif
 
 #include <algorithm>
-#include <climits>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <shared_mutex>
 
@@ -35,18 +31,6 @@ static double secs_since(std::chrono::steady_clock::time_point t0) {
 }
 
 PeerConnector::~PeerConnector() {
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-    if (rc_stack_op_mu_ && rc_stack_op_mu_.use_count() > 1) {
-        fprintf(stderr,
-                "[PeerConnector] WARNING: %ld dc remote-op session(s) (or "
-                "retained lock=true results) outlive this client — their "
-                "destruction is use-after-free. Drop all RemotePeer handles AND "
-                "locked QueryResults before the RadixClient.\n",
-                (long)(rc_stack_op_mu_.use_count() - 1));
-    }
-    dc_rc_ini_.reset();
-    dc_rc_tgt_.reset();
-#endif
     slots_.clear();
 }
 
@@ -283,20 +267,6 @@ bool PeerConnector::dec_ref_components_remote(int remote,
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-static int resolve_rc_client_rank(int default_rank) {
-    int client_rank = default_rank;
-    if (const char* e = ::getenv("RADIXSHMEM_RC_CLIENT_RANK")) {
-        char* end = nullptr;
-        long v = std::strtol(e, &end, 10);
-        if (end != e && *end == '\0' && v >= 0 && v <= INT_MAX)
-            client_rank = (int)v;
-        else
-            fprintf(stderr, "[PeerConnector] ignoring invalid "
-                    "RADIXSHMEM_RC_CLIENT_RANK='%s'\n", e);
-    }
-    return client_rank;
-}
-
 std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
     PeerEntry p;
     {
@@ -308,67 +278,11 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
     if (p.rank != rank)
         throw std::runtime_error("open_remote: peer rank " + std::to_string(rank) +
                                  " is not registered (node down)");
-    int client_rank = rc_client_rank_;
-    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_DC) {
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-        if (p.rc_dct_num == 0)
-            throw std::runtime_error(
-                "open_remote: peer rank " + std::to_string(rank) +
-                " has remote ops disabled (rc_dct_num == 0)");
-        if (!dc_rc_tgt_) {
-            auto tgt = std::make_unique<DcTarget>(
-                tx_.ctx(), cfg_.dc_access_key, /*srq_max_wr=*/16);
-            auto ini = std::make_unique<DcInitiator>(tx_.ctx(), cfg_.dc_access_key);
-            dc_rc_tgt_ = std::move(tgt);
-            dc_rc_ini_ = std::move(ini);
-        }
-        int p_eff = 1;
-        for (int i = 0; i < 3 && p.rc_dct_num_extra[i] != 0; ++i) ++p_eff;
-        int lane = (int)((unsigned)client_rank % (unsigned)p_eff);
-        uint32_t dctn = lane == 0 ? p.rc_dct_num : p.rc_dct_num_extra[lane - 1];
-        ibv_gid dgid;
-        std::memcpy(&dgid, p.gid_raw, 16);
-        ibv_ah* ah = dc_create_ah(tx_.ctx(), dgid, p.lid, p.link_layer);
-        if (!ah)
-            throw std::runtime_error(
-                "open_remote: ibv_create_ah to rank " +
-                std::to_string(rank) + " failed");
-        auto t = std::make_unique<DcClientTransport>(
-            *dc_rc_ini_, *dc_rc_tgt_, ah, dctn, client_rank);
-        std::string dep = "dc://" + std::string(p.host) + "#" +
-                          std::to_string(dctn);
-        auto rc = std::make_shared<RemotePeer>(std::move(t), std::move(dep));
-        rc->set_peer_rank(rank);
-        return rc;
-#else
-        throw std::runtime_error(
-            "open_remote: cluster remote-op transport is dc but "
-            "this build has no RDMA control-plane backend");
-#endif
-    }
-
-    if (p.zmq_listen_port == 0)
-        throw std::runtime_error(
-            "open_remote: peer rank " + std::to_string(rank) +
-            " has remote ops disabled (remote-op listen port == 0)");
-    std::string ep = "tcp://" + std::string(p.host) + ":" +
-                     std::to_string(p.zmq_listen_port);
-
-    if (cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_RDMA) {
-        throw std::runtime_error(
-            "open_remote: cluster advertises the removed xrc/rdma "
-            "control-plane backend — redeploy rank 0 with remote_op_transport "
-            "= dc (or zmq)");
-    }
-#ifdef RADIXSHMEM_HAS_ZMQ
-    auto rc = std::make_shared<RemotePeer>(ep);
+    std::string endpoint;
+    auto t = make_remote_op_client(p, endpoint);
+    auto rc = std::make_shared<RemotePeer>(std::move(t), std::move(endpoint));
     rc->set_peer_rank(rank);
     return rc;
-#else
-    throw std::runtime_error(
-        "open_remote: cluster remote-op transport is zmq but "
-        "ZMQ is not compiled into this build");
-#endif
 }
 
 std::shared_ptr<RemotePeer> PeerConnector::open_remote(int rank) {
@@ -377,25 +291,7 @@ std::shared_ptr<RemotePeer> PeerConnector::open_remote(int rank) {
             "open_remote: target is this client's own rank — "
             "talking to yourself is query()'s job");
     std::lock_guard<std::mutex> g(rc_open_mu_);
-    if (rc_client_rank_ < 0)
-        rc_client_rank_ = resolve_rc_client_rank(peers_.my_rank());
-    const bool is_zmq = cfg_.remote_op_transport == REMOTE_OP_TRANSPORT_ZMQ;
-    std::shared_ptr<std::mutex> mu;
-    if (is_zmq) {
-        mu = std::make_shared<std::mutex>();
-    } else {
-        if (!rc_stack_op_mu_)
-            rc_stack_op_mu_ = std::make_shared<std::mutex>();
-        mu = rc_stack_op_mu_;
-    }
-    std::shared_ptr<RemotePeer> rc;
-    {
-        std::unique_lock<std::mutex> opg;
-        if (!is_zmq) opg = std::unique_lock<std::mutex>(*mu);
-        rc = build_rc_session(rank);
-    }
-    rc->set_op_mu(std::move(mu));
-    return rc;
+    return build_rc_session(rank);
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA

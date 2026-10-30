@@ -100,17 +100,19 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 | `rht_slots_per_bucket`  | `int`              | `4`                       | Number of slots W per RHT bucket (chaining to handle hash collisions), one of `{1,2,4,8}`. Can be overridden by env `RADIXSHMEM_RHT_SLOTS`. **Only rank0 is authoritative**. |
 | `enable_remote_insert`  | `bool`             | `false`                   | Allow peers to insert remotely into this server's tree (two-phase `[remote_allocate](#remote_allocate)` → `[remote_insert](#remote_insert)`). |
 | `enable_remote_query`   | `bool`             | `false`                   | Allow peers to query this server's tree remotely (`[remote_query](#remote_query)`; `lock=true` can pin the matched prefix). |
-| `zmq_listen_port`       | `uint16_t`         | `0`                       | TCP port of the remote-op endpoint (shared by insert/query; used only by the zmq backend as the REP socket; dc has no TCP endpoint, so this value is always 0). `0` = assigned by the OS (the real port is read back and published to etcd `/peers`). |
-| `remote_op_transport`   | `std::string`      | `"zmq"`                   | remote-op transport: `"zmq"` (TCP REQ/REP) or `"dc"` (DCI/DCT). rank0 is authoritative. Can be overridden by env `RADIXSHMEM_REMOTE_OP_TRANSPORT`. ("rdma"/"xrc" are the removed XRC backend; bootstrap reports an error.) |
+| `remote_op_listen_port` | `uint16_t` | `0` | TCP port of the gRPC remote-op endpoint, shared by insert/query. `0` = assigned by the OS; the actual port is published to etcd `/peers`. The old `zmq_listen_port` alias is removed. |
+| `remote_op_transport` | `std::string` | `"grpc"` | Compatibility setting: only `"grpc"` is supported. In distributed mode env `RADIXSHMEM_REMOTE_OP_TRANSPORT` overrides this value. Any other value makes `bootstrap()` throw before creating shared memory. A build without gRPC cannot serve remote ops; there is no fallback. |
 
 
 > **Distributed criterion**: `want_cluster()` = `expected_min_nodes > 1 || num_rht_shards > 1 || world_size > 1`. If any of the three holds, etcd + RDMA bootstrap is used, and in that case **one of** `rpc_address` / `rpc_interface` **must be given**; otherwise `bootstrap()` throws `std::runtime_error`.
 
-> **Lane count**: the remote-op service lane count P (one poller thread per lane; at most 4 for the dc backend, always 1 for zmq) is not a config field. It is controlled only by env `RADIXSHMEM_RC_LANES` (default 1; must be set before bootstrap).
+> **Concurrency and deadlines**: the gRPC service admits at most 32 concurrent ops by default and answers excess requests with `RESOURCE_EXHAUSTED`. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms). The old DC/ZMQ lane settings no longer apply.
+
+> **Deployment**: all nodes and clients must use gRPC for remote ops; a cluster advertising another remote-op transport is rejected. The manifest and shard map retain their existing layout and version, with former remote-op DCT fields reserved. All nodes and clients should run the same build; mixed-version rolling upgrades are not supported. RHT and peer-index XRC/DC transport choices are unaffected.
 
 > **Note**: `RadixServer::bootstrap()` **writes** `cfg.register_chunk_tokens` into `cfg.shm.register_chunk_tokens`, so you do not need to mirror it manually. `world_size` / `rank` flow in the opposite direction: after etcd determines them during rendezvous they are **written back into `cfg`**, and together with the identity fields they are stamped into the shm header (`my_rank` / `is_distributed` / `node_name` / `registry` / `cluster_id`).
 
-> **rank0 is authoritative**: for `rht_transport` / `peer_index_transport` / `num_rht_shards` / `rht_shard_holders` / `rht_slots_per_bucket` / `remote_op_transport` (and RDMA QoS `RADIXSHMEM_RDMA_SL` / `RADIXSHMEM_RDMA_TC`), only the values on **rank 0** take effect. They are computed at bootstrap and **written into etcd `/config`** (shard map blob), and all other nodes and clients read them from there. Other ranks that pass different values have them ignored (a warning is printed) and run with rank0's authoritative values. This way the operator configures them once on rank0, all nodes + clients align automatically, and the client side needs no configuration. These are all **new fields whose defaults keep the old behavior**; existing deployments that do not set them see no change.
+> **rank0 is authoritative**: for `rht_transport` / `peer_index_transport` / `num_rht_shards` / `rht_shard_holders` / `rht_slots_per_bucket` (and RDMA QoS `RADIXSHMEM_RDMA_SL` / `RADIXSHMEM_RDMA_TC`), only the values on **rank 0** take effect. They are computed at bootstrap and **written into etcd `/config`** (shard map blob), and all other nodes and clients read them from there. Other ranks that pass different values have them ignored (a warning is printed) and run with rank0's authoritative values. This way the operator configures them once on rank0, all nodes + clients align automatically, and the client side needs no configuration. These are all **new fields whose defaults keep the old behavior**; existing deployments that do not set them see no change.
 
 
 
@@ -503,7 +505,9 @@ client.insert(hashes, n, m.data(), 1,
 
 ---
 
-> **All remote operations are rank-first and handle-free**: the first parameter is the target peer `rank`; the client internally opens and caches one session per rank (created lazily on first use, reused afterwards). An **invalid rank** (own rank / out of range / negative / target has remote-op disabled) is reported in place in the return value as `BAD_TARGET` (query) / `REMOTE_FAILED` (insert) / `false` (recycle, unlock), and **never throws**. A transport `TIMEOUT` recovers by itself and does not invalidate the cached session.
+> **All remote operations are rank-first and handle-free**: the first parameter is the target peer `rank`; the client internally opens and caches one session per rank (created lazily on first use, reused afterwards). An **invalid rank** (own rank / out of range / negative / target has remote-op disabled) is reported in place in the return value as `BAD_TARGET` (query) / `REMOTE_FAILED` (insert) / `false` (recycle, unlock), and **never throws**. A transport `TIMEOUT` / `UNAVAILABLE` recovers by itself and does not invalidate the cached session.
+
+> **Uncertain outcome**: `TIMEOUT` and `UNAVAILABLE` do not mean that the target skipped the op; it may have run. The gRPC transport never resends an op. After such a failure, do not assume the allocated slots are unused on the target, and do not recycle them only because of the failure.
 
 ### `remote_allocate`
 
@@ -530,6 +534,7 @@ AllocateReply remote_allocate(int rank, int n);
 | Field       | Type                              | Meaning                                                                                                  |
 | -------- | ------------------------------- | --------------------------------------------------------------------------------------------------- |
 | `status` | `[RemoteStatus](#remotestatus)` | **Check first**; when not `OK`, `slots` is empty.                                                                          |
+| `error`  | `InsertError`                   | Business result when `status == OK`: `MEMPOOL_FULL` when the target could not supply all `n` slots (nothing is allocated, `slots` is empty), else `OK`. |
 | `slots`  | `std::vector<int32_t>`          | **Target-local** physical slot ids (not addressable from this process; for use by the KV transfer channel), length == `n`. The allocated slots are not bound to any prefix and the evictor cannot touch them; the server is stateless, so **abandoned slots must be returned with** `remote_recycle`. |
 
 
@@ -563,7 +568,7 @@ InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
 
 #### Return value
 
-Same `InsertResult` (`{error, unused_slots}`) as local `[insert](#insert)`: `unused_slots` = slots not consumed due to dedup hits + tail slots that were not applied (if everything is deduplicated, == all `length` slots); the number actually published = `length - unused_slots.size()`; `error` reports the target tree insert result. With `auto_recycle=false`, the caller must return these `unused_slots` with `[remote_recycle](#remote_recycle)`. Invalid rank / transport failure → `error = REMOTE_FAILED`.
+Same `InsertResult` (`{error, unused_slots}`) as local `[insert](#insert)`: `unused_slots` = slots not consumed due to dedup hits + tail slots that were not applied (if everything is deduplicated, == all `length` slots); the number actually published = `length - unused_slots.size()`; `error` reports the target tree insert result. With `auto_recycle=false`, the caller must return these `unused_slots` with `[remote_recycle](#remote_recycle)`. Invalid rank / transport failure → `error = REMOTE_FAILED`, and `remote_status` holds the [RemoteStatus](#remotestatus) behind it (`BAD_TARGET`, `TIMEOUT`, `UNAVAILABLE`, ...); `remote_status` is `OK` otherwise.
 
 ---
 
@@ -953,14 +958,16 @@ enum class RemoteStatus : uint16_t {
     UNKNOWN_OP    = 2,  // op not recognized by the target (detected by target, sent over the wire)
     // 3 was PEER_DISABLED (removed: when the target has remote-op disabled, peer_for returns nullptr internally,
     //   the op reports BAD_TARGET locally, and there is no corresponding status code anymore; do not reuse this value)
-    TIMEOUT       = 4,  // request() retries exhausted with no reply (synthesized locally by the client)
-    BAD_REPLY     = 5,  // Reply received but magic/version/req_id validation failed (synthesized locally by the client)
+    TIMEOUT       = 4,  // No reply before the deadline (synthesized locally by the client)
+    BAD_REPLY     = 5,  // Reply received but malformed or inconsistent with the request (synthesized locally by the client)
     BAD_TARGET    = 6,  // target of remote_* out of range / == own rank (synthesized locally by the client)
-    INTERNAL      = 7,  // Internal consistency / remote pin completion error
+    INTERNAL      = 7,  // Internal consistency / remote pin completion error, or the target's handler failed
+    UNAVAILABLE   = 8,  // grpc: target unreachable, not yet serving, or shutting down
+    RESOURCE_EXHAUSTED = 9,  // grpc: target refused the op at its in-flight limit (the op did not run)
 };
 ```
 
-The return values of all `remote_*` are judged by this: `QueryResult::status` of `remote_query`, `AllocateReply::status` of `remote_allocate`, `remote_recycle` / `remote_unlock` return `RemoteStatus` directly, and `remote_insert` folds it into `InsertError::REMOTE_FAILED`. Anything other than `OK` means the request did not complete at all; do not read the other fields. It is **orthogonal** to `[InsertError](#inserterror)`: `RemoteStatus` describes "whether the request was delivered / processed / the reply is valid", `InsertError` describes "the insert result on the target tree", and `InsertError` is only meaningful when `RemoteStatus == OK`.
+The return values of all `remote_*` are judged by this: `QueryResult::status` of `remote_query`, `AllocateReply::status` of `remote_allocate`, `remote_recycle` / `remote_unlock` return `RemoteStatus` directly, and `remote_insert` folds it into `InsertError::REMOTE_FAILED` and keeps it in `InsertResult::remote_status`. Anything other than `OK` means no valid reply was obtained; do not read the other fields. `TIMEOUT` / `UNAVAILABLE` leave the outcome on the target unknown (see the note at the start of the remote operations). It is **orthogonal** to `[InsertError](#inserterror)`: `RemoteStatus` describes "whether the request was delivered / processed / the reply is valid", `InsertError` describes "the insert result on the target tree", and `InsertError` is only meaningful when `RemoteStatus == OK`.
 
 ### `HealthFlag`
 
@@ -1006,7 +1013,7 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 - `client.remote_recycle(rank, slots) → RemoteStatus` (return unpublished allocations)
 - `client.remote_query(rank, hashes, lock=False, update_meta=True) → QueryResult` (remote operation, 1 RTT)
 - `client.remote_unlock(rank, hashes, hit_length) → RemoteStatus` (release the pin from `lock=True`)
-- New types exposed readonly: `AllocateReply` (`status`/`slots`); enum `radixshmem.RemoteStatus` (7 values). `RemotePeer` is no longer in Python (sessions are managed inside the client).
+- New types exposed readonly: `AllocateReply` (`status`/`error`/`slots`); enum `radixshmem.RemoteStatus` (9 values); `InsertResult.remote_status`. `RemotePeer` is no longer in Python (sessions are managed inside the client).
 - The `finalize` closure of `remote_query(lock=True)` carries `keep_alive`: it keeps the parent `RadixClient` from being GC'd (the reply DCT of a dc session is attached to its process-level receive target).
 
 **Plain query (Python)**: `client.query(...)` is the only entry point, and `mask` defaults to `COMPONENT_MASK_FULL`: `client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL | radixshmem.COMPONENT_MASK_SWA, local_only=False, lock=False, update_meta=True)`. Key points:
@@ -1017,7 +1024,7 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 
 **Configuration**: `radixshmem.ShmConfig(...)` supports keyword construction; its 13 parameters map one to one to the C++ fields (8 base fields `max_nodes` / `max_blocks` / `block_size` / `register_chunk_tokens` / `background_evict_ratio` / `evict_policy` / `data_pool_ratio` / `hugepage_path`, plus 5 component fields; `effective_register_chunk_size()` gives the converted block count `component_mask` / `swa_window_blocks` / `mamba_state_bytes` / `swa_max_blocks` / `mamba_max_slots`).
 
-`radixshmem.RadixServerConfig` **has only a default constructor**; fields are set by attribute assignment (`cfg.enable_remote_insert = True`, etc.). All are exposed (25): `name` / `shm` / `rank` / `world_size` / `registry` / `cluster_id` / `node_name` / `rpc_address` / `rpc_interface` / `rpc_port` / `expected_min_nodes` / `settle_ms` / `index_dev` / `gid_idx` / `bootstrap_timeout_sec` / `register_chunk_size` / `num_rht_shards` / `rht_shard_holders` / `rht_transport` / `peer_index_transport` / `rht_slots_per_bucket` / `enable_remote_insert` / `enable_remote_query` / `remote_op_transport` / `zmq_listen_port` (the two ports are read and written as `int` on the Python side).
+`radixshmem.RadixServerConfig` **has only a default constructor**; fields are set by attribute assignment (`cfg.enable_remote_insert = True`, etc.). Exposed fields include: `name` / `shm` / `rank` / `world_size` / `registry` / `cluster_id` / `node_name` / `rpc_address` / `rpc_interface` / `rpc_port` / `expected_min_nodes` / `settle_ms` / `index_dev` / `gid_idx` / `bootstrap_timeout_sec` / `register_chunk_size` / `num_rht_shards` / `rht_shard_holders` / `rht_transport` / `peer_index_transport` / `rht_slots_per_bucket` / `enable_remote_insert` / `enable_remote_query` / `remote_op_transport` / `remote_op_listen_port` (the ports are read and written as `int` on the Python side).
 
 **The whole `RadixClientConfig` class is not exported**: on the Python side there are only two constructors, `radixshmem._core.RadixClient(name, local_read_only=False)` and `radixshmem._core.RadixClient(server)`; etcd discovery is done automatically from the identity in the shm header (observer / `rht_only` modes are C++-only); `local_read_only=True` is a lightweight read-only attach that does not join the cluster, see [3.1](#31-construction-and-lifecycle).
 
@@ -1025,6 +1032,6 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 
 **Health check ([§3.8](#38-health-check-check_health))**: `client.check_health() -> int` (`HealthFlag` bit set, 0 = healthy) and `client.health_report() -> HealthReport` (readonly fields `flags` / `locks_inspected` / `rwlock_readers` / `rwlock_writers_waiting` / `rwlock_writer_held` / `lru_locked` / `rdma_rwlock` / `full` / `swa` / `mamba` (`HealthPoolReport`) / `nodes_with_refs` / `ref_total` / `nodes_reachable` / `nodes_in_pool`, methods `ok()` / `describe()`; `bool(report)` is `ok()`, and `repr(report)` includes the `describe()` text). `server.check_health()` / `server.health_report()` have the same meaning. The bit constants are in `radixshmem.HealthFlag` (a `py::arithmetic` enum; `int(radixshmem.HealthFlag.FULL_SLOT_LEAK)` gives the integer to bitwise-AND with the return value). Conventions: each case in `python/tests/test_radixshmem.py` ends with `assert client.check_health() == 0`; `test_cluster.py` runs a `health` role on each node at the end; `tests/agentic_stress.py` / `tests/dist_stress_test.py` have each worker audit its own tree at the end, and if there is a leak the whole run returns non-zero.
 
-**C++-only, not exported to Python**: `RadixServer::insert_error_mempool_count()`. (The number of remote-op lanes is controlled by the env `RADIXSHMEM_RC_LANES`, not a config field.)
+**C++-only, not exported to Python**: `RadixServer::insert_error_mempool_count()`.
 
 All datapath methods of the Python module release the GIL correctly when calling the C++ implementation, so they can be used in multithreaded programs.

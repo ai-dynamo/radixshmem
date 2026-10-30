@@ -94,6 +94,8 @@ enum class RemoteStatus : uint16_t {
     BAD_REPLY     = 5,  // reply received but magic/version/req_id check failed
     BAD_TARGET    = 6,  // remote_* target out of range / == own rank (client synthesized)
     INTERNAL      = 7,
+    UNAVAILABLE   = 8,  // target unreachable or not serving (may still have executed the op)
+    RESOURCE_EXHAUSTED = 9,  // target refused the op: concurrent admission limit reached
 };
 
 struct QueryResult {
@@ -374,8 +376,22 @@ struct QueryInternalDetail {
     int last_node_matched_blocks = 0;
 };
 
+struct AllocateReply {
+    RemoteStatus status = RemoteStatus::OK;
+    InsertError  error  = InsertError::OK;   // MEMPOOL_FULL when status is OK but nothing was allocated
+    std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
+};
+
+struct QueryReply {
+    RemoteStatus status = RemoteStatus::OK;
+    int hit_length       = 0;   // B local-tree total matched blocks
+    std::vector<int32_t> slots; // target-local physical slot ids (len == hit_length)
+};
+
 struct InsertResult {
     InsertError error = InsertError::OK;
+    // remote_insert only: the comms status behind error == REMOTE_FAILED.
+    RemoteStatus remote_status = RemoteStatus::OK;
     // Slots not consumed (leading redundant prefix + unlanded suffix, merged).
     // Always populated; auto-recycled inside insert when auto_recycle=true.
     std::vector<int32_t> unused_slots;

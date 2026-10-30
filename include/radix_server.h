@@ -17,6 +17,7 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
+#include "cluster_protocol.h"      // ibv_cq, CLUSTER_TRANSPORT_*, REMOTE_OP_TRANSPORT_*
 #include <unordered_map>
 #endif
 
@@ -37,12 +38,7 @@ class XrcRecvQp;
 class EtcdRegistry;
 struct PeerEntry;
 struct ShardMapMsg;
-struct RemoteOpReqHeader;
-
-struct RemoteOpAddr {
-    uint16_t port = 0;        // zmq: actual bound TCP port (0 = not zmq / off)
-    uint32_t dctns[4] = {};   // dc: lane DCT numbers, lane 0 first, 0-padded
-};
+class RemoteOpService;
 #endif
 
 struct RadixServerConfig {
@@ -81,10 +77,10 @@ struct RadixServerConfig {
 
     bool              enable_remote_insert = false;   // remote-insert control plane
     bool              enable_remote_query = false;    // remote-query control plane
-    uint16_t          zmq_listen_port = 0;            // remote-op endpoint TCP port
+    uint16_t          remote_op_listen_port = 0;
 
-    // Control-plane backend: "zmq" | "dc" ("dc" needs world_size>1 + mlx5). rank 0 authoritative.
-    std::string       remote_op_transport = "zmq";
+    // Compatibility setting: only "grpc" is accepted.
+    std::string       remote_op_transport = "grpc";
 
     // Cluster bootstrap registry: "etcd://host:port" (etcd dynamic discovery).
     std::string       registry   = "etcd://127.0.0.1:2379";
@@ -178,13 +174,11 @@ private:
     // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE).
     std::unique_ptr<RhtHolder>         rht_holder_;
 
-    // DC read target — only when either plane is DC and no lane-0 DCT donated.
+    // DC read target for the RHT and peer-index planes.
     std::unique_ptr<DcTarget>          dct_;
-    uint32_t                           rc_lane0_dctn_ = 0;   // remote-op lane-0 dctn (0 = none)
     uint32_t                           rht_transport_ = CLUSTER_TRANSPORT_XRC;
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
-    uint32_t                           remote_op_transport_ = REMOTE_OP_TRANSPORT_ZMQ;
 
     // Authoritative shard map (resolved on rank 0, broadcast to all).
     int                  num_shards_ = 0;       // M
@@ -228,26 +222,14 @@ private:
     void xrc_listener_loop();
     void handle_client(int conn_fd);
 
-    // ---- remote-op control plane (remote_op_endpoint.cpp) ----
+    // ---- remote-op control plane (remote_op_service.cpp) ----
     std::unique_ptr<IRemoteOpServerTransport> rc_server_;
-    std::vector<std::thread> rc_threads_;   // one poller per lane
-    std::atomic<bool>    rc_running_{false};
+    std::unique_ptr<RemoteOpService> rc_service_;   // built by rc_spawn on svc_*
 
-    // build_remote_op callback body: create the authoritative transport, return its address material.
-    RemoteOpAddr rc_build_endpoint(uint32_t rot_auth, uint64_t dc_access_key,
-                                   RdmaContext& ctx);
+    RemoteOpAddr rc_build_endpoint();
+    // Start serving once svc_* exist; rc_stop stops serving, then drops the service.
     void     rc_spawn();
     void     rc_stop();
-    // Poller for `lane`: recv → validate → dispatch in place → send.
-    void     rc_loop(int lane);
-    // op handlers — return serialized wire bytes for rc_loop to send.
-    std::vector<char> handle_insert(const RemoteOpReqHeader& req,
-                                    const uint64_t* hashes);
-    // FINALIZE / INSERT_RELEASE / QUERY_RELEASE, branched on req.op.
-    std::vector<char> handle_finalize_like(const RemoteOpReqHeader& req,
-                                           const uint64_t* hashes);
-    std::vector<char> handle_query(const RemoteOpReqHeader& req,
-                                   const uint64_t* hashes);
 #endif
 };
 

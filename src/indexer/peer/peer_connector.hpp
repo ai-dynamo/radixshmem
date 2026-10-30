@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Peer-facing plane: per-peer one-sided data-plane endpoints (lazy) for remote
-// walks, and the remote-op session factory. Borrows the shared peer table and
-// RDMA base; owns only the per-peer endpoint slots and the DC control stack.
+// Owns peer RDMA endpoints and opens gRPC sessions; borrows the peer table and RDMA base.
 
 #pragma once
 
@@ -26,13 +24,10 @@ class PeerRegistry;
 class RdmaTransportClient;
 #ifndef RADIXSHMEM_NO_RDMA
 class RemotePeer;
-class DcInitiator;
-class DcTarget;
 #endif
 
 struct PeerConnectorConfig {
     uint32_t transport = 0;            // peer-index-plane ClusterTransport (XRC vs DC)
-    uint32_t remote_op_transport = 0;  // REMOTE_OP_TRANSPORT_*
     uint64_t dc_access_key = 0;
     int      bootstrap_timeout_sec = 60;
     PeerFaultCounters* faults = nullptr;   // node-wide fault counters, may be null
@@ -78,7 +73,7 @@ class PeerConnector {
     void peer_left(int rank);
 
 #ifndef RADIXSHMEM_NO_RDMA
-    // Fresh remote-op session to `rank` (ZMQ or DC); caller owns the handle.
+    // Fresh gRPC remote-op session to `rank`; caller owns the handle.
     std::shared_ptr<RemotePeer> open_remote(int rank);
 #endif
 
@@ -109,11 +104,7 @@ class PeerConnector {
     std::unique_ptr<PeerBreaker> breaker_;
 
 #ifndef RADIXSHMEM_NO_RDMA
-    std::unique_ptr<DcInitiator> dc_rc_ini_;
-    std::unique_ptr<DcTarget>    dc_rc_tgt_;
     std::mutex rc_open_mu_;
-    std::shared_ptr<std::mutex> rc_stack_op_mu_;
-    int rc_client_rank_ = -1;
 #endif
 };
 
