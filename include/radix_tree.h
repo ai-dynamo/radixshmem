@@ -98,8 +98,9 @@ public:
 
     // Background eviction: non-blocking write_lock, evict up to target_blocks.
     // Returns blocks freed (0 if lock was busy).
+    // budget: per pool, nullptr = none; a batch stops at the task that uses one up.
     int try_evict_batch(int target_blocks, std::vector<HeldEviction>* held = nullptr,
-                        uint64_t budget = UINT64_MAX);
+                        const uint64_t* budget = nullptr);
     void release_held(const std::vector<HeldEviction>& hs);
     uint32_t held_slots(ComponentType component) const;
     uint64_t reset_generation() const;
@@ -287,7 +288,7 @@ private:
     // protect: node to pin for the walk (INVALID_NODE_ID = none).
     int  evict(int need, uint32_t protect = INVALID_NODE_ID);
     int  evict_walk(int need, std::vector<HeldEviction>* held = nullptr,
-                    uint64_t budget = UINT64_MAX);
+                    const uint64_t* budget = nullptr);
     void post_evict_fixup(uint32_t parent_id);
     void touch_node(uint32_t node_id);
 

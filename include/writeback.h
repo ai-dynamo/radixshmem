@@ -23,17 +23,17 @@ struct WritebackTask {
 
 struct WritebackStats {
     uint64_t queued = 0;        // pushed, not popped yet
-    uint64_t popped = 0;        // popped, not completed yet
+    uint64_t popped = 0;        // popped, slots not released yet
     uint64_t produced = 0;
     uint64_t completed = 0;
     uint64_t dropped = 0;       // released without a write-back
     uint64_t inflight_slots[NUM_COMPONENT_TYPES] = {};   // covered by queued + popped tasks
 };
 
+// Destroying it releases nothing: the tree goes with it.
 class WritebackQueue {
 public:
     explicit WritebackQueue(RadixShmemTree& tree) : tree_(tree) {}
-    ~WritebackQueue() { drop_all(); }
 
     WritebackQueue(const WritebackQueue&) = delete;
     WritebackQueue& operator=(const WritebackQueue&) = delete;
@@ -51,10 +51,12 @@ private:
     std::condition_variable cv_;
     std::deque<WritebackTask> queued_;
     std::unordered_map<uint64_t, WritebackTask> popped_;
+    uint64_t releasing_ = 0;   // taken out of popped_, slots not released yet
     uint64_t next_id_ = 1;
     WritebackStats st_;
 
     void account(const HeldEviction& h, bool add);   // under mu_
+    void release(const std::vector<HeldEviction>& hs, bool completed, uint64_t from_popped);
 };
 
 } // namespace radixshmem

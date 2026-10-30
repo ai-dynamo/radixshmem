@@ -149,14 +149,15 @@ void RadixServer::evictor_loop() {
         uint64_t inflight[NUM_COMPONENT_TYPES];
         writeback_->inflight_slots(inflight);
         bool paused = false;
-        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+        uint64_t budget[NUM_COMPONENT_TYPES];
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
             paused |= wb_limit[k] > 0 && inflight[k] >= wb_limit[k];
+            budget[k] = wb_limit[k] > 0 ? wb_limit[k] - inflight[k] : UINT64_MAX;
+        }
         if (paused)
             continue;
-        const int full = (int)ComponentType::FULL;
         held.clear();
-        tree_->try_evict_batch(LOCK_BATCH, &held,
-                               wb_limit[full] > 0 ? wb_limit[full] - inflight[full] : UINT64_MAX);
+        tree_->try_evict_batch(LOCK_BATCH, &held, budget);
         if (!held.empty())
             writeback_->push(std::move(held));
     }
@@ -630,6 +631,9 @@ RadixServer::~RadixServer() {
 
 bool RadixServer::bootstrap() {
     const bool distributed = want_cluster(cfg_);
+    const float held_ratio = cfg_.writeback_max_held_ratio;
+    if (cfg_.writeback_enabled && !(held_ratio > 0.0f && held_ratio <= 1.0f))
+        throw std::runtime_error("RadixServer: writeback_max_held_ratio must be in (0, 1]");
 
     ShmConfig shm = cfg_.shm;
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;

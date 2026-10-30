@@ -2,7 +2,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 """A write-back handler on node1 pull_async()s node0's prefixes with its
-in-process RadixClient, inside node1's server process.
+in-process RadixClient, inside node1's server process, and pulls the last
+one from stop() while node1 closes.
 
     python3 test_writeback_pull.py [--index-dev mlx5_bond_0] [--transfer-dev mlx5_bond_0] [--gid-idx 3]
 
@@ -28,35 +29,39 @@ from radixshmem.writeback import WritebackHandler
 class PullHandler(WritebackHandler):
     def __init__(self, config):
         self.cfg = config
+        self.client = None
         self._stop = threading.Event()
         self._thread = None
 
     def start(self, client):
-        self._thread = threading.Thread(target=self._run, args=(client,), daemon=True)
+        self.client = client
+        self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
-    def _run(self, client):
-        import numpy as np
-        import radixshmem
-
+    def _run(self):
         while not os.path.exists(self.cfg["go"]):
             if self._stop.wait(0.1):
                 return
+        _dump(self.cfg["out"], self._pull(range(p2p.PREFIXES - 1)))
+
+    def _pull(self, prefixes):
+        import numpy as np
+        import radixshmem
+
+        prefixes = list(prefixes)
         hs = [radixshmem.compute_hashes(np.arange(1000 * (k + 1), 1000 * (k + 1) + p2p.PREFIX_LEN,
-                                                  dtype=np.int64), 1) for k in range(p2p.PREFIXES)]
+                                                  dtype=np.int64), 1) for k in prefixes]
         try:
-            results = [j.wait(120) for j in [client.pull_async(h) for h in hs]]
+            results = [j.wait(120) for j in [self.client.pull_async(h) for h in hs]]
             out = {"hits": sum(r.common_hit for r in results),
                    "remote_blocks": sum(r.remote_blocks for r in results),
-                   "bytes_ok": sum(bytes(client.slot_view(int(s))) == p2p._pattern(k, i)
-                                   for k, r in enumerate(results) for i, s in enumerate(r.full_slots))}
+                   "bytes_ok": sum(bytes(self.client.slot_view(int(s))) == p2p._pattern(k, i)
+                                   for k, r in zip(prefixes, results) for i, s in enumerate(r.full_slots))}
             for r in results:
                 r.finalize()
         except Exception as e:  # noqa: BLE001 - reported to the orchestrator
             out = {"error": f"{type(e).__name__}: {e}"}
-        with open(self.cfg["out"] + ".tmp", "w") as f:
-            json.dump(out, f)
-        os.rename(self.cfg["out"] + ".tmp", self.cfg["out"])
+        return out
 
     def write(self, tasks, done):
         done([t.task_id for t in tasks])
@@ -65,6 +70,13 @@ class PullHandler(WritebackHandler):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(130)
+        _dump(self.cfg["out"] + ".stop", self._pull([p2p.PREFIXES - 1]))
+
+
+def _dump(path, out):
+    with open(path + ".tmp", "w") as f:
+        json.dump(out, f)
+    os.rename(path + ".tmp", path)
 
 
 def make(config):
@@ -130,8 +142,8 @@ def orchestrate(a) -> int:
         w, = p2p.run_clients([("writer", endpoints[0])])
         p2p.check(w["insert_errors"] == ["InsertError.OK"], "writer inserted")
 
-        total = p2p.PREFIXES * p2p.PREFIX_LEN
-        print("\n[4] node1's handler pulls them inside its server process")
+        total = (p2p.PREFIXES - 1) * p2p.PREFIX_LEN
+        print("\n[4] node1's handler pulls all but the last inside its server process")
         open(go, "w").close()
         deadline = time.time() + 150
         while not os.path.exists(result):
@@ -147,6 +159,15 @@ def orchestrate(a) -> int:
         print("\n[5] both trees are leak-free")
         for i, h in enumerate(p2p.run_clients([("health", endpoints[0]), ("health", endpoints[1])])):
             p2p.check(h["health"] == 0, f"node{i} check_health == 0 ({h['report']})")
+
+        print("\n[6] node1 closes; its handler's stop() pulls the last prefix")
+        servers[1].send_signal(signal.SIGINT)
+        servers[1].wait(timeout=60)
+        r = json.load(open(result + ".stop"))
+        print(f"  {r}")
+        n = p2p.PREFIX_LEN
+        p2p.check("error" not in r and r["hits"] == r["remote_blocks"] == r["bytes_ok"] == n,
+                  f"the pull from stop() moved all {n} blocks")
         print("\nPASS")
         return 0
     except Exception as exc:  # noqa: BLE001

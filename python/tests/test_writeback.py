@@ -3,6 +3,8 @@
 
 """Write-back of background-evicted KV on a standalone data-mode server."""
 
+import asyncio
+import math
 import os
 import struct
 import threading
@@ -13,7 +15,7 @@ import numpy as np
 import pytest
 
 import radixshmem
-from radixshmem import Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler
+from radixshmem import Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler, writeback
 from radixshmem.writeback import load_handler
 
 pytestmark = pytest.mark.skipif(not hasattr(radixshmem, "_data"), reason="radixshmem._data not built")
@@ -38,27 +40,35 @@ def cfg(tmp_path):
 
 
 class Recorder(WritebackHandler):
-    """Reads every task's slots; done at once unless ``hold`` (then ``release``)."""
+    """Reads every task's slots; done at once unless ``hold`` (then ``release``).
+    The first ``fail`` writes raise ``error``; with ``block`` write() waits for stop()."""
 
-    def __init__(self, hold=False, fail=False):
-        self.hold, self.fail = hold, fail
+    def __init__(self, hold=False, fail=0, error=None, block=False):
+        self.hold, self.fail, self.error, self.block = hold, fail, error, block
         self.client = None
-        self.tasks, self.data, self.hits = [], [], []
+        self.tasks, self.data, self.hits, self.valid = [], [], [], []
         self.pending, self.done = [], None
         self.stopped = False
+        self.entered, self.unblock = threading.Event(), threading.Event()
         self.mu = threading.Lock()
 
     def start(self, client):
         self.client = client
 
     def write(self, tasks, done):
+        if self.block:
+            self.entered.set()
+            self.unblock.wait()
+            return
         if self.fail:
-            raise RuntimeError("storage down")
+            self.fail -= 1
+            raise self.error or RuntimeError("storage down")
         for t in tasks:
             self.data.append([bytes(self.client.slot_view(int(s))[:8]) for s in t.full_slots])
             q = self.client.query(t.hashes, mask=radixshmem.COMPONENT_MASK_FULL, local_only=True,
                                   lock=False, update_meta=False)
             self.hits.append(int(q.common_hit))
+            self.valid.append(t.valid())
         with self.mu:
             self.tasks.extend(tasks)
             if self.hold:
@@ -74,10 +84,21 @@ class Recorder(WritebackHandler):
 
     def stop(self):
         self.stopped = True
+        self.unblock.set()
+
+
+class ReadyAtStart(Recorder):
+    def start(self, client):
+        self.ready = client.wait_ready(5)
+        super().start(client)
 
 
 def make_handler(config):
     return Recorder(**config)
+
+
+def returns_none(config):
+    return None
 
 
 def up(c, handler):
@@ -85,6 +106,7 @@ def up(c, handler):
     cl = RadixClient(c.name, Geometry(block_size=4, full_slot_bytes=8192, register_chunk_tokens=16),
                      endpoint=c.endpoint)
     cl.wait_ready(30)
+    wait_for(lambda: handler.client is not None)            # start() runs once the server is ready
     return srv, cl
 
 
@@ -125,6 +147,9 @@ def test_handler_gets_whole_prefixes_with_intact_data(cfg):
             assert data == [struct.pack("<Q", int(x)) for x in t.hashes]
             assert hit == t.evicted_from                     # the prefix was still in the tree
             assert len(t.swa_slots) == 0 and len(t.mamba_ends) == 0
+        assert all(rec.valid) and not rec.tasks[0].valid()   # valid until done
+        rec.client.geometry["pools"] = None
+        assert srv.geometry["pools"] is not None            # the client's NodeInfo is a copy
         assert cl.check_health() == 0
     finally:
         cl.close()
@@ -174,7 +199,7 @@ def test_unfinished_writebacks_pause_background_eviction(cfg):
 
 
 def test_handler_failure_gives_the_tasks_up(cfg):
-    rec = Recorder(fail=True)
+    rec = Recorder(fail=math.inf)
     srv, cl = up(cfg(), rec)
     try:
         fill(cl, 10)
@@ -188,7 +213,51 @@ def test_handler_failure_gives_the_tasks_up(cfg):
         srv.close()
 
 
-def test_close_releases_unfinished_writebacks(cfg):
+def test_base_exception_does_not_end_the_thread(cfg):
+    rec = Recorder(fail=1, error=asyncio.CancelledError())
+    srv, cl = up(cfg(), rec)
+    try:
+        fill(cl, 10)
+        wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
+        st = srv.stats()["writeback"]
+        assert st["failed"] == 1 and len(rec.tasks) > 0      # later batches were still written
+        assert st["completed"] == st["produced"] == st["failed"] + len(rec.tasks)
+        assert cl.check_health() == 0
+    finally:
+        cl.close()
+        srv.close()
+
+
+def test_reset_invalidates_unfinished_tasks(cfg):
+    rec = Recorder(hold=True)
+    srv, cl = up(cfg(), rec)
+    try:
+        fill(cl, 10)
+        wait_for(lambda: len(rec.tasks) >= 1)
+        t = rec.tasks[0]
+        assert t.valid() and t.generation == srv.index.reset_generation()
+        cl.reset()                                           # frees every slot, held ones included
+        assert not t.valid()
+        rec.release()
+        st = srv.stats()["writeback"]
+        assert st["inflight_slots"] == (0, 0, 0) and st["held_slots"] == (0, 0, 0)
+        assert cl.check_health() == 0
+    finally:
+        cl.close()
+        srv.close()
+
+
+def test_start_runs_once_ready(cfg):
+    rec = ReadyAtStart()
+    srv, cl = up(cfg(), rec)
+    try:
+        assert rec.ready.mode == "ready" and rec.client.info.mode == "ready"
+    finally:
+        cl.close()
+        srv.close()
+
+
+def test_close_with_unfinished_writebacks(cfg):
     c = cfg()
     rec = Recorder(hold=True)
     srv, cl = up(c, rec)
@@ -198,7 +267,20 @@ def test_close_releases_unfinished_writebacks(cfg):
     srv.close()
     assert rec.stopped and srv.mode == "closed"
     assert not os.path.exists(f"/dev/shm{c.name}")
+    assert not rec.tasks[0].valid()
     rec.release()                                            # late done: ignored
+
+
+def test_close_stops_a_stuck_write(cfg, monkeypatch):
+    monkeypatch.setattr(writeback, "_STOP_WAIT_S", 0.3)
+    rec = Recorder(block=True)
+    srv, cl = up(cfg(), rec)
+    fill(cl, 10)
+    assert rec.entered.wait(10)                              # write() waits for stop()
+    cl.close()
+    t0 = time.monotonic()
+    srv.close()
+    assert time.monotonic() - t0 < 5 and rec.stopped and srv.mode == "closed"
 
 
 def test_config_and_cli(cfg):
@@ -222,3 +304,5 @@ def test_config_and_cli(cfg):
     assert not cli.build_config(cli.parse_args([])).writeback
     with pytest.raises(ValueError, match="module:factory"):
         load_handler("no_colon", {})
+    with pytest.raises(TypeError, match="not a WritebackHandler"):
+        load_handler("test_writeback:returns_none", {})

@@ -36,7 +36,7 @@ static py::tuple writeback_task_tuple(const WritebackTask& t) {
     py::array_t<uint32_t> ends(static_cast<py::ssize_t>(h.mamba_ends.size()));
     std::memcpy(ends.mutable_data(), h.mamba_ends.data(), h.mamba_ends.size() * sizeof(uint32_t));
     return py::make_tuple(t.id, hashes, vec_to_npy_i32(h.full_slots), vec_to_npy_i32(h.swa_slots),
-                          ends, vec_to_npy_i32(h.mamba_slots), h.evicted_from);
+                          ends, vec_to_npy_i32(h.mamba_slots), h.evicted_from, h.generation);
 }
 
 static WritebackQueue& writeback_of(RadixServer& s) {
@@ -458,6 +458,7 @@ PYBIND11_MODULE(_core, m) {
             py::gil_scoped_release nogil;
             q.drop_all();
         })
+        .def("reset_generation", [](RadixServer& s) { return s.tree().reset_generation(); })
         .def("writeback_stats", [](RadixServer& s) -> py::object {
             WritebackQueue* q = s.writeback();
             if (!q) return py::none();

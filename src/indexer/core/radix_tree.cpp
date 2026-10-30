@@ -1181,6 +1181,9 @@ uint32_t RadixShmemTree::held_slots(ComponentType component) const {
 }
 
 uint64_t RadixShmemTree::reset_generation() const {
+    // Slot reads before this call stay before the load: if it still returns a task's
+    // generation, no reset() has handed that task's slots out again.
+    std::atomic_thread_fence(std::memory_order_acquire);
     return header()->reset_generation.load(std::memory_order_relaxed);
 }
 
@@ -1763,13 +1766,18 @@ static inline uint64_t access_time_of(const TreeNode* n) {
 }
 
 int RadixShmemTree::evict_walk(int need, std::vector<HeldEviction>* held,
-                               uint64_t budget) {
+                               const uint64_t* budget) {
     int freed = 0;
-    uint64_t covered = 0;
+    uint64_t covered[NUM_COMPONENT_TYPES] = {};
+    auto within_budget = [&] {
+        for (int k = 0; budget && k < NUM_COMPONENT_TYPES; k++)
+            if (covered[k] >= budget[k]) return false;
+        return true;
+    };
     std::vector<int32_t> tmp;
     // Restart from head after each eviction (evict_node mutates leaf_list);
     // skip pinned/root, stop when a full pass evicts nothing.
-    while (freed < need && covered < budget) {
+    while (freed < need && within_budget()) {
         uint32_t cur = header()->leaf_list_head;
         bool evicted_one = false;
         while (cur != INVALID_NODE_ID) {
@@ -1778,7 +1786,9 @@ int RadixShmemTree::evict_walk(int need, std::vector<HeldEviction>* held,
                 if (held) {
                     held->emplace_back();
                     freed += evict_node(cur, tmp, &held->back());
-                    covered += held->back().end();
+                    uint64_t c[NUM_COMPONENT_TYPES];
+                    held->back().covered(c);
+                    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) covered[k] += c[k];
                 } else {
                     freed += evict_node(cur, tmp);
                 }
@@ -1827,7 +1837,7 @@ void RadixShmemTree::flush_evicted() {
 
 int RadixShmemTree::try_evict_batch(int target_blocks,
                                     std::vector<HeldEviction>* held,
-                                    uint64_t budget) {
+                                    const uint64_t* budget) {
     set_write_op("evict_bg");
     if (!try_write_lock()) return 0;
     int freed = evict_walk(target_blocks, held, budget);

@@ -16,8 +16,9 @@ while the server is still waiting or configuring."""
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
@@ -162,20 +163,25 @@ class _Rpc:
         self._stub.close()
 
 
+def _copied(info: NodeInfo) -> NodeInfo:
+    return replace(info, geometry=copy.deepcopy(info.geometry))
+
+
 class _LocalTransport:
-    """``_Rpc`` without gRPC, for a client inside the server's process."""
+    """``_Rpc`` without gRPC, for a client inside the server's process; the
+    NodeInfo it returns does not share the server's geometry dict."""
 
     def __init__(self, server):
         self._s = server
 
     def describe(self) -> NodeInfo:
-        return self._s.describe()
+        return _copied(self._s.describe())
 
     def wait_ready(self, timeout_s) -> NodeInfo:
-        return self._s.wait_ready(timeout_s)
+        return _copied(self._s.wait_ready(timeout_s))
 
     def configure(self, spec: Dict[str, Any]) -> NodeInfo:
-        return self._s.configure(spec)
+        return _copied(self._s.configure(spec))
 
     def nodes(self) -> List[Dict[str, Any]]:
         return self._s.nodes()
@@ -233,7 +239,7 @@ class RadixClient:
     def _in_process(cls, server, max_outstanding: int = 256) -> "RadixClient":
         self = cls.__new__(cls)
         self._init(server.cfg.name, _LocalTransport(server), max_outstanding, False)
-        self.info = server.describe()
+        self.info = self._t.describe()
         self._index, self._store = server._iclient, server._store
         return self
 
