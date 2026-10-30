@@ -6,6 +6,7 @@
 #include "test_utils.h"
 #include "grpc_remote_op.hpp"
 #include "remote_op_service.hpp"
+#include "remote_op_factory.hpp"
 #include "remote_ops.grpc.pb.h"
 #include "local.h"
 
@@ -13,9 +14,12 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -77,6 +81,68 @@ bool wait_until(Pred p, int timeout_ms = 5000) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
     return p();
+}
+
+void test_transport_factory() {
+    TEST_BEGIN("transport factory serves gRPC and rejects a disabled endpoint");
+    Node node("factory");
+    RemoteOpAddr address;
+    auto server = make_remote_op_server(0, address);
+    assert(address.port != 0);
+    server->start(*node.svc);
+    PeerEntry peer{};
+    peer.rank = 1;
+    std::strcpy(peer.host, "127.0.0.1");
+    peer.remote_op_listen_port = address.port;
+    std::string endpoint;
+    auto client = make_remote_op_client(peer, endpoint);
+    assert(endpoint == "grpc://" + target_of(address.port));
+    auto allocated = client->allocate(2);
+    assert(allocated.status == RemoteStatus::OK && allocated.slots.size() == 2);
+    assert(client->recycle(allocated.slots.data(), 2) == RemoteStatus::OK);
+    assert(node.used() == 0);
+    peer.remote_op_listen_port = 0;
+    bool rejected = false;
+    try {
+        make_remote_op_client(peer, endpoint);
+    } catch (const std::runtime_error& error) {
+        rejected = std::string(error.what()).find("disabled") != std::string::npos;
+    }
+    assert(rejected);
+    server->stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
+void test_removed_transports() {
+    TEST_BEGIN("removed remote-op transports fail before bootstrap creates resources");
+    const char* previous = ::getenv("RADIXSHMEM_REMOTE_OP_TRANSPORT");
+    const bool had_previous = previous != nullptr;
+    const std::string saved = previous ? previous : "";
+    for (const char* transport : {"zmq", "dc", "rdma", "xrc", "unknown"}) {
+        for (bool from_environment : {false, true}) {
+            RadixServerConfig config;
+            if (from_environment) {
+                config.expected_min_nodes = 2;
+                ::setenv("RADIXSHMEM_REMOTE_OP_TRANSPORT", transport, 1);
+            } else {
+                config.remote_op_transport = transport;
+            }
+            RadixServer server(config);
+            bool rejected = false;
+            try {
+                server.bootstrap();
+            } catch (const std::runtime_error& error) {
+                rejected = std::string(error.what()).find("only grpc is supported") != std::string::npos;
+            }
+            assert(rejected);
+        }
+    }
+    if (had_previous)
+        ::setenv("RADIXSHMEM_REMOTE_OP_TRANSPORT", saved.c_str(), 1);
+    else
+        ::unsetenv("RADIXSHMEM_REMOTE_OP_TRANSPORT");
+    TEST_PASS();
 }
 
 // ---- the five ops end to end, business vs request-level errors ----
@@ -247,6 +313,8 @@ void test_bad_reply() {
 
 int main() {
     printf("test_remote_op_grpc\n");
+    test_transport_factory();
+    test_removed_transports();
     test_roundtrip();
     test_deadline_no_replay();
     test_admission();

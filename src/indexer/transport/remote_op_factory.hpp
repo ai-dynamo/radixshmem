@@ -15,37 +15,14 @@
 
 namespace radixshmem {
 
-class RdmaContext;
-class DcClientStack;
 struct PeerEntry;
 
-// The only place that names concrete remote-op backends; `rot` is a REMOTE_OP_TRANSPORT_* value.
-
-// Server backend for `rot`; fills `addr` with what peers dial (TCP port or DC lane DCT numbers).
+// Creates the gRPC transport behind the typed service interface.
 std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
-    uint32_t rot, uint16_t listen_port, RdmaContext& ctx,
-    uint64_t dc_access_key, RemoteOpAddr& addr);
+    uint16_t listen_port, RemoteOpAddr& addr);
 
-// Client sessions of one connector; holds per-connector backend state (the DC stack).
-class RemoteOpClientFactory {
-public:
-    RemoteOpClientFactory(uint32_t rot, RdmaContext& ctx, uint64_t dc_access_key);
-    ~RemoteOpClientFactory();
-
-    RemoteOpClientFactory(const RemoteOpClientFactory&) = delete;
-    RemoteOpClientFactory& operator=(const RemoteOpClientFactory&) = delete;
-
-    // Session to `peer`; `endpoint` gets its name. Throws when the peer serves no remote ops.
-    std::unique_ptr<IRemoteOpClientTransport> open(const PeerEntry& peer,
-                                                   int client_rank,
-                                                   std::string& endpoint);
-
-private:
-    uint32_t     rot_;
-    RdmaContext& ctx_;
-    uint64_t     dc_access_key_;
-    std::unique_ptr<DcClientStack> dc_;   // created on the first DC session
-};
+std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
+    const PeerEntry& peer, std::string& endpoint);
 
 }  // namespace radixshmem
 

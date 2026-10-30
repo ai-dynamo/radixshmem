@@ -52,12 +52,9 @@ void RadixClient::teardown_cluster() {
 #ifdef RADIXSHMEM_HAS_ETCD
     if (etcd_ && etcd_->reg) etcd_->reg->stop_watch();
 #endif
-    // Cached per-rank sessions hold DC AHs + reference the connector's shared
-    // DCI/DCT, so they must die before the connector.
+    // Release cached gRPC sessions before tearing down the peer connector.
     { std::lock_guard<std::mutex> g(peer_cache_mu_); peer_cache_.clear(); }
-    // Connector (data-plane endpoints + DC control stack) before the RHT plane,
-    // then the RHT plane, then the transport. DcReaders reference the shared DCI
-    // + AHs the transport frees in its dtor, so the transport must outlive them.
+    // Destroy peer and RHT readers before the transport that owns their DCI/AHs.
     peer_conn_.reset();
     rht_conn_.reset();
     rht_holder_qps_.clear();
@@ -121,10 +118,11 @@ void RadixClient::read_topology() {
     ClusterTopology t = etcd_->reg->read_topology();
 
     const ShardMapMsg& sm = t.sm;
+    if (sm.remote_op_transport != REMOTE_OP_TRANSPORT_GRPC)
+        throw std::runtime_error("RadixClient: cluster remote-op transport is not grpc; redeploy the cluster with grpc");
     rht_transport_        = sm.rht_transport;
     peer_index_transport_ = sm.peer_index_transport;
     dc_access_key_       = sm.dc_access_key;
-    remote_op_transport_ = sm.remote_op_transport;
     rdma_sl_             = sm.rdma_sl;
     rdma_tc_             = sm.rdma_tc;
     cluster_cs_          = (int)sm.register_chunk_size;
@@ -263,7 +261,6 @@ void RadixClient::bootstrap_cluster() {
     // the peer table via the registry grow hook.
     PeerConnectorConfig pcfg;
     pcfg.transport            = peer_index_transport_;
-    pcfg.remote_op_transport  = remote_op_transport_;
     pcfg.dc_access_key        = dc_access_key_;
     pcfg.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
     pcfg.faults               = peer_faults();
