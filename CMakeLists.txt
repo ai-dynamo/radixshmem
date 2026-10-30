@@ -58,6 +58,7 @@ set(_radixshmem_sources
     # Write-back queue between the background evictor and the write-back side.
     src/indexer/writeback.cpp
     src/indexer/local.cpp
+    src/indexer/client.cpp
     # Lock-free leak audit (check_health); friend of RadixShmemTree, no other coupling.
     src/indexer/health_check.cpp)
 if(ENABLE_RDMA)
@@ -71,7 +72,6 @@ if(ENABLE_RDMA)
         src/indexer/transport/rdma/rc_endpoint.cpp
         src/indexer/transport/rdma/xrc.cpp
         src/indexer/transport/rdma/dc_oneside.cpp
-        src/indexer/client.cpp
         # Peer-facing plane: lazy data-plane endpoints + remote-walk executor +
         # remote-op session factory + client-side remote-op protocol (RemotePeer).
         src/indexer/peer/peer_connector.cpp
@@ -327,10 +327,8 @@ configure_file(include/radixshmem_config.h.in
 target_include_directories(radixshmem PUBLIC ${CMAKE_BINARY_DIR}/include)
 
 # ==================== radix_server tool (launched by ServerLauncher) ====================
-if(ENABLE_RDMA)
-    add_executable(radix_server tools/server_main.cpp)
-    target_link_libraries(radix_server PRIVATE radixshmem)
-endif()
+add_executable(radix_server tools/server_main.cpp)
+target_link_libraries(radix_server PRIVATE radixshmem)
 
 # ==================== Unit tests ====================
 # Keep assert() live in test TUs under Release (trailing -UNDEBUG overrides -DNDEBUG).
@@ -370,9 +368,7 @@ foreach(_t ${_core_unit_tests})
     target_include_directories(${_t} PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer
                                              ${CMAKE_SOURCE_DIR}/src/indexer/rht)
     radixshmem_enable_asserts(${_t})
-    if(ENABLE_RDMA)
-        add_dependencies(${_t} radix_server)
-    endif()
+    add_dependencies(${_t} radix_server)
     add_test(NAME ${_t} COMMAND ${_t})
 endforeach()
 
@@ -525,9 +521,7 @@ foreach(_b ${_benches})
     target_link_libraries(${_b} PRIVATE radixshmem)
     # bench/* may include test_utils.h, now under tests/indexer/.
     target_include_directories(${_b} PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
-    if(ENABLE_RDMA)
-        add_dependencies(${_b} radix_server)
-    endif()
+    add_dependencies(${_b} radix_server)
 endforeach()
 
 # Remote-op correctness smoke on a 2-rank cluster; manual quick check (needs RDMA device, not in ctest).

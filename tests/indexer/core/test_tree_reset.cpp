@@ -218,7 +218,6 @@ static void test_rht_shard_reset() {
 
     TEST_PASS();   // no radix tree in this case: nothing to audit
 }
-#endif // RADIXSHMEM_NO_RDMA
 
 // A holder receives a REQUESTED capacity and must allocate the normalized
 // bucket count (power of two, floor 16) so the engine's mask on every peer
@@ -247,6 +246,7 @@ static void test_rht_shard_capacity_normalized() {
 
     TEST_PASS();
 }
+#endif
 
 // ==================================================================
 int main() {

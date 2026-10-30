@@ -28,6 +28,9 @@ An RDMA build with `ENABLE_GRPC=ON` fails configuration if these dependencies ar
 `-DENABLE_GRPC=OFF` only when remote ops are not needed. There is no ZMQ/DC remote-op fallback.
 The RHT and peer-index planes still support one-sided XRC/DC RDMA independently.
 
+C++ local-only builds (`-DENABLE_RDMA=OFF`) retain `RadixClient`, the standalone
+`radix_server`, and local tests; distributed client/server entry points are rejected.
+
 The optional data-plane backends are built separately; see [Transfer backends](#transfer-backends).
 
 ### Start the server
