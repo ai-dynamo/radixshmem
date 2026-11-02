@@ -135,6 +135,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--decode", action="store_true",
                    help="PD disaggregation: this node serves decode (default: prefill)")
     g.add_argument("--interval", type=int, default=5, help="stats interval in seconds, 0 = silent")
+    g.add_argument("--monitor-port", type=int, default=0,
+                   help="serve Prometheus /metrics (with the radix tree for the Grafana dashboard) "
+                        "on this port, or the next free one; 0 = off (default: 0, suggested: 9810)")
+    g.add_argument("--monitor-interval", type=float, default=10.0,
+                   help="seconds between tree copies for /metrics (default: 10)")
+    g.add_argument("--monitor-tree-nodes", type=int, default=150,
+                   help="nodes of this server's tree exported, 0 = none (default: 150)")
+    g.add_argument("--monitor-cluster-nodes", type=int, default=300,
+                   help="nodes of the merged cluster tree the leader exports, 0 = none (default: 300)")
     g.add_argument("--transfer-log", default="-",
                    help="one line per transfer that moved data (time, bytes, bandwidth): '-' = stdout, "
                         "a path appends there, '' = off (default: -)")
@@ -201,6 +210,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
         evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
         transfer_log=a.transfer_log, role="decode" if a.decode else "prefill",
+        monitor_port=a.monitor_port, monitor_interval_s=a.monitor_interval,
+        monitor_tree_nodes=a.monitor_tree_nodes, monitor_cluster_nodes=a.monitor_cluster_nodes,
         writeback=bool(a.writeback_handler), writeback_max_held_ratio=a.writeback_max_held,
         cluster=cluster, **kw)
 
@@ -277,6 +288,8 @@ def main(argv=None) -> None:
     except Exception as e:  # noqa: BLE001
         srv.close()
         sys.exit(f"Start FAILED: {e}")
+    if srv.monitor is not None:
+        print(f"  Monitor:        {srv.monitor.url}/metrics  (Prometheus service discovery: {srv.monitor.url}/sd)")
     print("Waiting for a client's geometry (RadixClient(name, Geometry(...))) ...", flush=True)
     last, seen = 0.0, srv.mode
     tty = sys.stdout.isatty()

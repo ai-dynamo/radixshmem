@@ -39,6 +39,39 @@ static py::tuple writeback_task_tuple(const WritebackTask& t) {
                           ends, vec_to_npy_i32(h.mamba_slots), h.evicted_from, h.generation);
 }
 
+template <typename T>
+static py::array_t<T> vec_to_npy(const std::vector<T>& v) {
+    py::array_t<T> arr(static_cast<py::ssize_t>(v.size()));
+    std::memcpy(arr.mutable_data(), v.data(), v.size() * sizeof(T));
+    return arr;
+}
+
+static py::dict tree_dump_dict(const TreeDump& d) {
+    py::dict out;
+    out["parent"] = vec_to_npy(d.parent);
+    out["level"] = vec_to_npy(d.level);
+    out["depth"] = vec_to_npy(d.depth);
+    out["num_blocks"] = vec_to_npy(d.num_blocks);
+    out["swa_blocks"] = vec_to_npy(d.swa_blocks);
+    out["ref_count"] = vec_to_npy(d.ref_count);
+    out["last_access"] = vec_to_npy(d.last_access);
+    out["mamba"] = vec_to_npy(d.mamba);
+    out["hashes"] = vec_to_npy(d.hashes);
+    out["now"] = d.now;
+    out["nodes_in_pool"] = d.nodes_in_pool;
+    out["total_blocks"] = d.total_blocks;
+    out["torn"] = d.torn;
+    out["truncated"] = d.truncated;
+    out["block_size"] = d.block_size;
+    out["register_chunk_size"] = d.register_chunk_size;
+    out["reset_generation"] = d.reset_generation;
+    out["is_distributed"] = d.is_distributed;
+    out["rank"] = d.rank;
+    out["node_name"] = d.node_name;
+    out["cluster_id"] = d.cluster_id;
+    return out;
+}
+
 static WritebackQueue& writeback_of(RadixServer& s) {
     WritebackQueue* q = s.writeback();
     if (!q) throw std::runtime_error("write-back is not enabled on this server");
@@ -437,6 +470,12 @@ PYBIND11_MODULE(_core, m) {
         .def("health_report", [](const RadixServer& s) {
             HealthReport r; s.check_health(&r); return r;
         }, "Lock-free leak audit; returns the full HealthReport.")
+        .def("dump_tree", [](RadixServer& s, uint32_t max_nodes, uint64_t max_blocks) {
+            TreeDump d;
+            { py::gil_scoped_release rel; d = dump_tree(s.tree(), max_nodes, max_blocks); }
+            return tree_dump_dict(d);
+        }, py::arg("max_nodes") = 0, py::arg("max_blocks") = 0,
+           "Lock-free copy of this server's tree; see RadixClient.dump_tree.")
         .def("pop_writeback", [](RadixServer& s, size_t max_tasks, int timeout_ms) {
             WritebackQueue& q = writeback_of(s);
             std::vector<WritebackTask> ts;
@@ -646,6 +685,16 @@ PYBIND11_MODULE(_core, m) {
         .def("health_report", [](const RadixClient& c) {
             HealthReport r; c.check_health(&r); return r;
         }, "Lock-free leak audit; returns the full HealthReport.")
+        .def("dump_tree", [](const RadixClient& c, uint32_t max_nodes, uint64_t max_blocks) {
+            TreeDump d;
+            { py::gil_scoped_release rel; d = c.dump_tree(max_nodes, max_blocks); }
+            return tree_dump_dict(d);
+        }, py::arg("max_nodes") = 0, py::arg("max_blocks") = 0,
+           "Lock-free copy of the local tree for monitoring: a dict of numpy arrays, one entry\n"
+           "per node in BFS order (parent, level, depth, num_blocks, swa_blocks, ref_count,\n"
+           "last_access in steady_clock ns, mamba), the concatenated block hashes, and header\n"
+           "fields. A racing writer can make it slightly inconsistent (counted in `torn`).\n"
+           "0 = no limit; `truncated` reports a limit reached.")
 #ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
         .def("remote_allocate", [](RadixClient& c, int rank, int n) {

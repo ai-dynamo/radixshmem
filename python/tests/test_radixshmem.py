@@ -283,6 +283,37 @@ def test_health_check_smoke():
     print("  PASS: health_check_smoke")
 
 
+def test_dump_tree_smoke():
+    """dump_tree binding: BFS arrays, prefix hashes per node, pins, limits."""
+    cfg = radixshmem._core.ShmConfig(max_nodes=1000, max_blocks=1000)
+    server = radixshmem._core.RadixServer("/py_smoke_dump", cfg)
+    client = radixshmem._core.RadixClient("/py_smoke_dump")
+    a = radixshmem.compute_hashes(np.arange(1, 11, dtype=np.int64), 1)
+    b = radixshmem.compute_hashes(np.array([1, 2, 3, 4, 50, 60], dtype=np.int64), 1)
+    insert_auto(client, a)
+    insert_auto(client, b)
+    q = client.query(b, mask=radixshmem.COMPONENT_MASK_FULL, lock=True)
+
+    d = radixshmem._core.RadixClient("/py_smoke_dump", True).dump_tree()
+    assert d["parent"].tolist() == [-1, 0, 1, 1] and d["level"].tolist() == [0, 1, 2, 2]
+    assert d["depth"].tolist() == [0, 0, 4, 4] and d["num_blocks"][1] == 4
+    assert d["hashes"].dtype == np.uint64 and len(d["hashes"]) == 12 == d["total_blocks"]
+    off = np.concatenate([[0], np.cumsum(d["num_blocks"])]).astype(np.int64)
+    nodes = {len(d["hashes"][off[i]:off[i + 1]]): d["hashes"][off[i]:off[i + 1]] for i in (2, 3)}
+    np.testing.assert_array_equal(d["hashes"][:4], a[:4])
+    np.testing.assert_array_equal(nodes[6], a[4:])
+    np.testing.assert_array_equal(nodes[2], b[4:])
+    pinned = {int(d["num_blocks"][i]) for i in range(4) if d["ref_count"][i] > 0}
+    assert pinned == {4, 2}   # b's path: the shared node and b's own leaf
+    assert d["torn"] == 0 and not d["truncated"] and d["now"] >= d["last_access"].max()
+    q.finalize()
+
+    assert client.dump_tree(max_nodes=2)["parent"].tolist() == [-1, 0]
+    t = client.dump_tree(max_blocks=5)
+    assert t["truncated"] and t["num_blocks"].tolist() == [0, 4]
+    print("  PASS: dump_tree_smoke")
+
+
 if __name__ == "__main__":
     print("=== radixshmem Python binding smoke tests ===\n")
     test_compute_hashes_returns_numpy()
@@ -292,4 +323,5 @@ if __name__ == "__main__":
     test_component_query_smoke()
     test_component_insert_smoke()
     test_health_check_smoke()
+    test_dump_tree_smoke()
     print("\nAll tests passed.")
