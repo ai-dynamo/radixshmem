@@ -90,8 +90,6 @@ int run_server(int rank, int master_port) {
     cfg.index_dev    = g_index_dev;
     cfg.gid_idx     = g_gid_idx;
     cfg.bootstrap_timeout_sec = 30;
-    cfg.enable_remote_insert = (rank == 0);   // rank 0 = target
-    cfg.enable_remote_query  = (rank == 0);
     try {
         RadixServer srv(cfg);
         if (!srv.bootstrap()) return 10;
@@ -144,9 +142,8 @@ int run_checks(int64_t seed) {
     q = cli.remote_query(T, h.data(), kPlen, /*lock=*/true);
     CHECK(q.status == RemoteStatus::OK && q.total_hit_length == kPlen,
           "query(lock): full prefix pinned");
-    CHECK(cli.remote_unlock(T, h.data(), kPlen, q.total_hit_length)
-              == RemoteStatus::OK,
-          "unlock: drop the query(lock) refs");
+    CHECK(q.finalize, "query(lock): finalize armed");
+    q.finalize();
 
     // unknown prefix → OK with no hit
     auto miss = make_hashes(seed + 1'000'000, kPlen);

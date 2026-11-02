@@ -44,6 +44,8 @@ message QueryRequest {
 message QueryResponse {
   int32 hit_length = 1;
   repeated int32 slots = 2;  // hit_length entries
+  int32 pin_end = 3;
+  repeated fixed64 pin_tail = 4;
 }
 
 // Publish slots[i] for hashes[start + i] after the KV transfer completed.
@@ -69,5 +71,7 @@ message UnlockRequest {
   repeated fixed64 hashes = 1;
   int32 start = 2;
   int32 length = 3;
+  int32 pin_end = 4;
+  repeated fixed64 pin_tail = 5;
 }
 message UnlockResponse {}

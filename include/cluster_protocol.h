@@ -31,7 +31,7 @@ struct ShardMapMsg {
     uint32_t peer_index_transport;  // authoritative peer-index-plane transport
     uint32_t rht_slots;      // authoritative W (RHT slots per bucket)
     uint64_t dc_access_key;  // cluster-wide DCT key (when either plane is DC)
-    uint32_t remote_op_transport;   // authoritative remote-op transport (RemoteOpTransport)
+    uint32_t reserved_remote_op_transport;
     uint32_t register_chunk_size;   // cs; node-boundary / probe stride alignment
     uint32_t holder_rank[CLUSTER_MAX_SHARDS];  // shard s → holder rank
 };

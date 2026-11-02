@@ -200,8 +200,7 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
             cluster_id=f"agentic_{cfg.run_id}", node_name=f"node{rank}", rpc_address="0.0.0.0",
             num_rht_shards=cfg.nodes, rht_shard_holders=list(range(cfg.nodes)),
             index_dev=dev[0] if dev else "", gid_idx=cfg.gid_idx,
-            bootstrap_timeout_sec=cfg.bootstrap_timeout, rht_slots_per_bucket=cfg.rht_slots,
-            enable_remote_query=cfg.diag_misses)
+            bootstrap_timeout_sec=cfg.bootstrap_timeout, rht_slots_per_bucket=cfg.rht_slots)
     return radixshmem.ServerConfig(
         name=f"/agentic_{cfg.run_id}_r{rank}", data_bytes=data_bytes,
         swa_ratio=swa_bytes / data_bytes if data_bytes else 0.0,

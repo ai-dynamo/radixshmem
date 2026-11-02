@@ -96,6 +96,7 @@ enum class RemoteStatus : uint16_t {
     INTERNAL      = 7,
     UNAVAILABLE   = 8,  // target unreachable or not serving (may still have executed the op)
     RESOURCE_EXHAUSTED = 9,  // target refused the op: concurrent admission limit reached
+    STALE_TARGET  = 10,
 };
 
 struct QueryResult {
@@ -391,6 +392,8 @@ struct QueryReply {
     RemoteStatus status = RemoteStatus::OK;
     int hit_length       = 0;   // B local-tree total matched blocks
     std::vector<int32_t> slots; // target-local physical slot ids (len == hit_length)
+    int pin_end = 0;
+    std::vector<uint64_t> pin_tail;
 };
 
 struct InsertResult {

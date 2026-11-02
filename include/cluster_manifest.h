@@ -44,8 +44,7 @@ struct ClusterManifestHeader {
     uint32_t rht_slots;          // W: RHT slots per bucket (chaining depth)
     uint64_t dc_access_key;      // cluster-wide DCT key (either plane DC)
 
-    // ---- Remote-op control-plane transport (rank 0, broadcast) ----
-    uint32_t remote_op_transport;   // see RemoteOpTransport
+    uint32_t reserved_remote_op_transport;
     uint32_t rht_transport;         // client -> RHT shard holder, see ClusterTransport
 };
 static_assert(sizeof(ClusterManifestHeader) == 320,
@@ -54,10 +53,6 @@ static_assert(sizeof(ClusterManifestHeader) == 320,
 enum ClusterTransport : uint32_t {
     CLUSTER_TRANSPORT_XRC = 0,
     CLUSTER_TRANSPORT_DC  = 1,
-};
-
-enum RemoteOpTransport : uint32_t {
-    REMOTE_OP_TRANSPORT_GRPC = 3,   // gRPC over TCP
 };
 
 // One entry per rank (each server fills its own; master broadcasts the union).
@@ -69,7 +64,7 @@ struct PeerEntry {
     // Reachability — TCP bootstrap endpoint for this rank's XRC listener
     char     host[CLUSTER_MANIFEST_HOST_LEN];
     uint16_t xrc_listen_port;
-    // gRPC remote-op TCP port (0 = disabled).
+    // gRPC remote-op TCP port.
     uint16_t remote_op_listen_port;
     uint32_t _pad2;
 
@@ -110,7 +105,8 @@ struct PeerEntry {
     // RDMA device name (client's local entry picks the same device)
     char     index_dev[32];
 
-    uint32_t reserved_remote_op_dct_extra[3];
+    uint32_t reserved_remote_op_dct_extra;
+    uint64_t instance_id;
 
     // Component ABI (from ShmHeader at bootstrap); layout sizes are
     // binary-generation-gated, so peers validate values, not layout.

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // test_remote_api — e2e gate for RadixClient rank-first remote ops:
-// remote_query, two-phase remote_allocate→remote_insert, remote_recycle, remote_unlock.
+// remote_query, two-phase remote_allocate→remote_insert, remote_recycle.
 //
 // Servers are registry-named by node identity (node0/node1 → ranks 0/1 in
 // sorted /peers order). Every server AND client case is a re-exec'd image: the
@@ -70,10 +70,6 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.index_dev    = kRdmaDev;
     cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
-    if (node == node_name_for(kTargetRank)) {
-        cfg.enable_remote_insert = true;
-        cfg.enable_remote_query  = true;
-    }
 
     try {
         radixshmem::RadixServer srv(cfg);
@@ -283,8 +279,6 @@ int run_bad_target() {
                     != radixshmem::RemoteStatus::BAD_TARGET) return 82;
             if (cli.remote_insert(t, h.data(), n, 0, n, dummy_slots.data()).error
                     != radixshmem::InsertError::REMOTE_FAILED) return 83;
-            if (cli.remote_unlock(t, h.data(), n, n)
-                    != radixshmem::RemoteStatus::BAD_TARGET) return 84;
             if (cli.remote_recycle(t, dummy_slots.data(), n)
                     != radixshmem::RemoteStatus::BAD_TARGET) return 84;
         }

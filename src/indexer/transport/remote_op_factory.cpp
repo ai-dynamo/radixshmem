@@ -17,14 +17,15 @@
 namespace radixshmem {
 
 std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
-        uint16_t listen_port, RemoteOpAddr& addr) {
+        uint16_t listen_port, uint64_t instance_id, RemoteOpAddr& addr) {
     addr = RemoteOpAddr{};
 #ifdef RADIXSHMEM_HAS_GRPC
-    auto server = std::make_unique<GrpcRemoteOpServer>(listen_port);
+    auto server = std::make_unique<GrpcRemoteOpServer>(listen_port, instance_id);
     addr.port = server->port();
     return server;
 #else
     (void)listen_port;
+    (void)instance_id;
     throw std::runtime_error(
         "remote-op: gRPC is the only supported transport but is not compiled into this build");
 #endif
@@ -35,14 +36,14 @@ std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
     if (peer.remote_op_listen_port == 0)
         throw std::runtime_error(
             "open_remote: peer rank " + std::to_string(peer.rank) +
-            " has remote ops disabled (remote-op listen port == 0)");
+            " registered no remote-op port");
 
 #ifdef RADIXSHMEM_HAS_GRPC
     const std::string hostport = std::string(peer.host) + ":" +
                                 std::to_string(peer.remote_op_listen_port);
     endpoint = "grpc://" + hostport;
     return std::make_unique<GrpcRemoteOpClientTransport>(
-        hostport, grpc_remote_op_timeout_ms());
+        hostport, grpc_remote_op_timeout_ms(), peer.instance_id);
 #else
     (void)endpoint;
     throw std::runtime_error(

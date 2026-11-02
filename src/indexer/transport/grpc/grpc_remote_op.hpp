@@ -12,8 +12,13 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace radixshmem {
+
+constexpr int kGrpcRemoteOpMaxMessageBytes = 64 * 1024;
+constexpr int kGrpcRemoteOpKeepaliveMs = 10000;
+constexpr const char* kGrpcRemoteOpInstanceKey = "radixshmem-instance";
 
 // Default per-op deadline (RADIXSHMEM_REMOTE_OP_TIMEOUT_MS, else 5000 ms).
 int grpc_remote_op_timeout_ms();
@@ -22,7 +27,8 @@ int grpc_remote_op_timeout_ms();
 class GrpcRemoteOpClientTransport : public IRemoteOpClientTransport {
 public:
     // `target` is "host:port"; the channel connects lazily.
-    GrpcRemoteOpClientTransport(const std::string& target, int timeout_ms);
+    GrpcRemoteOpClientTransport(const std::string& target, int timeout_ms,
+                                uint64_t instance_id);
     ~GrpcRemoteOpClientTransport() override;
 
     GrpcRemoteOpClientTransport(const GrpcRemoteOpClientTransport&) = delete;
@@ -35,18 +41,19 @@ public:
                         const int32_t* slots, bool auto_recycle) override;
     RemoteStatus recycle(const int32_t* slots, int num_slots) override;
     RemoteStatus unlock(const uint64_t* hashes, int n, int start,
-                        int length) override;
+                        int length, int pin_end,
+                        const std::vector<uint64_t>& pin_tail) override;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-// Binds on construction; UNAVAILABLE until start(svc), RESOURCE_EXHAUSTED at max_inflight; stop() drains handlers.
+// Binds on construction; UNAVAILABLE until start(svc); stop() drains handlers.
 class GrpcRemoteOpServer : public IRemoteOpServerTransport {
 public:
-    // listen_port 0 = OS-assigned; max_inflight <= 0 = 32; bind failure throws.
-    explicit GrpcRemoteOpServer(uint16_t listen_port, int max_inflight = 0);
+    // listen_port 0 = OS-assigned; bind failure throws.
+    GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id);
     ~GrpcRemoteOpServer() override;
 
     GrpcRemoteOpServer(const GrpcRemoteOpServer&) = delete;

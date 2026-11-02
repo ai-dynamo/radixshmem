@@ -97,6 +97,7 @@ void RadixClient::admit_peer(const PeerEntry& e) {
 void RadixClient::remove_peer(int rank) {
     if (rank == peer_reg_->my_rank()) return;
     peer_reg_->remove(rank);
+    drop_peer_session(rank);
     if (rht_conn_) rht_conn_->holder_left(rank);
     if (peer_conn_) peer_conn_->peer_left(rank);
 }
@@ -121,8 +122,6 @@ void RadixClient::read_topology() {
     ClusterTopology t = etcd_->reg->read_topology();
 
     const ShardMapMsg& sm = t.sm;
-    if (sm.remote_op_transport != REMOTE_OP_TRANSPORT_GRPC)
-        throw std::runtime_error("RadixClient: cluster remote-op transport is not grpc; redeploy the cluster with grpc");
     rht_transport_        = sm.rht_transport;
     peer_index_transport_ = sm.peer_index_transport;
     dc_access_key_       = sm.dc_access_key;
@@ -445,6 +444,13 @@ std::shared_ptr<RemotePeer> RadixClient::peer_for(int rank) {
 void RadixClient::drop_peer_session(int rank) {
     std::lock_guard<std::mutex> g(peer_cache_mu_);
     peer_cache_.erase(rank);
+}
+
+RemoteStatus RadixClient::missing_peer_status(int rank) const {
+    if (!distributed_ || !peer_reg_ || rank < 0 ||
+        rank >= peer_reg_->world_size() || rank == peer_reg_->my_rank())
+        return RemoteStatus::BAD_TARGET;
+    return RemoteStatus::UNAVAILABLE;
 }
 #endif
 
@@ -929,11 +935,33 @@ void RadixClient::dec_ref_remote(int remote_node, const uint64_t* hashes,
 
 #ifndef RADIXSHMEM_NO_RDMA
 
+template <typename Op>
+static RemoteStatus retry_unexecuted(Op op) {
+    RemoteStatus st = op();
+    for (int i = 0; i < 5 && st == RemoteStatus::RESOURCE_EXHAUSTED; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10 << i));
+        st = op();
+    }
+    return st;
+}
+
+static void release_remote_pin(RemotePeer& peer, const std::vector<uint64_t>& hashes,
+                               int hit_length, int pin_end,
+                               const std::vector<uint64_t>& pin_tail) {
+    RemoteStatus st = retry_unexecuted([&] {
+        return peer.unlock(hashes.data(), (int)hashes.size(), 0, hit_length,
+                           pin_end, pin_tail);
+    });
+    if (st != RemoteStatus::OK && st != RemoteStatus::STALE_TARGET)
+        fprintf(stderr, "[RadixClient] remote unlock on rank %d failed: status %d\n",
+                peer.peer_rank(), (int)st);
+}
+
 AllocateReply RadixClient::remote_allocate(int rank, int n) {
     AllocateReply out;
     if (n <= 0) return out;                       // nothing to allocate, status OK
     auto p = peer_for(rank);
-    if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
+    if (!p) { out.status = missing_peer_status(rank); return out; }
     return p->allocate(n);            // serializes + caps internally
 }
 
@@ -945,7 +973,7 @@ InsertResult RadixClient::remote_insert(int rank,
     auto p = peer_for(rank);
     if (!p) {
         out.error = InsertError::REMOTE_FAILED;
-        out.remote_status = RemoteStatus::BAD_TARGET;
+        out.remote_status = missing_peer_status(rank);
         return out;
     }
     return p->insert(hashes, n, start, length, slots, auto_recycle);
@@ -954,8 +982,8 @@ InsertResult RadixClient::remote_insert(int rank,
 RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
     auto p = peer_for(rank);
-    if (!p) return RemoteStatus::BAD_TARGET;
-    return p->recycle(slots, num_slots);
+    if (!p) return missing_peer_status(rank);
+    return retry_unexecuted([&] { return p->recycle(slots, num_slots); });
 }
 
 QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
@@ -963,7 +991,7 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
     QueryResult out;
     if (n <= 0) return out;                       // empty input, status OK
     auto p = peer_for(rank);
-    if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
+    if (!p) { out.status = missing_peer_status(rank); return out; }
     QueryReply rep = p->query(hashes, n, lock, update_meta);
 
     out.status            = rep.status;
@@ -974,20 +1002,13 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
     out.remote_node_id    = p->peer_rank();
     if (lock && rep.status == RemoteStatus::OK && rep.hit_length > 0) {
         std::vector<uint64_t> hc(hashes, hashes + n);
-        int  len  = rep.hit_length;
-        auto* self = this;
-        out.finalize = FinalizeFn([self, rank, hc = std::move(hc), len]() {
-            self->remote_unlock(rank, hc.data(), (int)hc.size(), len);
+        out.finalize = FinalizeFn([p, hc = std::move(hc), len = rep.hit_length,
+                                   pin_end = rep.pin_end,
+                                   tail = std::move(rep.pin_tail)]() {
+            release_remote_pin(*p, hc, len, pin_end, tail);
         });
     }
     return out;
-}
-
-RemoteStatus RadixClient::remote_unlock(int rank, const uint64_t* hashes, int n,
-                                int hit_length) {
-    auto p = peer_for(rank);
-    if (!p) return RemoteStatus::BAD_TARGET;
-    return p->unlock(hashes, n, 0, hit_length);
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA

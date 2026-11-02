@@ -18,7 +18,7 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "cluster_protocol.h"      // ibv_cq, CLUSTER_TRANSPORT_*, REMOTE_OP_TRANSPORT_*
+#include "cluster_protocol.h"      // ibv_cq, CLUSTER_TRANSPORT_*
 #include <unordered_map>
 #endif
 
@@ -79,12 +79,7 @@ struct RadixServerConfig {
     // RHT slots per bucket (W): must be in {1,2,4,8}. rank 0 authoritative (broadcast).
     int               rht_slots_per_bucket = 4;
 
-    bool              enable_remote_insert = false;   // remote-insert control plane
-    bool              enable_remote_query = false;    // remote-query control plane
     uint16_t          remote_op_listen_port = 0;
-
-    // Compatibility setting: only "grpc" is accepted.
-    std::string       remote_op_transport = "grpc";
 
     // Cluster bootstrap registry: "etcd://host:port" (etcd dynamic discovery).
     std::string       registry   = "etcd://127.0.0.1:2379";
@@ -233,6 +228,7 @@ private:
 
     // ---- remote-op control plane (remote_op_service.cpp) ----
     std::unique_ptr<IRemoteOpServerTransport> rc_server_;
+    uint64_t instance_id_ = 0;
     std::unique_ptr<RemoteOpService> rc_service_;   // built by rc_spawn on svc_*
 
     RemoteOpAddr rc_build_endpoint();

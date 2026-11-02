@@ -6,6 +6,7 @@
 #include "types.h"   // AllocateReply, QueryReply, InsertResult, RemoteStatus
 
 #include <cstdint>
+#include <vector>
 
 namespace radixshmem {
 
@@ -21,7 +22,8 @@ public:
                                 bool auto_recycle) = 0;
     virtual RemoteStatus recycle(const int32_t* slots, int num_slots) = 0;
     virtual RemoteStatus unlock(const uint64_t* hashes, int n, int start,
-                                int length) = 0;
+                                int length, int pin_end,
+                                const std::vector<uint64_t>& pin_tail) = 0;
 };
 
 // The gRPC server's TCP endpoint.

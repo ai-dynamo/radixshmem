@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace radixshmem {
 
@@ -40,8 +41,9 @@ RemoteStatus RemotePeer::recycle(const int32_t* slots, int num_slots) {
 }
 
 RemoteStatus RemotePeer::unlock(const uint64_t* hashes, int n, int start,
-                                int length) {
-    return transport_->unlock(hashes, n, start, length);
+                                int length, int pin_end,
+                                const std::vector<uint64_t>& pin_tail) {
+    return transport_->unlock(hashes, n, start, length, pin_end, pin_tail);
 }
 
 }  // namespace radixshmem

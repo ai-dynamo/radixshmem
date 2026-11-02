@@ -222,23 +222,22 @@ def test_role_in_node_info_and_nodes(cfg):
             srv.close()
 
 
-def test_grpc_is_the_only_remote_op_transport():
+def test_remote_op_options():
     from radixshmem import cli
     from radixshmem.server import ClusterConfig
 
     config = cli.build_config(cli.parse_args([
-        "--remote-op-transport", "grpc", "--remote-op-listen-port", "31001",
-        "--rht-transport", "dc", "--peer-index-transport", "dc"]))
-    assert config.cluster.remote_op_transport == "grpc"
+        "--remote-op-listen-port", "31001", "--rht-transport", "dc", "--peer-index-transport", "dc"]))
     assert config.cluster.remote_op_listen_port == 31001
     assert config.cluster.rht_transport == config.cluster.peer_index_transport == "dc"
-    for transport in ("zmq", "dc", "rdma", "xrc", "unknown"):
+    for removed in (["--remote-op-transport", "grpc"], ["--enable-remote-insert"],
+                    ["--enable-remote-query"], ["--zmq-listen-port", "31001"]):
         with pytest.raises(SystemExit):
-            cli.parse_args(["--remote-op-transport", transport])
-        with pytest.raises(ValueError, match="only grpc"):
-            ClusterConfig(remote_op_transport=transport)
-    with pytest.raises(SystemExit):
-        cli.parse_args(["--zmq-listen-port", "31001"])
+            cli.parse_args(removed)
+    for name in ("remote_op_transport", "enable_remote_insert", "enable_remote_query"):
+        with pytest.raises(TypeError):
+            ClusterConfig(**{name: True})
+        assert not hasattr(radixshmem._core.RadixServerConfig(), name)
     assert not hasattr(radixshmem._core.RadixServerConfig(), "zmq_listen_port")
 
 

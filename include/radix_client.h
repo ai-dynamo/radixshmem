@@ -58,7 +58,8 @@ public:
 
     // Both return the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
     RemoteStatus recycle(const int32_t* slots, int num_slots);
-    RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length);
+    RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length,
+                        int pin_end, const std::vector<uint64_t>& pin_tail);
 
     const std::string& endpoint() const { return endpoint_; }
 
@@ -177,9 +178,6 @@ public:
 
     QueryResult remote_query(int rank, const uint64_t* hashes, int n,
                              bool lock = false, bool update_meta = true);
-
-    // Drop a remote_query(lock=true) pin: dec_ref over [0, hit_length).
-    RemoteStatus remote_unlock(int rank, const uint64_t* hashes, int n, int hit_length);
 #endif
 
     // ==================== Stats / accessors ====================
@@ -251,6 +249,7 @@ private:
     // Cached per-rank session; nullptr on illegal rank (self/oob/negative).
     std::shared_ptr<RemotePeer> peer_for(int rank);
     void drop_peer_session(int rank);
+    RemoteStatus missing_peer_status(int rank) const;
 
     // RHT probe from the deepest position not past the incumbent, with the
     // chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.

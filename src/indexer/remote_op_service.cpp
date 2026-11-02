@@ -14,6 +14,7 @@
 #include "remote_op_factory.hpp"   // make_remote_op_server
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -35,16 +36,21 @@ bool valid_range(int start, int length, int n) {
     return start >= 0 && length >= 0 && start <= n - length;
 }
 
+bool expired(RemoteOpService::Deadline deadline) {
+    return std::chrono::system_clock::now() + std::chrono::milliseconds(10) >= deadline;
+}
+
 }  // namespace
 
 // ==================== RemoteOpService ====================
 
-AllocateReply RemoteOpService::allocate(int n) {
+AllocateReply RemoteOpService::allocate(int n, Deadline deadline) {
     // Allocate without hashes or dedup; insert consumes only the unmatched tail.
     AllocateReply out;
     if (!valid_count(n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
     if (n == 0) return out;
     std::lock_guard<std::mutex> g(insert_mu_);
+    if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
     int got = tree_.allocate_slots(n, out.slots);
     if (got < n) {
         tree_.recycle_slots(out.slots.data(), got);
@@ -55,16 +61,21 @@ AllocateReply RemoteOpService::allocate(int n) {
 }
 
 QueryReply RemoteOpService::query(const uint64_t* hashes, int n, bool lock,
-                                  bool update_meta) {
+                                  bool update_meta, Deadline deadline) {
     QueryReply out;
     if (!valid_count(n) || (n > 0 && !hashes)) {
         out.status = RemoteStatus::BAD_REQUEST;
         return out;
     }
+    if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
     TreeComponentQueryResult r = tree_.tree().query_components(
         hashes, n, COMPONENT_MASK_FULL, lock, update_meta);
     out.hit_length = (int)r.common_hit;
     out.slots      = std::move(r.full_slots);   // len == hit_length
+    if (lock) {
+        out.pin_end  = (int)r.pin.full.end;
+        out.pin_tail = std::move(r.pin.tail);
+    }
     return out;
 }
 
@@ -92,16 +103,18 @@ RemoteStatus RemoteOpService::recycle(const int32_t* slots, int num_slots) {
 }
 
 RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, int start,
-                                     int length) {
+                                     int length, int pin_end,
+                                     const uint64_t* pin_tail, int pin_tail_n) {
     if (!valid_count(n) || !valid_range(start, length, n) ||
-        (n > 0 && !hashes))
+        (n > 0 && !hashes) || !valid_count(pin_tail_n) ||
+        (pin_tail_n > 0 && !pin_tail) || pin_end < start + length)
         return RemoteStatus::BAD_REQUEST;
     if (length == 0) return RemoteStatus::OK;
-    // Rebuild the fully-inside record from the wire range and release through the component pair.
     PinRecord pin;
-    pin.full = {(uint32_t)start, (uint32_t)(start + length)};
-    (void)tree_.tree().dec_ref(hashes, n, std::move(pin));
-    return RemoteStatus::OK;
+    pin.full = {(uint32_t)start, (uint32_t)pin_end};
+    pin.tail.assign(pin_tail, pin_tail + pin_tail_n);
+    return tree_.tree().dec_ref(hashes, n, std::move(pin)) ? RemoteStatus::OK
+                                                           : RemoteStatus::BAD_REQUEST;
 }
 
 // ==================== RadixServer remote-op endpoint ====================
@@ -109,7 +122,7 @@ RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, int start,
 RemoteOpAddr RadixServer::rc_build_endpoint() {
     // Body of the build_remote_op callback.
     RemoteOpAddr addr{};
-    rc_server_ = make_remote_op_server(cfg_.remote_op_listen_port, addr);
+    rc_server_ = make_remote_op_server(cfg_.remote_op_listen_port, instance_id_, addr);
     return addr;
 }
 
@@ -117,7 +130,7 @@ void RadixServer::rc_spawn() {
     if (!rc_server_) return;
     if (!svc_client_ || !svc_tree_) {
         throw std::runtime_error(
-            "rc_spawn: enable_remote_insert/_query set but svc_* not built "
+            "rc_spawn: remote-op server is up but svc_* not built "
             "(need world_size>1 + successful svc RadixClient bootstrap)");
     }
     rc_service_ = std::make_unique<RemoteOpService>(*svc_tree_, *svc_client_,

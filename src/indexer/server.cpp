@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -332,8 +333,6 @@ void RadixServer::resolve_shard_map(int n_obs) {
 }
 
 void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
-    if (sm.remote_op_transport != REMOTE_OP_TRANSPORT_GRPC)
-        throw std::runtime_error("RadixServer: cluster remote-op transport is not grpc; redeploy the cluster with grpc");
     // Follower path: install the leader's authoritative shard map + QoS. Mirrors
     // what resolve_shard_map() computes on the leader, but from the wire message.
     num_shards_   = (int)sm.num_shards;
@@ -387,9 +386,9 @@ void RadixServer::setup_dct(PeerEntry& e) {
 }
 
 void RadixServer::setup_remote_op(PeerEntry& e) {
-    // Remote ops off for this rank unless the control plane was requested.
-    if (!(cfg_.enable_remote_insert || cfg_.enable_remote_query)) return;
-
+    std::random_device rd;
+    instance_id_ = (((uint64_t)rd() << 32) | rd()) | 1;
+    e.instance_id = instance_id_;
     e.remote_op_listen_port = rc_build_endpoint().port;
     fprintf(stderr, "[RadixServer rank %d] remote-op endpoint up: grpc (port=%u)\n",
             cfg_.rank, e.remote_op_listen_port);
@@ -631,13 +630,6 @@ RadixServer::~RadixServer() {
 
 bool RadixServer::bootstrap() {
     const bool distributed = want_cluster(cfg_);
-    if (distributed) {
-        if (const char* transport = ::getenv("RADIXSHMEM_REMOTE_OP_TRANSPORT"))
-            cfg_.remote_op_transport = transport;
-    }
-    if (cfg_.remote_op_transport != "grpc")
-        throw std::runtime_error("RadixServer: remote_op_transport '" +
-                                 cfg_.remote_op_transport + "' is unsupported; only grpc is supported");
 
     ShmConfig shm = cfg_.shm;
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;
@@ -696,60 +688,54 @@ bool RadixServer::bootstrap() {
         }
         // rank + observed world size were written by the rendezvous into cfg_.
         const bool want_evict = cfg_.shm.background_evict_ratio > 0.0f;
-        const bool want_svc   = want_evict || cfg_.enable_remote_insert
-                                           || cfg_.enable_remote_query;
-        if (want_svc) {
-            svc_tree_ = std::make_unique<LocalTreeConnector>(shm_name);
-            RadixClientConfig cc;
-            cc.index_dev = cfg_.index_dev;
-            cc.gid_idx  = cfg_.gid_idx;
-            cc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
-            cc.rht_only = true;
-            cc.registry           = cfg_.registry;
-            cc.cluster_id         = cfg_.cluster_id;
-            cc.node_name          = cfg_.node_name;
-            cc.expected_min_nodes = cfg_.expected_min_nodes;
-            cc.settle_ms          = cfg_.settle_ms;
-            try {
-                // Borrows svc_tree_ (no second attach); builds the RHT plane only.
-                svc_client_ = std::make_unique<RadixClient>(cc, svc_tree_.get());
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[RadixServer] svc RadixClient bootstrap failed: %s\n",
-                        e.what());
-                svc_client_.reset();
-                svc_tree_.reset();
-                rc_stop();
-                stop_evictor();
-                writeback_.reset();
-                if (tree_) { tree_->destroy(); tree_.reset(); }
-                return false;
-            }
-            if (want_evict) {
-                RadixClient*  ec = svc_client_.get();
-                std::mutex*    mu = &svc_client_mu_;
-                tree_->set_evict_callback(
-                    [ec, mu](const std::vector<EvictedNode>& evicted) {
-                        std::vector<RadixClient::EvictedKey> keys;
-                        keys.reserve(evicted.size());
-                        for (const auto& e : evicted)
-                            keys.push_back({e.first_hash, e.tree_node_id});
-                        std::lock_guard<std::mutex> g(*mu);
-                        ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
-                    });
-            }
-            if (cfg_.enable_remote_insert) {
-                // RemoteOpService::allocate holds svc_client_mu_; relocking here would self-deadlock.
-                RadixClient* ec = svc_client_.get();
-                svc_tree_->tree().set_evict_callback(
-                    [ec](const std::vector<EvictedNode>& evicted) {
-                        std::vector<RadixClient::EvictedKey> keys;
-                        keys.reserve(evicted.size());
-                        for (const auto& e : evicted)
-                            keys.push_back({e.first_hash, e.tree_node_id});
-                        ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
-                    });
-            }
+        svc_tree_ = std::make_unique<LocalTreeConnector>(shm_name);
+        RadixClientConfig cc;
+        cc.index_dev = cfg_.index_dev;
+        cc.gid_idx  = cfg_.gid_idx;
+        cc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
+        cc.rht_only = true;
+        cc.registry           = cfg_.registry;
+        cc.cluster_id         = cfg_.cluster_id;
+        cc.node_name          = cfg_.node_name;
+        cc.expected_min_nodes = cfg_.expected_min_nodes;
+        cc.settle_ms          = cfg_.settle_ms;
+        try {
+            // Borrows svc_tree_ (no second attach); builds the RHT plane only.
+            svc_client_ = std::make_unique<RadixClient>(cc, svc_tree_.get());
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[RadixServer] svc RadixClient bootstrap failed: %s\n",
+                    e.what());
+            svc_client_.reset();
+            svc_tree_.reset();
+            rc_stop();
+            stop_evictor();
+            writeback_.reset();
+            if (tree_) { tree_->destroy(); tree_.reset(); }
+            return false;
         }
+        if (want_evict) {
+            RadixClient*  ec = svc_client_.get();
+            std::mutex*    mu = &svc_client_mu_;
+            tree_->set_evict_callback(
+                [ec, mu](const std::vector<EvictedNode>& evicted) {
+                    std::vector<RadixClient::EvictedKey> keys;
+                    keys.reserve(evicted.size());
+                    for (const auto& e : evicted)
+                        keys.push_back({e.first_hash, e.tree_node_id});
+                    std::lock_guard<std::mutex> g(*mu);
+                    ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
+                });
+        }
+        // RemoteOpService::allocate holds svc_client_mu_; relocking here would self-deadlock.
+        RadixClient* ec = svc_client_.get();
+        svc_tree_->tree().set_evict_callback(
+            [ec](const std::vector<EvictedNode>& evicted) {
+                std::vector<RadixClient::EvictedKey> keys;
+                keys.reserve(evicted.size());
+                for (const auto& e : evicted)
+                    keys.push_back({e.first_hash, e.tree_node_id});
+                ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
+            });
     }
 #endif
 #ifndef RADIXSHMEM_NO_RDMA

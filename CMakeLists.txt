@@ -18,9 +18,6 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 # RDMA support (libibverbs) is optional; disable on hosts without IB headers.
 option(ENABLE_RDMA "Build RDMA-dependent sources (requires libibverbs)" ON)
 
-# gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin) is the only remote-op control plane backend.
-option(ENABLE_GRPC "Build the gRPC remote-op backend (requires grpc++ and protobuf)" ON)
-
 option(ENABLE_ETCD "Build the etcd cluster-bootstrap registry (requires Go toolchain)" ON)
 
 # Mooncake TransferEngine backs the data plane's transfer backend (src/transfer).
@@ -119,7 +116,7 @@ target_link_libraries(radixshmem PUBLIC ${_radixshmem_link_libs})
 # ==================== gRPC (remote-op control plane) ====================
 # grpc++/protobuf via pkg-config plus protoc/grpc_cpp_plugin; the generated code is a static library only transport/grpc sees.
 set(RADIXSHMEM_GRPC_FOUND OFF)
-if(ENABLE_GRPC AND ENABLE_RDMA)
+if(ENABLE_RDMA)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(GRPCPP QUIET grpc++)
@@ -166,10 +163,10 @@ if(ENABLE_GRPC AND ENABLE_RDMA)
         set(RADIXSHMEM_HAS_GRPC ON)
         message(STATUS "gRPC found (grpc++ ${GRPCPP_VERSION}, protobuf ${PROTOBUF_VERSION}) — grpc remote-op backend enabled")
     else()
-        message(FATAL_ERROR "gRPC requires grpc++/protobuf via pkg-config, protoc and grpc_cpp_plugin. Install them, or set ENABLE_GRPC=OFF to build without remote ops; no alternate backend is available.")
+        message(FATAL_ERROR "RDMA builds need gRPC for remote ops: grpc++ and protobuf via pkg-config, protoc and grpc_cpp_plugin (Ubuntu: apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc).")
     endif()
 else()
-    message(STATUS "gRPC disabled (ENABLE_GRPC=${ENABLE_GRPC}, ENABLE_RDMA=${ENABLE_RDMA})")
+    message(STATUS "gRPC not needed (ENABLE_RDMA=${ENABLE_RDMA})")
 endif()
 
 # ==================== radixshmem_registry: the etcd plane (Go client wrapper) ====================
@@ -453,11 +450,9 @@ if(ENABLE_RDMA)
 
     if(RADIXSHMEM_GRPC_FOUND)
         add_test(NAME test_remote_api_grpc COMMAND test_remote_api)
-        set_tests_properties(test_remote_api_grpc PROPERTIES
-            ENVIRONMENT "RADIXSHMEM_REMOTE_OP_TRANSPORT=grpc")
         add_test(NAME test_remote_api_grpc_dcd COMMAND test_remote_api)
         set_tests_properties(test_remote_api_grpc_dcd PROPERTIES
-            ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_REMOTE_OP_TRANSPORT=grpc")
+            ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
     endif()
 endif()
 

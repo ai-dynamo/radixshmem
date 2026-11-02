@@ -19,7 +19,7 @@ struct PeerEntry;
 
 // Creates the gRPC transport behind the typed service interface.
 std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
-    uint16_t listen_port, RemoteOpAddr& addr);
+    uint16_t listen_port, uint64_t instance_id, RemoteOpAddr& addr);
 
 std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
     const PeerEntry& peer, std::string& endpoint);
