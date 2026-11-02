@@ -222,6 +222,25 @@ def test_role_in_node_info_and_nodes(cfg):
             srv.close()
 
 
+def test_remote_op_options():
+    from radixshmem import cli
+    from radixshmem.server import ClusterConfig
+
+    config = cli.build_config(cli.parse_args([
+        "--remote-op-listen-port", "31001", "--rht-transport", "dc", "--peer-index-transport", "dc"]))
+    assert config.cluster.remote_op_listen_port == 31001
+    assert config.cluster.rht_transport == config.cluster.peer_index_transport == "dc"
+    for removed in (["--remote-op-transport", "grpc"], ["--enable-remote-insert"],
+                    ["--enable-remote-query"], ["--zmq-listen-port", "31001"]):
+        with pytest.raises(SystemExit):
+            cli.parse_args(removed)
+    for name in ("remote_op_transport", "enable_remote_insert", "enable_remote_query"):
+        with pytest.raises(TypeError):
+            ClusterConfig(**{name: True})
+        assert not hasattr(radixshmem._core.RadixServerConfig(), name)
+    assert not hasattr(radixshmem._core.RadixServerConfig(), "zmq_listen_port")
+
+
 def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):
     c = cfg(**data())
     srv = up(c, geometry())
@@ -558,4 +577,3 @@ def test_transfer_log_writes_one_line_per_transfer_that_moved_data(cfg, tmp_path
         m = re.match(pat, line)
         assert m, line
         assert abs(4096 / float(m.group(1)) - float(m.group(2))) <= 0.1 + 0.01 * float(m.group(2))
-

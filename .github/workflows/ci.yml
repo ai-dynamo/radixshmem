@@ -54,7 +54,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake pkg-config \
-            libibverbs-dev libxxhash-dev libzmq3-dev
+            libibverbs-dev libxxhash-dev libgrpc++-dev libprotobuf-dev \
+            protobuf-compiler protobuf-compiler-grpc
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"

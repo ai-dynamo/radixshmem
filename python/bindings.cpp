@@ -106,7 +106,10 @@ PYBIND11_MODULE(_core, m) {
         .value("TIMEOUT", RemoteStatus::TIMEOUT)
         .value("BAD_REPLY", RemoteStatus::BAD_REPLY)
         .value("BAD_TARGET", RemoteStatus::BAD_TARGET)
-        .value("INTERNAL", RemoteStatus::INTERNAL);
+        .value("INTERNAL", RemoteStatus::INTERNAL)
+        .value("UNAVAILABLE", RemoteStatus::UNAVAILABLE)
+        .value("RESOURCE_EXHAUSTED", RemoteStatus::RESOURCE_EXHAUSTED)
+        .value("STALE_TARGET", RemoteStatus::STALE_TARGET);
 
 
     m.attr("MAX_REMOTE_OP_BLOCKS") = MAX_REMOTE_OP_BLOCKS;
@@ -248,16 +251,9 @@ PYBIND11_MODULE(_core, m) {
                        &RadixServerConfig::peer_index_transport)
         .def_readwrite("rht_slots_per_bucket",
                        &RadixServerConfig::rht_slots_per_bucket)
-        .def_readwrite("enable_remote_insert",
-                       &RadixServerConfig::enable_remote_insert)
-        .def_readwrite("enable_remote_query",
-                       &RadixServerConfig::enable_remote_query)
-        // Control-plane transport backend: "zmq" or "dc"; rank 0 authoritative.
-        .def_readwrite("remote_op_transport",
-                       &RadixServerConfig::remote_op_transport)
-        .def_property("zmq_listen_port",
-                      [](const RadixServerConfig& c) { return (int)c.zmq_listen_port; },
-                      [](RadixServerConfig& c, int v) { c.zmq_listen_port = (uint16_t)v; })
+        .def_property("remote_op_listen_port",
+                      [](const RadixServerConfig& c) { return (int)c.remote_op_listen_port; },
+                      [](RadixServerConfig& c, int v) { c.remote_op_listen_port = (uint16_t)v; })
         .def_readwrite("writeback_enabled", &RadixServerConfig::writeback_enabled)
         .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
 
@@ -334,6 +330,7 @@ PYBIND11_MODULE(_core, m) {
 
     py::class_<InsertResult>(m, "InsertResult")
         .def_readonly("error", &InsertResult::error)
+        .def_readonly("remote_status", &InsertResult::remote_status)
         .def_property_readonly("unused_slots", [](const InsertResult& r) {
             return vec_to_npy_i32(r.unused_slots);
         });
@@ -697,19 +694,7 @@ PYBIND11_MODULE(_core, m) {
             return result;
         }, py::arg("rank"), py::arg("hashes"), py::arg("lock") = false,
            py::arg("update_meta") = true,
-           // keep_alive<0,1>: lock=True result's finalize calls back into client.
-           py::keep_alive<0, 1>(),
            "Query `rank`'s own tree (1 RTT); lock=True releases via finalize().")
-
-        .def("remote_unlock", [](RadixClient& c, int rank,
-                                 py::array_t<uint64_t> hashes, int hit_length) {
-            auto [ptr, len] = npy_1d(hashes, "hashes");
-            RemoteStatus st;
-            { py::gil_scoped_release rel;
-              st = c.remote_unlock(rank, ptr, len, hit_length); }
-            return st;
-        }, py::arg("rank"), py::arg("hashes"), py::arg("hit_length"),
-           "Manually drop a remote_query(lock=True) pin: dec_ref over [0, hit_length); returns RemoteStatus.")
 #endif
 
         .def_static("compute_hashes", &py_compute_hashes,
@@ -721,6 +706,7 @@ PYBIND11_MODULE(_core, m) {
 
     py::class_<AllocateReply>(m, "AllocateReply")
         .def_readonly("status", &AllocateReply::status)
+        .def_readonly("error", &AllocateReply::error)
         .def_property_readonly("slots", [](const AllocateReply& r) {
             return vec_to_npy_i32(r.slots);
         });
