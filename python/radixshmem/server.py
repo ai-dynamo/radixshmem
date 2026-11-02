@@ -128,6 +128,11 @@ class ServerConfig:
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     rpc_workers: int = 32            # one blocks per client with jobs in flight
     role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
+    # monitoring endpoint (radixshmem.monitor): Prometheus /metrics with the tree, 0 = off
+    monitor_port: int = 0            # first port tried; servers sharing a host take the next free one
+    monitor_interval_s: float = 10.0  # tree copy period
+    monitor_tree_nodes: int = 150    # nodes of this server's tree exported per copy, 0 = none
+    monitor_cluster_nodes: int = 300  # nodes of the merged cluster tree the leader exports, 0 = none
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
 
     def __post_init__(self) -> None:
@@ -154,6 +159,10 @@ class ServerConfig:
             raise ValueError("writeback_max_held_ratio must be in (0, 1]")
         if self.writeback and self.background_evict_ratio <= 0:
             raise ValueError("writeback needs background eviction (background_evict_ratio > 0)")
+        if not 0 <= self.monitor_port < 65536:
+            raise ValueError("monitor_port must be in [0, 65536)")
+        if self.monitor_tree_nodes < 0 or self.monitor_cluster_nodes < 0:
+            raise ValueError("monitor_tree_nodes / monitor_cluster_nodes must be >= 0")
 
     @property
     def index_only(self) -> bool:
@@ -414,6 +423,7 @@ class RadixServer:
         self._running = False
         self.transfers = self.transfer_failures = self.transfer_bytes = 0
         self._xlog: Optional[_TransferLog] = None
+        self.monitor = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -435,9 +445,13 @@ class RadixServer:
             self._xlog = _TransferLog(self.cfg.transfer_log)
         try:
             self._preflight()
+            self._start_monitor()
         except BaseException:
             self._rpc.stop(grace=0).wait()
             self._rpc = None
+            if self._greg is not None:
+                self._greg.close()
+                self._greg = None
             with self._cv:
                 self._mode = MODE_CLOSED
                 self._cv.notify_all()
@@ -466,6 +480,16 @@ class RadixServer:
         if not c.index_only:
             self._backend = self._make_backend()
 
+    def _start_monitor(self) -> None:
+        c = self.cfg
+        if not c.monitor_port or self.monitor is not None:
+            return
+        from radixshmem.monitor import MonitorProcess
+        host = c.cluster.rpc_address if c.cluster.rpc_address not in ("", "0.0.0.0") else ""
+        if c.cluster.rpc_interface:
+            host = _nic_ip(c.cluster.rpc_interface)
+        self.monitor = MonitorProcess(c, host)   # a child process: no share of this one's GIL
+
     def _make_backend(self):
         from radixshmem import _data
 
@@ -486,6 +510,9 @@ class RadixServer:
     def close(self) -> None:
         self._stop_writeback(closing=True)   # first: its handler may still pull while it stops
         self._stop.set()
+        if self.monitor is not None:
+            self.monitor.close()
+            self.monitor = None
         if self._poller is not None:
             self._poller.join(2)
             self._poller = None
@@ -600,9 +627,12 @@ class RadixServer:
 
     def _node_record(self) -> Dict[str, Any]:
         info = self.describe()
-        return {"node_name": self._node_key() if self.cfg.distributed else info.node_name,
-                "role": info.role, "rank": info.rank, "mode": info.mode,
-                "data_plane": info.data_plane, "endpoint": self.cfg.resolved_endpoint}
+        rec = {"node_name": self._node_key() if self.cfg.distributed else info.node_name,
+               "role": info.role, "rank": info.rank, "mode": info.mode,
+               "data_plane": info.data_plane, "endpoint": self.cfg.resolved_endpoint}
+        if self.monitor is not None:
+            rec["monitor"] = self.monitor.url
+        return rec
 
     def _publish_node(self) -> None:
         if self._greg is None:
@@ -737,6 +767,10 @@ class RadixServer:
                        insert_errors=idx.insert_error_node_pool_count()
                        + idx.insert_error_data_pool_count() + idx.insert_error_ht_pool_count(),
                        **idx.peer_fault_counts())
+            pools = {"full": (idx.mempool_used(), idx.mempool_total()),
+                     "swa": (idx.swa_mempool_total() - idx.swa_mempool_free(), idx.swa_mempool_total()),
+                     "mamba": (idx.mamba_mempool_total() - idx.mamba_mempool_free(), idx.mamba_mempool_total())}
+            out["pools"] = {k: [int(u), int(n)] for k, (u, n) in pools.items() if n > 0}   # [used, total]
         return out
 
     # ------------------------------------------------------------ bring-up

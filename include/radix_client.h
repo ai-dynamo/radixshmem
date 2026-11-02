@@ -6,6 +6,7 @@
 #include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "component_types.h"
 #include "health_check.h"
+#include "tree_dump.h"
 #include "types.h"
 
 #include <cstddef>
@@ -208,6 +209,10 @@ public:
     // vs tree slot accounting, pins, node accounting. Returns HealthFlag bits
     // (0 == healthy); HEALTH_NOT_ATTACHED for an observer. Never blocks.
     int check_health(HealthReport* report = nullptr) const;
+
+    // Lock-free copy of the attached local tree for monitoring (see tree_dump.h);
+    // throws for an observer. 0 = no limit.
+    TreeDump dump_tree(uint32_t max_nodes = 0, uint64_t max_blocks = 0) const;
 
 private:
     // `local_` attaches the node-local shm (null for an observer). The cluster
