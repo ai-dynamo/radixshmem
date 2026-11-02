@@ -202,6 +202,7 @@ public:
 
 private:
     friend class HealthAuditor;
+    friend class TreeDumper;
 
     RadixShmemTree() = default;
 

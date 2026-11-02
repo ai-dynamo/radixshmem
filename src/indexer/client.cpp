@@ -1071,6 +1071,10 @@ int RadixClient::check_health(HealthReport* report) const {
     if (report) *report = r;
     return (int)r.flags;
 }
+TreeDump RadixClient::dump_tree(uint32_t max_nodes, uint64_t max_blocks) const {
+    if (!local_) throw std::runtime_error("RadixClient::dump_tree: no local tree (observer client)");
+    return radixshmem::dump_tree(local_->tree(), max_nodes, max_blocks);
+}
 const std::string& RadixClient::name() const {
     static const std::string kNone;
     return local_ ? local_->name() : kNone;
