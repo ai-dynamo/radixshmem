@@ -98,12 +98,16 @@ public:
             d.mamba.push_back(node->mamba_checkpoint_slot != INVALID_COMPONENT_SLOT);
 
             uint32_t e = torn ? HT_END : node->first_child_entry;
+            uint32_t prev = HT_END;
             for (uint32_t steps = 0; e != HT_END; steps++) {
                 if (e >= entry_cap || steps >= entry_cap) { d.torn++; break; }
                 const ChainHTEntry ent = entries[e];
+                const uint32_t back = prev;
+                prev = e;
                 e = ent.sibling_next;
                 const uint32_t c = ent.child_node_id;
-                if (ent.parent_id != ids[i] || c >= capacity || (seen[c >> 6] >> (c & 63)) & 1) {
+                if (ent.sibling_prev != back || c >= capacity || (seen[c >> 6] >> (c & 63)) & 1 ||
+                    t.nodes_.get(c)->parent_id != ids[i]) {
                     d.torn++;
                     continue;
                 }
