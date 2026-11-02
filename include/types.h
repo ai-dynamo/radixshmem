@@ -22,7 +22,7 @@ using HashType = uint64_t;
 static constexpr uint32_t INVALID_NODE_ID = UINT32_MAX;
 static constexpr uint64_t INVALID_OFFSET = UINT64_MAX;
 static constexpr uint64_t SHM_MAGIC = 0x534852444958ULL;
-static constexpr uint32_t SHM_VERSION = 27;   // 27: write-back held slots, reset generation
+static constexpr uint32_t SHM_VERSION = 28;
 // cluster_ready_magic sentinel — same-host clients spin on it as a local ready flag.
 static constexpr uint64_t CLUSTER_MANIFEST_MAGIC = 0x434c5354524d4644ULL; // "CLSTRMFD"
 static constexpr size_t HUGEPAGE_SIZE = 2ULL * 1024 * 1024;
@@ -308,7 +308,7 @@ static_assert(sizeof(TreeNode) == 64, "TreeNode must be 64 bytes");
 
 struct ChainHTEntry {
     uint64_t token_hash;
-    uint32_t parent_id;
+    uint32_t sibling_prev;
     uint32_t child_node_id;
     uint32_t hash_next;       // next in hash bucket chain (or free list next when free)
     uint32_t sibling_next;    // next child of same parent
