@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 
-from radixshmem._core import INVALID_COMPONENT_SLOT
+from radixshmem._core import INVALID_COMPONENT_SLOT, MAX_REMOTE_OP_BLOCKS
 from radixshmem.client import MODE_READY, PushJob
 
 _STOP_WAIT_S = 5.0   # how long close() waits for a running write() before handler.stop()
@@ -62,6 +62,9 @@ class WritebackHandler:
     def stop(self) -> None:
         pass
 
+    def stats(self) -> Dict[str, int]:
+        return {}
+
 
 class PeerWriteback(WritebackHandler):
     """Pushes each evicted path to a ready decode node with ``push_async``,
@@ -73,20 +76,32 @@ class PeerWriteback(WritebackHandler):
         self.timeout_ms = int(config.get("timeout_ms", 30000))
         self.client = None
         self._window = 0
+        self._decode = False
+        self._stats = dict.fromkeys(("pushed", "incomplete", "no_target", "too_long"), 0)
 
     def start(self, client) -> None:
         self.client = client
         self._window = int(client.geometry["pools"].get("swa", {}).get("window_blocks", 0))
+        self._decode = client.info.role == "decode"
+        if self._decode:
+            print("radixshmem: PeerWriteback on a decode node pushes nothing", file=sys.stderr)
+
+    def stats(self) -> Dict[str, int]:
+        return dict(self._stats)
 
     def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
-        nodes = self.client.nodes()
+        nodes = [] if self._decode else self.client.nodes()
         jobs = []
         for t in tasks:
             rank = self._choose_target(nodes, t)
-            if rank >= 0:
+            if rank < 0:
+                self._stats["no_target"] += 1
+            elif t.end > MAX_REMOTE_OP_BLOCKS:
+                self._stats["too_long"] += 1
+            else:
                 jobs.append(self._push(t, rank))
         for job in jobs:
-            job.wait()
+            self._stats["pushed" if job.wait().complete else "incomplete"] += 1
         done([t.task_id for t in tasks])
 
     def _choose_target(self, nodes: List[Dict[str, Any]], t: WritebackTask) -> int:

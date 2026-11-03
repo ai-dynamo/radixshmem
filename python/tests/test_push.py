@@ -47,6 +47,7 @@ FULL_BYTES, SWA_BYTES, MAMBA_BYTES = 65536, 16384, 32768
 SALT = {"full": 0x46554C4C, "swa": 0x535741, "mamba": 0x4D414D42}
 EVICT_RATIO = 0.2
 PUSHED = 4          # prefixes [0, PUSHED) are for push_async; write-back gets the ones after
+LONG = 600
 
 
 def prefix_tokens(k: int):
@@ -98,44 +99,56 @@ def client_main(role: str, endpoint: str) -> int:
             bad += bytes(view(q.mamba[1], MAMBA)) != pattern(h[-1], SALT["mamba"], MAMBA_BYTES)
         return bad
 
+    def put(h):
+        n = len(h)
+        m = int(c.query(h, local_only=True, update_meta=False).common_hit)
+        slots = c.allocate_slots(n - m)
+        for i, s in enumerate(slots):
+            view(s, FULL)[:] = pattern(h[m + i], SALT["full"], FULL_BYTES)
+        errors = {str(c.insert(h, slots, start=m).error)}
+        sw = c.allocate_slots(WINDOW, SWA)
+        for i, s in enumerate(sw):
+            view(s, SWA)[:] = pattern(h[n - WINDOW + i], SALT["swa"], SWA_BYTES)
+        errors.add(str(c.insert(h, sw, component=SWA).error))
+        mb = c.allocate_slots(1, MAMBA)
+        view(mb[0], MAMBA)[:] = pattern(h[-1], SALT["mamba"], MAMBA_BYTES)
+        errors.add(str(c.insert(h, mb, component=MAMBA).error))
+        return errors
+
+    def push(h, rank, valid=None):
+        q = joint(h)
+        r = c.push_async(rank, h, full_of(q), q.swa_slots, int(q.mamba[1]) if q.mamba else -1,
+                         valid=valid).wait(60)
+        q.finalize()
+        return [r.common_hit, r.remote_hit, r.remote_blocks, r.remote_bytes, r.complete]
+
+    long_path = radixshmem.compute_hashes(np.arange(5_000_000, 5_000_000 + LONG, dtype=np.int64), 1)
+
     if role.startswith("writer:"):
         errors = set()
         for k in span(role.split(":", 1)[1]):
-            h = hs(k)
             deadline = time.time() + 60
             while c.mempool_free() < N and time.time() < deadline:
                 time.sleep(0.005)     # background eviction makes room, so allocate_slots never evicts
-            m = int(c.query(h, local_only=True, update_meta=False).common_hit)
-            slots = c.allocate_slots(N - m)
-            for i, s in enumerate(slots):
-                view(s, FULL)[:] = pattern(h[m + i], SALT["full"], FULL_BYTES)
-            errors.add(str(c.insert(h, slots, start=m).error))
-            sw = c.allocate_slots(WINDOW, SWA)
-            for i, s in enumerate(sw):
-                view(s, SWA)[:] = pattern(h[N - WINDOW + i], SALT["swa"], SWA_BYTES)
-            errors.add(str(c.insert(h, sw, component=SWA).error))
-            mb = c.allocate_slots(1, MAMBA)
-            view(mb[0], MAMBA)[:] = pattern(h[-1], SALT["mamba"], MAMBA_BYTES)
-            errors.add(str(c.insert(h, mb, component=MAMBA).error))
+            errors |= put(hs(k))
             time.sleep(0.005)
         c.flush()
         out["insert_errors"] = sorted(errors)
     elif role.startswith("push:"):
         target = int(role.split(":", 1)[1])
-
-        def push(k, rank, valid=None):
-            h = hs(k)
-            q = joint(h)
-            r = c.push_async(rank, h, full_of(q), q.swa_slots, int(q.mamba[1]) if q.mamba else -1,
-                             valid=valid).wait(60)
-            q.finalize()
-            return [r.common_hit, r.remote_hit, r.remote_blocks, r.remote_bytes, r.complete]
-
-        out["new"] = push(0, target)
-        out["sibling"] = push(1, target)
-        out["again"] = push(0, target)
-        out["refused"] = push(2, target, valid=lambda: False)
-        out["self"] = push(3, c.rank())
+        out["new"] = push(hs(0), target)
+        out["sibling"] = push(hs(1), target)
+        out["again"] = push(hs(0), target)
+        out["refused"] = push(hs(2), target, valid=lambda: False)
+        out["self"] = push(hs(3), c.rank())
+    elif role.startswith("long:"):
+        out["insert_errors"] = sorted(put(long_path))
+        out["long"] = push(long_path, int(role.split(":", 1)[1]))
+    elif role == "longcensus":
+        q = joint(long_path)
+        out["row"] = [int(c.query(long_path, local_only=True, update_meta=False).common_hit), int(q.common_hit),
+                      verify(long_path, q) if int(q.common_hit) == LONG else 0]
+        q.finalize()
     elif role.startswith("census:"):
         rows = []   # per prefix: FULL hit, joint FULL | SWA | MAMBA hit, bad slots
         for k in span(role.split(":", 1)[1]):
@@ -217,6 +230,11 @@ def test_push(eps, ranks):
     p2p.check(rows[2][0] == 0 and rows[3][0] == 0, "and nothing of prefixes 2 and 3")
     h = run_client("health", eps[1])
     p2p.check(h["health"] == 0, f"node1 leaks no slot and no pin ({h['report']})")
+    r = run_client(f"long:{ranks[2]}", eps[3])
+    p2p.check(r["insert_errors"] == ["InsertError.OK"] and
+              r["long"] == [LONG, 0, LONG + WINDOW + 1, LONG * FULL_BYTES + rest, True],
+              f"node3 pushes a {LONG}-block path to node2 whole")
+    p2p.check(run_client("longcensus", eps[2])["row"] == [LONG, LONG, 0], "node2 holds it, bytes intact")
 
 
 def test_writeback(eps, full_slots):
@@ -231,6 +249,8 @@ def test_writeback(eps, full_slots):
     print(f"  node0 writeback {wb}  transfers {st['transfers']} ({st['transfer_failures']} failed)")
     p2p.check(wb["produced"] > 0 and wb["completed"] == wb["produced"] and wb["failed"] == 0 and wb["dropped"] == 0,
           "background eviction produced tasks and PeerWriteback completed all of them")
+    p2p.check(wb["pushed"] == wb["produced"] and wb["incomplete"] == wb["no_target"] == wb["too_long"] == 0,
+          "PeerWriteback pushed every task whole")
     p2p.check(st["transfers"] > 0 and st["transfer_failures"] == 0, "every push's RDMA write completed")
     span = f"{first}:{last}"
     src = run_client(f"census:{span}", eps[0])["rows"]

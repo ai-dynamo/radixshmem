@@ -766,7 +766,8 @@ class RadixServer:
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
         wb = self._wb
         if idx is not None and self.cfg.writeback:
-            out["writeback"] = dict(idx.writeback_stats(), failed=wb.failed if wb else 0)
+            out["writeback"] = {**self._wb_handler.stats(), **idx.writeback_stats(),
+                                "failed": wb.failed if wb else 0}
         if idx is not None:
             out.update(rank=idx.rank(), world_size=idx.world_size(),
                        total_radix_nodes=idx.total_radix_nodes(), total_blocks=idx.total_blocks(),

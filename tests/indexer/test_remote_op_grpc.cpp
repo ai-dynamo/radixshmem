@@ -52,11 +52,11 @@ struct Node {
     std::mutex insert_mu;
     std::unique_ptr<RemoteOpService> svc;
 
-    explicit Node(const char* tag)
+    explicit Node(const char* tag, int max_blocks = kMaxBlocks)
         : name(std::string("/test_grpc_") + tag + "_" + std::to_string(::getpid())) {
         ::shm_unlink(name.c_str());
         ShmConfig cfg;
-        cfg.max_blocks = kMaxBlocks;
+        cfg.max_blocks = max_blocks;
         cfg.hugepage_path = "";
         cfg.background_evict_ratio = 0.0f;   // no async eviction under the test
         srv = std::make_unique<RadixServer>(name, cfg);
@@ -167,6 +167,27 @@ void test_roundtrip() {
     assert(cli.recycle(a.slots.data(), 1, bogus) == RemoteStatus::BAD_REQUEST);
     assert(node.used() == (uint32_t)n);
     server.stop();
+    TEST_PASS();
+}
+
+void test_largest_request() {
+    TEST_BEGIN("ops of MAX_REMOTE_OP_BLOCKS blocks fit the message limit");
+    Node node("max", MAX_REMOTE_OP_BLOCKS);
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    const int n = MAX_REMOTE_OP_BLOCKS;
+    auto h = make_hashes(100000, n);
+    AllocateReply a = cli.allocate(n);
+    assert(a.status == RemoteStatus::OK && (int)a.slots.size() == n);
+    InsertResult ins = cli.insert(h.data(), n, 0, n, a.slots.data(), true);
+    assert(ins.remote_status == RemoteStatus::OK && ins.error == InsertError::OK);
+    QueryReply q = cli.query(h.data(), n, true, false);
+    assert(q.status == RemoteStatus::OK && q.hit_length == n && q.slots == a.slots);
+    assert(cli.unlock(h.data(), n, 0, q.hit_length, q.pin_end, q.pin_tail) == RemoteStatus::OK);
+    assert(node.used() == (uint32_t)n);
+    server.stop();
+    expect_healthy(*node.client);
     TEST_PASS();
 }
 
@@ -400,6 +421,7 @@ int main() {
     printf("test_remote_op_grpc\n");
     test_transport_factory();
     test_roundtrip();
+    test_largest_request();
     test_deadline_no_replay();
     test_no_admission_cap();
     test_deadline_skips_allocate_and_query();

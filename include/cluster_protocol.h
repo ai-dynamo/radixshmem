@@ -68,6 +68,6 @@ struct ClusterReplyMsg {
     union ibv_gid gid;
 };
 
-constexpr int      MAX_REMOTE_OP_BLOCKS = 512;
+constexpr int      MAX_REMOTE_OP_BLOCKS = 8192;
 
 } // namespace radixshmem

@@ -10,6 +10,7 @@ import struct
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -86,6 +87,10 @@ class Recorder(WritebackHandler):
         self.stopped = True
         self.unblock.set()
 
+    def stats(self):
+        with self.mu:
+            return {"written": len(self.tasks)}
+
 
 class ReadyAtStart(Recorder):
     def start(self, client):
@@ -138,7 +143,7 @@ def test_handler_gets_whole_prefixes_with_intact_data(cfg):
         seqs = fill(cl, 11)                                  # 440 of 512: two sequences to evict
         wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
         st = srv.stats()["writeback"]
-        assert st["produced"] == st["completed"] == len(rec.tasks) > 1
+        assert st["produced"] == st["completed"] == len(rec.tasks) == st["written"] > 1
         assert st["held_slots"] == (0, 0, 0) and st["inflight_slots"] == (0, 0, 0)
         for t, data, hit in zip(rec.tasks, rec.data, rec.hits):
             assert t.end == SEQ_BLOCKS and t.evicted_from == 0   # unshared: one chain, root to leaf
@@ -306,3 +311,65 @@ def test_config_and_cli(cfg):
         load_handler("no_colon", {})
     with pytest.raises(TypeError, match="not a WritebackHandler"):
         load_handler("test_writeback:returns_none", {})
+
+
+class StubJob:
+    def __init__(self, complete):
+        self.complete = complete
+
+    def wait(self, timeout=None):
+        return self
+
+
+class StubClient:
+    def __init__(self, role, complete=True):
+        self.info = SimpleNamespace(role=role)
+        self.geometry = {"pools": {"full": {"slot_bytes": 8192, "num_slots": 64}}}
+        self.complete = complete
+        self.pushes = []
+
+    def rank(self):
+        return 0
+
+    def nodes(self):
+        return [{"rank": r, "mode": "ready", "data_plane": True, "role": role}
+                for r, role in ((0, self.info.role), (1, "decode"), (2, "decode"), (3, "prefill"))]
+
+    def push_async(self, rank, hashes, full_slots, swa_slots=None, mamba_slot=-1, **kw):
+        self.pushes.append((rank, len(hashes)))
+        return StubJob(self.complete)
+
+
+def task(task_id, n, first=1):
+    return writeback.WritebackTask(task_id, np.arange(first, first + n, dtype=np.uint64),
+                                   np.arange(n, dtype=np.int32), np.empty(0, np.int32),
+                                   np.empty(0, np.uint32), np.empty(0, np.int32), 0, 0)
+
+
+def peer_writeback(role, complete=True):
+    h = writeback.PeerWriteback({})
+    h.start(StubClient(role, complete))
+    return h
+
+
+def test_peer_writeback_counts_tasks_and_skips_long_paths():
+    h = peer_writeback("prefill")
+    done = []
+    h.write([task(1, 8), task(2, 8, first=2), task(3, radixshmem.MAX_REMOTE_OP_BLOCKS + 1)], done.extend)
+    assert done == [1, 2, 3]
+    assert h.client.pushes == [(2, 8), (1, 8)]
+    assert h.stats() == {"pushed": 2, "incomplete": 0, "no_target": 0, "too_long": 1}
+
+    h = peer_writeback("prefill", complete=False)
+    h.write([task(1, radixshmem.MAX_REMOTE_OP_BLOCKS)], done.extend)
+    assert h.client.pushes == [(2, radixshmem.MAX_REMOTE_OP_BLOCKS)]
+    assert h.stats() == {"pushed": 0, "incomplete": 1, "no_target": 0, "too_long": 0}
+
+
+def test_peer_writeback_pushes_nothing_from_a_decode_node(capfd):
+    h = peer_writeback("decode")
+    assert "decode node" in capfd.readouterr().err
+    done = []
+    h.write([task(1, 8), task(2, 8, first=2)], done.extend)
+    assert done == [1, 2] and h.client.pushes == []
+    assert h.stats() == {"pushed": 0, "incomplete": 0, "no_target": 2, "too_long": 0}
