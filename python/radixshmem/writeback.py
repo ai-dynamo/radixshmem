@@ -70,10 +70,10 @@ class PeerWriteback(WritebackHandler):
     """Pushes each evicted path to a ready decode node with ``push_async``,
     picked by the hash of its first block so that a prefix tree stays on one
     node. On prefill nodes it extends them with the decode nodes' memory.
-    ``config``: ``timeout_ms`` (default 30000)."""
+    ``timeout_ms``: the deadline of each push."""
 
-    def __init__(self, config: Dict[str, Any]):
-        self.timeout_ms = int(config.get("timeout_ms", 30000))
+    def __init__(self, timeout_ms: int = 30000):
+        self.timeout_ms = int(timeout_ms)
         self.client = None
         self._decode = False
         self._nodes: List[Dict[str, Any]] = []

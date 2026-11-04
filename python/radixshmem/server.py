@@ -551,7 +551,7 @@ class RadixServer:
     def _make_writeback_handler(self) -> Optional[WritebackHandler]:
         c = self.cfg
         if c.role == "prefill" and c.distributed and not c.index_only and c.background_evict_ratio > 0:
-            return PeerWriteback({})
+            return PeerWriteback()
         return None
 
     def _start_writeback(self) -> None:

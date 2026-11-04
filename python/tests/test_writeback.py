@@ -341,7 +341,7 @@ def task(task_id, n, first=1):
 
 
 def peer_writeback(role, complete=True):
-    h = writeback.PeerWriteback({})
+    h = writeback.PeerWriteback()
     h.start(StubClient(role, complete))
     return h
 
