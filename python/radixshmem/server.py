@@ -41,7 +41,8 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
-                             XFER_READ, XFER_WRITE, NodeInfo, RadixClient, TransferItem, TransferReply)
+                             XFER_READ, XFER_TIMEOUT, XFER_WRITE, NodeInfo, RadixClient, TransferItem,
+                             TransferReply)
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy
 from radixshmem.writeback import WritebackHandler, _Worker
 
@@ -962,7 +963,8 @@ class RadixServer:
                 ok = st == _data.XferState.COMPLETED
                 if not ok:
                     self._peers.pop(job.items[i][0], None)
-                self._resolve(job, i, (ok, int(done), int(nd), "" if ok else str(st)))
+                err = "" if ok else XFER_TIMEOUT if st == _data.XferState.TIMEOUT else str(st)
+                self._resolve(job, i, (ok, int(done), int(nd), err))
                 progressed = True
             inflight = still
             if now - last_gc > 1.0:

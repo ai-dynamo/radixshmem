@@ -43,6 +43,7 @@ _ATTACH_TIMEOUT_MS = 30000          # a ready server's SlotStore is complete; at
 # op is XFER_READ ("r", the default: peer -> local) or XFER_WRITE ("w": local -> peer).
 TransferItem = Tuple[int, int, List[int], List[int]]
 XFER_READ, XFER_WRITE = "r", "w"
+XFER_TIMEOUT = "XferState.TIMEOUT"
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -542,12 +543,15 @@ class RadixClient:
 
     def _complete_push(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
         ok = {ComponentType(it[1]): rep[0] for it, rep in zip(job._items, replies)}
+        late = {ComponentType(it[1]) for it, rep in zip(job._items, replies) if rep[3] == XFER_TIMEOUT}
         self.transfer_failures += sum(not v for v in ok.values())
         if ok and job._valid is not None and not job._valid():
             ok = dict.fromkeys(ok, False)
         idx, rank, h = self._index, job._rank, job._hashes
         n, hit, landed, nbytes = len(h), job._hit, [], 0
         for kind, remote in job._reserved.items():
+            if kind in late:
+                continue
             if not ok[kind] or (kind != FULL and hit < n):
                 idx.remote_recycle(rank, remote, kind)
                 continue
