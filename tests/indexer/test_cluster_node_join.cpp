@@ -52,7 +52,7 @@ constexpr int    kBootstrapTO  = 30;
 constexpr int    kJoinTO       = 40;   // reader's budget to sense node2 + hit
 constexpr const char* kShmPrefix = "/test_join";
 constexpr const char* kRdmaDev   = "mlx5_bond_0";
-constexpr int    kGidIdx        = 3;
+constexpr int    kGidIdx        = -1;   // auto: must resolve to the RoCE v2 IPv4 entry on this host
 
 std::string node_name_for(int rank) { return "node" + std::to_string(rank); }
 std::string shm_name_for(int rank) {

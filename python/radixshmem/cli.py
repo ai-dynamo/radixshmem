@@ -158,13 +158,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--registry", default="etcd://127.0.0.1:2379")
     g.add_argument("--cluster-id", default="default")
     g.add_argument("--node-name", default="")
-    g.add_argument("--rpc-address", default="", help="bootstrap IP peers dial; 0.0.0.0 on one host")
-    g.add_argument("--rpc-interface", default="", help="NIC to resolve the bootstrap IP from")
+    g.add_argument("--rpc-address", default="",
+                   help="control IP peers dial (default: the index device's IPv4); 0.0.0.0 on one host")
+    g.add_argument("--rpc-interface", default="", help="NIC to resolve the control IP from (wins over --rpc-address)")
     g.add_argument("--rpc-port", type=int, default=0)
     g.add_argument("--index-dev", default="",
-                   help="HCA of the index control plane (default: first available); "
-                        "the data plane's is --transfer-dev")
-    g.add_argument("--gid-idx", type=int, default=3)
+                   help="HCA of the index control plane (default: chosen from the local devices; "
+                        "several fitting ones is an error listing them); the data plane's is --transfer-dev")
+    g.add_argument("--gid-idx", type=int, default=-1,
+                   help="GID index on --index-dev (default: -1 = the RoCE v2 IPv4 entry, or the IB GID)")
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")

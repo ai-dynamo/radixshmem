@@ -56,13 +56,17 @@ struct RadixServerConfig {
     // rank: etcd-assigned dense rank, filled after bootstrap.
     int          rank        = 0;
     int          world_size  = 1;   // observed count(/peers) overrides at bootstrap
-    std::string  index_dev;          // empty = first available device
-    int          gid_idx     = 3;
+    // Index-plane RDMA device and GID index. Empty / -1 = chosen from the local devices at
+    // bootstrap (net_discovery); explicit values are constraints. Both are written back resolved.
+    std::string  index_dev;
+    int          gid_idx     = -1;
     int          bootstrap_timeout_sec = 60;
     // TTL of this node's etcd lease and of the shared cluster lease: how long a
     // killed node's keys, or a fully stopped cluster's /config, outlive it.
     int          lease_ttl_sec = 30;
 
+    // Control-plane address published to peers: rpc_interface's IPv4 wins over rpc_address; both
+    // empty = the index GID's IPv4. Written back resolved into rpc_address.
     std::string  rpc_address;              // explicit IPv4, e.g. "192.168.1.11"
     std::string  rpc_interface;            // NIC name, e.g. "eth0"
     uint16_t     rpc_port    = 0;          // 0 = OS-assigned bootstrap / XRC listen port
@@ -80,6 +84,12 @@ struct RadixServerConfig {
     std::string       cluster_id = "default";   // etcd key namespace: radix/<cluster_id>/...
     std::string       node_name  = "";          // etcd identity; empty → auto "node<host-ip>"
 };
+
+#ifndef RADIXSHMEM_NO_RDMA
+// Settle index_dev / gid_idx / rpc_address in place from the local devices (explicit values are
+// validated and kept) and return the one-line summary; throws with the candidates when ambiguous.
+std::string resolve_cluster_net(RadixServerConfig& cfg);
+#endif
 
 class RadixServer {
 #ifndef RADIXSHMEM_NO_RDMA

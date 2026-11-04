@@ -97,8 +97,10 @@ struct RadixClientConfig {
     std::string registry   = "etcd://127.0.0.1:2379";
     std::string cluster_id = "default";
     std::string node_name  = "";     // identity whose shm to attach (/shm/<node_name>)
-    std::string index_dev;            // empty = first available
-    int         gid_idx    = 3;
+    // Index-plane device / GID: explicit values win; empty / -1 = this node's published choice,
+    // or (observers) the local net_discovery rules.
+    std::string index_dev;
+    int         gid_idx    = -1;
     int         bootstrap_timeout_sec = 60;
     bool        rht_only   = false;  // build only RHT-plane QPs (eviction client)
     bool        no_local_tree = false;  // observer: no local server, rank -1, remote-only
