@@ -74,7 +74,7 @@ radix-server --name /my_kv_cache --data-bytes 1024G --mamba-ratio 0.2 \
 
 ### Client API
 
-A client connects to the local server by name and provides `query`, `pull_async`, and `insert`.
+A client connects to the local server by name and provides `query`, `pull_async`, `push_async`, and `insert`.
 
 1. **Initialize.** Construct the client with the server name and a `Geometry` (tokens per block and bytes per
    slot), then wait until the server is ready.
@@ -109,7 +109,17 @@ for slot in r.full_slots:
 r.finalize()                           # release the pin on the hit blocks
 ```
 
-4. **Insert.** To add new KV cache, query the local hit, allocate slots for the remaining blocks, copy the KV
+4. **Push.** `push_async()` is the reverse: it writes local slots to a peer and publishes them in the peer's
+   radix tree. A prefill server pushes its background-evicted KV to the decode nodes with it.
+
+```python
+q = client.query(hashes, local_only=True, lock=True)
+full = np.concatenate([s for _, _, s in q.full_fragments])
+r = client.push_async(peer_rank, hashes[:q.common_hit], full).wait()   # the peer holds [0, r.common_hit)
+q.finalize()
+```
+
+5. **Insert.** To add new KV cache, query the local hit, allocate slots for the remaining blocks, copy the KV
    from GPU straight into the slots through their memoryviews (zero-copy D2H), then insert.
 
 ```python

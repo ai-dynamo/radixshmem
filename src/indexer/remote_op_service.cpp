@@ -31,6 +31,8 @@ namespace {
 
 bool valid_count(int n) { return n >= 0 && n <= MAX_REMOTE_OP_BLOCKS; }
 
+bool valid_component(ComponentType c) { return (int)c < NUM_COMPONENT_TYPES; }
+
 // [start, start + length) inside [0, n).
 bool valid_range(int start, int length, int n) {
     return start >= 0 && length >= 0 && start <= n - length;
@@ -44,18 +46,56 @@ bool expired(RemoteOpService::Deadline deadline) {
 
 // ==================== RemoteOpService ====================
 
-AllocateReply RemoteOpService::allocate(int n, Deadline deadline) {
+AllocateReply RemoteOpService::allocate(int n, Deadline deadline,
+                                        ComponentType component) {
     // Allocate without hashes or dedup; insert consumes only the unmatched tail.
     AllocateReply out;
-    if (!valid_count(n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
+    if (!valid_count(n) || !valid_component(component)) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
     if (n == 0) return out;
     std::lock_guard<std::mutex> g(insert_mu_);
     if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
-    int got = tree_.allocate_slots(n, out.slots);
+    int got = tree_.allocate_slots(n, out.slots, component);
     if (got < n) {
-        tree_.recycle_slots(out.slots.data(), got);
+        tree_.recycle_slots(out.slots.data(), got, component);
         out.slots.clear();
         out.error = InsertError::MEMPOOL_FULL;
+    }
+    return out;
+}
+
+AllocateComponentsReply RemoteOpService::allocate_components(
+        const std::vector<ComponentCount>& components, Deadline deadline) {
+    AllocateComponentsReply out;
+    bool seen[NUM_COMPONENT_TYPES] = {};
+    int64_t total = 0;
+    for (const ComponentCount& c : components) {
+        if (!valid_component(c.component) || seen[(int)c.component] || !valid_count(c.n)) {
+            out.status = RemoteStatus::BAD_REQUEST;
+            return out;
+        }
+        seen[(int)c.component] = true;
+        total += c.n;
+    }
+    if (total > MAX_REMOTE_OP_BLOCKS) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    if (components.empty()) return out;
+    std::lock_guard<std::mutex> g(insert_mu_);
+    if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
+    out.slots.resize(components.size());
+    for (size_t i = 0; i < components.size(); i++) {
+        const ComponentCount& c = components[i];
+        if (c.n == 0 || tree_.allocate_slots(c.n, out.slots[i], c.component) == c.n) continue;
+        for (size_t j = 0; j <= i; j++)
+            tree_.recycle_slots(out.slots[j].data(), (int)out.slots[j].size(),
+                                components[j].component);
+        out.slots.clear();
+        out.error = InsertError::MEMPOOL_FULL;
+        return out;
     }
     return out;
 }
@@ -81,9 +121,9 @@ QueryReply RemoteOpService::query(const uint64_t* hashes, int n, bool lock,
 
 InsertResult RemoteOpService::insert(const uint64_t* hashes, int n, int start,
                                      int length, const int32_t* slots,
-                                     bool auto_recycle) {
+                                     bool auto_recycle, ComponentType component) {
     InsertResult out;
-    if (!valid_count(n) || !valid_range(start, length, n) ||
+    if (!valid_count(n) || !valid_range(start, length, n) || !valid_component(component) ||
         (n > 0 && !hashes) || (length > 0 && !slots)) {
         out.error = InsertError::REMOTE_FAILED;
         out.remote_status = RemoteStatus::BAD_REQUEST;
@@ -92,13 +132,41 @@ InsertResult RemoteOpService::insert(const uint64_t* hashes, int n, int start,
     if (length == 0) return out;
     std::lock_guard<std::mutex> g(insert_mu_);
     // auto_recycle: the target recycles the surplus; else the initiator does.
-    return client_.insert(hashes, n, slots, length, start, auto_recycle);
+    return client_.insert(hashes, n, slots, length, start, auto_recycle, component);
 }
 
-RemoteStatus RemoteOpService::recycle(const int32_t* slots, int num_slots) {
-    if (!valid_count(num_slots) || (num_slots > 0 && !slots))
+InsertPathResult RemoteOpService::insert_path(const uint64_t* hashes, int n, int start,
+                                              int length, const int32_t* full_slots,
+                                              const std::vector<ComponentRun>& runs,
+                                              bool auto_recycle) {
+    InsertPathResult out;
+    out.runs.resize(runs.size());
+    bool sane = valid_count(n) && valid_range(start, length, n) && (n == 0 || hashes) &&
+                (length == 0 || full_slots) && runs.size() <= (size_t)MAX_REMOTE_OP_BLOCKS;
+    for (const ComponentRun& r : runs)
+        sane = sane && (r.component == ComponentType::SWA || r.component == ComponentType::MAMBA) &&
+               r.end > 0 && r.end <= n && !r.slots.empty() && (int)r.slots.size() <= r.end &&
+               (r.component == ComponentType::SWA || r.slots.size() == 1);
+    if (!sane) {
+        out.remote_status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    std::lock_guard<std::mutex> g(insert_mu_);
+    if (length > 0)
+        out.full = client_.insert(hashes, n, full_slots, length, start, auto_recycle,
+                                  ComponentType::FULL);
+    for (size_t i = 0; i < runs.size(); i++)
+        out.runs[i] = client_.insert(hashes, runs[i].end, runs[i].slots.data(),
+                                     (int)runs[i].slots.size(), 0, auto_recycle,
+                                     runs[i].component);
+    return out;
+}
+
+RemoteStatus RemoteOpService::recycle(const int32_t* slots, int num_slots,
+                                      ComponentType component) {
+    if (!valid_count(num_slots) || (num_slots > 0 && !slots) || !valid_component(component))
         return RemoteStatus::BAD_REQUEST;
-    if (num_slots > 0) tree_.recycle_slots(slots, num_slots);
+    if (num_slots > 0) tree_.recycle_slots(slots, num_slots, component);
     return RemoteStatus::OK;
 }
 

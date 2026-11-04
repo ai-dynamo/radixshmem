@@ -13,7 +13,7 @@
 
 namespace radixshmem {
 
-static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 12; // 12: grpc remote-op transport
+static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 13; // 13: remote-op component pool
 static constexpr uint32_t CLUSTER_MANIFEST_HOST_LEN = 64;
 static constexpr uint32_t CLUSTER_MANIFEST_ENTRY_SIZE = 352;
 static constexpr uint32_t CLUSTER_RHT_NAME_LEN = 64;

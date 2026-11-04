@@ -7,6 +7,7 @@
 
 #include "radix_tree.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -44,9 +45,12 @@ public:
     void drop_all();
     void inflight_slots(uint64_t out[NUM_COMPONENT_TYPES]) const;
     WritebackStats stats() const;
+    void set_active(bool on) { active_.store(on, std::memory_order_relaxed); }
+    bool active() const { return active_.load(std::memory_order_relaxed); }
 
 private:
     RadixShmemTree& tree_;
+    std::atomic<bool> active_{false};
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::deque<WritebackTask> queued_;

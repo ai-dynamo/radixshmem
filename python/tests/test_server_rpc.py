@@ -13,6 +13,7 @@ import pytest
 
 import radixshmem
 from radixshmem import Geometry, RadixClient, RadixServer, ServerConfig
+from radixshmem.client import XFER_IN_FLIGHT
 
 pytestmark = pytest.mark.skipif(not hasattr(radixshmem, "_data"), reason="radixshmem._data not built")
 
@@ -520,7 +521,7 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
         x.hang.add(x.n + 1)
         t3 = srv.submit([item], 100)
         rep = collect([t3])[t3][0]
-        assert rep[0] is False and "TIMEOUT" in rep[3] and srv._zombies == [x.n]
+        assert rep[0] is False and rep[3] == XFER_IN_FLIGHT and srv._zombies == [x.n]
 
         x.reject = True
         t4 = srv.submit([item], 1000)

@@ -14,16 +14,25 @@ namespace radixshmem {
 class IRemoteOpClientTransport {
 public:
     virtual ~IRemoteOpClientTransport() = default;
-    virtual AllocateReply allocate(int n) = 0;
+    virtual AllocateReply allocate(int n, ComponentType component = ComponentType::FULL) = 0;
+    virtual AllocateComponentsReply allocate_components(
+        const std::vector<ComponentCount>& components) = 0;
     virtual QueryReply query(const uint64_t* hashes, int n, bool lock,
                              bool update_meta) = 0;
     virtual InsertResult insert(const uint64_t* hashes, int n, int start,
                                 int length, const int32_t* slots,
-                                bool auto_recycle) = 0;
-    virtual RemoteStatus recycle(const int32_t* slots, int num_slots) = 0;
+                                bool auto_recycle,
+                                ComponentType component = ComponentType::FULL) = 0;
+    virtual InsertPathResult insert_path(const uint64_t* hashes, int n, int start, int length,
+                                         const int32_t* full_slots,
+                                         const std::vector<ComponentRun>& runs,
+                                         bool auto_recycle) = 0;
+    virtual RemoteStatus recycle(const int32_t* slots, int num_slots,
+                                 ComponentType component = ComponentType::FULL) = 0;
     virtual RemoteStatus unlock(const uint64_t* hashes, int n, int start,
                                 int length, int pin_end,
                                 const std::vector<uint64_t>& pin_tail) = 0;
+    virtual bool connected() = 0;
 };
 
 // The gRPC server's TCP endpoint.

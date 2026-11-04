@@ -9,8 +9,10 @@ package radixshmem.remoteops.v1;
 
 service RemoteOps {
   rpc Allocate(AllocateRequest) returns (AllocateResponse);
+  rpc AllocateComponents(AllocateComponentsRequest) returns (AllocateComponentsResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
   rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc InsertPath(InsertPathRequest) returns (InsertPathResponse);
   rpc Recycle(RecycleRequest) returns (RecycleResponse);
   rpc Unlock(UnlockRequest) returns (UnlockResponse);
 }
@@ -27,13 +29,37 @@ enum InsertError {
   INSERT_ERROR_FULL_PATH_MISSING = 7;
 }
 
+// Mirrors radixshmem::ComponentType (component_kind.h); the pool an op works on.
+enum Component {
+  COMPONENT_FULL = 0;
+  COMPONENT_SWA = 1;
+  COMPONENT_MAMBA = 2;
+}
+
 // Reserve `num_blocks` slots; no hashes, no dedup. All-or-nothing.
 message AllocateRequest {
   int32 num_blocks = 1;
+  Component component = 2;
 }
 message AllocateResponse {
   InsertError error = 1;
   repeated int32 slots = 2;  // num_blocks entries when error is OK, else empty
+}
+
+// Reserve slots from several pools at once; all of them or none.
+message ComponentCount {
+  Component component = 1;
+  int32 num_blocks = 2;
+}
+message AllocateComponentsRequest {
+  repeated ComponentCount components = 1;
+}
+message ComponentSlots {
+  repeated int32 slots = 1;
+}
+message AllocateComponentsResponse {
+  InsertError error = 1;
+  repeated ComponentSlots components = 2;  // one per request entry when error is OK, else none
 }
 
 message QueryRequest {
@@ -54,15 +80,34 @@ message InsertRequest {
   repeated int32 slots = 2;
   int32 start = 3;
   bool auto_recycle = 4;  // target recycles the slots it did not consume
+  Component component = 5;
 }
 message InsertResponse {
   InsertError error = 1;
   repeated int32 unused_slots = 2;
 }
 
+message ComponentRun {
+  Component component = 1;
+  int32 end = 2;
+  repeated int32 slots = 3;
+}
+message InsertPathRequest {
+  repeated fixed64 hashes = 1;
+  int32 start = 2;
+  repeated int32 full_slots = 3;
+  repeated ComponentRun runs = 4;
+  bool auto_recycle = 5;
+}
+message InsertPathResponse {
+  InsertResponse full = 1;
+  repeated InsertResponse runs = 2;
+}
+
 // Return slots that were allocated but never published.
 message RecycleRequest {
   repeated int32 slots = 1;
+  Component component = 2;
 }
 message RecycleResponse {}
 

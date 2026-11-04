@@ -10,13 +10,13 @@ import struct
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import radixshmem
-from radixshmem import Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler, writeback
-from radixshmem.writeback import load_handler
+from radixshmem import ClusterConfig, Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler, writeback
 
 pytestmark = pytest.mark.skipif(not hasattr(radixshmem, "_data"), reason="radixshmem._data not built")
 
@@ -32,7 +32,7 @@ def cfg(tmp_path):
 
     def make(**kw):
         kw = {"data_bytes": 4 << 20, "slot_align": 64, "prefault": False, "background_evict_ratio": 0.25,
-              "writeback": True, "writeback_max_held_ratio": 0.05, **kw}
+              "writeback_max_held_ratio": 0.05, **kw}
         return ServerConfig(name=make.name, endpoint=make.endpoint, **kw)
 
     make.name, make.endpoint = f"/py_wb_{tag}", f"unix://{tmp_path}/{tag}.sock"
@@ -86,6 +86,10 @@ class Recorder(WritebackHandler):
         self.stopped = True
         self.unblock.set()
 
+    def stats(self):
+        with self.mu:
+            return {"written": len(self.tasks)}
+
 
 class ReadyAtStart(Recorder):
     def start(self, client):
@@ -93,16 +97,16 @@ class ReadyAtStart(Recorder):
         super().start(client)
 
 
-def make_handler(config):
-    return Recorder(**config)
+def with_handler(c, handler):
+    class Server(RadixServer):
+        def _make_writeback_handler(self):
+            return handler
 
-
-def returns_none(config):
-    return None
+    return Server(c)
 
 
 def up(c, handler):
-    srv = RadixServer(c, writeback=handler).start()
+    srv = with_handler(c, handler).start()
     cl = RadixClient(c.name, Geometry(block_size=4, full_slot_bytes=8192, register_chunk_tokens=16),
                      endpoint=c.endpoint)
     cl.wait_ready(30)
@@ -135,17 +139,17 @@ def test_handler_gets_whole_prefixes_with_intact_data(cfg):
     srv, cl = up(cfg(), rec)
     try:
         assert rec.client is not None and rec.client.store is not None
-        seqs = fill(cl, 10)                                  # 400 of 512: below the 25% free mark
+        seqs = fill(cl, 11)                                  # 440 of 512: two sequences to evict
         wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
         st = srv.stats()["writeback"]
-        assert st["produced"] == st["completed"] == len(rec.tasks) > 1
+        assert st["produced"] == st["completed"] == len(rec.tasks) == st["written"] > 1
         assert st["held_slots"] == (0, 0, 0) and st["inflight_slots"] == (0, 0, 0)
         for t, data, hit in zip(rec.tasks, rec.data, rec.hits):
-            assert t.end - t.evicted_from == 4 and t.end % 4 == 0
+            assert t.end == SEQ_BLOCKS and t.evicted_from == 0   # unshared: one chain, root to leaf
             owner = [h for h in seqs if np.array_equal(h[:t.end], t.hashes)]
             assert len(owner) == 1                           # a whole prefix of one sequence
             assert data == [struct.pack("<Q", int(x)) for x in t.hashes]
-            assert hit == t.evicted_from                     # the prefix was still in the tree
+            assert hit == t.evicted_from                     # [0, evicted_from) is still in the tree
             assert len(t.swa_slots) == 0 and len(t.mamba_ends) == 0
         assert all(rec.valid) and not rec.tasks[0].valid()   # valid until done
         rec.client.geometry["pools"] = None
@@ -155,6 +159,45 @@ def test_handler_gets_whole_prefixes_with_intact_data(cfg):
         cl.close()
         srv.close()
     assert rec.stopped
+
+
+class Switch(Recorder):
+    def __init__(self):
+        super().__init__()
+        self.on = False
+
+    def active(self):
+        return self.on
+
+
+def test_inactive_handler_lets_background_eviction_recycle_at_once(cfg):
+    rec = Switch()
+    srv, cl = up(cfg(), rec)
+    try:
+        assert srv.stats()["writeback"]["active"] is False
+        fill(cl, 11)
+        wait_for(lambda: cl.mempool_free() >= THRESHOLD)
+        st = srv.stats()["writeback"]
+        assert st["produced"] == st["queued"] == st["popped"] == 0 and rec.tasks == []
+        assert st["held_slots"] == (0, 0, 0) and st["inflight_slots"] == (0, 0, 0)
+        assert cl.check_health() == 0
+
+        rec.on = True
+        wait_for(lambda: srv.stats()["writeback"]["active"])
+        fill(cl, 3, first=11)
+        wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
+        st = srv.stats()["writeback"]
+        assert st["produced"] == st["completed"] == len(rec.tasks) > 0
+
+        rec.on = False
+        wait_for(lambda: not srv.stats()["writeback"]["active"])
+        produced = st["produced"]
+        fill(cl, 3, first=14)
+        wait_for(lambda: cl.mempool_free() >= THRESHOLD)
+        assert srv.stats()["writeback"]["produced"] == produced
+    finally:
+        cl.close()
+        srv.close()
 
 
 def test_unfinished_writebacks_pause_background_eviction(cfg):
@@ -167,7 +210,7 @@ def test_unfinished_writebacks_pause_background_eviction(cfg):
         st = srv.stats()["writeback"]
         # one task already covers SEQ_BLOCKS > LIMIT slots: nothing else is evicted
         assert st["produced"] == 1 and st["inflight_slots"][0] == SEQ_BLOCKS > LIMIT
-        assert st["held_slots"][0] == 4
+        assert st["held_slots"][0] == SEQ_BLOCKS
         free = cl.mempool_free()
         assert free == SLOTS - 10 * SEQ_BLOCKS               # held slots are not free
 
@@ -217,7 +260,7 @@ def test_base_exception_does_not_end_the_thread(cfg):
     rec = Recorder(fail=1, error=asyncio.CancelledError())
     srv, cl = up(cfg(), rec)
     try:
-        fill(cl, 10)
+        fill(cl, 11)
         wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
         st = srv.stats()["writeback"]
         assert st["failed"] == 1 and len(rec.tasks) > 0      # later batches were still written
@@ -284,25 +327,151 @@ def test_close_stops_a_stuck_write(cfg, monkeypatch):
 
 
 def test_config_and_cli(cfg):
-    with pytest.raises(ValueError, match="go together"):
-        RadixServer(cfg())
-    with pytest.raises(ValueError, match="go together"):
-        RadixServer(cfg(writeback=False), writeback=Recorder())
-    with pytest.raises(ValueError, match="background eviction"):
-        cfg(background_evict_ratio=0.0)
     with pytest.raises(ValueError, match="writeback_max_held_ratio"):
         cfg(writeback_max_held_ratio=0.0)
 
     from radixshmem import cli
 
-    a = cli.parse_args(["--data-bytes", "64M", "--writeback-handler", "test_writeback:make_handler",
-                        "--writeback-config", '{"hold": true}', "--writeback-max-held", "0.1"])
-    c = cli.build_config(a)
-    assert c.writeback and c.writeback_max_held_ratio == 0.1
-    h = load_handler(a.writeback_handler, cli.writeback_config(a.writeback_config))
-    assert isinstance(h, Recorder) and h.hold
-    assert not cli.build_config(cli.parse_args([])).writeback
-    with pytest.raises(ValueError, match="module:factory"):
-        load_handler("no_colon", {})
-    with pytest.raises(TypeError, match="not a WritebackHandler"):
-        load_handler("test_writeback:returns_none", {})
+    c = cli.build_config(cli.parse_args(["--data-bytes", "64M", "--writeback-max-held", "0.1"]))
+    assert c.writeback_max_held_ratio == 0.1
+
+
+def test_role_picks_the_handler(cfg):
+    cluster = ClusterConfig(expected_min_nodes=2, registry="etcd://127.0.0.1:2379", rpc_address="127.0.0.1")
+    assert isinstance(RadixServer(cfg(cluster=cluster)).writeback_handler, writeback.PeerWriteback)
+    assert RadixServer(cfg(cluster=cluster, role="decode")).writeback_handler is None
+    assert RadixServer(cfg(cluster=cluster, background_evict_ratio=0.0)).writeback_handler is None
+    assert RadixServer(cfg(cluster=cluster, data_bytes=0)).writeback_handler is None
+    assert RadixServer(cfg()).writeback_handler is None
+
+
+class StubJob:
+    def __init__(self, complete, no_space):
+        self.complete = complete
+        self.no_space = no_space
+
+    def wait(self, timeout=None):
+        return self
+
+
+class StubClient:
+    def __init__(self, role, complete=True, no_space=False):
+        self.info = SimpleNamespace(role=role)
+        self.complete, self.no_space = complete, no_space
+        self.mu, self.running, self.peak, self.delay = threading.Lock(), 0, 0, 0.0
+        self.pushes = []
+        self.components = []
+
+    def rank(self):
+        return 0
+
+    def nodes(self):
+        return [{"rank": r, "mode": "ready", "data_plane": True, "role": role}
+                for r, role in ((0, self.info.role), (1, "decode"), (2, "decode"), (3, "prefill"))]
+
+    def push_async(self, rank, hashes, full_slots, swa=(), mamba=(), **kw):
+        with self.mu:
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        time.sleep(self.delay)
+        with self.mu:
+            self.running -= 1
+        self.pushes.append((rank, len(hashes)))
+        self.components.append(([(e, [int(x) for x in s]) for e, s in swa], list(mamba)))
+        return StubJob(self.complete, self.no_space)
+
+
+def task(task_id, n, first=1):
+    return writeback.WritebackTask(task_id, np.arange(first, first + n, dtype=np.uint64),
+                                   np.arange(n, dtype=np.int32), np.empty(0, np.int32),
+                                   np.empty(0, np.uint32), np.empty(0, np.int32), 0, 0)
+
+
+def peer_writeback(role, complete=True, no_space=False):
+    h = writeback.PeerWriteback()
+    h.start(StubClient(role, complete, no_space))
+    if role != "decode":
+        h._refresh()
+    return h
+
+
+def test_peer_writeback_is_active_while_a_decode_node_is_ready(capfd):
+    h = peer_writeback("prefill")
+    assert h.active() and h._targets == [1, 2]
+    roles = {1: "decode", 2: "decode", 3: "prefill"}
+    h.client.nodes = lambda: [{"rank": r, "mode": "ready", "data_plane": True, "role": role}
+                              for r, role in roles.items()]
+    roles[1] = roles[2] = "prefill"
+    h._refresh()
+    assert not h.active()
+    done = []
+    h.write([task(1, 8)], done.extend)
+    assert done == [1] and h.client.pushes == [] and h.stats()["no_target"] == 1
+
+    roles[2] = "decode"
+    h._refresh()
+    assert h.active() and h._targets == [2]
+
+    def down():
+        raise ConnectionError("etcd down")
+    h.client.nodes = down
+    capfd.readouterr()
+    h._refresh()
+    h._refresh()
+    assert h.active() and h._targets == [2]
+    assert capfd.readouterr().err.count("cannot read the node list") == 1
+
+    h.stop()
+    d = peer_writeback("decode")
+    assert not d.active() and d._targets == []
+
+
+def test_peer_writeback_counts_tasks_and_skips_long_paths():
+    h = peer_writeback("prefill")
+    done = []
+    h.write([task(1, 8), task(2, 8, first=2), task(3, radixshmem.MAX_REMOTE_OP_BLOCKS + 1)], done.extend)
+    assert done == [1, 2, 3]
+    assert sorted(h.client.pushes) == [(1, 8), (2, 8)]
+    assert h.stats() == {"pushed": 2, "incomplete": 0, "no_space": 0, "no_target": 0, "too_long": 1}
+
+    h = peer_writeback("prefill", complete=False)
+    h.write([task(1, radixshmem.MAX_REMOTE_OP_BLOCKS)], done.extend)
+    assert h.client.pushes == [(2, radixshmem.MAX_REMOTE_OP_BLOCKS)]
+    assert h.stats() == {"pushed": 0, "incomplete": 1, "no_space": 0, "no_target": 0, "too_long": 0}
+
+    h = peer_writeback("prefill", complete=False, no_space=True)
+    h.write([task(1, 8), task(2, 8, first=2)], done.extend)
+    assert h.stats() == {"pushed": 0, "incomplete": 0, "no_space": 2, "no_target": 0, "too_long": 0}
+
+
+def test_peer_writeback_pushes_a_batch_in_parallel():
+    h = peer_writeback("prefill")
+    h.client.delay = 0.2
+    done = []
+    t0 = time.monotonic()
+    h.write([task(i, 8, first=i) for i in range(1, 33)], done.extend)
+    assert time.monotonic() - t0 < 1.0
+    assert h.client.peak == writeback.PUSH_THREADS and len(h.client.pushes) == 32
+    assert done == list(range(1, 33)) and h.stats()["pushed"] == 32
+    h.stop()
+    with pytest.raises(RuntimeError):
+        h.write([task(40, 8)], done.extend)
+
+
+def test_peer_writeback_pushes_the_components_of_the_whole_chain():
+    h = peer_writeback("prefill")
+    x = radixshmem.INVALID_COMPONENT_SLOT
+    t = writeback.WritebackTask(1, np.arange(1, 9, dtype=np.uint64), np.arange(8, dtype=np.int32),
+                                np.array([x, 50, 51, 52, 53, x, x, 57], dtype=np.int32),
+                                np.array([2, 5, 8], dtype=np.uint32), np.array([60, 61, 62], dtype=np.int32), 3, 0)
+    h.write([t], lambda ids: None)
+    assert h.client.components == [([(5, [50, 51, 52, 53]), (8, [57])], [(5, 61), (8, 62)])]
+
+
+def test_peer_writeback_pushes_nothing_from_a_decode_node(capfd):
+    h = peer_writeback("decode")
+    assert "decode node" in capfd.readouterr().err
+    done = []
+    h.write([task(1, 8), task(2, 8, first=2)], done.extend)
+    assert done == [1, 2] and h.client.pushes == []
+    assert h.stats() == {"pushed": 0, "incomplete": 0, "no_space": 0, "no_target": 2, "too_long": 0}

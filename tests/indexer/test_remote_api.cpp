@@ -457,6 +457,43 @@ int run_full_dedup() {
     }
 }
 
+// ---- #11: remote_query(lock) pin across a split at the hit — finalize releases both halves ----
+int run_lock_split() {
+    try {
+        auto old_path = make_hashes(8000, 8);
+        if (seed_prefix_on_B(old_path, /*pin=*/false) != 8) return 130;
+        std::vector<int64_t> tok = {8000, 8001, 8002, 8500, 8501};
+        auto h = radixshmem::RadixClient::compute_hashes(tok.data(), 5, kBlockSize);
+
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
+        auto q = cli.remote_query(kTargetRank, h.data(), 5, /*lock=*/true);
+        if (q.status != radixshmem::RemoteStatus::OK || q.total_hit_length != 3 || !q.finalize)
+            return 131;
+        evict_pressure_on_B();
+        if (b_local_hit(old_path) != 8) {
+            fprintf(stderr, "[lock_split] pinned terminal was evicted\n");
+            return 132;
+        }
+
+        auto rep = cli.remote_allocate(kTargetRank, 2);
+        if (rep.status != radixshmem::RemoteStatus::OK || rep.slots.size() != 2) return 133;
+        auto ins = cli.remote_insert(kTargetRank, h.data(), 5, 3, 2, rep.slots.data());
+        if (ins.error != radixshmem::InsertError::OK || !ins.unused_slots.empty()) return 134;
+
+        q.finalize();
+        evict_pressure_on_B();
+        if (b_local_hit(old_path) != 0 || b_local_hit(h) != 0) {
+            fprintf(stderr, "[lock_split] a half of the split survived eviction (leaked ref?)\n");
+            return 135;
+        }
+        fprintf(stderr, "[lock_split] OK pin held the terminal, finalize released both halves\n");
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[lock_split] exception: %s\n", e.what());
+        return 136;
+    }
+}
+
 // ---- #2 + #3: target dead → TIMEOUT or UNAVAILABLE; cached session stays safe ----
 // The two sync fds reach the re-exec'd child as argv numbers; they survive execv (not CLOEXEC).
 int g_to_parent_fd = -1, g_from_parent_fd = -1;
@@ -524,6 +561,7 @@ int client_main(int argc, char** argv) {
     if (cs == "insert_finalize")   return run_insert_finalize();
     if (cs == "release_abort")     return run_release_abort();
     if (cs == "full_dedup")        return run_full_dedup();
+    if (cs == "lock_split")        return run_lock_split();
     if (cs == "timeout_rebuild") {
         // argv[3]/argv[4]: fd numbers for parent sync (survive execv).
         g_to_parent_fd   = std::atoi(argv[3]);
@@ -599,6 +637,7 @@ int main(int argc, char** argv) {
     run_case("insert_finalize");   // #7
     run_case("release_abort");     // #8
     run_case("full_dedup");        // #9
+    run_case("lock_split");        // #11
 
     // #2/#3/#10 last: pipe-synchronized kill and restart of B (nothing runs after it). The child
     // is re-exec'd; the two sync-pipe fd numbers ride on its argv (not CLOEXEC).

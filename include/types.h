@@ -388,6 +388,17 @@ struct AllocateReply {
     std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
 };
 
+struct ComponentCount {
+    ComponentType component = ComponentType::FULL;
+    int n = 0;
+};
+
+struct AllocateComponentsReply {
+    RemoteStatus status = RemoteStatus::OK;
+    InsertError  error  = InsertError::OK;
+    std::vector<std::vector<int32_t>> slots;
+};
+
 struct QueryReply {
     RemoteStatus status = RemoteStatus::OK;
     int hit_length       = 0;   // B local-tree total matched blocks
@@ -411,6 +422,18 @@ struct InsertResult {
     uint32_t split_node_id = INVALID_NODE_ID;
     uint32_t split_num_blocks = 0;
     uint64_t split_first_hash = 0;
+};
+
+struct ComponentRun {
+    ComponentType component = ComponentType::SWA;
+    int end = 0;
+    std::vector<int32_t> slots;
+};
+
+struct InsertPathResult {
+    RemoteStatus remote_status = RemoteStatus::OK;
+    InsertResult full;
+    std::vector<InsertResult> runs;
 };
 
 struct NodeBoundary {

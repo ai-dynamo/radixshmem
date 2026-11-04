@@ -957,18 +957,28 @@ static void release_remote_pin(RemotePeer& peer, const std::vector<uint64_t>& ha
                 peer.peer_rank(), (int)st);
 }
 
-AllocateReply RadixClient::remote_allocate(int rank, int n) {
+AllocateReply RadixClient::remote_allocate(int rank, int n, ComponentType component) {
     AllocateReply out;
     if (n <= 0) return out;                       // nothing to allocate, status OK
     auto p = peer_for(rank);
     if (!p) { out.status = missing_peer_status(rank); return out; }
-    return p->allocate(n);            // serializes + caps internally
+    return p->allocate(n, component); // serializes + caps internally
+}
+
+AllocateComponentsReply RadixClient::remote_allocate_components(
+        int rank, const std::vector<ComponentCount>& components) {
+    AllocateComponentsReply out;
+    if (components.empty()) return out;
+    auto p = peer_for(rank);
+    if (!p) { out.status = missing_peer_status(rank); return out; }
+    return p->allocate_components(components);
 }
 
 InsertResult RadixClient::remote_insert(int rank,
                                         const uint64_t* hashes, int n,
                                         int start, int length,
-                                        const int32_t* slots, bool auto_recycle) {
+                                        const int32_t* slots, bool auto_recycle,
+                                        ComponentType component) {
     InsertResult out;
     auto p = peer_for(rank);
     if (!p) {
@@ -976,14 +986,29 @@ InsertResult RadixClient::remote_insert(int rank,
         out.remote_status = missing_peer_status(rank);
         return out;
     }
-    return p->insert(hashes, n, start, length, slots, auto_recycle);
+    return p->insert(hashes, n, start, length, slots, auto_recycle, component);
 }
 
-RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
+InsertPathResult RadixClient::remote_insert_path(int rank, const uint64_t* hashes, int n,
+                                                 int start, int length, const int32_t* full_slots,
+                                                 const std::vector<ComponentRun>& runs,
+                                                 bool auto_recycle) {
+    auto p = peer_for(rank);
+    if (p) return p->insert_path(hashes, n, start, length, full_slots, runs, auto_recycle);
+    InsertPathResult out;
+    out.remote_status = missing_peer_status(rank);
+    out.full.error = InsertError::REMOTE_FAILED;
+    out.full.remote_status = out.remote_status;
+    out.runs.assign(runs.size(), out.full);
+    return out;
+}
+
+RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                         ComponentType component) {
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
     auto p = peer_for(rank);
     if (!p) return missing_peer_status(rank);
-    return retry_unexecuted([&] { return p->recycle(slots, num_slots); });
+    return retry_unexecuted([&] { return p->recycle(slots, num_slots, component); });
 }
 
 QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,

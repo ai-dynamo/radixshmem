@@ -8,6 +8,7 @@
 #ifdef RADIXSHMEM_HAS_GRPC
 
 #include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
+#include "cluster_protocol.h"
 
 #include <cstdint>
 #include <memory>
@@ -16,7 +17,7 @@
 
 namespace radixshmem {
 
-constexpr int kGrpcRemoteOpMaxMessageBytes = 64 * 1024;
+constexpr int kGrpcRemoteOpMaxMessageBytes = MAX_REMOTE_OP_MESSAGE_BYTES;
 constexpr int kGrpcRemoteOpKeepaliveMs = 10000;
 constexpr const char* kGrpcRemoteOpInstanceKey = "radixshmem-instance";
 
@@ -34,15 +35,23 @@ public:
     GrpcRemoteOpClientTransport(const GrpcRemoteOpClientTransport&) = delete;
     GrpcRemoteOpClientTransport& operator=(const GrpcRemoteOpClientTransport&) = delete;
 
-    AllocateReply allocate(int n) override;
+    AllocateReply allocate(int n, ComponentType component = ComponentType::FULL) override;
     QueryReply query(const uint64_t* hashes, int n, bool lock,
                      bool update_meta) override;
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
-                        const int32_t* slots, bool auto_recycle) override;
-    RemoteStatus recycle(const int32_t* slots, int num_slots) override;
+                        const int32_t* slots, bool auto_recycle,
+                        ComponentType component = ComponentType::FULL) override;
+    AllocateComponentsReply allocate_components(
+        const std::vector<ComponentCount>& components) override;
+    InsertPathResult insert_path(const uint64_t* hashes, int n, int start, int length,
+                                 const int32_t* full_slots, const std::vector<ComponentRun>& runs,
+                                 bool auto_recycle) override;
+    RemoteStatus recycle(const int32_t* slots, int num_slots,
+                         ComponentType component = ComponentType::FULL) override;
     RemoteStatus unlock(const uint64_t* hashes, int n, int start,
                         int length, int pin_end,
                         const std::vector<uint64_t>& pin_tail) override;
+    bool connected() override;
 
 private:
     struct Impl;
