@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "context.hpp"
+#include "net_discovery.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -17,25 +18,31 @@ RdmaContext::RdmaContext(const char* dev_name, int port, int gid_idx)
     if (const char* s = ::getenv("RADIXSHMEM_RDMA_SL")) sl_ = atoi(s);
     if (const char* t = ::getenv("RADIXSHMEM_RDMA_TC")) tc_ = atoi(t);
 
+    // The caller chooses the device (net_discovery settles an empty config); a negative GID index
+    // means the device's own auto choice, so one device name is enough to open a context.
+    if (!dev_name || !*dev_name)
+        throw std::runtime_error("RdmaContext: no RDMA device chosen (see net_discovery / index_dev)");
+    if (gid_idx_ < 0) {
+        NetSelectionInput in;
+        in.index_dev = dev_name;
+        gid_idx_ = resolve_net(in).index.gid_index;
+    }
+
     int num_devices = 0;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
     if (!dev_list || num_devices == 0)
         throw std::runtime_error("No RDMA devices found");
 
     ibv_device* dev = nullptr;
-    if (dev_name) {
-        for (int i = 0; i < num_devices; i++) {
-            if (strcmp(ibv_get_device_name(dev_list[i]), dev_name) == 0) {
-                dev = dev_list[i];
-                break;
-            }
+    for (int i = 0; i < num_devices; i++) {
+        if (strcmp(ibv_get_device_name(dev_list[i]), dev_name) == 0) {
+            dev = dev_list[i];
+            break;
         }
-        if (!dev) {
-            ibv_free_device_list(dev_list);
-            throw std::runtime_error(std::string("RDMA device not found: ") + dev_name);
-        }
-    } else {
-        dev = dev_list[0];
+    }
+    if (!dev) {
+        ibv_free_device_list(dev_list);
+        throw std::runtime_error(std::string("RDMA device not found: ") + dev_name);
     }
 
     ctx_ = ibv_open_device(dev);
