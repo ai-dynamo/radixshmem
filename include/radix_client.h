@@ -53,6 +53,8 @@ public:
     // pure slot alloc from the target's `component` pool; no hashes, no dedup
     AllocateReply allocate(int n, ComponentType component = ComponentType::FULL);
 
+    AllocateComponentsReply allocate_components(const std::vector<ComponentCount>& components);
+
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
                         const int32_t* slots, bool auto_recycle = true,
                         ComponentType component = ComponentType::FULL);
@@ -182,6 +184,9 @@ public:
     // Phase 1: allocate `n` slots from the peer's `component` pool (no hashes, no dedup).
     AllocateReply remote_allocate(int rank, int n,
                                   ComponentType component = ComponentType::FULL);
+
+    AllocateComponentsReply remote_allocate_components(
+        int rank, const std::vector<ComponentCount>& components);
 
     // Phase 2: publish `slots` on the peer; dedup + surplus recycle happen here.
     // FULL is the positional prefix insert; SWA / MAMBA follow the local insert's

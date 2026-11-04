@@ -9,6 +9,7 @@ package radixshmem.remoteops.v1;
 
 service RemoteOps {
   rpc Allocate(AllocateRequest) returns (AllocateResponse);
+  rpc AllocateComponents(AllocateComponentsRequest) returns (AllocateComponentsResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
   rpc Insert(InsertRequest) returns (InsertResponse);
   rpc InsertPath(InsertPathRequest) returns (InsertPathResponse);
@@ -43,6 +44,22 @@ message AllocateRequest {
 message AllocateResponse {
   InsertError error = 1;
   repeated int32 slots = 2;  // num_blocks entries when error is OK, else empty
+}
+
+// Reserve slots from several pools at once; all of them or none.
+message ComponentCount {
+  Component component = 1;
+  int32 num_blocks = 2;
+}
+message AllocateComponentsRequest {
+  repeated ComponentCount components = 1;
+}
+message ComponentSlots {
+  repeated int32 slots = 1;
+}
+message AllocateComponentsResponse {
+  InsertError error = 1;
+  repeated ComponentSlots components = 2;  // one per request entry when error is OK, else none
 }
 
 message QueryRequest {

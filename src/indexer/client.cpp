@@ -965,6 +965,15 @@ AllocateReply RadixClient::remote_allocate(int rank, int n, ComponentType compon
     return p->allocate(n, component); // serializes + caps internally
 }
 
+AllocateComponentsReply RadixClient::remote_allocate_components(
+        int rank, const std::vector<ComponentCount>& components) {
+    AllocateComponentsReply out;
+    if (components.empty()) return out;
+    auto p = peer_for(rank);
+    if (!p) { out.status = missing_peer_status(rank); return out; }
+    return p->allocate_components(components);
+}
+
 InsertResult RadixClient::remote_insert(int rank,
                                         const uint64_t* hashes, int n,
                                         int start, int length,

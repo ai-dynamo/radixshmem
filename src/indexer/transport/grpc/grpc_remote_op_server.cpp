@@ -89,6 +89,24 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
         });
     }
 
+    grpc::Status AllocateComponents(grpc::ServerContext* ctx,
+                                    const pb::AllocateComponentsRequest* req,
+                                    pb::AllocateComponentsResponse* rep) override {
+        return run(ctx, [&] {
+            std::vector<ComponentCount> components(req->components_size());
+            for (int i = 0; i < req->components_size(); i++) {
+                components[i].component = static_cast<ComponentType>(req->components(i).component());
+                components[i].n = req->components(i).num_blocks();
+            }
+            AllocateComponentsReply r = svc->allocate_components(components, ctx->deadline());
+            if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
+            rep->set_error(static_cast<pb::InsertError>(r.error));
+            for (const std::vector<int32_t>& s : r.slots)
+                rep->add_components()->mutable_slots()->Add(s.begin(), s.end());
+            return grpc::Status::OK;
+        });
+    }
+
     grpc::Status Query(grpc::ServerContext* ctx, const pb::QueryRequest* req,
                        pb::QueryResponse* rep) override {
         return run(ctx, [&] {

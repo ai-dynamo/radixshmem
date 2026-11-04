@@ -710,6 +710,22 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("rank"), py::arg("n"), py::arg("component") = ComponentType::FULL,
            "Phase 1: allocate `n` slots from `rank`'s `component` pool (no hashes, no dedup).")
 
+        .def("remote_allocate_components", [](RadixClient& c, int rank, py::list components) {
+            std::vector<ComponentCount> counts;
+            counts.reserve(components.size());
+            for (const py::handle& item : components) {
+                auto t = item.cast<py::tuple>();
+                if (t.size() != 2)
+                    throw std::runtime_error("components entries are (component, n)");
+                counts.push_back(ComponentCount{t[0].cast<ComponentType>(), t[1].cast<int>()});
+            }
+            AllocateComponentsReply rep;
+            { py::gil_scoped_release rel; rep = c.remote_allocate_components(rank, counts); }
+            return rep;
+        }, py::arg("rank"), py::arg("components"),
+           "Phase 1 for several pools: allocate n slots from each (component, n) pool of `rank`, "
+           "all of them or none.")
+
         .def("remote_insert", [](RadixClient& c, int rank,
                                    py::array_t<uint64_t> hashes,
                                    int start, int length,
@@ -791,6 +807,15 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("error", &AllocateReply::error)
         .def_property_readonly("slots", [](const AllocateReply& r) {
             return vec_to_npy_i32(r.slots);
+        });
+
+    py::class_<AllocateComponentsReply>(m, "AllocateComponentsReply")
+        .def_readonly("status", &AllocateComponentsReply::status)
+        .def_readonly("error", &AllocateComponentsReply::error)
+        .def_property_readonly("slots", [](const AllocateComponentsReply& r) {
+            py::list out;
+            for (const std::vector<int32_t>& s : r.slots) out.append(vec_to_npy_i32(s));
+            return out;
         });
 #endif  // !RADIXSHMEM_NO_RDMA
 

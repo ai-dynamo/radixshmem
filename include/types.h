@@ -388,6 +388,17 @@ struct AllocateReply {
     std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
 };
 
+struct ComponentCount {
+    ComponentType component = ComponentType::FULL;
+    int n = 0;
+};
+
+struct AllocateComponentsReply {
+    RemoteStatus status = RemoteStatus::OK;
+    InsertError  error  = InsertError::OK;
+    std::vector<std::vector<int32_t>> slots;
+};
+
 struct QueryReply {
     RemoteStatus status = RemoteStatus::OK;
     int hit_length       = 0;   // B local-tree total matched blocks

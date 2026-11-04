@@ -15,6 +15,8 @@ class IRemoteOpClientTransport {
 public:
     virtual ~IRemoteOpClientTransport() = default;
     virtual AllocateReply allocate(int n, ComponentType component = ComponentType::FULL) = 0;
+    virtual AllocateComponentsReply allocate_components(
+        const std::vector<ComponentCount>& components) = 0;
     virtual QueryReply query(const uint64_t* hashes, int n, bool lock,
                              bool update_meta) = 0;
     virtual InsertResult insert(const uint64_t* hashes, int n, int start,

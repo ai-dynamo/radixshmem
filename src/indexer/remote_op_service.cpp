@@ -66,6 +66,40 @@ AllocateReply RemoteOpService::allocate(int n, Deadline deadline,
     return out;
 }
 
+AllocateComponentsReply RemoteOpService::allocate_components(
+        const std::vector<ComponentCount>& components, Deadline deadline) {
+    AllocateComponentsReply out;
+    bool seen[NUM_COMPONENT_TYPES] = {};
+    int64_t total = 0;
+    for (const ComponentCount& c : components) {
+        if (!valid_component(c.component) || seen[(int)c.component] || !valid_count(c.n)) {
+            out.status = RemoteStatus::BAD_REQUEST;
+            return out;
+        }
+        seen[(int)c.component] = true;
+        total += c.n;
+    }
+    if (total > MAX_REMOTE_OP_BLOCKS) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    if (components.empty()) return out;
+    std::lock_guard<std::mutex> g(insert_mu_);
+    if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
+    out.slots.resize(components.size());
+    for (size_t i = 0; i < components.size(); i++) {
+        const ComponentCount& c = components[i];
+        if (c.n == 0 || tree_.allocate_slots(c.n, out.slots[i], c.component) == c.n) continue;
+        for (size_t j = 0; j <= i; j++)
+            tree_.recycle_slots(out.slots[j].data(), (int)out.slots[j].size(),
+                                components[j].component);
+        out.slots.clear();
+        out.error = InsertError::MEMPOOL_FULL;
+        return out;
+    }
+    return out;
+}
+
 QueryReply RemoteOpService::query(const uint64_t* hashes, int n, bool lock,
                                   bool update_meta, Deadline deadline) {
     QueryReply out;

@@ -26,6 +26,8 @@ public:
     // All-or-nothing: on a short pool, error = MEMPOOL_FULL and no slots.
     AllocateReply allocate(int n, Deadline deadline = Deadline::max(),
                            ComponentType component = ComponentType::FULL);
+    AllocateComponentsReply allocate_components(const std::vector<ComponentCount>& components,
+                                                Deadline deadline = Deadline::max());
     QueryReply    query(const uint64_t* hashes, int n, bool lock,
                         bool update_meta, Deadline deadline = Deadline::max());
     // slots[i] holds hashes[start + i]; invalid requests yield REMOTE_FAILED with remote_status = BAD_REQUEST.

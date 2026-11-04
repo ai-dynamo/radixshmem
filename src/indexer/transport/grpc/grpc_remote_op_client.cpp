@@ -114,6 +114,42 @@ AllocateReply GrpcRemoteOpClientTransport::allocate(int n, ComponentType compone
     return out;
 }
 
+AllocateComponentsReply GrpcRemoteOpClientTransport::allocate_components(
+        const std::vector<ComponentCount>& components) {
+    AllocateComponentsReply out;
+    bool sane = true;
+    int64_t total = 0;
+    for (const ComponentCount& c : components) {
+        sane = sane && c.n >= 0;
+        total += c.n;
+    }
+    if (!sane || total > MAX_REMOTE_OP_BLOCKS) { out.status = RemoteStatus::BAD_REQUEST; return out; }
+    pb::AllocateComponentsRequest req;
+    for (const ComponentCount& c : components) {
+        pb::ComponentCount* m = req.add_components();
+        m->set_component(static_cast<pb::Component>(c.component));
+        m->set_num_blocks(c.n);
+    }
+    pb::AllocateComponentsResponse rep;
+    grpc::ClientContext ctx;
+    impl_->prepare(ctx);
+    out.status = to_remote_status(impl_->stub->AllocateComponents(&ctx, req, &rep));
+    if (out.status != RemoteStatus::OK) return out;
+    sane = to_insert_error(rep.error(), out.error) &&
+                rep.components_size() == (out.error == InsertError::OK ? (int)components.size() : 0);
+    for (int i = 0; sane && i < rep.components_size(); i++)
+        sane = rep.components(i).slots_size() == components[i].n;
+    if (!sane) {
+        out.status = RemoteStatus::BAD_REPLY;
+        out.error = InsertError::OK;
+        return out;
+    }
+    out.slots.resize(rep.components_size());
+    for (int i = 0; i < rep.components_size(); i++)
+        out.slots[i].assign(rep.components(i).slots().begin(), rep.components(i).slots().end());
+    return out;
+}
+
 QueryReply GrpcRemoteOpClientTransport::query(const uint64_t* hashes, int n,
                                               bool lock, bool update_meta) {
     QueryReply out;

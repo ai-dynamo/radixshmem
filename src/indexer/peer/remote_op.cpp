@@ -70,6 +70,19 @@ AllocateReply RemotePeer::allocate(int n, ComponentType component) {
     return r;
 }
 
+AllocateComponentsReply RemotePeer::allocate_components(
+        const std::vector<ComponentCount>& components) {
+    AllocateComponentsReply r;
+    if (skipped()) {
+        r.status = RemoteStatus::UNAVAILABLE;
+        return r;
+    }
+    const auto t0 = Clock::now();
+    r = transport_->allocate_components(components);
+    observe("allocate components", r.status, since(t0));
+    return r;
+}
+
 InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
                                 int start, int length, const int32_t* slots,
                                 bool auto_recycle, ComponentType component) {

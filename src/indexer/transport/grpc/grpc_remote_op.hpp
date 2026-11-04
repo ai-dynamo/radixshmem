@@ -41,6 +41,8 @@ public:
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
                         const int32_t* slots, bool auto_recycle,
                         ComponentType component = ComponentType::FULL) override;
+    AllocateComponentsReply allocate_components(
+        const std::vector<ComponentCount>& components) override;
     InsertPathResult insert_path(const uint64_t* hashes, int n, int start, int length,
                                  const int32_t* full_slots, const std::vector<ComponentRun>& runs,
                                  bool auto_recycle) override;

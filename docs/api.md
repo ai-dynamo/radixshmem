@@ -25,6 +25,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
     - `[query](#query)`
     - `[component semantics of insert](#component-semantics-of-insert)`
     - `[remote_allocate](#remote_allocate)`
+    - `[remote_allocate_components](#remote_allocate_components)`
     - `[remote_insert](#remote_insert)`
     - `[remote_insert_path](#remote_insert_path)`
     - `[remote_recycle](#remote_recycle)`
@@ -99,14 +100,14 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 | `num_rht_shards`        | `int`              | `0`                       | Number of RHT shards M. `0` = M == world_size (each node holds one shard; old behavior). When `> 0`, only some nodes hold RHT shards, and clients create RHT-plane QPs only to the M holders. When `M > world_size`, `bootstrap()` throws `std::runtime_error` directly (there cannot be more holders than ranks); it is no longer silently truncated. **Only rank0 is authoritative**. |
 | `rht_shard_holders`     | `std::vector<int>` | `{}`                      | Candidate holder rank list (e.g. `{0,2,4,6}`). Empty = default ranks `[0, M)`. **Only rank0 is authoritative**. |
 | `rht_slots_per_bucket`  | `int`              | `4`                       | Number of slots W per RHT bucket (chaining to handle hash collisions), one of `{1,2,4,8}`. Can be overridden by env `RADIXSHMEM_RHT_SLOTS`. **Only rank0 is authoritative**. |
-| `remote_op_listen_port` | `uint16_t` | `0` | TCP port of the gRPC remote-op endpoint. Every distributed server serves all remote ops (`[remote_allocate](#remote_allocate)`, `[remote_insert](#remote_insert)`, `[remote_insert_path](#remote_insert_path)`, `[remote_recycle](#remote_recycle)`, `[remote_query](#remote_query)`); a standalone server does not start the endpoint. `0` = assigned by the OS; the actual port is published to etcd `/peers`. |
+| `remote_op_listen_port` | `uint16_t` | `0` | TCP port of the gRPC remote-op endpoint. Every distributed server serves all remote ops (`[remote_allocate](#remote_allocate)`, `[remote_allocate_components](#remote_allocate_components)`, `[remote_insert](#remote_insert)`, `[remote_insert_path](#remote_insert_path)`, `[remote_recycle](#remote_recycle)`, `[remote_query](#remote_query)`); a standalone server does not start the endpoint. `0` = assigned by the OS; the actual port is published to etcd `/peers`. |
 | `writeback_enabled`     | `bool`             | `false`                   | Background eviction holds the evicted slots for write-back instead of recycling them; see [2.6](#26-write-back-of-background-eviction). |
 | `writeback_max_held_ratio` | `float`         | `0.05`                    | Background eviction runs only while the slots covered by unfinished write-backs stay below this share of every pool. |
 
 
 > **Distributed criterion**: `want_cluster()` = `expected_min_nodes > 1 || num_rht_shards > 1 || world_size > 1`. If any of the three holds, etcd + RDMA bootstrap is used, and in that case **one of** `rpc_address` / `rpc_interface` **must be given**; otherwise `bootstrap()` throws `std::runtime_error`.
 
-> **Concurrency and deadlines**: the gRPC service has no per-op admission limit; allocate, insert and insert-path queue on the target's insert lock, query and unlock run in parallel. The server's gRPC threads are capped at `RADIXSHMEM_REMOTE_OP_MAX_THREADS` (default 256); past that cap a request is answered with `RESOURCE_EXHAUSTED` without running. A message may take up to 2 GiB, the most gRPC carries, so an op carries up to `MAX_REMOTE_OP_BLOCKS` (134,217,471) blocks. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms); an allocate or query that waited until its deadline is not run and returns `TIMEOUT`, while insert, insert-path, recycle and unlock always run. Clients send gRPC keepalive pings every 10 s, so a dead connection fails with `UNAVAILABLE` instead of waiting for each op's deadline.
+> **Concurrency and deadlines**: the gRPC service has no per-op admission limit; allocate, allocate-components, insert and insert-path queue on the target's insert lock, query and unlock run in parallel. The server's gRPC threads are capped at `RADIXSHMEM_REMOTE_OP_MAX_THREADS` (default 256); past that cap a request is answered with `RESOURCE_EXHAUSTED` without running. A message may take up to 2 GiB, the most gRPC carries, so an op carries up to `MAX_REMOTE_OP_BLOCKS` (134,217,471) blocks. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms); an allocate, allocate-components or query that waited until its deadline is not run and returns `TIMEOUT`, while insert, insert-path, recycle and unlock always run. Clients send gRPC keepalive pings every 10 s, so a dead connection fails with `UNAVAILABLE` instead of waiting for each op's deadline.
 
 > **Deployment**: remote ops use gRPC only, and an RDMA build needs gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin). The manifest and cluster protocol versions are 13 (13: remote ops carry the component pool); the former remote-op transport and DCT fields are reserved. All nodes and clients must run the same build; mixed-version rolling upgrades are not supported. RHT and peer-index XRC/DC transport choices are unaffected.
 
@@ -553,6 +554,32 @@ AllocateReply remote_allocate(int rank, int n,
 | `error`  | `InsertError`                   | Business result when `status == OK`: `MEMPOOL_FULL` when the target could not supply all `n` slots (nothing is allocated, `slots` is empty), else `OK`. |
 | `slots`  | `std::vector<int32_t>`          | **Target-local** physical slot ids (not addressable from this process; for use by the KV transfer channel), length == `n`. The allocated slots are not bound to any prefix and the evictor cannot touch them; the server is stateless, so **abandoned slots must be returned with** `remote_recycle`. |
 
+
+---
+
+
+
+### `remote_allocate_components`
+
+```cpp
+AllocateComponentsReply remote_allocate_components(
+    int rank, const std::vector<ComponentCount>& components);
+```
+
+Phase 1 for several pools in one request: allocates `n` slots from each `ComponentCount{component, n}` pool of the peer, in order and under one hold of its insert lock, **all of them or none**. A push of a path with SWA windows and Mamba checkpoints reserves them with one request.
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+| `rank` | `int` | Target peer, as in `remote_allocate`. |
+| `components` | `std::vector<ComponentCount>` | Each component at most once; `n ≥ 0` (`0` reserves nothing for it); the sum of `n` at most `MAX_REMOTE_OP_BLOCKS`. An empty list returns `OK` without a request. |
+
+#### Return value `AllocateComponentsReply`
+
+| Field | Type | Meaning |
+| ----- | ---- | ------- |
+| `status` | `[RemoteStatus](#remotestatus)` | **Check first**; a repeated or unknown component, a negative `n` or a sum over the limit is `BAD_REQUEST`, and an allocation that waited past its deadline is not run (`TIMEOUT`). |
+| `error` | `InsertError` | `MEMPOOL_FULL` when a pool could not supply its `n` slots: the slots already taken from the other pools are returned and `slots` is empty. `OK` otherwise. |
+| `slots` | `std::vector<std::vector<int32_t>>` | When `error == OK`, one vector per entry of `components`, in the same order, of its `n` target-local slot ids. Abandoned slots go back with `remote_recycle` of their component. |
 
 ---
 
@@ -1037,6 +1064,7 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 
 - **Always rank-first, no handles**: the client opens and caches sessions per rank internally and lazily. The normal automatic cross-node walk goes through `client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL, local_only=False)`; when the one-sided RDMA continuation fails, the local incumbent is kept (observer returns an empty hit).
 - `client.remote_allocate(rank, n, component=FULL) → AllocateReply` (phase 1, allocation only)
+- `client.remote_allocate_components(rank, components) → AllocateComponentsReply` (phase 1 for several pools, all or none; `components` are `(component, n)` tuples; `AllocateComponentsReply` has `status`, `error` and `slots`, a list of `int32` arrays)
 - `client.remote_insert(rank, hashes, start, length, slots, auto_recycle=True, component=FULL) → InsertResult` (phase 2, publish + dedup)
 - `client.remote_insert_path(rank, hashes, start, full_slots, runs, auto_recycle=True) → InsertPathResult` (phase 2 for a whole path; `runs` are `(component, end, slots)` tuples; `InsertPathResult` has `remote_status`, `full` and `runs`)
 - `client.remote_recycle(rank, slots, component=FULL) → RemoteStatus` (return unpublished allocations)
