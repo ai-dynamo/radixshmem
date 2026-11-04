@@ -610,6 +610,7 @@ class RadixClient:
 
     def _complete(self, job: PullJob, replies: Sequence[TransferReply]) -> None:
         ok = {ComponentType(k): rep[0] for (_, k, _, _), rep in zip(job._items, replies)}
+        late = {ComponentType(k) for (_, k, _, _), rep in zip(job._items, replies) if rep[3] == XFER_TIMEOUT}
         self.transfer_failures += sum(not v for v in ok.values())
         job._q.finalize()   # unpinned parent absorbs the promoted leaf; an evicted prefix fails the insert (slots auto-recycled)
         hit, pulled, nbytes = job._hit, 0, 0
@@ -620,7 +621,8 @@ class RadixClient:
                 pulled += len(st)
                 nbytes += len(st) * int(self._store.pool(FULL).slot_bytes)
             else:
-                self._recycle(st, FULL)
+                if FULL not in late:
+                    self._recycle(st, FULL)
                 hit = off
         for kind in (SWA, MAMBA):
             if kind not in job._staged:
@@ -630,7 +632,7 @@ class RadixClient:
                 self._index.insert(job._hashes[:hit], st, component=kind)
                 pulled += len(st)
                 nbytes += len(st) * int(self._store.pool(kind).slot_bytes)
-            else:
+            elif kind not in late:
                 self._recycle(st, kind)
         self._finish(job, hit, pulled, nbytes)
 
