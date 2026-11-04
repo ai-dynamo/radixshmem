@@ -457,7 +457,7 @@ int run_full_dedup() {
     }
 }
 
-// ---- #10: remote_query(lock) pin across a split at the hit — finalize releases both halves ----
+// ---- #11: remote_query(lock) pin across a split at the hit — finalize releases both halves ----
 int run_lock_split() {
     try {
         auto old_path = make_hashes(8000, 8);
@@ -637,7 +637,7 @@ int main(int argc, char** argv) {
     run_case("insert_finalize");   // #7
     run_case("release_abort");     // #8
     run_case("full_dedup");        // #9
-    run_case("lock_split");        // #10
+    run_case("lock_split");        // #11
 
     // #2/#3/#10 last: pipe-synchronized kill and restart of B (nothing runs after it). The child
     // is re-exec'd; the two sync-pipe fd numbers ride on its argv (not CLOEXEC).
