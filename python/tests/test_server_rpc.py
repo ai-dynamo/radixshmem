@@ -244,6 +244,49 @@ def test_remote_op_options():
     assert not hasattr(radixshmem._core.RadixServerConfig(), "zmq_listen_port")
 
 
+def test_control_address_resolution():
+    """The transfer handshake address follows the control address settled at preflight; only the
+    explicit single-host 0.0.0.0 maps to loopback. The resolver keeps explicit device / GID values,
+    fills the control address from the index GID, and refuses a GID the device does not have."""
+    c = ServerConfig(transfer_ip="10.9.9.9")
+    assert c.resolved_transfer_ip() == "10.9.9.9"
+    c = ServerConfig()
+    c.cluster.rpc_address = "0.0.0.0"
+    assert c.resolved_transfer_ip() == "127.0.0.1"
+    c.cluster.rpc_address = "10.6.131.12"
+    assert c.resolved_transfer_ip() == "10.6.131.12"
+    c.cluster.rpc_address = ""
+    with pytest.raises(ValueError):
+        c.resolved_transfer_ip()
+
+    sysfs = "/sys/class/infiniband"
+    devs = sorted(os.listdir(sysfs)) if os.path.isdir(sysfs) else []
+    if not devs or not hasattr(radixshmem._core, "resolve_cluster_net"):
+        pytest.skip("no RDMA device or built without RDMA")
+    picked = None
+    for dev in devs:
+        cc = radixshmem._core.RadixServerConfig()
+        cc.index_dev = dev
+        try:
+            summary = radixshmem._core.resolve_cluster_net(cc)
+        except RuntimeError:
+            continue   # not ACTIVE, no usable GID or several of them on this device
+        picked = (dev, cc.gid_idx, cc.rpc_address, summary)
+        break
+    if picked is None:
+        pytest.skip("no device with one usable GID")
+    dev, gid, addr, summary = picked
+    assert gid >= 0 and addr and addr != "0.0.0.0"
+    assert f"index {dev} port 1 gid {gid}" in summary and "explicit device" in summary
+    cc = radixshmem._core.RadixServerConfig()
+    cc.index_dev, cc.gid_idx, cc.rpc_address = dev, gid, "10.9.9.9"
+    radixshmem._core.resolve_cluster_net(cc)
+    assert (cc.index_dev, cc.gid_idx, cc.rpc_address) == (dev, gid, "10.9.9.9")
+    cc.gid_idx = 250
+    with pytest.raises(RuntimeError, match="gid 250 is not set"):
+        radixshmem._core.resolve_cluster_net(cc)
+
+
 def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):
     c = cfg(**data())
     srv = up(c, geometry())
