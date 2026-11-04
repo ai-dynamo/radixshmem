@@ -41,7 +41,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
-                             XFER_READ, XFER_TIMEOUT, XFER_WRITE, NodeInfo, RadixClient, TransferItem,
+                             XFER_IN_FLIGHT, XFER_READ, XFER_WRITE, NodeInfo, RadixClient, TransferItem,
                              TransferReply)
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy
 from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
@@ -933,8 +933,12 @@ class RadixServer:
                     job = self._queue.popleft() if self._queue else None
                 if job is None:
                     break
+                expired = time.monotonic() >= job.deadline
                 for i, (rank, kind, remote, local, op) in enumerate(job.items):
                     if job.replies[i] is not None:
+                        continue
+                    if expired:
+                        self._resolve(job, i, (False, 0, 0, "deadline passed before the transfer was issued"))
                         continue
                     issued = clock() if xlog is not None else 0
                     try:
@@ -963,12 +967,13 @@ class RadixServer:
                               ("TIMEOUT" if st == _data.XferState.PENDING else st.name), ahead, op))
                 if st == _data.XferState.PENDING:
                     st = _data.XferState.TIMEOUT
-                if self._xfer.release(h) == _data.XFER_EBUSY:
+                busy = self._xfer.release(h) == _data.XFER_EBUSY
+                if busy:
                     self._zombies.append(h)
                 ok = st == _data.XferState.COMPLETED
                 if not ok:
                     self._peers.pop(job.items[i][0], None)
-                err = "" if ok else XFER_TIMEOUT if st == _data.XferState.TIMEOUT else str(st)
+                err = "" if ok else XFER_IN_FLIGHT if busy else str(st)
                 self._resolve(job, i, (ok, int(done), int(nd), err))
                 progressed = True
             inflight = still

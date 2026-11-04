@@ -16,9 +16,7 @@ import numpy as np
 import pytest
 
 import radixshmem
-from radixshmem import (ClusterConfig, ComponentType, Geometry, PullJob, PushJob, PushResult, RadixClient,
-                        RadixServer, ServerConfig, WritebackHandler, writeback)
-from radixshmem.client import XFER_TIMEOUT
+from radixshmem import ClusterConfig, Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler, writeback
 
 pytestmark = pytest.mark.skipif(not hasattr(radixshmem, "_data"), reason="radixshmem._data not built")
 
@@ -379,37 +377,3 @@ def test_peer_writeback_pushes_nothing_from_a_decode_node(capfd):
     h.write([task(1, 8), task(2, 8, first=2)], done.extend)
     assert done == [1, 2] and h.client.pushes == []
     assert h.stats() == {"pushed": 0, "incomplete": 0, "no_target": 2, "too_long": 0}
-
-
-def test_close_releases_the_pins_of_unfinished_pushes():
-    released = []
-    c = RadixClient.__new__(RadixClient)
-    c._init("/py_wb_stub", SimpleNamespace(close=lambda: None), 4, False)
-    job = PushJob(1, c, 2, np.arange(8, dtype=np.uint64))
-    job._q, job._hit = SimpleNamespace(finalize=lambda: released.append(job.job_id)), 3
-    c._pending[7] = job
-    c.close()
-    assert released == [1] and not c._pending
-    assert job.wait(0) == PushResult(3, 3, 0, 0, False)
-
-
-class StubIndex:
-    def __init__(self):
-        self.recycled = []
-
-    def recycle_slots(self, slots, kind):
-        self.recycled.append((kind, [int(x) for x in slots]))
-
-
-def test_pull_keeps_the_staging_slots_of_a_timed_out_read():
-    c = RadixClient.__new__(RadixClient)
-    c._init("/py_wb_stub", SimpleNamespace(close=lambda: None), 4, False)
-    c._index = StubIndex()
-    full, swa = ComponentType.FULL, ComponentType.SWA
-    job = PullJob(1, c)
-    job._q, job._hashes = SimpleNamespace(finalize=lambda: None), np.arange(8, dtype=np.uint64)
-    job._items = [(1, int(full), [5, 6], [10, 11]), (1, int(swa), [7], [12])]
-    job._staged = {full: (0, np.array([10, 11], dtype=np.int32)), swa: (0, np.array([12], dtype=np.int32))}
-    c._complete(job, [(False, 0, 0, XFER_TIMEOUT), (False, 0, 0, "XferState.FAILED")])
-    assert c._index.recycled == [(swa, [12])]
-    assert job.wait(0).common_hit == 0

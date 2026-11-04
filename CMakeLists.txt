@@ -659,7 +659,7 @@ if(BUILD_PYTHON_MODULES)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
             RESULT_VARIABLE _pytest_rc OUTPUT_QUIET ERROR_QUIET)
         foreach(_t test_geometry test_server_rpc test_radixshmem test_geometry_registry test_writeback
-                   test_monitor)
+                   test_monitor test_transfer_jobs)
             if(_pytest_rc EQUAL 0)
                 add_test(NAME py_${_t}
                          COMMAND ${Python3_EXECUTABLE} -m pytest -q tests/${_t}.py)
@@ -687,7 +687,8 @@ if(BUILD_PYTHON_MODULES)
                          --executors-per-worker 8 --rht-slots 4 --register-chunk-size 1
                          --flush-after-insert)
         foreach(_t py_test_geometry py_test_server_rpc py_test_radixshmem py_test_geometry_registry
-                   py_test_writeback py_test_monitor py_test_cluster py_test_p2p_pull py_test_writeback_pull
+                   py_test_writeback py_test_monitor py_test_transfer_jobs py_test_cluster py_test_p2p_pull
+                   py_test_writeback_pull
                    py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)
             set_tests_properties(${_t} PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
