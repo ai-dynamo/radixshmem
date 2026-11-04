@@ -497,6 +497,8 @@ PYBIND11_MODULE(_core, m) {
             py::gil_scoped_release nogil;
             return q.complete(ids);
         }, py::arg("task_ids"))
+        .def("set_writeback_active", [](RadixServer& s, bool on) { writeback_of(s).set_active(on); },
+             py::arg("on"), "Whether background eviction holds what it takes for write-back.")
         .def("drop_writeback", [](RadixServer& s) {
             WritebackQueue& q = writeback_of(s);
             py::gil_scoped_release nogil;
@@ -514,6 +516,7 @@ PYBIND11_MODULE(_core, m) {
             d["produced"] = st.produced;
             d["completed"] = st.completed;
             d["dropped"] = st.dropped;
+            d["active"] = q->active();
             d["inflight_slots"] = py::make_tuple(st.inflight_slots[0], st.inflight_slots[1],
                                                  st.inflight_slots[2]);
             d["held_slots"] = py::make_tuple(t.held_slots(ComponentType::FULL),

@@ -10,9 +10,8 @@ from __future__ import annotations
 import concurrent.futures
 import sys
 import threading
-import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -54,10 +53,14 @@ class WritebackHandler:
     may be stored only if ``task.valid()`` is still True after the read (a
     ``reset()`` or ``done`` ends it). ``close()`` calls ``stop`` first, while the
     client can still pull, once ``write`` returned or after 5 s; tasks not done
-    by then are dropped."""
+    by then are dropped. While ``active()`` is False, background eviction
+    recycles what it takes at once and hands nothing to ``write``."""
 
     def start(self, client) -> None:
         pass
+
+    def active(self) -> bool:
+        return True
 
     def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
         raise NotImplementedError
@@ -79,8 +82,9 @@ class PeerWriteback(WritebackHandler):
         self.timeout_ms = int(timeout_ms)
         self.client = None
         self._decode = False
-        self._nodes: List[Dict[str, Any]] = []
-        self._nodes_at = float("-inf")
+        self._targets: List[int] = []
+        self._error: Optional[str] = None
+        self._stopping = threading.Event()
         self._stats = dict.fromkeys(("pushed", "incomplete", "no_space", "no_target", "too_long"), 0)
         self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
@@ -91,21 +95,25 @@ class PeerWriteback(WritebackHandler):
                                                            thread_name_prefix="radixshmem-writeback")
         if self._decode:
             print("radixshmem: PeerWriteback on a decode node pushes nothing", file=sys.stderr)
+        else:
+            threading.Thread(target=self._watch, name="radixshmem-writeback-nodes", daemon=True).start()
+
+    def active(self) -> bool:
+        return bool(self._targets)
 
     def stats(self) -> Dict[str, int]:
         return dict(self._stats)
 
     def stop(self) -> None:
+        self._stopping.set()
         if self._pool is not None:
             self._pool.shutdown(wait=False, cancel_futures=True)
 
     def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
-        now = time.monotonic()
-        if not self._decode and now - self._nodes_at >= 1.0:
-            self._nodes, self._nodes_at = self.client.nodes(), now
+        targets = self._targets
         picked = []
         for t in tasks:
-            rank = self._choose_target(self._nodes, t)
+            rank = targets[int(t.hashes[0]) % len(targets)] if targets else -1
             if rank < 0:
                 self._stats["no_target"] += 1
             elif t.end > MAX_REMOTE_OP_BLOCKS:
@@ -117,12 +125,24 @@ class PeerWriteback(WritebackHandler):
             self._stats["pushed" if job.wait().complete else "no_space" if job.no_space else "incomplete"] += 1
         done([t.task_id for t in tasks])
 
-    def _choose_target(self, nodes: List[Dict[str, Any]], t: WritebackTask) -> int:
-        """A ready decode node other than this one, by ``t``'s first block hash; -1 if none."""
-        me = self.client.rank()
-        ranks = sorted(int(r["rank"]) for r in nodes if r.get("mode") == MODE_READY and r.get("data_plane")
-                       and r.get("role") == "decode" and int(r.get("rank", -1)) not in (-1, me))
-        return ranks[int(t.hashes[0]) % len(ranks)] if ranks else -1
+    def _watch(self) -> None:
+        while True:
+            self._refresh()
+            if self._stopping.wait(1.0):
+                return
+
+    def _refresh(self) -> None:
+        try:
+            nodes, me = self.client.nodes(), self.client.rank()
+        except Exception as e:  # noqa: BLE001 - etcd or the server is away: the last list stays
+            if self._error is None:
+                print(f"radixshmem: PeerWriteback cannot read the node list, keeps the last one: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+            self._error = str(e)
+            return
+        self._error = None
+        self._targets = sorted(int(r["rank"]) for r in nodes if r.get("mode") == MODE_READY and r.get("data_plane")
+                               and r.get("role") == "decode" and int(r.get("rank", -1)) not in (-1, me))
 
     def _push(self, t: WritebackTask, rank: int) -> PushJob:
         mamba = [(int(e), int(s)) for e, s in zip(t.mamba_ends, t.mamba_slots) if e > t.evicted_from]
@@ -148,12 +168,14 @@ class _Worker:
         self._mu = threading.Lock()     # held across index calls, so stop() waits for them
         self._open: Set[int] = set()    # handed to the handler, not done yet
         self.failed = 0
+        self._active: Optional[bool] = None
         self._thread = threading.Thread(target=self._run, name="radixshmem-writeback", daemon=True)
 
     def start(self) -> None:
         with self._life:
             if self._stop.is_set():
                 return
+            self._sync_active()
             self._handler.start(self._client)
             self._started = True
             self._thread.start()
@@ -174,6 +196,7 @@ class _Worker:
         while not self._stop.is_set():
             ids: List[int] = []
             try:
+                self._sync_active()
                 raw = self._index.pop_writeback(self._batch, self._poll_ms)
                 ids = [int(r[0]) for r in raw]
                 with self._mu:
@@ -182,6 +205,12 @@ class _Worker:
                     self._handler.write([WritebackTask(*r, _check=self._valid) for r in raw], self.done)
             except BaseException as e:  # noqa: BLE001 - the batch is given up, the thread goes on
                 self._give_up(ids, e)
+
+    def _sync_active(self) -> None:
+        active = bool(self._handler.active())
+        if active != self._active:
+            self._index.set_writeback_active(active)
+            self._active = active
 
     def _give_up(self, ids: List[int], e: BaseException) -> None:
         with self._mu:
@@ -212,6 +241,8 @@ class _Worker:
                           file=sys.stderr)
         # The handler may keep `done`, which must not keep the index alive.
         with self._mu:
+            if self._index is not None:
+                self._index.set_writeback_active(False)
             self._index = None
             self._open.clear()
         client, self._client = self._client, None

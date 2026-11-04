@@ -281,6 +281,7 @@ def test_writeback(eps, full_slots):
     st = wait_writeback(eps[0], int(EVICT_RATIO * full_slots))
     wb = st["writeback"]
     print(f"  node0 writeback {wb}  transfers {st['transfers']} ({st['transfer_failures']} failed)")
+    p2p.check(wb["active"], "background eviction holds for write-back while decode nodes are ready")
     p2p.check(wb["produced"] > 0 and wb["completed"] == wb["produced"] and wb["failed"] == 0 and wb["dropped"] == 0,
           "background eviction produced tasks and PeerWriteback completed all of them")
     p2p.check(wb["pushed"] == wb["produced"] and wb["incomplete"] == wb["no_target"] == wb["too_long"] == 0,

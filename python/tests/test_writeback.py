@@ -161,6 +161,45 @@ def test_handler_gets_whole_prefixes_with_intact_data(cfg):
     assert rec.stopped
 
 
+class Switch(Recorder):
+    def __init__(self):
+        super().__init__()
+        self.on = False
+
+    def active(self):
+        return self.on
+
+
+def test_inactive_handler_lets_background_eviction_recycle_at_once(cfg):
+    rec = Switch()
+    srv, cl = up(cfg(), rec)
+    try:
+        assert srv.stats()["writeback"]["active"] is False
+        fill(cl, 11)
+        wait_for(lambda: cl.mempool_free() >= THRESHOLD)
+        st = srv.stats()["writeback"]
+        assert st["produced"] == st["queued"] == st["popped"] == 0 and rec.tasks == []
+        assert st["held_slots"] == (0, 0, 0) and st["inflight_slots"] == (0, 0, 0)
+        assert cl.check_health() == 0
+
+        rec.on = True
+        wait_for(lambda: srv.stats()["writeback"]["active"])
+        fill(cl, 3, first=11)
+        wait_for(lambda: cl.mempool_free() >= THRESHOLD and srv.stats()["writeback"]["popped"] == 0)
+        st = srv.stats()["writeback"]
+        assert st["produced"] == st["completed"] == len(rec.tasks) > 0
+
+        rec.on = False
+        wait_for(lambda: not srv.stats()["writeback"]["active"])
+        produced = st["produced"]
+        fill(cl, 3, first=14)
+        wait_for(lambda: cl.mempool_free() >= THRESHOLD)
+        assert srv.stats()["writeback"]["produced"] == produced
+    finally:
+        cl.close()
+        srv.close()
+
+
 def test_unfinished_writebacks_pause_background_eviction(cfg):
     rec = Recorder(hold=True)
     srv, cl = up(cfg(), rec)
@@ -351,7 +390,40 @@ def task(task_id, n, first=1):
 def peer_writeback(role, complete=True, no_space=False):
     h = writeback.PeerWriteback()
     h.start(StubClient(role, complete, no_space))
+    if role != "decode":
+        h._refresh()
     return h
+
+
+def test_peer_writeback_is_active_while_a_decode_node_is_ready(capfd):
+    h = peer_writeback("prefill")
+    assert h.active() and h._targets == [1, 2]
+    roles = {1: "decode", 2: "decode", 3: "prefill"}
+    h.client.nodes = lambda: [{"rank": r, "mode": "ready", "data_plane": True, "role": role}
+                              for r, role in roles.items()]
+    roles[1] = roles[2] = "prefill"
+    h._refresh()
+    assert not h.active()
+    done = []
+    h.write([task(1, 8)], done.extend)
+    assert done == [1] and h.client.pushes == [] and h.stats()["no_target"] == 1
+
+    roles[2] = "decode"
+    h._refresh()
+    assert h.active() and h._targets == [2]
+
+    def down():
+        raise ConnectionError("etcd down")
+    h.client.nodes = down
+    capfd.readouterr()
+    h._refresh()
+    h._refresh()
+    assert h.active() and h._targets == [2]
+    assert capfd.readouterr().err.count("cannot read the node list") == 1
+
+    h.stop()
+    d = peer_writeback("decode")
+    assert not d.active() and d._targets == []
 
 
 def test_peer_writeback_counts_tasks_and_skips_long_paths():

@@ -140,7 +140,7 @@ void RadixServer::evictor_loop() {
             need_evict = true;
         if (!need_evict)
             continue;
-        if (!writeback_) {
+        if (!writeback_ || !writeback_->active()) {
             tree_->try_evict_batch(LOCK_BATCH);
             continue;
         }
