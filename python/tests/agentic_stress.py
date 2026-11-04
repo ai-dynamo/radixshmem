@@ -105,6 +105,7 @@ class Config:
     trace_speedup: float = 1.0
     trace_stagger: float = 1.0        # seconds between the first traces' starts
     subagent_sticky: float = 0.0      # chance a subagent starts on the main stream's worker
+    decode_nodes: int = 0
     # internal (filled by the launcher)
     run_id: str = ""
     etcd_port: int = 0
@@ -178,6 +179,9 @@ def parse_args():
     p.add_argument("--trace-speedup", type=float, default=d.trace_speedup)
     p.add_argument("--trace-stagger", type=float, default=d.trace_stagger)
     p.add_argument("--subagent-sticky", type=float, default=d.subagent_sticky)
+    p.add_argument("--decode-nodes", type=int, default=d.decode_nodes,
+                   help="the last N ranks are decode servers: prefill ranks write back to them, "
+                        "requests go to prefill ranks only")
     p.add_argument("--role", choices=["launcher", "worker"], default="launcher")
     p.add_argument("--rank", type=int, default=-1)
     p.add_argument("--config-json", default="")
@@ -187,6 +191,8 @@ def parse_args():
     else:
         cfg = Config(**{k: getattr(a, k) for k in Config.__dataclass_fields__
                         if hasattr(a, k)})
+    if not 0 <= cfg.decode_nodes < cfg.nodes:
+        p.error("--decode-nodes must leave at least one prefill rank")
     return cfg, a.role, a.rank
 
 
@@ -226,7 +232,8 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
         swa_ratio=swa_bytes / data_bytes if data_bytes else 0.0,
         mamba_ratio=mamba_bytes / data_bytes if data_bytes else 0.0,
         slot_align=64, transfer_devices=dev, max_nodes=cfg.max_nodes,
-        data_pool_ratio=cfg.data_pool_ratio, cluster=cluster)
+        data_pool_ratio=cfg.data_pool_ratio, cluster=cluster,
+        role="decode" if rank >= cfg.nodes - cfg.decode_nodes else "prefill")
 
 
 class DelayedWriteback(radixshmem.WritebackHandler):
@@ -943,13 +950,14 @@ async def run_generator(cfg: Config) -> dict:
     drain_deadline = [0.0]
     next_sid = [0]
     in_flight = [0]
+    serving = conns[:cfg.nodes - cfg.decode_nodes]
     if cfg.trace:
         feed = TraceFeed(cfg)
-        tasks = [asyncio.create_task(trace_loop(cfg, conns, rec, rng, feed, stop_new, drain_deadline,
+        tasks = [asyncio.create_task(trace_loop(cfg, serving, rec, rng, feed, stop_new, drain_deadline,
                                                 in_flight, i * cfg.trace_stagger))
                  for i in range(cfg.concurrency)]
     else:
-        tasks = [asyncio.create_task(session_loop(cfg, conns, rec, rng, stop_new,
+        tasks = [asyncio.create_task(session_loop(cfg, serving, rec, rng, stop_new,
                                                   drain_deadline, next_sid, in_flight))
                  for _ in range(cfg.concurrency)]
 
