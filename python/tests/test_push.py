@@ -11,7 +11,8 @@ each with a FULL path and an SWA window and a Mamba checkpoint at block MID and 
   push       a client on node0 push_async()s prefixes to node1: a new path, its
              sibling (the stem is deduplicated), the first one again, one whose
              valid() says no and one to its own rank. node1 then holds exactly
-             the two that landed, bytes intact, and leaks nothing.
+             the two that landed, bytes intact, and leaks nothing. A push to
+             node2 with its Mamba pool taken writes nothing and leaves nothing.
   writeback  a writer puts twice node0's FULL pool through it; every prefix
              background eviction takes from node0 is on node1 or node2 with
              FULL + SWA + Mamba at both ends and intact bytes, on the same node as its
@@ -144,6 +145,22 @@ def client_main(role: str, endpoint: str) -> int:
         out["again"] = push(hs(0), target)
         out["refused"] = push(hs(2), target, valid=lambda: False)
         out["self"] = push(hs(3), c.rank())
+    elif role.startswith("nospace:"):
+        target, h = int(role.split(":", 1)[1]), hs(3)
+        out["insert_errors"] = sorted(put(h))
+        held, n = [], 64
+        while n:
+            r = c.remote_allocate_components(target, [(MAMBA, n)])
+            if r.error == radixshmem.InsertError.OK and r.status == radixshmem.RemoteStatus.OK:
+                held.append(r.slots[0])
+            else:
+                n //= 2
+        q = joint(h)
+        job = c.push_async(target, h, full_of(q), [(N, q.swa_slots)], [(N, int(q.mamba[1]))])
+        r = job.wait(60)
+        q.finalize()
+        out["nospace"] = [r.common_hit, r.remote_hit, r.remote_blocks, r.remote_bytes, r.complete, job.no_space]
+        out["recycled"] = sorted({str(c.remote_recycle(target, s, MAMBA)) for s in held})
     elif role.startswith("long:"):
         out["insert_errors"] = sorted(put(long_path))
         out["long"] = push(long_path, int(role.split(":", 1)[1]))
@@ -241,6 +258,12 @@ def test_push(eps, ranks):
     p2p.check(rows[2][0] == 0 and rows[3][0] == 0, "and nothing of prefixes 2 and 3")
     h = run_client("health", eps[1])
     p2p.check(h["health"] == 0, f"node1 leaks no slot and no pin ({h['report']})")
+    r = run_client(f"nospace:{ranks[2]}", eps[3])
+    p2p.check(r["insert_errors"] == ["InsertError.OK"] and r["nospace"] == [0, 0, 0, 0, False, True] and
+              r["recycled"] == ["RemoteStatus.OK"], "a target without a free Mamba slot gets nothing written")
+    p2p.check(run_client("census:3:4", eps[2])["rows"][0][0] == 0, "node2 holds no block of it")
+    h = run_client("health", eps[2])
+    p2p.check(h["health"] == 0, f"node2 leaks no slot and no pin ({h['report']})")
     r = run_client(f"long:{ranks[2]}", eps[3])
     p2p.check(r["insert_errors"] == ["InsertError.OK"] and
               r["long"] == [LONG, 0, LONG + WINDOW + 1, LONG * FULL_BYTES + rest, True],

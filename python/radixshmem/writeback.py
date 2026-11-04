@@ -78,7 +78,7 @@ class PeerWriteback(WritebackHandler):
         self._decode = False
         self._nodes: List[Dict[str, Any]] = []
         self._nodes_at = float("-inf")
-        self._stats = dict.fromkeys(("pushed", "incomplete", "no_target", "too_long"), 0)
+        self._stats = dict.fromkeys(("pushed", "incomplete", "no_space", "no_target", "too_long"), 0)
 
     def start(self, client) -> None:
         self.client = client
@@ -103,7 +103,7 @@ class PeerWriteback(WritebackHandler):
             else:
                 jobs.append(self._push(t, rank))
         for job in jobs:
-            self._stats["pushed" if job.wait().complete else "incomplete"] += 1
+            self._stats["pushed" if job.wait().complete else "no_space" if job.no_space else "incomplete"] += 1
         done([t.task_id for t in tasks])
 
     def _choose_target(self, nodes: List[Dict[str, Any]], t: WritebackTask) -> int:

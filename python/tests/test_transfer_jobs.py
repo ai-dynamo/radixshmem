@@ -106,18 +106,26 @@ def test_items_go_out_in_their_direction_and_resolved_items_are_skipped():
 
 
 class StubIndex:
-    def __init__(self, hit=0, status=None, full_error=None, run_errors=None):
+    def __init__(self, hit=0, status=None, full_error=None, run_errors=None, alloc=None):
         self.hit, self.next = hit, 100
         self.status, self.full_error, self.run_errors = status, full_error, run_errors or {}
-        self.log = []
+        self.alloc = alloc
+        self.log, self.allocs = [], []
 
     def remote_query(self, rank, hashes, lock, update_meta):
         return SimpleNamespace(status=0, total_hit_length=self.hit,
                                finalize=lambda: self.log.append(("unlock", rank)))
 
-    def remote_allocate(self, rank, n, kind):
-        slots, self.next = list(range(self.next, self.next + n)), self.next + n
-        return SimpleNamespace(slots=slots)
+    def remote_allocate_components(self, rank, components):
+        self.allocs.append([(kind, n) for kind, n in components])
+        status, error = self.alloc or (radixshmem.RemoteStatus.OK, radixshmem.InsertError.OK)
+        if status != radixshmem.RemoteStatus.OK or error != radixshmem.InsertError.OK:
+            return SimpleNamespace(status=status, error=error, slots=[])
+        slots = []
+        for _, n in components:
+            slots.append(np.arange(self.next, self.next + n, dtype=np.int32))
+            self.next += n
+        return SimpleNamespace(status=status, error=error, slots=slots)
 
     def remote_insert_path(self, rank, hashes, start, full_slots, runs, auto_recycle):
         self.log.append(("insert", len(hashes), start, [int(x) for x in full_slots],
@@ -174,14 +182,44 @@ RUNS = [(SWA, 8, [105, 106, 107, 108]), (MAMBA, 5, [109]), (MAMBA, 8, [110])]
 def test_push_publishes_every_part_in_one_insert_once_all_writes_landed():
     index = StubIndex(hit=3)
     assert push(index) == PushResult(8, 3, 11, 110, True)
+    assert index.allocs == [[(FULL, 5), (SWA, 4), (MAMBA, 2)]]
     assert index.log == [("insert", 8, 3, [100, 101, 102, 103, 104], RUNS), ("unlock", 2)]
 
 
 def test_push_skips_a_full_path_the_target_already_holds():
     index = StubIndex(hit=8)
     assert push(index) == PushResult(8, 8, 6, 60, True)
+    assert index.allocs == [[(SWA, 4), (MAMBA, 2)]]
     assert index.log == [("insert", 8, 8, [], [(SWA, 8, [100, 101, 102, 103]), (MAMBA, 5, [104]),
                                                 (MAMBA, 8, [105])]), ("unlock", 2)]
+
+
+def test_push_of_a_path_the_target_holds_whole_sends_nothing():
+    index = StubIndex(hit=8)
+    c = client(index)
+    try:
+        job = c.push_async(2, np.arange(1, 9, dtype=np.uint64), np.arange(10, 18, dtype=np.int32))
+        assert job.wait(0) == PushResult(8, 8, 0, 0, True) and not job.no_space
+        assert index.allocs == [] and c._t.items == [] and index.log == [("unlock", 2)]
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("status, error, no_space", [
+    (radixshmem.RemoteStatus.OK, radixshmem.InsertError.MEMPOOL_FULL, True),
+    (radixshmem.RemoteStatus.UNAVAILABLE, radixshmem.InsertError.OK, False),
+    (radixshmem.RemoteStatus.TIMEOUT, radixshmem.InsertError.OK, False),
+])
+def test_push_writes_nothing_when_the_target_reserves_nothing(status, error, no_space):
+    index = StubIndex(hit=3, alloc=(status, error))
+    c = client(index)
+    try:
+        job = c.push_async(*push_args())
+        assert job.wait(0) == PushResult(3, 3, 0, 0, False) and job.no_space is no_space
+        assert index.allocs == [[(FULL, 5), (SWA, 4), (MAMBA, 2)]]
+        assert c._t.items == [] and index.log == [("unlock", 2)]
+    finally:
+        c.close()
 
 
 def test_push_leaves_only_the_slots_a_write_may_still_reach():
@@ -191,11 +229,12 @@ def test_push_leaves_only_the_slots_a_write_may_still_reach():
     assert index.log == [("recycle", SWA, [105, 106, 107, 108]), ("recycle", MAMBA, [109, 110]), ("unlock", 2)]
 
 
-def test_push_publishes_the_parts_whose_writes_landed():
+@pytest.mark.parametrize("failed", [FULL, SWA, MAMBA])
+def test_push_publishes_nothing_unless_every_write_landed(failed):
     index = StubIndex(hit=3)
-    assert push(index, {SWA: (False, 0, 0, "XferState.FAILED")}) == PushResult(8, 3, 7, 70, False)
-    assert index.log == [("recycle", SWA, [105, 106, 107, 108]),
-                         ("insert", 8, 3, [100, 101, 102, 103, 104], RUNS[1:]), ("unlock", 2)]
+    assert push(index, {failed: (False, 0, 0, "XferState.FAILED")}) == PushResult(3, 3, 0, 0, False)
+    assert index.log == [("recycle", FULL, [100, 101, 102, 103, 104]), ("recycle", SWA, [105, 106, 107, 108]),
+                         ("recycle", MAMBA, [109, 110]), ("unlock", 2)]
 
 
 def test_push_recycles_landed_writes_when_the_task_is_no_longer_valid():
@@ -284,11 +323,11 @@ class ClosingIndex(StubIndex):
         super().__init__(**kw)
         self.at, self.client = at, None
 
-    def remote_allocate(self, rank, n, kind):
+    def remote_allocate_components(self, rank, components):
         if self.at == "allocate":
             self.at = None
             self.client.close()
-        return super().remote_allocate(rank, n, kind)
+        return super().remote_allocate_components(rank, components)
 
 
 class ClosingTransport(StubTransport):
@@ -381,10 +420,10 @@ class FailingIndex(StubIndex):
         super().__init__(**kw)
         self.fail, self.client = fail, None
 
-    def remote_allocate(self, rank, n, kind):
-        if self.fail == ("allocate", kind):
+    def remote_allocate_components(self, rank, components):
+        if self.fail == "allocate":
             raise RuntimeError("allocate broke")
-        return super().remote_allocate(rank, n, kind)
+        return super().remote_allocate_components(rank, components)
 
     def remote_insert_path(self, *args):
         if self.fail == "insert":
@@ -404,13 +443,13 @@ def test_a_push_whose_completion_raises_still_completes_and_releases_its_pin():
         c.close()
 
 
-def test_a_push_whose_reservation_raises_returns_what_it_reserved():
-    index = FailingIndex(("allocate", SWA), hit=3)
+def test_a_push_whose_reservation_raises_releases_its_pin():
+    index = FailingIndex("allocate", hit=3)
     c = index.client = client(index)
     try:
         job = c.push_async(*push_args())
         assert job.wait(0) == PushResult(3, 3, 0, 0, False) and c._t.items == []
-        assert index.log == [("recycle", FULL, [100, 101, 102, 103, 104]), ("unlock", 2)]
+        assert index.log == [("unlock", 2)]
     finally:
         c.close()
 

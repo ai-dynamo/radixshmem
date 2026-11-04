@@ -164,6 +164,7 @@ class PushJob:
         self._parts: Dict[ComponentType, List[Tuple[int, int]]] = {}
         self._valid: Optional[Callable[[], bool]] = None
         self._ticket = -1
+        self.no_space = False
 
     def done(self) -> bool:
         return self._f.done()
@@ -564,21 +565,24 @@ class RadixClient:
         (self._complete_push if isinstance(job, PushJob) else self._complete)(job, replies)
 
     def _reserve(self, job: PushJob, full: np.ndarray, swa, mamba) -> None:
-        """Allocate the target's slots, FULL first: nothing else lands without the path."""
+        """Allocate the target's slots of every part in one request: all of them or none."""
         n, m = len(full), job._hit
         swa_parts = [(e, s) for e, s in swa if len(s)]
         mamba_parts = [(e, np.asarray([s], dtype=np.int32)) for e, s in mamba if s >= 0]
         pieces = (([(FULL, [(n, full[m:])])] if m < n else []) + ([(SWA, swa_parts)] if swa_parts else [])
                   + ([(MAMBA, mamba_parts)] if mamba_parts else []))
         job._want = [kind for kind, _ in pieces]
-        for kind, parts in pieces:
-            local = np.concatenate([s for _, s in parts])
-            remote = np.asarray(job._index.remote_allocate(job._rank, len(local), kind).slots, dtype=np.int32)
-            if len(remote) != len(local):       # refused or MEMPOOL_FULL: no slots
-                if kind == FULL:
-                    return
-                continue
-            job._items.append((job._rank, int(kind), remote.tolist(), local.tolist(), XFER_WRITE))
+        if not pieces:
+            return
+        local = [np.concatenate([s for _, s in parts]) for _, parts in pieces]
+        counts = [(kind, len(x)) for (kind, _), x in zip(pieces, local)]
+        r = job._index.remote_allocate_components(job._rank, counts)
+        if r.status != _core.RemoteStatus.OK or r.error != _core.InsertError.OK:
+            job.no_space = r.status == _core.RemoteStatus.OK and r.error == _core.InsertError.MEMPOOL_FULL
+            return
+        for (kind, parts), src, dst in zip(pieces, local, r.slots):
+            remote = np.asarray(dst, dtype=np.int32)
+            job._items.append((job._rank, int(kind), remote.tolist(), src.tolist(), XFER_WRITE))
             job._reserved[kind] = remote
             job._parts[kind] = [(e, len(s)) for e, s in parts]
 
@@ -596,17 +600,13 @@ class RadixClient:
         ok = {ComponentType(it[1]): rep[0] for it, rep in zip(job._items, replies)}
         late = {ComponentType(it[1]) for it, rep in zip(job._items, replies) if rep[3] == XFER_IN_FLIGHT}
         self.transfer_failures += sum(not v for v in ok.values())
-        if ok and job._valid is not None and not job._valid():
-            ok = dict.fromkeys(ok, False)
-        n, hit, publish = len(job._hashes), job._hit, []
-        for kind, remote in job._reserved.items():
-            if kind in late:
-                continue
-            if ok[kind] and (kind == FULL or hit == n or ok[FULL]):
-                publish.append(kind)
-            else:
-                job._index.remote_recycle(job._rank, remote, kind)
-        landed = self._publish(job, publish) if publish else {}
+        publish = bool(ok) and all(ok.values()) and (job._valid is None or job._valid())
+        if not publish:
+            for kind, remote in job._reserved.items():
+                if kind not in late:
+                    job._index.remote_recycle(job._rank, remote, kind)
+        n, hit = len(job._hashes), job._hit
+        landed = self._publish(job) if publish else {}
         whole = [k for k, count in landed.items() if count == len(job._reserved[k])]
         hit = n if FULL in whole else hit
         nbytes = sum(count * int(job._store.pool(k).slot_bytes) for k, count in landed.items())
@@ -614,21 +614,19 @@ class RadixClient:
         job._f.set_result(PushResult(hit, job._hit, sum(landed.values()), nbytes,
                                      hit == n and all(k in whole for k in job._want)))
 
-    def _publish(self, job: PushJob, kinds: List[ComponentType]) -> Dict[ComponentType, int]:
+    def _publish(self, job: PushJob) -> Dict[ComponentType, int]:
         runs = []
-        for kind in kinds:
-            if kind == FULL:
-                continue
+        for kind in (SWA, MAMBA):
             a = 0
-            for end, count in job._parts[kind]:
+            for end, count in job._parts.get(kind, ()):
                 runs.append((kind, end, job._reserved[kind][a:a + count]))
                 a += count
-        full = job._reserved[FULL] if FULL in kinds else _empty()
+        full = job._reserved.get(FULL, _empty())
         res = job._index.remote_insert_path(job._rank, job._hashes, job._hit, full, runs, True)
         if res.remote_status != _core.RemoteStatus.OK:
             return {}
-        landed = dict.fromkeys(kinds, 0)
-        if FULL in kinds and res.full.error == _core.InsertError.OK:
+        landed = dict.fromkeys(job._reserved, 0)
+        if FULL in job._reserved and res.full.error == _core.InsertError.OK:
             landed[FULL] = len(full)
         for (kind, _, slots), r in zip(runs, res.runs):
             if r.error == _core.InsertError.OK:

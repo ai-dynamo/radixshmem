@@ -307,17 +307,18 @@ def test_role_picks_the_handler(cfg):
 
 
 class StubJob:
-    def __init__(self, complete):
+    def __init__(self, complete, no_space):
         self.complete = complete
+        self.no_space = no_space
 
     def wait(self, timeout=None):
         return self
 
 
 class StubClient:
-    def __init__(self, role, complete=True):
+    def __init__(self, role, complete=True, no_space=False):
         self.info = SimpleNamespace(role=role)
-        self.complete = complete
+        self.complete, self.no_space = complete, no_space
         self.pushes = []
         self.components = []
 
@@ -331,7 +332,7 @@ class StubClient:
     def push_async(self, rank, hashes, full_slots, swa=(), mamba=(), **kw):
         self.pushes.append((rank, len(hashes)))
         self.components.append(([(e, [int(x) for x in s]) for e, s in swa], list(mamba)))
-        return StubJob(self.complete)
+        return StubJob(self.complete, self.no_space)
 
 
 def task(task_id, n, first=1):
@@ -340,9 +341,9 @@ def task(task_id, n, first=1):
                                    np.empty(0, np.uint32), np.empty(0, np.int32), 0, 0)
 
 
-def peer_writeback(role, complete=True):
+def peer_writeback(role, complete=True, no_space=False):
     h = writeback.PeerWriteback()
-    h.start(StubClient(role, complete))
+    h.start(StubClient(role, complete, no_space))
     return h
 
 
@@ -352,12 +353,16 @@ def test_peer_writeback_counts_tasks_and_skips_long_paths():
     h.write([task(1, 8), task(2, 8, first=2), task(3, radixshmem.MAX_REMOTE_OP_BLOCKS + 1)], done.extend)
     assert done == [1, 2, 3]
     assert h.client.pushes == [(2, 8), (1, 8)]
-    assert h.stats() == {"pushed": 2, "incomplete": 0, "no_target": 0, "too_long": 1}
+    assert h.stats() == {"pushed": 2, "incomplete": 0, "no_space": 0, "no_target": 0, "too_long": 1}
 
     h = peer_writeback("prefill", complete=False)
     h.write([task(1, radixshmem.MAX_REMOTE_OP_BLOCKS)], done.extend)
     assert h.client.pushes == [(2, radixshmem.MAX_REMOTE_OP_BLOCKS)]
-    assert h.stats() == {"pushed": 0, "incomplete": 1, "no_target": 0, "too_long": 0}
+    assert h.stats() == {"pushed": 0, "incomplete": 1, "no_space": 0, "no_target": 0, "too_long": 0}
+
+    h = peer_writeback("prefill", complete=False, no_space=True)
+    h.write([task(1, 8), task(2, 8, first=2)], done.extend)
+    assert h.stats() == {"pushed": 0, "incomplete": 0, "no_space": 2, "no_target": 0, "too_long": 0}
 
 
 def test_peer_writeback_pushes_the_components_of_the_whole_chain():
@@ -376,4 +381,4 @@ def test_peer_writeback_pushes_nothing_from_a_decode_node(capfd):
     done = []
     h.write([task(1, 8), task(2, 8, first=2)], done.extend)
     assert done == [1, 2] and h.client.pushes == []
-    assert h.stats() == {"pushed": 0, "incomplete": 0, "no_target": 2, "too_long": 0}
+    assert h.stats() == {"pushed": 0, "incomplete": 0, "no_space": 0, "no_target": 2, "too_long": 0}
