@@ -42,7 +42,7 @@ _ATTACH_TIMEOUT_MS = 30000          # a ready server's SlotStore is complete; at
 
 # (peer_rank, kind, remote_slots, local_slots[, op]) -> (ok, bytes, descriptors, error).
 # op is XFER_READ ("r", the default: peer -> local) or XFER_WRITE ("w": local -> peer).
-TransferItem = Tuple[int, int, List[int], List[int]]
+TransferItem = Union[Tuple[int, int, List[int], List[int]], Tuple[int, int, List[int], List[int], str]]
 XFER_READ, XFER_WRITE = "r", "w"
 XFER_IN_FLIGHT = "in flight"
 CLIENT_CLOSED = "client closed"
