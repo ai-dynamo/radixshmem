@@ -44,6 +44,7 @@ _ATTACH_TIMEOUT_MS = 30000          # a ready server's SlotStore is complete; at
 TransferItem = Tuple[int, int, List[int], List[int]]
 XFER_READ, XFER_WRITE = "r", "w"
 XFER_IN_FLIGHT = "in flight"
+CLIENT_CLOSED = "client closed"
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -152,6 +153,7 @@ class PushJob:
         self._f: concurrent.futures.Future = concurrent.futures.Future()
         self._rank = rank
         self._hashes = hashes
+        self._index = None
         self._q = None                  # remote_query(lock=True): the target's pin on its hit
         self._hit = 0
         self._want: List[ComponentType] = []
@@ -391,6 +393,7 @@ class RadixClient:
             pushes = {t: j for t, j in self._pending.items() if isinstance(j, PushJob)}
             for t in pushes:
                 del self._pending[t]
+                self._slots.release()
         if pushes:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pushes), 32)) as pool:
                 list(pool.map(lambda job: job._q.finalize(), pushes.values()))
@@ -450,12 +453,13 @@ class RadixClient:
             raise ValueError(f"{len(full)} FULL slots for {len(h)} hashes")
         if any(not len(s) <= e <= len(h) for e, s in swa) or any(not 0 < e <= len(h) for e, _ in mamba):
             raise ValueError(f"an SWA run or a Mamba checkpoint ends outside the {len(h)}-block path")
+        index = self._attach()
         with self._mu:
             job = PushJob(self._next_id, self, int(rank), h)
             self._next_id += 1
             self._jobs[job.job_id] = job
-        job._valid = valid
-        job._q = q = self._index.remote_query(job._rank, h, lock=True, update_meta=False)
+        job._index, job._valid = index, valid
+        job._q = q = index.remote_query(job._rank, h, lock=True, update_meta=False)
         if int(q.status) == 0:
             job._hit = int(q.total_hit_length)
             self._reserve(job, full, swa, mamba)
@@ -521,6 +525,11 @@ class RadixClient:
             self.saturated += 1
             self._complete_any(job, [(False, 0, 0, "client saturated")] * len(job._items))
             return
+        push = isinstance(job, PushJob)
+        if push and self._closed:
+            self._slots.release()
+            self._complete_push(job, [(False, 0, 0, CLIENT_CLOSED)] * len(job._items))
+            return
         try:
             job._ticket = self._t.submit(job._items, timeout_ms)
         except Exception as e:  # noqa: BLE001 - busy or unreachable server: nothing moves
@@ -528,11 +537,18 @@ class RadixClient:
             self._complete_any(job, [(False, 0, 0, str(e))] * len(job._items))
             return
         with self._mu:
-            self._pending[job._ticket] = job
-            if self._completer is None:
-                self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
-                                                   daemon=True)
-                self._completer.start()
+            closed = push and self._closed
+            if not closed:
+                self._pending[job._ticket] = job
+                if self._completer is None:
+                    self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
+                                                       daemon=True)
+                    self._completer.start()
+        if closed:
+            self._slots.release()
+            job._q.finalize()
+            job._f.set_result(PushResult(job._hit, job._hit, 0, 0, False))
+            return
         self._work.set()
 
     def _complete_any(self, job: Union[PullJob, PushJob], replies: Sequence[TransferReply]) -> None:
@@ -548,7 +564,7 @@ class RadixClient:
         job._want = [kind for kind, _ in pieces]
         for kind, parts in pieces:
             local = np.concatenate([s for _, s in parts])
-            remote = np.asarray(self._index.remote_allocate(job._rank, len(local), kind).slots, dtype=np.int32)
+            remote = np.asarray(job._index.remote_allocate(job._rank, len(local), kind).slots, dtype=np.int32)
             if len(remote) != len(local):       # refused or MEMPOOL_FULL: no slots
                 if kind == FULL:
                     return
@@ -570,7 +586,7 @@ class RadixClient:
             if ok[kind] and (kind == FULL or hit == n or ok[FULL]):
                 publish.append(kind)
             else:
-                self._index.remote_recycle(job._rank, remote, kind)
+                job._index.remote_recycle(job._rank, remote, kind)
         landed = self._publish(job, publish) if publish else {}
         whole = [k for k, count in landed.items() if count == len(job._reserved[k])]
         hit = n if FULL in whole else hit
@@ -589,7 +605,7 @@ class RadixClient:
                 runs.append((kind, end, job._reserved[kind][a:a + count]))
                 a += count
         full = job._reserved[FULL] if FULL in kinds else _empty()
-        res = self._index.remote_insert_path(job._rank, job._hashes, job._hit, full, runs, True)
+        res = job._index.remote_insert_path(job._rank, job._hashes, job._hit, full, runs, True)
         if res.remote_status != _core.RemoteStatus.OK:
             return {}
         landed = dict.fromkeys(kinds, 0)

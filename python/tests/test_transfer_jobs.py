@@ -277,3 +277,85 @@ def test_close_releases_the_pins_of_unfinished_pushes_concurrently():
     assert sorted(released) == list(range(8))
     assert list(c._pending.values()) == [pull] and not pull.done()
     assert all(job.wait(0) == PushResult(3, 3, 0, 0, False) for job in pushes)
+
+
+class ClosingIndex(StubIndex):
+    def __init__(self, at, **kw):
+        super().__init__(**kw)
+        self.at, self.client = at, None
+
+    def remote_allocate(self, rank, n, kind):
+        if self.at == "allocate":
+            self.at = None
+            self.client.close()
+        return super().remote_allocate(rank, n, kind)
+
+
+class ClosingTransport(StubTransport):
+    def __init__(self):
+        super().__init__({})
+        self.client = None
+
+    def submit(self, items, timeout_ms):
+        ticket = super().submit(items, timeout_ms)
+        self.client.close()
+        return ticket
+
+
+def push_args():
+    return (2, np.arange(1, 9, dtype=np.uint64), np.arange(10, 18, dtype=np.int32),
+            [(8, [20, 21, 22, 23])], [(5, 30), (8, 31)])
+
+
+def test_a_push_reaching_submit_after_close_recycles_its_slots_and_releases_its_pin():
+    index = ClosingIndex("allocate", hit=3)
+    c = index.client = client(index)
+    job = c.push_async(*push_args())
+    assert c._index is None and c._t.items == []
+    assert job.wait(0) == PushResult(3, 3, 0, 0, False)
+    assert index.log == [("recycle", FULL, [100, 101, 102, 103, 104]), ("recycle", SWA, [105, 106, 107, 108]),
+                         ("recycle", MAMBA, [109, 110]), ("unlock", 2)]
+    assert c._pending == {} and c._completer is None and c._slots._value == 4
+
+
+def test_a_push_submitted_while_closing_releases_its_pin_and_keeps_its_slots():
+    index = StubIndex(hit=3)
+    c = client(index)
+    c._t = t = ClosingTransport()
+    t.client = c
+    job = c.push_async(*push_args())
+    assert len(t.items) == 3 and job.wait(0) == PushResult(3, 3, 0, 0, False)
+    assert index.log == [("unlock", 2)]
+    assert c._pending == {} and c._completer is None and c._slots._value == 4
+
+
+def test_close_lets_a_push_waiting_for_a_slot_finish():
+    index = StubIndex(hit=3)
+    c = client(index)
+    c._slots = threading.Semaphore(1)
+    held = PushJob(1, c, 2, np.arange(8, dtype=np.uint64))
+    held._q = SimpleNamespace(finalize=lambda: index.log.append(("unlock held", 2)))
+    c._slots.acquire()
+    c._pending[1] = held
+    jobs = []
+    th = threading.Thread(target=lambda: jobs.append(c.push_async(*push_args())))
+    th.start()
+    time.sleep(0.2)
+    assert th.is_alive() and index.log == []
+    c.close()
+    th.join(2)
+    assert not th.is_alive() and jobs[0].wait(0) == PushResult(3, 3, 0, 0, False)
+    assert held.wait(0) == PushResult(0, 0, 0, 0, False)
+    assert sorted(index.log, key=str) == sorted([
+        ("unlock held", 2), ("recycle", FULL, [100, 101, 102, 103, 104]), ("recycle", SWA, [105, 106, 107, 108]),
+        ("recycle", MAMBA, [109, 110]), ("unlock", 2)], key=str)
+    assert c._pending == {}
+
+
+def test_a_push_after_close_takes_no_pin():
+    index = StubIndex(hit=3)
+    c = client(index)
+    c.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        c.push_async(*push_args())
+    assert index.log == [] and c._jobs == {}
