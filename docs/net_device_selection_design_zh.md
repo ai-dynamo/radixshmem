@@ -1,6 +1,6 @@
 # 网络设备发现与选择设计
 
-状态：第 1–4 步已实现（分支 `feat/net-device-discovery`，基线 `feat/pd-support@e98f4be`）：`net_discovery` 模块与 `test_net_select`、服务端/客户端/Python 启动前解析、Mooncake/NIXL 采用诊断、`register_store` 按页所在 NUMA 注册。第 5 步双机验证未做。Mooncake 行为分析参考本地 `v0.3.14` 源码。
+状态：第 1–4 步已实现（分支 `feat/net-device-discovery`，基线 `feat/pd-support@e98f4be`）：`net_discovery` 模块与 `test_net_select`、服务端/客户端/Python 启动前解析、Mooncake/NIXL 采用诊断、`register_store` 按页所在 NUMA 注册。第 5 步：A 机单机零配置彩排通过，A+B 双机步骤待执行，runbook 和记录见 §7.4。Mooncake 行为分析参考本地 `v0.3.14` 源码。
 
 ## 1. 问题
 
@@ -254,6 +254,22 @@ Python、CLI、C++ 入口的默认值和覆盖语义需统一；自动解析在�
 A/B 在各自本地规则可消歧时零配置启动，运行 gRPC remote-op、索引面访问和数据传输，与显式配置基线对比。覆盖本机设备命名/GID 索引不同、索引与控制分网、数据面设备过滤等场景。
 
 明确区分“本地选择正确”“跨机诊断提示”“实际建链和数据校验通过”。无共同可达网络时报告候选和有界建链错误，不保证单靠子网信息提前识别所有故障。
+
+### 7.4 验证记录与 runbook
+
+A 机单机彩排（2026-11-04，H20-GPU-12）：etcd 监听 `10.6.131.12:12379`，两个服务端进程不带任何 `rpc`/`index`/`gid`/`transfer` 参数启动；客户端给 node0 几何；writer 在 node0 写 8 个前缀共 256 块；reader 在 node1 用 `pull_async` 拉取。结果：
+
+- 两边 Python preflight 都打印 `[radixshmem] net: control 10.6.131.12 (index gid) | index mlx5_bond_0 port 1 gid 3 (10.6.131.12, bond0, numa 0, registry-route hint)`。随后 C++ bootstrap 打印同一设备、GID 和地址，理由为 `explicit device and gid`，因为 Python 已把解析结果写回配置。理由看第一行，一致性看第二行。
+- Mooncake 行：`transfer devices allowed=all engine=mlx5_4,…,mlx5_bond_0 active=unverified`。
+- 集群 rank 0/2、1/2 成形；reader 结果 `hits=256 remote_blocks=256 bytes_ok=256`。
+- `--no-prefault` 时槽池页未驻留，`move_pages` 返回 ENOENT，日志为 `NUMA node of the pool unknown`，位置交给后端；默认 prefault 下注册为 `cpu:N`。
+
+A+B 双机步骤在 `scripts/dual_node_net_check.sh`，B 侧经 ssh 执行，顺序：`probe`（B 的设备、地址、GID 3、工具链）→ `sync` → `build_b` → `run`（零配置）→ `run --rpc-interface bond0 --index-dev mlx5_bond_0 --gid-idx 3 --transfer-dev mlx5_bond_0`（显式基线）。通过标准：两台服务端的 net 行各自选到有路由到 registry 的设备和 IPv4 RoCE v2 GID；日志出现 `Cluster ready rank=0/2` 与 `1/2`；B 上 reader 的 `bytes_ok` 等于 256。零配置下数据面设备不受约束，由 Mooncake 自行选卡；若零配置跨机建链失败而显式基线通过，问题在数据面可达性，不在索引面选择。本文撰写时 B 侧步骤尚未执行。
+
+部署注意：
+
+- etcd 的 Go 客户端和 gRPC 遵守 `HTTP_PROXY`/`HTTPS_PROXY`。环境有代理时 registry 地址必须在 `NO_PROXY` 内，否则 `RadixEtcdGrantLease` 以 DeadlineExceeded 失败。runbook 直接 unset 这些变量。
+- 本机 2379 可能被其他 etcd 占用，runbook 用 12379。
 
 ## 8. 实现顺序与范围控制
 
