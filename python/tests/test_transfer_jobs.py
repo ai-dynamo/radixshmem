@@ -359,3 +359,18 @@ def test_a_push_after_close_takes_no_pin():
     with pytest.raises(RuntimeError, match="closed"):
         c.push_async(*push_args())
     assert index.log == [] and c._jobs == {}
+
+
+def test_a_push_cannot_be_cancelled_and_runs_on():
+    index = StubIndex(hit=3)
+    c = client(index)
+    try:
+        job = c.push_async(*push_args())
+        for target in (job, job.job_id):
+            with pytest.raises(TypeError, match="push"):
+                c.cancel(target)
+        assert c._jobs[job.job_id] is job and not hasattr(job, "_cancelled")
+        assert job.wait(5) == PushResult(8, 3, 11, 110, True)
+        assert index.log[-1] == ("unlock", 2)
+    finally:
+        c.close()

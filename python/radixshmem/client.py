@@ -475,8 +475,11 @@ class RadixClient:
 
     def cancel(self, job: Union[PullJob, int]) -> None:
         """See ``PullJob.cancel``. Under ``_mu`` so that a result set by the
-        completer at the same moment still gets its pin released."""
-        job = job if isinstance(job, PullJob) else self._jobs[job]
+        completer at the same moment still gets its pin released. A push has
+        nothing to give up: it raises ``TypeError`` and runs on."""
+        job = self._jobs[job] if isinstance(job, int) else job
+        if not isinstance(job, PullJob):
+            raise TypeError(f"job {job.job_id} is a push: only a pull can be cancelled")
         with self._mu:
             job._cancelled = True
             self._jobs.pop(job.job_id, None)
