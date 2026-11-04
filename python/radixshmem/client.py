@@ -157,6 +157,7 @@ class PushJob:
         self._want: List[ComponentType] = []
         self._items: List[TransferItem] = []
         self._reserved: Dict[ComponentType, np.ndarray] = {}
+        self._parts: Dict[ComponentType, List[Tuple[int, int]]] = {}
         self._valid: Optional[Callable[[], bool]] = None
         self._ticket = -1
 
@@ -426,12 +427,13 @@ class RadixClient:
             self._submit(job, timeout_ms, block)
         return job
 
-    def push_async(self, rank: int, hashes, full_slots, swa_slots=None, mamba_slot: int = -1, *,
+    def push_async(self, rank: int, hashes, full_slots, swa=(), mamba=(), *,
                    valid: Optional[Callable[[], bool]] = None, timeout_ms: int = 30000,
                    block: bool = True) -> PushJob:
         """Reverse of ``pull_async``: write a path from local slots to peer
-        ``rank`` and publish it there. ``swa_slots`` / ``mamba_slot``: the SWA
-        window and Mamba checkpoint at its end (None / -1: none). The target's
+        ``rank`` and publish it there. ``swa``: ``(end, slots)`` runs of SWA
+        cells covering ``[end - len(slots), end)``; ``mamba``: ``(end, slot)``
+        checkpoints; every ``end`` is at most ``len(hashes)``. The target's
         hit stays pinned while the rest is written; ``valid``, if given, is
         checked after the write and False publishes nothing. Keep the local
         slots until the job is done."""
@@ -440,8 +442,12 @@ class RadixClient:
         self.store
         h = np.ascontiguousarray(hashes, dtype=np.uint64)
         full = np.ascontiguousarray(full_slots, dtype=np.int32)
+        swa = [(int(e), np.ascontiguousarray(s, dtype=np.int32)) for e, s in swa]
+        mamba = [(int(e), int(s)) for e, s in mamba]
         if len(full) != len(h):
             raise ValueError(f"{len(full)} FULL slots for {len(h)} hashes")
+        if any(not len(s) <= e <= len(h) for e, s in swa) or any(not 0 < e <= len(h) for e, _ in mamba):
+            raise ValueError(f"an SWA run or a Mamba checkpoint ends outside the {len(h)}-block path")
         with self._mu:
             job = PushJob(self._next_id, self, int(rank), h)
             self._next_id += 1
@@ -450,7 +456,7 @@ class RadixClient:
         job._q = q = self._index.remote_query(job._rank, h, lock=True, update_meta=False)
         if int(q.status) == 0:
             job._hit = int(q.total_hit_length)
-            self._reserve(job, full, swa_slots, mamba_slot)
+            self._reserve(job, full, swa, mamba)
         if not job._items:
             self._complete_push(job, [])
         else:
@@ -530,16 +536,16 @@ class RadixClient:
     def _complete_any(self, job: Union[PullJob, PushJob], replies: Sequence[TransferReply]) -> None:
         (self._complete_push if isinstance(job, PushJob) else self._complete)(job, replies)
 
-    def _reserve(self, job: PushJob, full: np.ndarray, swa_slots, mamba_slot) -> None:
+    def _reserve(self, job: PushJob, full: np.ndarray, swa, mamba) -> None:
         """Allocate the target's slots, FULL first: nothing else lands without the path."""
-        m = job._hit
-        pieces = [(FULL, full[m:])] if m < len(full) else []
-        if swa_slots is not None and len(swa_slots):
-            pieces.append((SWA, np.ascontiguousarray(swa_slots, dtype=np.int32)))
-        if mamba_slot is not None and int(mamba_slot) >= 0:
-            pieces.append((MAMBA, np.asarray([int(mamba_slot)], dtype=np.int32)))
+        n, m = len(full), job._hit
+        swa_parts = [(e, s) for e, s in swa if len(s)]
+        mamba_parts = [(e, np.asarray([s], dtype=np.int32)) for e, s in mamba if s >= 0]
+        pieces = (([(FULL, [(n, full[m:])])] if m < n else []) + ([(SWA, swa_parts)] if swa_parts else [])
+                  + ([(MAMBA, mamba_parts)] if mamba_parts else []))
         job._want = [kind for kind, _ in pieces]
-        for kind, local in pieces:
+        for kind, parts in pieces:
+            local = np.concatenate([s for _, s in parts])
             remote = np.asarray(self._index.remote_allocate(job._rank, len(local), kind).slots, dtype=np.int32)
             if len(remote) != len(local):       # refused or MEMPOOL_FULL: no slots
                 if kind == FULL:
@@ -547,6 +553,7 @@ class RadixClient:
                 continue
             job._items.append((job._rank, int(kind), remote.tolist(), local.tolist(), XFER_WRITE))
             job._reserved[kind] = remote
+            job._parts[kind] = [(e, len(s)) for e, s in parts]
 
     def _complete_push(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
         ok = {ComponentType(it[1]): rep[0] for it, rep in zip(job._items, replies)}
@@ -562,8 +569,14 @@ class RadixClient:
             if not ok[kind] or (kind != FULL and hit < n):
                 idx.remote_recycle(rank, remote, kind)
                 continue
-            res = idx.remote_insert(rank, h, hit if kind == FULL else 0, len(remote), remote, True, kind)
-            if res.error != _core.InsertError.OK:
+            if kind == FULL:
+                good = idx.remote_insert(rank, h, hit, len(remote), remote, True, kind).error == _core.InsertError.OK
+            else:
+                good, a = True, 0
+                for end, count in job._parts[kind]:
+                    res = idx.remote_insert(rank, h[:end], 0, count, remote[a:a + count], True, kind)
+                    good, a = good and res.error == _core.InsertError.OK, a + count
+            if not good:
                 continue
             landed.append(kind)
             nbytes += len(remote) * int(self._store.pool(kind).slot_bytes)

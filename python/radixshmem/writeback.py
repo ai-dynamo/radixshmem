@@ -11,7 +11,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 
@@ -75,7 +75,6 @@ class PeerWriteback(WritebackHandler):
     def __init__(self, config: Dict[str, Any]):
         self.timeout_ms = int(config.get("timeout_ms", 30000))
         self.client = None
-        self._window = 0
         self._decode = False
         self._nodes: List[Dict[str, Any]] = []
         self._nodes_at = float("-inf")
@@ -83,7 +82,6 @@ class PeerWriteback(WritebackHandler):
 
     def start(self, client) -> None:
         self.client = client
-        self._window = int(client.geometry["pools"].get("swa", {}).get("window_blocks", 0))
         self._decode = client.info.role == "decode"
         if self._decode:
             print("radixshmem: PeerWriteback on a decode node pushes nothing", file=sys.stderr)
@@ -116,11 +114,17 @@ class PeerWriteback(WritebackHandler):
         return ranks[int(t.hashes[0]) % len(ranks)] if ranks else -1
 
     def _push(self, t: WritebackTask, rank: int) -> PushJob:
-        swa = t.swa_slots[max(0, t.end - self._window):]
-        live = len(swa) > 0 and bool((swa != INVALID_COMPONENT_SLOT).all())
-        mamba = int(t.mamba_slots[-1]) if len(t.mamba_ends) and int(t.mamba_ends[-1]) == t.end else -1
-        return self.client.push_async(rank, t.hashes, t.full_slots, swa if live else None, mamba,
-                                      valid=t.valid, timeout_ms=self.timeout_ms)
+        mamba = [(int(e), int(s)) for e, s in zip(t.mamba_ends, t.mamba_slots) if e > t.evicted_from]
+        return self.client.push_async(rank, t.hashes, t.full_slots, _swa_runs(t.swa_slots, t.evicted_from),
+                                      mamba, valid=t.valid, timeout_ms=self.timeout_ms)
+
+
+def _swa_runs(slots: np.ndarray, past: int) -> List[Tuple[int, np.ndarray]]:
+    live = np.flatnonzero(slots != INVALID_COMPONENT_SLOT)
+    if not len(live):
+        return []
+    runs = np.split(live, np.flatnonzero(np.diff(live) != 1) + 1)
+    return [(int(r[-1]) + 1, slots[r[0]:r[-1] + 1]) for r in runs if r[-1] >= past]
 
 
 class _Worker:

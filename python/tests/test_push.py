@@ -6,7 +6,7 @@ radix-server processes on one host.
 
 node0 is a prefill node with background eviction and PeerWriteback; node1 and
 node2 are empty decode nodes, node3 an empty prefill node. Prefixes come in pairs sharing a 3-block stem,
-each with a FULL path, an SWA window and a Mamba checkpoint at its END.
+each with a FULL path and an SWA window and a Mamba checkpoint at block MID and at its END.
 
   push       a client on node0 push_async()s prefixes to node1: a new path, its
              sibling (the stem is deduplicated), the first one again, one whose
@@ -14,7 +14,7 @@ each with a FULL path, an SWA window and a Mamba checkpoint at its END.
              the two that landed, bytes intact, and leaks nothing.
   writeback  a writer puts twice node0's FULL pool through it; every prefix
              background eviction takes from node0 is on node1 or node2 with
-             FULL + SWA + Mamba and intact bytes, on the same node as its
+             FULL + SWA + Mamba at both ends and intact bytes, on the same node as its
              sibling, both nodes got some and node3 none, node0's cluster
              query finds each one whole, and node0 pulls some back.
 
@@ -48,6 +48,7 @@ SALT = {"full": 0x46554C4C, "swa": 0x535741, "mamba": 0x4D414D42}
 EVICT_RATIO = 0.2
 PUSHED = 4          # prefixes [0, PUSHED) are for push_async; write-back gets the ones after
 LONG = 600
+MID = STEM + 3
 
 
 def prefix_tokens(k: int):
@@ -99,26 +100,28 @@ def client_main(role: str, endpoint: str) -> int:
             bad += bytes(view(q.mamba[1], MAMBA)) != pattern(h[-1], SALT["mamba"], MAMBA_BYTES)
         return bad
 
-    def put(h):
-        n = len(h)
-        m = int(c.query(h, local_only=True, update_meta=False).common_hit)
-        slots = c.allocate_slots(n - m)
-        for i, s in enumerate(slots):
-            view(s, FULL)[:] = pattern(h[m + i], SALT["full"], FULL_BYTES)
-        errors = {str(c.insert(h, slots, start=m).error)}
-        sw = c.allocate_slots(WINDOW, SWA)
-        for i, s in enumerate(sw):
-            view(s, SWA)[:] = pattern(h[n - WINDOW + i], SALT["swa"], SWA_BYTES)
-        errors.add(str(c.insert(h, sw, component=SWA).error))
-        mb = c.allocate_slots(1, MAMBA)
-        view(mb[0], MAMBA)[:] = pattern(h[-1], SALT["mamba"], MAMBA_BYTES)
-        errors.add(str(c.insert(h, mb, component=MAMBA).error))
+    def put(h, ends=None):
+        errors = set()
+        for e in ends or (len(h),):
+            m = int(c.query(h[:e], local_only=True, update_meta=False).common_hit)
+            slots = c.allocate_slots(e - m)
+            for i, s in enumerate(slots):
+                view(s, FULL)[:] = pattern(h[m + i], SALT["full"], FULL_BYTES)
+            errors.add(str(c.insert(h[:e], slots, start=m).error))
+            sw = c.allocate_slots(WINDOW, SWA)
+            for i, s in enumerate(sw):
+                view(s, SWA)[:] = pattern(h[e - WINDOW + i], SALT["swa"], SWA_BYTES)
+            errors.add(str(c.insert(h[:e], sw, component=SWA).error))
+            mb = c.allocate_slots(1, MAMBA)
+            view(mb[0], MAMBA)[:] = pattern(h[e - 1], SALT["mamba"], MAMBA_BYTES)
+            errors.add(str(c.insert(h[:e], mb, component=MAMBA).error))
         return errors
 
     def push(h, rank, valid=None):
         q = joint(h)
-        r = c.push_async(rank, h, full_of(q), q.swa_slots, int(q.mamba[1]) if q.mamba else -1,
-                         valid=valid).wait(60)
+        swa = [(len(h), q.swa_slots)] if len(q.swa_slots) else []
+        mamba = [(len(h), int(q.mamba[1]))] if q.mamba else []
+        r = c.push_async(rank, h, full_of(q), swa, mamba, valid=valid).wait(60)
         q.finalize()
         return [r.common_hit, r.remote_hit, r.remote_blocks, r.remote_bytes, r.complete]
 
@@ -130,7 +133,7 @@ def client_main(role: str, endpoint: str) -> int:
             deadline = time.time() + 60
             while c.mempool_free() < N and time.time() < deadline:
                 time.sleep(0.005)     # background eviction makes room, so allocate_slots never evicts
-            errors |= put(hs(k))
+            errors |= put(hs(k), (MID, N))
             time.sleep(0.005)
         c.flush()
         out["insert_errors"] = sorted(errors)
@@ -149,6 +152,14 @@ def client_main(role: str, endpoint: str) -> int:
         out["row"] = [int(c.query(long_path, local_only=True, update_meta=False).common_hit), int(q.common_hit),
                       verify(long_path, q) if int(q.common_hit) == LONG else 0]
         q.finalize()
+    elif role.startswith("midcensus:"):
+        rows = []
+        for k in span(role.split(":", 1)[1]):
+            h = hs(k)[:MID]
+            q = joint(h)
+            rows.append([int(q.common_hit), verify(h, q) if int(q.common_hit) == MID else 0])
+            q.finalize()
+        out["rows"] = rows
     elif role.startswith("census:"):
         rows = []   # per prefix: FULL hit, joint FULL | SWA | MAMBA hit, bad slots
         for k in span(role.split(":", 1)[1]):
@@ -263,6 +274,9 @@ def test_writeback(eps, full_slots):
     lost = [first + k for k, hs in holders.items() if not hs]
     p2p.check(not lost, f"every prefix that left node0 is on node1 or node2 with FULL + SWA + Mamba, bytes intact "
                     f"(lost: {lost})")
+    mid = {i: run_client(f"midcensus:{span}", eps[i])["rows"] for i in (1, 2)}
+    short = [first + k for k, who in holders.items() if mid[who[0]][k] != [MID, 0]]
+    p2p.check(not short, f"and with the SWA window and Mamba checkpoint of its turn at block {MID} (short: {short})")
     pair = {}
     for k, hs in holders.items():
         pair.setdefault((first + k) // 2, set()).add(tuple(hs))

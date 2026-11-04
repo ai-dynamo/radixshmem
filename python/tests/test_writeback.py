@@ -319,9 +319,9 @@ class StubJob:
 class StubClient:
     def __init__(self, role, complete=True):
         self.info = SimpleNamespace(role=role)
-        self.geometry = {"pools": {"full": {"slot_bytes": 8192, "num_slots": 64}}}
         self.complete = complete
         self.pushes = []
+        self.components = []
 
     def rank(self):
         return 0
@@ -330,8 +330,9 @@ class StubClient:
         return [{"rank": r, "mode": "ready", "data_plane": True, "role": role}
                 for r, role in ((0, self.info.role), (1, "decode"), (2, "decode"), (3, "prefill"))]
 
-    def push_async(self, rank, hashes, full_slots, swa_slots=None, mamba_slot=-1, **kw):
+    def push_async(self, rank, hashes, full_slots, swa=(), mamba=(), **kw):
         self.pushes.append((rank, len(hashes)))
+        self.components.append(([(e, [int(x) for x in s]) for e, s in swa], list(mamba)))
         return StubJob(self.complete)
 
 
@@ -359,6 +360,16 @@ def test_peer_writeback_counts_tasks_and_skips_long_paths():
     h.write([task(1, radixshmem.MAX_REMOTE_OP_BLOCKS)], done.extend)
     assert h.client.pushes == [(2, radixshmem.MAX_REMOTE_OP_BLOCKS)]
     assert h.stats() == {"pushed": 0, "incomplete": 1, "no_target": 0, "too_long": 0}
+
+
+def test_peer_writeback_pushes_the_components_of_the_whole_chain():
+    h = peer_writeback("prefill")
+    x = radixshmem.INVALID_COMPONENT_SLOT
+    t = writeback.WritebackTask(1, np.arange(1, 9, dtype=np.uint64), np.arange(8, dtype=np.int32),
+                                np.array([x, 50, 51, 52, 53, x, x, 57], dtype=np.int32),
+                                np.array([2, 5, 8], dtype=np.uint32), np.array([60, 61, 62], dtype=np.int32), 3, 0)
+    h.write([t], lambda ids: None)
+    assert h.client.components == [([(5, [50, 51, 52, 53]), (8, [57])], [(5, 61), (8, 62)])]
 
 
 def test_peer_writeback_pushes_nothing_from_a_decode_node(capfd):
