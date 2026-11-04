@@ -23,6 +23,8 @@ import threading
 import time
 
 import test_p2p_pull as p2p
+from radixshmem import cli
+from radixshmem.server import RadixServer
 from radixshmem.writeback import WritebackHandler
 
 
@@ -79,8 +81,9 @@ def _dump(path, out):
     os.rename(path + ".tmp", path)
 
 
-def make(config):
-    return PullHandler(config)
+def serve(config, argv):
+    RadixServer._make_writeback_handler = lambda self: PullHandler(config)
+    cli.main(argv)
 
 
 def orchestrate(a) -> int:
@@ -107,7 +110,9 @@ def orchestrate(a) -> int:
         print("\n[1] two radix-server processes; node1 loads the write-back handler")
         for i in range(2):
             logs.append(os.path.join(workdir, f"server{i}.log"))
-            cmd = [sys.executable, "-m", "radixshmem.cli", "--name", p2p.NAME, "--node-name", f"node{i}",
+            launch = ([os.path.abspath(__file__), "--server", json.dumps({"go": go, "out": result})] if i == 1
+                      else ["-m", "radixshmem.cli"])
+            cmd = [sys.executable, *launch, "--name", p2p.NAME, "--node-name", f"node{i}",
                    "--data-name", f"{p2p.NAME}_data{i}", "--data-bytes", "64M", "--no-prefault",
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
@@ -115,12 +120,7 @@ def orchestrate(a) -> int:
                    "--interval", "0"]
             cmd += ["--index-dev", a.index_dev] if a.index_dev else []
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
-            if i == 1:
-                cmd += ["--background-evict-ratio", "0.01",
-                        "--writeback-handler", "test_writeback_pull:make",
-                        "--writeback-config", json.dumps({"go": go, "out": result})]
-            else:
-                cmd += ["--background-evict-ratio", "0"]
+            cmd += ["--background-evict-ratio", "0.01" if i == 1 else "0"]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT, env=env))
         try:
             p2p.wait_log(logs, servers, "Waiting for a client's geometry", 60)
@@ -129,7 +129,7 @@ def orchestrate(a) -> int:
                 print("SKIP: Mooncake transfer backend unavailable")
                 return 77
             raise
-        p2p.check("Write-back:     test_writeback_pull:make" in p2p.read(logs[1]), "node1 loaded the handler")
+        p2p.check("Write-back:     PullHandler" in p2p.read(logs[1]), "node1 loaded the handler")
 
         print("\n[2] a client brings node0 the geometry; the cluster forms")
         cl0 = radixshmem.RadixClient(p2p.NAME, radixshmem.Geometry(block_size=1, full_slot_bytes=p2p.SLOT_BYTES),
@@ -197,6 +197,8 @@ def orchestrate(a) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) > 2 and sys.argv[1] == "--server":
+        return serve(json.loads(sys.argv[2]), sys.argv[3:])
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--index-dev", default="mlx5_bond_0")
     p.add_argument("--transfer-dev", action="append", default=None)

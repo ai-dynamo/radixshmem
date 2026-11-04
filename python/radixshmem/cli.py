@@ -30,7 +30,6 @@ the slot shape may not (the servers cross-check it through etcd).
 from __future__ import annotations
 
 import argparse
-import json
 import signal
 import sys
 import threading
@@ -38,7 +37,6 @@ import time
 
 from radixshmem import _geometry
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
-from radixshmem.writeback import load_handler
 
 _SIZE = {"": 1, "B": 1, "K": 1 << 10, "M": 1 << 20, "G": 1 << 30, "T": 1 << 40}
 
@@ -149,10 +147,6 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "a path appends there, '' = off (default: -)")
 
     g = p.add_argument_group("write-back of background-evicted KV")
-    g.add_argument("--writeback-handler", default="", metavar="MODULE:FACTORY",
-                   help="enables write-back: FACTORY(config) returns the WritebackHandler")
-    g.add_argument("--writeback-config", default="{}",
-                   help="config passed to the factory: a JSON object, or a path to a JSON file")
     g.add_argument("--writeback-max-held", type=float, default=0.05,
                    help="background eviction pauses while unfinished write-backs cover this "
                         "share of a pool (default: 0.05)")
@@ -212,15 +206,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         transfer_log=a.transfer_log, role="decode" if a.decode else "prefill",
         monitor_port=a.monitor_port, monitor_interval_s=a.monitor_interval,
         monitor_tree_nodes=a.monitor_tree_nodes, monitor_cluster_nodes=a.monitor_cluster_nodes,
-        writeback=bool(a.writeback_handler), writeback_max_held_ratio=a.writeback_max_held,
+        writeback_max_held_ratio=a.writeback_max_held,
         cluster=cluster, **kw)
-
-
-def writeback_config(text: str) -> dict:
-    if text.lstrip().startswith("{"):
-        return json.loads(text)
-    with open(text) as f:
-        return json.load(f)
 
 
 def _stats_line(srv: RadixServer) -> str:
@@ -257,25 +244,18 @@ def main(argv=None) -> None:
         cfg = build_config(a)
     except (ValueError, TypeError) as e:
         sys.exit(f"ERROR: {e}")
-    handler = None
-    if a.writeback_handler:
-        try:
-            handler = load_handler(a.writeback_handler, writeback_config(a.writeback_config))
-        except Exception as e:  # noqa: BLE001 - whatever the operator's factory raises
-            sys.exit(f"ERROR: write-back handler {a.writeback_handler}: {type(e).__name__}: {e}")
-
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
-    srv = RadixServer(cfg, writeback=handler)
+    srv = RadixServer(cfg)
     print(f"Starting radix-server ({'index only' if cfg.index_only else 'index + data plane'})")
     print(f"  Name:           {cfg.name}")
     print(f"  Endpoint:       {cfg.resolved_endpoint}")
     print(f"  Role:           {cfg.role}")
-    if handler is not None:
-        print(f"  Write-back:     {a.writeback_handler}  (pause at {cfg.writeback_max_held_ratio:g} "
-              f"of a pool in flight)")
+    if srv.writeback_handler is not None:
+        print(f"  Write-back:     {type(srv.writeback_handler).__name__}  (pause at "
+              f"{cfg.writeback_max_held_ratio:g} of a pool in flight)")
     if not cfg.index_only:
         print(f"  Data name:      {cfg.resolved_data_name}")
         print(f"  Data budget:    {fmt_size(cfg.data_bytes)}  (swa {cfg.swa_ratio:g}, "

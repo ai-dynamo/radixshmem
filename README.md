@@ -110,7 +110,7 @@ r.finalize()                           # release the pin on the hit blocks
 ```
 
 4. **Push.** `push_async()` is the reverse: it writes local slots to a peer and publishes them in the peer's
-   radix tree. `--writeback-handler radixshmem.writeback:PeerWriteback` pushes evicted KV to the decode nodes with it.
+   radix tree. A prefill server pushes its background-evicted KV to the decode nodes with it.
 
 ```python
 q = client.query(hashes, local_only=True, lock=True)

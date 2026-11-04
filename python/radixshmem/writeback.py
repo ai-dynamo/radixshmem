@@ -7,9 +7,9 @@ them to the decode nodes."""
 
 from __future__ import annotations
 
-import importlib
 import sys
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
@@ -77,6 +77,8 @@ class PeerWriteback(WritebackHandler):
         self.client = None
         self._window = 0
         self._decode = False
+        self._nodes: List[Dict[str, Any]] = []
+        self._nodes_at = float("-inf")
         self._stats = dict.fromkeys(("pushed", "incomplete", "no_target", "too_long"), 0)
 
     def start(self, client) -> None:
@@ -90,10 +92,12 @@ class PeerWriteback(WritebackHandler):
         return dict(self._stats)
 
     def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
-        nodes = [] if self._decode else self.client.nodes()
+        now = time.monotonic()
+        if not self._decode and now - self._nodes_at >= 1.0:
+            self._nodes, self._nodes_at = self.client.nodes(), now
         jobs = []
         for t in tasks:
-            rank = self._choose_target(nodes, t)
+            rank = self._choose_target(self._nodes, t)
             if rank < 0:
                 self._stats["no_target"] += 1
             elif t.end > MAX_REMOTE_OP_BLOCKS:
@@ -117,16 +121,6 @@ class PeerWriteback(WritebackHandler):
         mamba = int(t.mamba_slots[-1]) if len(t.mamba_ends) and int(t.mamba_ends[-1]) == t.end else -1
         return self.client.push_async(rank, t.hashes, t.full_slots, swa if live else None, mamba,
                                       valid=t.valid, timeout_ms=self.timeout_ms)
-
-
-def load_handler(spec: str, config: Dict[str, Any]) -> WritebackHandler:
-    module, _, attr = spec.partition(":")
-    if not module or not attr:
-        raise ValueError(f"write-back handler {spec!r} is not 'module:factory'")
-    handler = getattr(importlib.import_module(module), attr)(config)
-    if not isinstance(handler, WritebackHandler):
-        raise TypeError(f"{spec} returned {type(handler).__name__}, not a WritebackHandler")
-    return handler
 
 
 class _Worker:

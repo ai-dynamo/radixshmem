@@ -16,8 +16,7 @@ import numpy as np
 import pytest
 
 import radixshmem
-from radixshmem import Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler, writeback
-from radixshmem.writeback import load_handler
+from radixshmem import ClusterConfig, Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler, writeback
 
 pytestmark = pytest.mark.skipif(not hasattr(radixshmem, "_data"), reason="radixshmem._data not built")
 
@@ -33,7 +32,7 @@ def cfg(tmp_path):
 
     def make(**kw):
         kw = {"data_bytes": 4 << 20, "slot_align": 64, "prefault": False, "background_evict_ratio": 0.25,
-              "writeback": True, "writeback_max_held_ratio": 0.05, **kw}
+              "writeback_max_held_ratio": 0.05, **kw}
         return ServerConfig(name=make.name, endpoint=make.endpoint, **kw)
 
     make.name, make.endpoint = f"/py_wb_{tag}", f"unix://{tmp_path}/{tag}.sock"
@@ -98,16 +97,16 @@ class ReadyAtStart(Recorder):
         super().start(client)
 
 
-def make_handler(config):
-    return Recorder(**config)
+def with_handler(c, handler):
+    class Server(RadixServer):
+        def _make_writeback_handler(self):
+            return handler
 
-
-def returns_none(config):
-    return None
+    return Server(c)
 
 
 def up(c, handler):
-    srv = RadixServer(c, writeback=handler).start()
+    srv = with_handler(c, handler).start()
     cl = RadixClient(c.name, Geometry(block_size=4, full_slot_bytes=8192, register_chunk_tokens=16),
                      endpoint=c.endpoint)
     cl.wait_ready(30)
@@ -289,28 +288,22 @@ def test_close_stops_a_stuck_write(cfg, monkeypatch):
 
 
 def test_config_and_cli(cfg):
-    with pytest.raises(ValueError, match="go together"):
-        RadixServer(cfg())
-    with pytest.raises(ValueError, match="go together"):
-        RadixServer(cfg(writeback=False), writeback=Recorder())
-    with pytest.raises(ValueError, match="background eviction"):
-        cfg(background_evict_ratio=0.0)
     with pytest.raises(ValueError, match="writeback_max_held_ratio"):
         cfg(writeback_max_held_ratio=0.0)
 
     from radixshmem import cli
 
-    a = cli.parse_args(["--data-bytes", "64M", "--writeback-handler", "test_writeback:make_handler",
-                        "--writeback-config", '{"hold": true}', "--writeback-max-held", "0.1"])
-    c = cli.build_config(a)
-    assert c.writeback and c.writeback_max_held_ratio == 0.1
-    h = load_handler(a.writeback_handler, cli.writeback_config(a.writeback_config))
-    assert isinstance(h, Recorder) and h.hold
-    assert not cli.build_config(cli.parse_args([])).writeback
-    with pytest.raises(ValueError, match="module:factory"):
-        load_handler("no_colon", {})
-    with pytest.raises(TypeError, match="not a WritebackHandler"):
-        load_handler("test_writeback:returns_none", {})
+    c = cli.build_config(cli.parse_args(["--data-bytes", "64M", "--writeback-max-held", "0.1"]))
+    assert c.writeback_max_held_ratio == 0.1
+
+
+def test_role_picks_the_handler(cfg):
+    cluster = ClusterConfig(expected_min_nodes=2, registry="etcd://127.0.0.1:2379", rpc_address="127.0.0.1")
+    assert isinstance(RadixServer(cfg(cluster=cluster)).writeback_handler, writeback.PeerWriteback)
+    assert RadixServer(cfg(cluster=cluster, role="decode")).writeback_handler is None
+    assert RadixServer(cfg(cluster=cluster, background_evict_ratio=0.0)).writeback_handler is None
+    assert RadixServer(cfg(cluster=cluster, data_bytes=0)).writeback_handler is None
+    assert RadixServer(cfg()).writeback_handler is None
 
 
 class StubJob:

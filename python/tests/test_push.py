@@ -304,8 +304,7 @@ def orchestrate(a) -> int:
                    "--expected-min-nodes", "4", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
                    "--gid-idx", str(a.gid_idx), "--bootstrap-timeout", str(a.bootstrap_timeout), "--interval", "1"]
             if i == 0:
-                cmd += ["--background-evict-ratio", str(EVICT_RATIO), "--writeback-max-held", "0.25",
-                        "--writeback-handler", "radixshmem.writeback:PeerWriteback"]
+                cmd += ["--background-evict-ratio", str(EVICT_RATIO), "--writeback-max-held", "0.25"]
             else:
                 cmd += ["--background-evict-ratio", "0"] + (["--decode"] if i < 3 else [])
             cmd += ["--index-dev", a.index_dev] if a.index_dev else []

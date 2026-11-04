@@ -44,7 +44,7 @@ from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_S
                              XFER_READ, XFER_TIMEOUT, XFER_WRITE, NodeInfo, RadixClient, TransferItem,
                              TransferReply)
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy
-from radixshmem.writeback import WritebackHandler, _Worker
+from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
@@ -123,7 +123,6 @@ class ServerConfig:
     background_evict_ratio: float = 0.05
     data_pool_ratio: float = 4.0     # DataPool bytes = full_slots x ratio x (12 | 16 with SWA)
     evict_policy: str = "lru"
-    writeback: bool = False              # needs RadixServer(cfg, writeback=handler)
     writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
@@ -158,8 +157,6 @@ class ServerConfig:
             raise ValueError(f"unknown role {self.role!r}")
         if not 0.0 < self.writeback_max_held_ratio <= 1.0:
             raise ValueError("writeback_max_held_ratio must be in (0, 1]")
-        if self.writeback and self.background_evict_ratio <= 0:
-            raise ValueError("writeback needs background eviction (background_evict_ratio > 0)")
         if not 0 <= self.monitor_port < 65536:
             raise ValueError("monitor_port must be in [0, 65536)")
         if self.monitor_tree_nodes < 0 or self.monitor_cluster_nodes < 0:
@@ -404,11 +401,9 @@ def _kind_name(kind: int) -> str:
 
 
 class RadixServer:
-    def __init__(self, cfg: ServerConfig, writeback: Optional[WritebackHandler] = None):
-        if cfg.writeback != (writeback is not None):
-            raise ValueError("ServerConfig.writeback and a WritebackHandler go together")
+    def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
-        self._wb_handler = writeback
+        self._wb_handler = self._make_writeback_handler()
         self._wb: Optional[_Worker] = None
         self._wb_closed = False
         self._geometry: Optional[Dict[str, Any]] = None
@@ -553,6 +548,12 @@ class RadixServer:
             self._mode = MODE_CLOSED
             self._cv.notify_all()
 
+    def _make_writeback_handler(self) -> Optional[WritebackHandler]:
+        c = self.cfg
+        if c.role == "prefill" and c.distributed and not c.index_only and c.background_evict_ratio > 0:
+            return PeerWriteback({})
+        return None
+
     def _start_writeback(self) -> None:
         if self._wb_handler is None:
             return
@@ -603,6 +604,10 @@ class RadixServer:
     @property
     def index(self):
         return self._index
+
+    @property
+    def writeback_handler(self) -> Optional[WritebackHandler]:
+        return self._wb_handler
 
     @property
     def geometry(self) -> Optional[Dict[str, Any]]:
@@ -766,7 +771,7 @@ class RadixServer:
                    "transfer_failures": self.transfer_failures, "transfer_bytes": self.transfer_bytes,
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
         wb = self._wb
-        if idx is not None and self.cfg.writeback:
+        if idx is not None and self._wb_handler is not None:
             out["writeback"] = {**self._wb_handler.stats(), **idx.writeback_stats(),
                                 "failed": wb.failed if wb else 0}
         if idx is not None:
@@ -790,7 +795,7 @@ class RadixServer:
         cc = _core.RadixServerConfig()
         cc.name, cc.shm = self.cfg.name, shm
         cc.register_chunk_tokens = int(g["register_chunk_tokens"])
-        cc.writeback_enabled = self.cfg.writeback
+        cc.writeback_enabled = self._wb_handler is not None
         cc.writeback_max_held_ratio = float(self.cfg.writeback_max_held_ratio)
         for k in _CLUSTER_FIELDS:
             setattr(cc, k, getattr(self.cfg.cluster, k))
