@@ -120,6 +120,31 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
         });
     }
 
+    grpc::Status InsertPath(grpc::ServerContext* ctx, const pb::InsertPathRequest* req,
+                            pb::InsertPathResponse* rep) override {
+        return run(ctx, [&] {
+            std::vector<ComponentRun> runs(req->runs_size());
+            for (int i = 0; i < req->runs_size(); i++) {
+                const pb::ComponentRun& m = req->runs(i);
+                runs[i].component = static_cast<ComponentType>(m.component());
+                runs[i].end = m.end();
+                runs[i].slots.assign(m.slots().begin(), m.slots().end());
+            }
+            InsertPathResult r = svc->insert_path(
+                req->hashes().data(), req->hashes_size(), req->start(),
+                req->full_slots_size(), req->full_slots().data(), runs, req->auto_recycle());
+            if (r.remote_status != RemoteStatus::OK)
+                return to_grpc_status(r.remote_status);
+            auto put = [](const InsertResult& in, pb::InsertResponse* o) {
+                o->set_error(static_cast<pb::InsertError>(in.error));
+                o->mutable_unused_slots()->Add(in.unused_slots.begin(), in.unused_slots.end());
+            };
+            put(r.full, rep->mutable_full());
+            for (const InsertResult& x : r.runs) put(x, rep->add_runs());
+            return grpc::Status::OK;
+        });
+    }
+
     grpc::Status Recycle(grpc::ServerContext* ctx, const pb::RecycleRequest* req,
                          pb::RecycleResponse*) override {
         return run(ctx, [&] {

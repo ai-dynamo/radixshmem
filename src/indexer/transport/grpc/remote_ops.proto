@@ -11,6 +11,7 @@ service RemoteOps {
   rpc Allocate(AllocateRequest) returns (AllocateResponse);
   rpc Query(QueryRequest) returns (QueryResponse);
   rpc Insert(InsertRequest) returns (InsertResponse);
+  rpc InsertPath(InsertPathRequest) returns (InsertPathResponse);
   rpc Recycle(RecycleRequest) returns (RecycleResponse);
   rpc Unlock(UnlockRequest) returns (UnlockResponse);
 }
@@ -67,6 +68,23 @@ message InsertRequest {
 message InsertResponse {
   InsertError error = 1;
   repeated int32 unused_slots = 2;
+}
+
+message ComponentRun {
+  Component component = 1;
+  int32 end = 2;
+  repeated int32 slots = 3;
+}
+message InsertPathRequest {
+  repeated fixed64 hashes = 1;
+  int32 start = 2;
+  repeated int32 full_slots = 3;
+  repeated ComponentRun runs = 4;
+  bool auto_recycle = 5;
+}
+message InsertPathResponse {
+  InsertResponse full = 1;
+  repeated InsertResponse runs = 2;
 }
 
 // Return slots that were allocated but never published.

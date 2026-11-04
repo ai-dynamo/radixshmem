@@ -101,6 +101,33 @@ InsertResult RemoteOpService::insert(const uint64_t* hashes, int n, int start,
     return client_.insert(hashes, n, slots, length, start, auto_recycle, component);
 }
 
+InsertPathResult RemoteOpService::insert_path(const uint64_t* hashes, int n, int start,
+                                              int length, const int32_t* full_slots,
+                                              const std::vector<ComponentRun>& runs,
+                                              bool auto_recycle) {
+    InsertPathResult out;
+    out.runs.resize(runs.size());
+    bool sane = valid_count(n) && valid_range(start, length, n) && (n == 0 || hashes) &&
+                (length == 0 || full_slots) && runs.size() <= (size_t)MAX_REMOTE_OP_BLOCKS;
+    for (const ComponentRun& r : runs)
+        sane = sane && (r.component == ComponentType::SWA || r.component == ComponentType::MAMBA) &&
+               r.end > 0 && r.end <= n && !r.slots.empty() && (int)r.slots.size() <= r.end &&
+               (r.component == ComponentType::SWA || r.slots.size() == 1);
+    if (!sane) {
+        out.remote_status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    std::lock_guard<std::mutex> g(insert_mu_);
+    if (length > 0)
+        out.full = client_.insert(hashes, n, full_slots, length, start, auto_recycle,
+                                  ComponentType::FULL);
+    for (size_t i = 0; i < runs.size(); i++)
+        out.runs[i] = client_.insert(hashes, runs[i].end, runs[i].slots.data(),
+                                     (int)runs[i].slots.size(), 0, auto_recycle,
+                                     runs[i].component);
+    return out;
+}
+
 RemoteStatus RemoteOpService::recycle(const int32_t* slots, int num_slots,
                                       ComponentType component) {
     if (!valid_count(num_slots) || (num_slots > 0 && !slots) || !valid_component(component))

@@ -33,6 +33,13 @@ InsertResult RemotePeer::insert(const uint64_t* hashes, int n,
     return transport_->insert(hashes, n, start, length, slots, auto_recycle, component);
 }
 
+InsertPathResult RemotePeer::insert_path(const uint64_t* hashes, int n, int start, int length,
+                                         const int32_t* full_slots,
+                                         const std::vector<ComponentRun>& runs,
+                                         bool auto_recycle) {
+    return transport_->insert_path(hashes, n, start, length, full_slots, runs, auto_recycle);
+}
+
 QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
                              bool update_meta) {
     return transport_->query(hashes, n, lock, update_meta);

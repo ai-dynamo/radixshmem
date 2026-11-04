@@ -368,6 +368,11 @@ PYBIND11_MODULE(_core, m) {
             return vec_to_npy_i32(r.unused_slots);
         });
 
+    py::class_<InsertPathResult>(m, "InsertPathResult")
+        .def_readonly("remote_status", &InsertPathResult::remote_status)
+        .def_readonly("full", &InsertPathResult::full)
+        .def_readonly("runs", &InsertPathResult::runs);
+
     // ==================== Health audit ====================
 
     py::enum_<HealthFlag>(m, "HealthFlag", py::arithmetic(),
@@ -723,6 +728,32 @@ PYBIND11_MODULE(_core, m) {
            py::arg("length"), py::arg("slots"),
            py::arg("auto_recycle") = true, py::arg("component") = ComponentType::FULL,
            "Phase 2: publish `slots` on `rank`; auto_recycle frees the unmatched surplus.")
+
+        .def("remote_insert_path", [](RadixClient& c, int rank, py::array_t<uint64_t> hashes,
+                                      int start, py::array_t<int32_t> full_slots, py::list runs,
+                                      bool auto_recycle) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            auto [fptr, flen] = npy_1d(full_slots, "full_slots");
+            std::vector<ComponentRun> parts;
+            parts.reserve(runs.size());
+            for (const py::handle& run : runs) {
+                auto t = run.cast<py::tuple>();
+                if (t.size() != 3)
+                    throw std::runtime_error("runs entries are (component, end, slots)");
+                auto slots = t[2].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                if (slots.ndim() != 1)
+                    throw std::runtime_error("run slots must be 1-D array");
+                parts.push_back(ComponentRun{t[0].cast<ComponentType>(), t[1].cast<int>(),
+                                             std::vector<int32_t>(slots.data(), slots.data() + slots.size())});
+            }
+            InsertPathResult res;
+            { py::gil_scoped_release rel;
+              res = c.remote_insert_path(rank, ptr, len, start, flen, fptr, parts, auto_recycle); }
+            return res;
+        }, py::arg("rank"), py::arg("hashes"), py::arg("start"), py::arg("full_slots"),
+           py::arg("runs"), py::arg("auto_recycle") = true,
+           "Publish on `rank`, in one request, FULL slots for hashes[start:] and each (component, "
+           "end, slots) run: SWA slots for hashes[end - len(slots):end], or the MAMBA checkpoint at end.")
 
         .def("remote_recycle", [](RadixClient& c, int rank,
                                   py::array_t<int32_t> slots, ComponentType component) {

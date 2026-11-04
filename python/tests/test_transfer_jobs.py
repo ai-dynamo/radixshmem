@@ -106,8 +106,9 @@ def test_items_go_out_in_their_direction_and_resolved_items_are_skipped():
 
 
 class StubIndex:
-    def __init__(self, hit=0):
+    def __init__(self, hit=0, status=None, full_error=None, run_errors=None):
         self.hit, self.next = hit, 100
+        self.status, self.full_error, self.run_errors = status, full_error, run_errors or {}
         self.log = []
 
     def remote_query(self, rank, hashes, lock, update_meta):
@@ -118,9 +119,14 @@ class StubIndex:
         slots, self.next = list(range(self.next, self.next + n)), self.next + n
         return SimpleNamespace(slots=slots)
 
-    def remote_insert(self, rank, hashes, start, length, slots, auto_recycle, kind):
-        self.log.append(("insert", kind, len(hashes), start, [int(x) for x in slots[:length]]))
-        return SimpleNamespace(error=radixshmem.InsertError.OK)
+    def remote_insert_path(self, rank, hashes, start, full_slots, runs, auto_recycle):
+        self.log.append(("insert", len(hashes), start, [int(x) for x in full_slots],
+                         [(kind, end, [int(x) for x in s]) for kind, end, s in runs]))
+        ok = radixshmem.InsertError.OK
+        return SimpleNamespace(
+            remote_status=radixshmem.RemoteStatus.OK if self.status is None else self.status,
+            full=SimpleNamespace(error=ok if self.full_error is None else self.full_error),
+            runs=[SimpleNamespace(error=self.run_errors.get((kind, end), ok)) for kind, end, _ in runs])
 
     def remote_recycle(self, rank, slots, kind):
         self.log.append(("recycle", kind, [int(x) for x in slots]))
@@ -162,19 +168,20 @@ def push(index, replies=None, valid=None):
         c.close()
 
 
-def test_push_inserts_every_part_once_all_writes_landed():
+RUNS = [(SWA, 8, [105, 106, 107, 108]), (MAMBA, 5, [109]), (MAMBA, 8, [110])]
+
+
+def test_push_publishes_every_part_in_one_insert_once_all_writes_landed():
     index = StubIndex(hit=3)
     assert push(index) == PushResult(8, 3, 11, 110, True)
-    assert index.log == [("insert", FULL, 8, 3, [100, 101, 102, 103, 104]),
-                         ("insert", SWA, 8, 0, [105, 106, 107, 108]),
-                         ("insert", MAMBA, 5, 0, [109]), ("insert", MAMBA, 8, 0, [110]), ("unlock", 2)]
+    assert index.log == [("insert", 8, 3, [100, 101, 102, 103, 104], RUNS), ("unlock", 2)]
 
 
 def test_push_skips_a_full_path_the_target_already_holds():
     index = StubIndex(hit=8)
     assert push(index) == PushResult(8, 8, 6, 60, True)
-    assert index.log == [("insert", SWA, 8, 0, [100, 101, 102, 103]),
-                         ("insert", MAMBA, 5, 0, [104]), ("insert", MAMBA, 8, 0, [105]), ("unlock", 2)]
+    assert index.log == [("insert", 8, 8, [], [(SWA, 8, [100, 101, 102, 103]), (MAMBA, 5, [104]),
+                                                (MAMBA, 8, [105])]), ("unlock", 2)]
 
 
 def test_push_leaves_only_the_slots_a_write_may_still_reach():
@@ -182,6 +189,13 @@ def test_push_leaves_only_the_slots_a_write_may_still_reach():
     replies = {FULL: (False, 0, 0, XFER_IN_FLIGHT), SWA: (False, 0, 0, "XferState.FAILED")}
     assert push(index, replies) == PushResult(3, 3, 0, 0, False)
     assert index.log == [("recycle", SWA, [105, 106, 107, 108]), ("recycle", MAMBA, [109, 110]), ("unlock", 2)]
+
+
+def test_push_publishes_the_parts_whose_writes_landed():
+    index = StubIndex(hit=3)
+    assert push(index, {SWA: (False, 0, 0, "XferState.FAILED")}) == PushResult(8, 3, 7, 70, False)
+    assert index.log == [("recycle", SWA, [105, 106, 107, 108]),
+                         ("insert", 8, 3, [100, 101, 102, 103, 104], RUNS[1:]), ("unlock", 2)]
 
 
 def test_push_recycles_landed_writes_when_the_task_is_no_longer_valid():
@@ -194,6 +208,23 @@ def test_push_recycles_landed_writes_when_the_task_is_no_longer_valid():
     assert push(index, {SWA: (False, 0, 0, XFER_IN_FLIGHT)}, valid=lambda: False).complete is False
     assert index.log == [("recycle", FULL, [100, 101, 102, 103, 104]), ("recycle", MAMBA, [109, 110]),
                          ("unlock", 2)]
+
+
+def test_push_counts_only_the_parts_the_target_published():
+    E = radixshmem.InsertError
+    index = StubIndex(hit=3, run_errors={(MAMBA, 5): E.FULL_PATH_MISSING})
+    assert push(index) == PushResult(8, 3, 10, 100, False)
+
+    index = StubIndex(hit=3, full_error=E.DATA_POOL_FULL,
+                      run_errors={(SWA, 8): E.FULL_PATH_MISSING, (MAMBA, 8): E.FULL_PATH_MISSING})
+    assert push(index) == PushResult(3, 3, 1, 10, False)
+    assert [entry[0] for entry in index.log] == ["insert", "unlock"]
+
+
+def test_push_keeps_every_slot_when_the_insert_request_failed():
+    index = StubIndex(hit=3, status=radixshmem.RemoteStatus.UNAVAILABLE)
+    assert push(index) == PushResult(3, 3, 0, 0, False)
+    assert index.log == [("insert", 8, 3, [100, 101, 102, 103, 104], RUNS), ("unlock", 2)]
 
 
 def test_push_rejects_parts_that_end_outside_the_path():

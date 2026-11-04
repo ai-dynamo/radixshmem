@@ -52,13 +52,21 @@ struct Node {
     std::mutex insert_mu;
     std::unique_ptr<RemoteOpService> svc;
 
-    explicit Node(const char* tag, int max_blocks = kMaxBlocks)
+    explicit Node(const char* tag, int max_blocks = kMaxBlocks, bool aux = false)
         : name(std::string("/test_grpc_") + tag + "_" + std::to_string(::getpid())) {
         ::shm_unlink(name.c_str());
         ShmConfig cfg;
         cfg.max_blocks = max_blocks;
         cfg.hugepage_path = "";
         cfg.background_evict_ratio = 0.0f;   // no async eviction under the test
+        if (aux) {
+            cfg.register_chunk_tokens = 4;
+            cfg.component_mask = COMPONENT_MASK_ALL;
+            cfg.swa_window_blocks = 4;
+            cfg.mamba_state_bytes = 256;
+            cfg.swa_max_blocks = max_blocks;
+            cfg.mamba_max_slots = 16;
+        }
         srv = std::make_unique<RadixServer>(name, cfg);
         tree = std::make_unique<LocalTreeConnector>(name);
         client = std::make_unique<RadixClient>(name);
@@ -186,6 +194,93 @@ void test_large_request() {
     assert(q.status == RemoteStatus::OK && q.hit_length == n && q.slots == a.slots);
     assert(cli.unlock(h.data(), n, 0, q.hit_length, q.pin_end, q.pin_tail) == RemoteStatus::OK);
     assert(node.used() == (uint32_t)n);
+    server.stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
+std::vector<int32_t> reserve(GrpcRemoteOpClientTransport& cli, int n, ComponentType kind) {
+    AllocateReply a = cli.allocate(n, kind);
+    assert(a.status == RemoteStatus::OK && a.error == InsertError::OK && (int)a.slots.size() == n);
+    return a.slots;
+}
+
+std::vector<ComponentRun> path_runs(GrpcRemoteOpClientTransport& cli) {
+    auto swa = reserve(cli, 6, ComponentType::SWA);
+    auto mamba = reserve(cli, 2, ComponentType::MAMBA);
+    return {{ComponentType::SWA, 6, {swa.begin(), swa.begin() + 4}},
+            {ComponentType::SWA, 8, {swa.begin() + 4, swa.end()}},
+            {ComponentType::MAMBA, 6, {mamba[0]}},
+            {ComponentType::MAMBA, 8, {mamba[1]}}};
+}
+
+void test_insert_path() {
+    TEST_BEGIN("InsertPath publishes FULL and every SWA run and checkpoint in one request");
+    Node node("path", kMaxBlocks, true);
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    const int n = 8;
+    auto h = make_hashes(700, n);
+
+    auto full = reserve(cli, n, ComponentType::FULL);
+    auto runs = path_runs(cli);
+    InsertPathResult r = cli.insert_path(h.data(), n, 0, n, full.data(), runs, true);
+    assert(r.remote_status == RemoteStatus::OK && r.full.error == InsertError::OK &&
+           r.full.unused_slots.empty() && r.runs.size() == runs.size());
+    for (const InsertResult& x : r.runs)
+        assert(x.error == InsertError::OK && x.unused_slots.empty());
+    for (int end : {6, 8})
+        assert((int)node.client->query(h.data(), end, COMPONENT_MASK_ALL, true, false, false)
+                   .common_hit == end);
+
+    auto again = reserve(cli, n, ComponentType::FULL);
+    auto runs2 = path_runs(cli);
+    r = cli.insert_path(h.data(), n, 0, n, again.data(), runs2, true);
+    assert(r.remote_status == RemoteStatus::OK && (int)r.full.unused_slots.size() == n);
+    for (size_t i = 0; i < runs2.size(); i++)
+        assert(r.runs[i].error == InsertError::OK &&
+               r.runs[i].unused_slots.size() == runs2[i].slots.size());
+    assert(node.used() == (uint32_t)n);
+
+    auto g = make_hashes(900, 4);
+    auto orphan = reserve(cli, 2, ComponentType::SWA);
+    r = cli.insert_path(g.data(), 4, 0, 0, nullptr, {{ComponentType::SWA, 4, orphan}}, true);
+    assert(r.remote_status == RemoteStatus::OK &&
+           r.runs[0].error == InsertError::FULL_PATH_MISSING && r.runs[0].unused_slots.size() == 2);
+
+    server.stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
+void test_insert_path_rejects_bad_runs() {
+    TEST_BEGIN("InsertPath rejects a malformed request and changes nothing");
+    Node node("pathbad", kMaxBlocks, true);
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    const int n = 8;
+    auto h = make_hashes(800, n);
+    std::vector<int32_t> full(n, 0), one{1}, two{1, 2};
+    const auto bogus = static_cast<ComponentType>(NUM_COMPONENT_TYPES);
+    auto rejected = [&](std::vector<ComponentRun> runs, int start, int length) {
+        InsertPathResult r = cli.insert_path(h.data(), n, start, length, full.data(), runs, true);
+        bool all_failed = r.full.error == InsertError::REMOTE_FAILED && r.runs.size() == runs.size();
+        for (const InsertResult& x : r.runs)
+            all_failed = all_failed && x.error == InsertError::REMOTE_FAILED &&
+                         x.remote_status == RemoteStatus::BAD_REQUEST;
+        return r.remote_status == RemoteStatus::BAD_REQUEST && all_failed;
+    };
+    assert(rejected({{ComponentType::FULL, 4, one}}, 0, 0));
+    assert(rejected({{bogus, 4, one}}, 0, 0));
+    assert(rejected({{ComponentType::SWA, 0, one}}, 0, 0));
+    assert(rejected({{ComponentType::SWA, n + 1, one}}, 0, 0));
+    assert(rejected({{ComponentType::SWA, 4, {}}}, 0, 0));
+    assert(rejected({{ComponentType::SWA, 1, two}}, 0, 0));
+    assert(rejected({{ComponentType::MAMBA, 4, two}}, 0, 0));
+    assert(rejected({}, 4, 5));
+    assert(node.used() == 0);
     server.stop();
     expect_healthy(*node.client);
     TEST_PASS();
@@ -390,6 +485,17 @@ struct BadService final : pb::RemoteOps::Service {
         rep->set_hit_length(3);   // fewer slots than hit_length
         return grpc::Status::OK;
     }
+    grpc::Status InsertPath(grpc::ServerContext*, const pb::InsertPathRequest* req,
+                            pb::InsertPathResponse* rep) override {
+        rep->mutable_full();
+        for (int i = 0; i < req->runs_size() - (req->start() == 0 ? 1 : 0); i++) rep->add_runs();
+        if (req->start() == 1)
+            for (int i = 0; i <= req->full_slots_size(); i++) rep->mutable_full()->add_unused_slots(i);
+        if (req->start() == 2) rep->mutable_runs(0)->set_error(static_cast<pb::InsertError>(99));
+        if (req->start() == 3)
+            for (int i = 0; i <= req->runs(0).slots_size(); i++) rep->mutable_runs(0)->add_unused_slots(i);
+        return grpc::Status::OK;
+    }
 };
 
 void test_bad_reply() {
@@ -407,6 +513,13 @@ void test_bad_reply() {
     assert(cli.allocate(4).status == RemoteStatus::BAD_REPLY);
     assert(cli.query(h.data(), 4, false, false).status == RemoteStatus::BAD_REPLY);
     assert(cli.recycle(s.data(), 4) == RemoteStatus::UNKNOWN_OP);
+    const std::vector<ComponentRun> runs = {{ComponentType::SWA, 4, {1, 2}}, {ComponentType::MAMBA, 4, {3}}};
+    for (int start : {0, 1, 2, 3}) {
+        InsertPathResult r = cli.insert_path(h.data(), 4, start, 4 - start, s.data(), runs, true);
+        assert(r.remote_status == RemoteStatus::BAD_REPLY && r.full.error == InsertError::REMOTE_FAILED &&
+               r.runs.size() == runs.size() && r.runs[1].error == InsertError::REMOTE_FAILED &&
+               r.full.unused_slots.empty());
+    }
     server->Shutdown();
     TEST_PASS();
 }
@@ -418,6 +531,8 @@ int main() {
     test_transport_factory();
     test_roundtrip();
     test_large_request();
+    test_insert_path();
+    test_insert_path_rejects_bad_runs();
     test_deadline_no_replay();
     test_no_admission_cap();
     test_deadline_skips_allocate_and_query();

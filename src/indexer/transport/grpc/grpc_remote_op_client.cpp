@@ -172,6 +172,58 @@ InsertResult GrpcRemoteOpClientTransport::insert(
     return out;
 }
 
+InsertPathResult GrpcRemoteOpClientTransport::insert_path(
+        const uint64_t* hashes, int n, int start, int length, const int32_t* full_slots,
+        const std::vector<ComponentRun>& runs, bool auto_recycle) {
+    InsertPathResult out;
+    out.runs.resize(runs.size());
+    auto fail = [&](RemoteStatus st) {
+        out.remote_status = st;
+        out.full = InsertResult{};
+        out.full.error = InsertError::REMOTE_FAILED;
+        out.full.remote_status = st;
+        out.runs.assign(runs.size(), out.full);
+        return out;
+    };
+    bool sane = copyable(hashes, n) && copyable(full_slots, length) &&
+                runs.size() <= (size_t)MAX_REMOTE_OP_BLOCKS;
+    for (const ComponentRun& r : runs)
+        sane = sane && copyable(r.slots.data(), (int)r.slots.size());
+    if (!sane) return fail(RemoteStatus::BAD_REQUEST);
+    pb::InsertPathRequest req;
+    req.mutable_hashes()->Add(hashes, hashes + n);
+    req.set_start(start);
+    req.mutable_full_slots()->Add(full_slots, full_slots + length);
+    req.set_auto_recycle(auto_recycle);
+    for (const ComponentRun& r : runs) {
+        pb::ComponentRun* m = req.add_runs();
+        m->set_component(static_cast<pb::Component>(r.component));
+        m->set_end(r.end);
+        m->mutable_slots()->Add(r.slots.begin(), r.slots.end());
+    }
+    if (req.ByteSizeLong() > (size_t)kGrpcRemoteOpMaxMessageBytes)
+        return fail(RemoteStatus::BAD_REQUEST);
+    pb::InsertPathResponse rep;
+    grpc::ClientContext ctx;
+    impl_->prepare(ctx);
+    RemoteStatus st = to_remote_status(impl_->stub->InsertPath(&ctx, req, &rep));
+    if (st == RemoteStatus::OK &&
+        (rep.runs_size() != (int)runs.size() ||
+         !to_insert_error(rep.full().error(), out.full.error) ||
+         rep.full().unused_slots_size() > length))
+        st = RemoteStatus::BAD_REPLY;
+    for (int i = 0; st == RemoteStatus::OK && i < rep.runs_size(); i++)
+        if (!to_insert_error(rep.runs(i).error(), out.runs[i].error) ||
+            rep.runs(i).unused_slots_size() > (int)runs[i].slots.size())
+            st = RemoteStatus::BAD_REPLY;
+    if (st != RemoteStatus::OK) return fail(st);
+    out.full.unused_slots.assign(rep.full().unused_slots().begin(), rep.full().unused_slots().end());
+    for (int i = 0; i < rep.runs_size(); i++)
+        out.runs[i].unused_slots.assign(rep.runs(i).unused_slots().begin(),
+                                        rep.runs(i).unused_slots().end());
+    return out;
+}
+
 RemoteStatus GrpcRemoteOpClientTransport::recycle(const int32_t* slots,
                                                   int num_slots,
                                                   ComponentType component) {

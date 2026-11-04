@@ -32,6 +32,9 @@ public:
     InsertResult  insert(const uint64_t* hashes, int n, int start, int length,
                          const int32_t* slots, bool auto_recycle,
                          ComponentType component = ComponentType::FULL);
+    InsertPathResult insert_path(const uint64_t* hashes, int n, int start, int length,
+                                 const int32_t* full_slots, const std::vector<ComponentRun>& runs,
+                                 bool auto_recycle);
     RemoteStatus  recycle(const int32_t* slots, int num_slots,
                           ComponentType component = ComponentType::FULL);
     // Drop a query(lock=true) pin over hashes[start, start + length).

@@ -980,6 +980,20 @@ InsertResult RadixClient::remote_insert(int rank,
     return p->insert(hashes, n, start, length, slots, auto_recycle, component);
 }
 
+InsertPathResult RadixClient::remote_insert_path(int rank, const uint64_t* hashes, int n,
+                                                 int start, int length, const int32_t* full_slots,
+                                                 const std::vector<ComponentRun>& runs,
+                                                 bool auto_recycle) {
+    auto p = peer_for(rank);
+    if (p) return p->insert_path(hashes, n, start, length, full_slots, runs, auto_recycle);
+    InsertPathResult out;
+    out.remote_status = missing_peer_status(rank);
+    out.full.error = InsertError::REMOTE_FAILED;
+    out.full.remote_status = out.remote_status;
+    out.runs.assign(runs.size(), out.full);
+    return out;
+}
+
 RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots,
                                          ComponentType component) {
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;

@@ -21,6 +21,10 @@ public:
                                 int length, const int32_t* slots,
                                 bool auto_recycle,
                                 ComponentType component = ComponentType::FULL) = 0;
+    virtual InsertPathResult insert_path(const uint64_t* hashes, int n, int start, int length,
+                                         const int32_t* full_slots,
+                                         const std::vector<ComponentRun>& runs,
+                                         bool auto_recycle) = 0;
     virtual RemoteStatus recycle(const int32_t* slots, int num_slots,
                                  ComponentType component = ComponentType::FULL) = 0;
     virtual RemoteStatus unlock(const uint64_t* hashes, int n, int start,

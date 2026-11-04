@@ -26,6 +26,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
     - `[component semantics of insert](#component-semantics-of-insert)`
     - `[remote_allocate](#remote_allocate)`
     - `[remote_insert](#remote_insert)`
+    - `[remote_insert_path](#remote_insert_path)`
     - `[remote_recycle](#remote_recycle)`
     - `[remote_query](#remote_query)`
   - [3.3 Slot management](#33-slot-management)
@@ -98,14 +99,14 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 | `num_rht_shards`        | `int`              | `0`                       | Number of RHT shards M. `0` = M == world_size (each node holds one shard; old behavior). When `> 0`, only some nodes hold RHT shards, and clients create RHT-plane QPs only to the M holders. When `M > world_size`, `bootstrap()` throws `std::runtime_error` directly (there cannot be more holders than ranks); it is no longer silently truncated. **Only rank0 is authoritative**. |
 | `rht_shard_holders`     | `std::vector<int>` | `{}`                      | Candidate holder rank list (e.g. `{0,2,4,6}`). Empty = default ranks `[0, M)`. **Only rank0 is authoritative**. |
 | `rht_slots_per_bucket`  | `int`              | `4`                       | Number of slots W per RHT bucket (chaining to handle hash collisions), one of `{1,2,4,8}`. Can be overridden by env `RADIXSHMEM_RHT_SLOTS`. **Only rank0 is authoritative**. |
-| `remote_op_listen_port` | `uint16_t` | `0` | TCP port of the gRPC remote-op endpoint. Every distributed server serves all remote ops (`[remote_allocate](#remote_allocate)`, `[remote_insert](#remote_insert)`, `[remote_recycle](#remote_recycle)`, `[remote_query](#remote_query)`); a standalone server does not start the endpoint. `0` = assigned by the OS; the actual port is published to etcd `/peers`. |
+| `remote_op_listen_port` | `uint16_t` | `0` | TCP port of the gRPC remote-op endpoint. Every distributed server serves all remote ops (`[remote_allocate](#remote_allocate)`, `[remote_insert](#remote_insert)`, `[remote_insert_path](#remote_insert_path)`, `[remote_recycle](#remote_recycle)`, `[remote_query](#remote_query)`); a standalone server does not start the endpoint. `0` = assigned by the OS; the actual port is published to etcd `/peers`. |
 | `writeback_enabled`     | `bool`             | `false`                   | Background eviction holds the evicted slots for write-back instead of recycling them; see [2.6](#26-write-back-of-background-eviction). |
 | `writeback_max_held_ratio` | `float`         | `0.05`                    | Background eviction runs only while the slots covered by unfinished write-backs stay below this share of every pool. |
 
 
 > **Distributed criterion**: `want_cluster()` = `expected_min_nodes > 1 || num_rht_shards > 1 || world_size > 1`. If any of the three holds, etcd + RDMA bootstrap is used, and in that case **one of** `rpc_address` / `rpc_interface` **must be given**; otherwise `bootstrap()` throws `std::runtime_error`.
 
-> **Concurrency and deadlines**: the gRPC service has no per-op admission limit; allocate and insert queue on the target's insert lock, query and unlock run in parallel. The server's gRPC threads are capped at `RADIXSHMEM_REMOTE_OP_MAX_THREADS` (default 256); past that cap a request is answered with `RESOURCE_EXHAUSTED` without running. A message may take up to 2 GiB, the most gRPC carries, so an op carries up to `MAX_REMOTE_OP_BLOCKS` (134,217,471) blocks. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms); an allocate or query that waited until its deadline is not run and returns `TIMEOUT`, while insert, recycle and unlock always run. Clients send gRPC keepalive pings every 10 s, so a dead connection fails with `UNAVAILABLE` instead of waiting for each op's deadline.
+> **Concurrency and deadlines**: the gRPC service has no per-op admission limit; allocate, insert and insert-path queue on the target's insert lock, query and unlock run in parallel. The server's gRPC threads are capped at `RADIXSHMEM_REMOTE_OP_MAX_THREADS` (default 256); past that cap a request is answered with `RESOURCE_EXHAUSTED` without running. A message may take up to 2 GiB, the most gRPC carries, so an op carries up to `MAX_REMOTE_OP_BLOCKS` (134,217,471) blocks. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms); an allocate or query that waited until its deadline is not run and returns `TIMEOUT`, while insert, insert-path, recycle and unlock always run. Clients send gRPC keepalive pings every 10 s, so a dead connection fails with `UNAVAILABLE` instead of waiting for each op's deadline.
 
 > **Deployment**: remote ops use gRPC only, and an RDMA build needs gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin). The manifest and cluster protocol versions are 13 (13: remote ops carry the component pool); the former remote-op transport and DCT fields are reserved. All nodes and clients must run the same build; mixed-version rolling upgrades are not supported. RHT and peer-index XRC/DC transport choices are unaffected.
 
@@ -591,6 +592,33 @@ Same `InsertResult` (`{error, unused_slots}`) as local `[insert](#insert)`: `unu
 
 
 
+### `remote_insert_path`
+
+```cpp
+InsertPathResult remote_insert_path(int rank, const uint64_t* hashes, int n,
+                                    int start, int length, const int32_t* full_slots,
+                                    const std::vector<ComponentRun>& runs,
+                                    bool auto_recycle = true);
+```
+
+Phase 2 for a whole path in one request: the target inserts, in order and under one hold of its insert lock, the FULL slots for `hashes[start, start + length)` (as `[remote_insert](#remote_insert)`) and then each `ComponentRun{component, end, slots}`: `SWA` slots for `hashes[end - slots.size(), end)`, or the `MAMBA` checkpoint (one slot) at `end`, each on the path `hashes[0, end)` the target holds by then. A push of a chain with many turns costs one request instead of one per window and checkpoint.
+
+| Parameter | Type | Description |
+| --------- | ---- | ----------- |
+| `rank` | `int` | Target peer, as in `remote_insert`. |
+| `hashes` / `n` | `const uint64_t*` / `int` | Root path, `n ≤ MAX_REMOTE_OP_BLOCKS`. |
+| `start` / `length` / `full_slots` | `int` / `int` / `const int32_t*` | FULL publish range and its slots; `length = 0` publishes no FULL block. |
+| `runs` | `std::vector<ComponentRun>` | `component` is `SWA` or `MAMBA`; `0 < end ≤ n`; `SWA`: `1 ≤ slots.size() ≤ end`; `MAMBA`: one slot. |
+| `auto_recycle` | `bool` | The target reclaims every unconsumed slot, FULL and component alike. |
+
+#### Return value
+
+`InsertPathResult{remote_status, full, runs}`: `full` and `runs[i]` are the `InsertResult` of each insert (`runs[i]` fails with `FULL_PATH_MISSING` when `hashes[0, end)` is not on the target). A malformed request returns `remote_status = BAD_REQUEST` and changes nothing; a transport failure sets `remote_status` (and `REMOTE_FAILED` in every result) without telling whether the inserts ran.
+
+---
+
+
+
 ### `remote_recycle`
 
 ```cpp
@@ -1010,6 +1038,7 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 - **Always rank-first, no handles**: the client opens and caches sessions per rank internally and lazily. The normal automatic cross-node walk goes through `client.query(hashes, mask=radixshmem.COMPONENT_MASK_FULL, local_only=False)`; when the one-sided RDMA continuation fails, the local incumbent is kept (observer returns an empty hit).
 - `client.remote_allocate(rank, n, component=FULL) → AllocateReply` (phase 1, allocation only)
 - `client.remote_insert(rank, hashes, start, length, slots, auto_recycle=True, component=FULL) → InsertResult` (phase 2, publish + dedup)
+- `client.remote_insert_path(rank, hashes, start, full_slots, runs, auto_recycle=True) → InsertPathResult` (phase 2 for a whole path; `runs` are `(component, end, slots)` tuples; `InsertPathResult` has `remote_status`, `full` and `runs`)
 - `client.remote_recycle(rank, slots, component=FULL) → RemoteStatus` (return unpublished allocations)
 - `client.remote_query(rank, hashes, lock=False, update_meta=True) → QueryResult` (remote operation, 1 RTT)
 - New types exposed readonly: `AllocateReply` (`status`/`error`/`slots`); enum `radixshmem.RemoteStatus` (10 values); `InsertResult.remote_status`. `RemotePeer` is no longer in Python (sessions are managed inside the client).

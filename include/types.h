@@ -413,6 +413,18 @@ struct InsertResult {
     uint64_t split_first_hash = 0;
 };
 
+struct ComponentRun {
+    ComponentType component = ComponentType::SWA;
+    int end = 0;
+    std::vector<int32_t> slots;
+};
+
+struct InsertPathResult {
+    RemoteStatus remote_status = RemoteStatus::OK;
+    InsertResult full;
+    std::vector<InsertResult> runs;
+};
+
 struct NodeBoundary {
     int offset;
     int num_blocks;          // blocks of this node matched by the query

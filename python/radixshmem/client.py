@@ -561,29 +561,42 @@ class RadixClient:
         self.transfer_failures += sum(not v for v in ok.values())
         if ok and job._valid is not None and not job._valid():
             ok = dict.fromkeys(ok, False)
-        idx, rank, h = self._index, job._rank, job._hashes
-        n, hit, landed, nbytes = len(h), job._hit, [], 0
+        n, hit, publish = len(job._hashes), job._hit, []
         for kind, remote in job._reserved.items():
             if kind in late:
                 continue
-            if not ok[kind] or (kind != FULL and hit < n):
-                idx.remote_recycle(rank, remote, kind)
-                continue
-            if kind == FULL:
-                good = idx.remote_insert(rank, h, hit, len(remote), remote, True, kind).error == _core.InsertError.OK
+            if ok[kind] and (kind == FULL or hit == n or ok[FULL]):
+                publish.append(kind)
             else:
-                good, a = True, 0
-                for end, count in job._parts[kind]:
-                    res = idx.remote_insert(rank, h[:end], 0, count, remote[a:a + count], True, kind)
-                    good, a = good and res.error == _core.InsertError.OK, a + count
-            if not good:
-                continue
-            landed.append(kind)
-            nbytes += len(remote) * int(self._store.pool(kind).slot_bytes)
-            hit = n if kind == FULL else hit
+                self._index.remote_recycle(job._rank, remote, kind)
+        landed = self._publish(job, publish) if publish else {}
+        whole = [k for k, count in landed.items() if count == len(job._reserved[k])]
+        hit = n if FULL in whole else hit
+        nbytes = sum(count * int(self._store.pool(k).slot_bytes) for k, count in landed.items())
         job._q.finalize()   # after the inserts: the pin's release covers a node they split
-        job._f.set_result(PushResult(hit, job._hit, sum(len(job._reserved[k]) for k in landed), nbytes,
-                                     hit == n and all(k in landed for k in job._want)))
+        job._f.set_result(PushResult(hit, job._hit, sum(landed.values()), nbytes,
+                                     hit == n and all(k in whole for k in job._want)))
+
+    def _publish(self, job: PushJob, kinds: List[ComponentType]) -> Dict[ComponentType, int]:
+        runs = []
+        for kind in kinds:
+            if kind == FULL:
+                continue
+            a = 0
+            for end, count in job._parts[kind]:
+                runs.append((kind, end, job._reserved[kind][a:a + count]))
+                a += count
+        full = job._reserved[FULL] if FULL in kinds else _empty()
+        res = self._index.remote_insert_path(job._rank, job._hashes, job._hit, full, runs, True)
+        if res.remote_status != _core.RemoteStatus.OK:
+            return {}
+        landed = dict.fromkeys(kinds, 0)
+        if FULL in kinds and res.full.error == _core.InsertError.OK:
+            landed[FULL] = len(full)
+        for (kind, _, slots), r in zip(runs, res.runs):
+            if r.error == _core.InsertError.OK:
+                landed[kind] += len(slots)
+        return landed
 
     def _stage(self, job: PullJob, hit: int) -> int:
         q, me = job._q, int(self._index.rank())

@@ -56,6 +56,10 @@ public:
                         const int32_t* slots, bool auto_recycle = true,
                         ComponentType component = ComponentType::FULL);
 
+    InsertPathResult insert_path(const uint64_t* hashes, int n, int start, int length,
+                                 const int32_t* full_slots, const std::vector<ComponentRun>& runs,
+                                 bool auto_recycle = true);
+
     QueryReply query(const uint64_t* hashes, int n, bool lock = false,
                      bool update_meta = true);
 
@@ -180,6 +184,11 @@ public:
                                int start, int length, const int32_t* slots,
                                bool auto_recycle = true,
                                ComponentType component = ComponentType::FULL);
+
+    InsertPathResult remote_insert_path(int rank, const uint64_t* hashes, int n, int start,
+                                        int length, const int32_t* full_slots,
+                                        const std::vector<ComponentRun>& runs,
+                                        bool auto_recycle = true);
 
     // Recycle unpublished slots into the peer's `component` pool (abort / surplus).
     RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots,
