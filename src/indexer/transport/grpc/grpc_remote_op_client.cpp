@@ -74,6 +74,7 @@ GrpcRemoteOpClientTransport::GrpcRemoteOpClientTransport(
     : impl_(std::make_unique<Impl>()) {
     grpc::ChannelArguments args;
     args.SetInt(GRPC_ARG_ENABLE_RETRIES, 0);   // never replay an op
+    args.SetInt(GRPC_ARG_ENABLE_HTTP_PROXY, 0);
     args.SetMaxSendMessageSize(kGrpcRemoteOpMaxMessageBytes);
     args.SetMaxReceiveMessageSize(kGrpcRemoteOpMaxMessageBytes);
     args.SetInt(GRPC_ARG_KEEPALIVE_TIME_MS, kGrpcRemoteOpKeepaliveMs);
