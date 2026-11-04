@@ -21,9 +21,12 @@
 #include "../range_merge.hpp"
 
 #include "transfer_engine.h"
+#include "topology.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -128,13 +131,52 @@ MooncakeBackend::~MooncakeBackend() {
     }
 }
 
+namespace {
+
+std::string join(const std::vector<std::string>& v, const char* empty) {
+    if (v.empty()) return empty;
+    std::string s;
+    for (const auto& x : v) s += (s.empty() ? "" : ",") + x;
+    return s;
+}
+
+// Comma-separated env list membership (MC_TE_FILTERS syntax).
+bool env_list_has(const char* env, const std::string& name) {
+    std::string s(env), tok;
+    for (size_t i = 0; i <= s.size(); i++) {
+        if (i == s.size() || s[i] == ',') {
+            while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
+            while (!tok.empty() && tok.back() == ' ') tok.pop_back();
+            if (tok == name) return true;
+            tok.clear();
+        } else {
+            tok += s[i];
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
 bool MooncakeBackend::init(const TransferConfig& cfg) {
     publish_ = cfg.publish;
 
     const bool auto_discover = cfg.protocol.empty() || cfg.protocol == "rdma";
-    // The engine intersects this allowlist with its own MC_TE_FILTERS env
-    // allowlist, so an empty filter here is "whatever the environment says",
-    // not "everything".
+    // The engine intersects this allowlist with its own MC_TE_FILTERS env allowlist; an explicit
+    // list the environment would narrow is a conflict and is reported before the engine starts.
+    if (auto_discover && !cfg.device_filter.empty()) {
+        if (const char* env = ::getenv("MC_TE_FILTERS"); env && *env) {
+            std::vector<std::string> dropped;
+            for (const auto& d : cfg.device_filter)
+                if (!env_list_has(env, d)) dropped.push_back(d);
+            if (!dropped.empty()) {
+                fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices %s are not in "
+                                "MC_TE_FILTERS='%s'; the engine would drop them silently — fix one side\n",
+                        join(dropped, "-").c_str(), env);
+                return false;
+            }
+        }
+    }
     if (!cfg.device_filter.empty()) {
         engine_.reset(new mooncake::TransferEngine(auto_discover, cfg.device_filter));
     } else {
@@ -164,6 +206,30 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
             engine_.reset();
             return false;
         }
+    }
+
+    // Adoption diagnostics. The engine's HCA list is what its discovery kept; a device whose context
+    // failed later may stay listed, so it is reported as the engine's list, not as proven active.
+    // device_filter is an allowlist intersected with the host (a name the host lacks costs nothing),
+    // but RDMA with no HCA at all would silently run over TCP, so that is refused.
+    if (auto_discover) {
+        std::vector<std::string> hcas;
+        if (auto topo = engine_->getLocalTopology()) hcas = topo->getHcaList();
+        if (hcas.empty()) {
+            fprintf(stderr, "[radixshmem] MooncakeBackend: protocol rdma but the engine topology has no HCA "
+                            "(allowed=%s); refusing to fall back to TCP\n", join(cfg.device_filter, "all").c_str());
+            engine_.reset();
+            return false;
+        }
+        std::vector<std::string> absent;
+        for (const auto& d : cfg.device_filter)
+            if (std::find(hcas.begin(), hcas.end(), d) == hcas.end()) absent.push_back(d);
+        fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices allowed=%s engine=%s%s%s active=unverified\n",
+                join(cfg.device_filter, "all").c_str(), join(hcas, "none").c_str(),
+                absent.empty() ? "" : " absent=", absent.empty() ? "" : join(absent, "-").c_str());
+    } else {
+        fprintf(stderr, "[radixshmem] MooncakeBackend: protocol %s; RDMA device constraints not applied\n",
+                cfg.protocol.c_str());
     }
 
     local_segment_ = engine_->getLocalIpAndPort();

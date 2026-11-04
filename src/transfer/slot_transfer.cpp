@@ -3,19 +3,58 @@
 
 #include "slot_transfer.h"
 
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <string>
+#include <sys/syscall.h>
+#include <unistd.h>
 #include <vector>
 
 namespace radixshmem {
+
+namespace {
+
+// NUMA node of the page holding addr (move_pages with no target nodes); < 0 = -errno, with
+// -ENOENT for a page that is not resident.
+int page_numa_node(const void* addr) {
+    const uintptr_t mask = ~(uintptr_t)(sysconf(_SC_PAGESIZE) - 1);
+    void* page = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(addr) & mask);
+    int status = -ENOENT;
+    if (syscall(SYS_move_pages, 0, 1, &page, nullptr, &status, 0) != 0) return -errno;
+    return status;
+}
+
+}  // namespace
 
 SlotTransfer::SlotTransfer(SlotStore& store, ITransferBackend& backend)
     : store_(store), backend_(backend) {}
 
 int SlotTransfer::register_store(const std::string& location) {
     if (!store_.valid()) return XFER_EINVAL;
-    return backend_.register_memory(store_.data_base(), store_.data_bytes(), location);
+    std::string loc = location;
+    if (loc.empty()) {
+        // Register the pool where its pages are: the first page's NUMA node, with the last page as a
+        // consistency check. Pages that cannot be probed (not resident without prefault, no permission)
+        // leave the location to the backend's own probe.
+        const char* base = static_cast<const char*>(store_.data_base());
+        const int first = page_numa_node(base);
+        const int last  = page_numa_node(base + store_.data_bytes() - 1);
+        if (first >= 0) {
+            loc = "cpu:" + std::to_string(first);
+            if (last >= 0 && last != first)
+                fprintf(stderr, "[radixshmem] SlotTransfer: pool pages span NUMA %d..%d; registered as %s "
+                                "(first page)\n", first, last, loc.c_str());
+            else
+                fprintf(stderr, "[radixshmem] SlotTransfer: pool on NUMA %d, registered as %s\n", first, loc.c_str());
+        } else {
+            fprintf(stderr, "[radixshmem] SlotTransfer: NUMA node of the pool unknown (%s); the backend "
+                            "chooses the location\n", strerror(-first));
+        }
+    }
+    return backend_.register_memory(store_.data_base(), store_.data_bytes(), loc);
 }
 
 // Published layout (or its absence) -> absolute peer geometry, or a refusal.

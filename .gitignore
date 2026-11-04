@@ -10,3 +10,4 @@ __pycache__/
 dist/
 *.so
 .nfs*
+build-mc/

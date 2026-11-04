@@ -885,7 +885,7 @@ class RadixServer:
 
         c = self.cfg
         xfer = _data.SlotTransfer(store, self._backend)
-        rc = xfer.register_store("cpu:0")
+        rc = xfer.register_store()   # placed on the pool's own NUMA node
         if rc != _data.XFER_OK:
             raise RuntimeError(f"register_store failed rc={rc}")
         dreg = _data.DataPlaneRegistry(c.cluster.registry, c.cluster.cluster_id)

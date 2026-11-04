@@ -23,6 +23,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -221,14 +222,21 @@ bool NixlBackend::init(const TransferConfig& cfg) {
     }
 
     nixl_b_params_t params;
-    if (!cfg.device_filter.empty()) {
-        std::string joined;
-        for (size_t i = 0; i < cfg.device_filter.size(); ++i) {
-            if (i) joined += ", ";
-            joined += cfg.device_filter[i];
-        }
-        params["device_list"] = joined;
+    std::string joined;
+    for (size_t i = 0; i < cfg.device_filter.size(); ++i) {
+        if (i) joined += ", ";
+        joined += cfg.device_filter[i];
     }
+    if (!joined.empty()) params["device_list"] = joined;
+    // UCX reads its own device list from the environment; which one wins cannot be read back
+    // through the agent, so a conflict is reported, not resolved.
+    const char* ucx_devs = ::getenv("UCX_NET_DEVICES");
+    if (ucx_devs && *ucx_devs && !joined.empty())
+        fprintf(stderr, "[radixshmem] NixlBackend: device_list='%s' and UCX_NET_DEVICES='%s' are both set; "
+                        "the effective devices are unverified\n", joined.c_str(), ucx_devs);
+    else
+        fprintf(stderr, "[radixshmem] NixlBackend: transfer devices allowed=%s active=unverified\n",
+                joined.empty() ? (ucx_devs && *ucx_devs ? ucx_devs : "all") : joined.c_str());
     nixlBackendH* backend = nullptr;
     const nixl_status_t st = agent_->createBackend("UCX", params, backend);
     if (st != NIXL_SUCCESS || backend == nullptr) {
