@@ -7,6 +7,7 @@ them to the decode nodes."""
 
 from __future__ import annotations
 
+import concurrent.futures
 import sys
 import threading
 import time
@@ -17,6 +18,8 @@ import numpy as np
 
 from radixshmem._core import INVALID_COMPONENT_SLOT, MAX_REMOTE_OP_BLOCKS
 from radixshmem.client import MODE_READY, PushJob
+
+PUSH_THREADS = 16
 
 _STOP_WAIT_S = 5.0   # how long close() waits for a running write() before handler.stop()
 
@@ -79,21 +82,28 @@ class PeerWriteback(WritebackHandler):
         self._nodes: List[Dict[str, Any]] = []
         self._nodes_at = float("-inf")
         self._stats = dict.fromkeys(("pushed", "incomplete", "no_space", "no_target", "too_long"), 0)
+        self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
 
     def start(self, client) -> None:
         self.client = client
         self._decode = client.info.role == "decode"
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=PUSH_THREADS,
+                                                           thread_name_prefix="radixshmem-writeback")
         if self._decode:
             print("radixshmem: PeerWriteback on a decode node pushes nothing", file=sys.stderr)
 
     def stats(self) -> Dict[str, int]:
         return dict(self._stats)
 
+    def stop(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+
     def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
         now = time.monotonic()
         if not self._decode and now - self._nodes_at >= 1.0:
             self._nodes, self._nodes_at = self.client.nodes(), now
-        jobs = []
+        picked = []
         for t in tasks:
             rank = self._choose_target(self._nodes, t)
             if rank < 0:
@@ -101,7 +111,8 @@ class PeerWriteback(WritebackHandler):
             elif t.end > MAX_REMOTE_OP_BLOCKS:
                 self._stats["too_long"] += 1
             else:
-                jobs.append(self._push(t, rank))
+                picked.append((t, rank))
+        jobs = list(self._pool.map(lambda p: self._push(*p), picked))
         for job in jobs:
             self._stats["pushed" if job.wait().complete else "no_space" if job.no_space else "incomplete"] += 1
         done([t.task_id for t in tasks])

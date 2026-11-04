@@ -461,3 +461,66 @@ def test_a_push_counts_its_bytes_with_the_store_it_started_with():
         assert c.push_async(*push_args()).wait(5) == PushResult(8, 3, 11, 110, True)
     finally:
         c.close()
+
+
+class ManyTransport(StubTransport):
+    def __init__(self):
+        super().__init__({})
+        self.next, self.tickets = 1, []
+
+    def submit(self, items, timeout_ms):
+        ticket, self.next = self.next, self.next + 1
+        self.tickets.append(ticket)
+        return ticket
+
+    def wait_any(self, tickets, timeout_ms):
+        return {"done": {t: [(True, 64, 1, "")] * 3 for t in tickets}, "unknown": []}
+
+
+class SlowIndex(StubIndex):
+    def __init__(self, delay, **kw):
+        super().__init__(**kw)
+        self.delay, self.started = delay, threading.Event()
+        self.mu, self.running, self.peak = threading.Lock(), 0, 0
+
+    def remote_insert_path(self, *args):
+        with self.mu:
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        self.started.set()
+        time.sleep(self.delay)
+        with self.mu:
+            self.running -= 1
+        return super().remote_insert_path(*args)
+
+
+def many_client(index):
+    c = client(index)
+    c._t, c._slots = ManyTransport(), threading.Semaphore(64)
+    return c
+
+
+def test_push_completions_run_in_parallel():
+    index = SlowIndex(0.2, hit=3)
+    c = many_client(index)
+    try:
+        t0 = time.monotonic()
+        jobs = [c.push_async(*push_args()) for _ in range(32)]
+        assert all(job.wait(5) == PushResult(8, 3, 11, 110, True) for job in jobs)
+        assert time.monotonic() - t0 < 1.5
+        assert index.peak == radixshmem.client.PUSH_SETTLE_THREADS
+        assert sum(entry == ("unlock", 2) for entry in index.log) == 32
+    finally:
+        c.close()
+
+
+def test_close_waits_for_the_pushes_being_completed():
+    index = SlowIndex(0.3, hit=3)
+    c = many_client(index)
+    jobs = [c.push_async(*push_args()) for _ in range(4)]
+    assert index.started.wait(2)
+    c.close()
+    assert all(job.done() for job in jobs)
+    inserted = sum(entry[0] == "insert" for entry in index.log)
+    assert inserted >= 1 and sum(job.wait(0).complete for job in jobs) == inserted
+    assert sum(entry == ("unlock", 2) for entry in index.log) == 4

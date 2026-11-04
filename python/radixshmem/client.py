@@ -46,6 +46,7 @@ TransferItem = Union[Tuple[int, int, List[int], List[int]], Tuple[int, int, List
 XFER_READ, XFER_WRITE = "r", "w"
 XFER_IN_FLIGHT = "in flight"
 CLIENT_CLOSED = "client closed"
+PUSH_SETTLE_THREADS = 16
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -312,6 +313,7 @@ class RadixClient:
         self._slots = threading.Semaphore(max_outstanding)
         self._work = threading.Event()
         self._completer: Optional[threading.Thread] = None
+        self._settlers: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._closed = False
 
     # ------------------------------------------------------------- control
@@ -393,15 +395,20 @@ class RadixClient:
         if self._completer is not None:
             self._completer.join(2)
         with self._mu:
+            settlers = self._settlers
             pushes = {t: j for t, j in self._pending.items() if isinstance(j, PushJob)}
             for t in pushes:
                 del self._pending[t]
                 self._slots.release()
+        if settlers is not None:
+            settlers.shutdown(wait=False)
         if pushes:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pushes), 32)) as pool:
                 list(pool.map(lambda job: job._q.finalize(), pushes.values()))
         for job in pushes.values():
             job._f.set_result(PushResult(job._hit, job._hit, 0, 0, False))
+        if settlers is not None:
+            settlers.shutdown(wait=True)
         self._store = None
         self._index = None
         self._t.close()
@@ -520,12 +527,21 @@ class RadixClient:
                 if job is None:
                     continue
                 replies = rep["done"].get(ticket) or [(False, 0, 0, lost)] * len(job._items)
-                try:
-                    self._complete_any(job, replies)
-                except Exception as e:  # noqa: BLE001
-                    job._q.finalize()
-                    job._f.set_exception(e)
+                if isinstance(job, PushJob):
+                    self._settle_later(job, replies)
+                else:
+                    try:
+                        self._complete(job, replies)
+                    except Exception as e:  # noqa: BLE001
+                        job._q.finalize()
+                        job._f.set_exception(e)
                 self._slots.release()
+
+    def _settle_later(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
+        try:
+            self._settlers.submit(self._complete_push, job, replies)
+        except RuntimeError:
+            self._complete_push(job, replies)
 
     def _submit(self, job: Union[PullJob, PushJob], timeout_ms: int, block: bool) -> None:
         """Hand ``job._items`` to the server; a refusal completes the job at once."""
@@ -550,6 +566,9 @@ class RadixClient:
             closed = push and self._closed
             if not closed:
                 self._pending[job._ticket] = job
+                if push and self._settlers is None:
+                    self._settlers = concurrent.futures.ThreadPoolExecutor(
+                        max_workers=PUSH_SETTLE_THREADS, thread_name_prefix="radixshmem-push")
                 if self._completer is None:
                     self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
                                                        daemon=True)

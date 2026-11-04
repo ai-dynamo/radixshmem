@@ -319,6 +319,7 @@ class StubClient:
     def __init__(self, role, complete=True, no_space=False):
         self.info = SimpleNamespace(role=role)
         self.complete, self.no_space = complete, no_space
+        self.mu, self.running, self.peak, self.delay = threading.Lock(), 0, 0, 0.0
         self.pushes = []
         self.components = []
 
@@ -330,6 +331,12 @@ class StubClient:
                 for r, role in ((0, self.info.role), (1, "decode"), (2, "decode"), (3, "prefill"))]
 
     def push_async(self, rank, hashes, full_slots, swa=(), mamba=(), **kw):
+        with self.mu:
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        time.sleep(self.delay)
+        with self.mu:
+            self.running -= 1
         self.pushes.append((rank, len(hashes)))
         self.components.append(([(e, [int(x) for x in s]) for e, s in swa], list(mamba)))
         return StubJob(self.complete, self.no_space)
@@ -352,7 +359,7 @@ def test_peer_writeback_counts_tasks_and_skips_long_paths():
     done = []
     h.write([task(1, 8), task(2, 8, first=2), task(3, radixshmem.MAX_REMOTE_OP_BLOCKS + 1)], done.extend)
     assert done == [1, 2, 3]
-    assert h.client.pushes == [(2, 8), (1, 8)]
+    assert sorted(h.client.pushes) == [(1, 8), (2, 8)]
     assert h.stats() == {"pushed": 2, "incomplete": 0, "no_space": 0, "no_target": 0, "too_long": 1}
 
     h = peer_writeback("prefill", complete=False)
@@ -363,6 +370,20 @@ def test_peer_writeback_counts_tasks_and_skips_long_paths():
     h = peer_writeback("prefill", complete=False, no_space=True)
     h.write([task(1, 8), task(2, 8, first=2)], done.extend)
     assert h.stats() == {"pushed": 0, "incomplete": 0, "no_space": 2, "no_target": 0, "too_long": 0}
+
+
+def test_peer_writeback_pushes_a_batch_in_parallel():
+    h = peer_writeback("prefill")
+    h.client.delay = 0.2
+    done = []
+    t0 = time.monotonic()
+    h.write([task(i, 8, first=i) for i in range(1, 33)], done.extend)
+    assert time.monotonic() - t0 < 1.0
+    assert h.client.peak == writeback.PUSH_THREADS and len(h.client.pushes) == 32
+    assert done == list(range(1, 33)) and h.stats()["pushed"] == 32
+    h.stop()
+    with pytest.raises(RuntimeError):
+        h.write([task(40, 8)], done.extend)
 
 
 def test_peer_writeback_pushes_the_components_of_the_whole_chain():
