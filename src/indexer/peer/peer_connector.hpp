@@ -102,6 +102,7 @@ class PeerConnector {
     // walk and release share tx_.buf(); interleaved threads read torn entries.
     std::mutex walk_mu_;
     std::unique_ptr<PeerBreaker> breaker_;
+    std::shared_ptr<PeerBreaker> rc_breaker_;
 
 #ifndef RADIXSHMEM_NO_RDMA
     std::mutex rc_open_mu_;

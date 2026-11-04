@@ -23,7 +23,8 @@ from typing import Any, Callable, Dict, Optional
 import grpc
 
 SERVICE = "radixshmem.RadixNode"
-_OPTIONS = [("grpc.max_receive_message_length", -1), ("grpc.max_send_message_length", -1)]
+_OPTIONS = [("grpc.max_receive_message_length", -1), ("grpc.max_send_message_length", -1),
+            ("grpc.enable_http_proxy", 0)]
 
 
 class DataPlaneUnavailable(RuntimeError):

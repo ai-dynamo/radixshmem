@@ -6,7 +6,7 @@
 Public surface: ``RadixServer`` (one per node: index, SlotStore, P2P transfer;
 started from a ``ServerConfig`` and configured by a client's ``Geometry``) and
 ``RadixClient`` (hands the server its geometry, ``status`` / ``wait_ready``,
-index ops plus ``pull_async``). ``WritebackHandler`` / ``WritebackTask``:
+index ops plus ``pull_async`` / ``push_async``). ``WritebackHandler`` / ``WritebackTask``:
 the write-back side of background eviction (``radixshmem.writeback``). The pybind modules ``_core`` (index) and
 ``_data`` (SlotStore, transfer) stay importable for tests and advanced users.
 """
@@ -36,7 +36,7 @@ except ImportError:
     pass
 
 from radixshmem._geometry import Geometry, check_pools_aligned
-from radixshmem.client import NodeInfo, PullJob, PullResult, RadixClient
+from radixshmem.client import NodeInfo, PullJob, PullResult, PushJob, PushResult, RadixClient
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy, ServerNotReady
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
 from radixshmem.writeback import WritebackHandler, WritebackTask
@@ -62,6 +62,8 @@ __all__ = [
     "NodeInfo",
     "PullJob",
     "PullResult",
+    "PushJob",
+    "PushResult",
     "QueryResult",
     "RadixClient",
     "RadixServer",

@@ -80,10 +80,29 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     grpc::Status Allocate(grpc::ServerContext* ctx, const pb::AllocateRequest* req,
                           pb::AllocateResponse* rep) override {
         return run(ctx, [&] {
-            AllocateReply r = svc->allocate(req->num_blocks(), ctx->deadline());
+            AllocateReply r = svc->allocate(req->num_blocks(), ctx->deadline(),
+                                            static_cast<ComponentType>(req->component()));
             if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
             rep->set_error(static_cast<pb::InsertError>(r.error));
             rep->mutable_slots()->Add(r.slots.begin(), r.slots.end());
+            return grpc::Status::OK;
+        });
+    }
+
+    grpc::Status AllocateComponents(grpc::ServerContext* ctx,
+                                    const pb::AllocateComponentsRequest* req,
+                                    pb::AllocateComponentsResponse* rep) override {
+        return run(ctx, [&] {
+            std::vector<ComponentCount> components(req->components_size());
+            for (int i = 0; i < req->components_size(); i++) {
+                components[i].component = static_cast<ComponentType>(req->components(i).component());
+                components[i].n = req->components(i).num_blocks();
+            }
+            AllocateComponentsReply r = svc->allocate_components(components, ctx->deadline());
+            if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
+            rep->set_error(static_cast<pb::InsertError>(r.error));
+            for (const std::vector<int32_t>& s : r.slots)
+                rep->add_components()->mutable_slots()->Add(s.begin(), s.end());
             return grpc::Status::OK;
         });
     }
@@ -108,7 +127,8 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
         return run(ctx, [&] {
             InsertResult r = svc->insert(
                 req->hashes().data(), req->hashes_size(), req->start(),
-                req->slots_size(), req->slots().data(), req->auto_recycle());
+                req->slots_size(), req->slots().data(), req->auto_recycle(),
+                static_cast<ComponentType>(req->component()));
             if (r.remote_status != RemoteStatus::OK)
                 return to_grpc_status(r.remote_status);
             rep->set_error(static_cast<pb::InsertError>(r.error));
@@ -118,11 +138,37 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
         });
     }
 
+    grpc::Status InsertPath(grpc::ServerContext* ctx, const pb::InsertPathRequest* req,
+                            pb::InsertPathResponse* rep) override {
+        return run(ctx, [&] {
+            std::vector<ComponentRun> runs(req->runs_size());
+            for (int i = 0; i < req->runs_size(); i++) {
+                const pb::ComponentRun& m = req->runs(i);
+                runs[i].component = static_cast<ComponentType>(m.component());
+                runs[i].end = m.end();
+                runs[i].slots.assign(m.slots().begin(), m.slots().end());
+            }
+            InsertPathResult r = svc->insert_path(
+                req->hashes().data(), req->hashes_size(), req->start(),
+                req->full_slots_size(), req->full_slots().data(), runs, req->auto_recycle());
+            if (r.remote_status != RemoteStatus::OK)
+                return to_grpc_status(r.remote_status);
+            auto put = [](const InsertResult& in, pb::InsertResponse* o) {
+                o->set_error(static_cast<pb::InsertError>(in.error));
+                o->mutable_unused_slots()->Add(in.unused_slots.begin(), in.unused_slots.end());
+            };
+            put(r.full, rep->mutable_full());
+            for (const InsertResult& x : r.runs) put(x, rep->add_runs());
+            return grpc::Status::OK;
+        });
+    }
+
     grpc::Status Recycle(grpc::ServerContext* ctx, const pb::RecycleRequest* req,
                          pb::RecycleResponse*) override {
         return run(ctx, [&] {
             RemoteStatus st = svc->recycle(req->slots().data(),
-                                           req->slots_size());
+                                           req->slots_size(),
+                                           static_cast<ComponentType>(req->component()));
             return st == RemoteStatus::OK ? grpc::Status::OK
                                           : to_grpc_status(st);
         });

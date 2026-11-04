@@ -368,6 +368,11 @@ PYBIND11_MODULE(_core, m) {
             return vec_to_npy_i32(r.unused_slots);
         });
 
+    py::class_<InsertPathResult>(m, "InsertPathResult")
+        .def_readonly("remote_status", &InsertPathResult::remote_status)
+        .def_readonly("full", &InsertPathResult::full)
+        .def_readonly("runs", &InsertPathResult::runs);
+
     // ==================== Health audit ====================
 
     py::enum_<HealthFlag>(m, "HealthFlag", py::arithmetic(),
@@ -492,6 +497,8 @@ PYBIND11_MODULE(_core, m) {
             py::gil_scoped_release nogil;
             return q.complete(ids);
         }, py::arg("task_ids"))
+        .def("set_writeback_active", [](RadixServer& s, bool on) { writeback_of(s).set_active(on); },
+             py::arg("on"), "Whether background eviction holds what it takes for write-back.")
         .def("drop_writeback", [](RadixServer& s) {
             WritebackQueue& q = writeback_of(s);
             py::gil_scoped_release nogil;
@@ -509,6 +516,7 @@ PYBIND11_MODULE(_core, m) {
             d["produced"] = st.produced;
             d["completed"] = st.completed;
             d["dropped"] = st.dropped;
+            d["active"] = q->active();
             d["inflight_slots"] = py::make_tuple(st.inflight_slots[0], st.inflight_slots[1],
                                                  st.inflight_slots[2]);
             d["held_slots"] = py::make_tuple(t.held_slots(ComponentType::FULL),
@@ -697,18 +705,35 @@ PYBIND11_MODULE(_core, m) {
            "0 = no limit; `truncated` reports a limit reached.")
 #ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
-        .def("remote_allocate", [](RadixClient& c, int rank, int n) {
+        .def("remote_allocate", [](RadixClient& c, int rank, int n,
+                                   ComponentType component) {
             AllocateReply rep;
-            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n); }
+            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n, component); }
             return rep;
-        }, py::arg("rank"), py::arg("n"),
-           "Phase 1: allocate `n` slots on `rank` (no hashes, no dedup).")
+        }, py::arg("rank"), py::arg("n"), py::arg("component") = ComponentType::FULL,
+           "Phase 1: allocate `n` slots from `rank`'s `component` pool (no hashes, no dedup).")
+
+        .def("remote_allocate_components", [](RadixClient& c, int rank, py::list components) {
+            std::vector<ComponentCount> counts;
+            counts.reserve(components.size());
+            for (const py::handle& item : components) {
+                auto t = item.cast<py::tuple>();
+                if (t.size() != 2)
+                    throw std::runtime_error("components entries are (component, n)");
+                counts.push_back(ComponentCount{t[0].cast<ComponentType>(), t[1].cast<int>()});
+            }
+            AllocateComponentsReply rep;
+            { py::gil_scoped_release rel; rep = c.remote_allocate_components(rank, counts); }
+            return rep;
+        }, py::arg("rank"), py::arg("components"),
+           "Phase 1 for several pools: allocate n slots from each (component, n) pool of `rank`, "
+           "all of them or none.")
 
         .def("remote_insert", [](RadixClient& c, int rank,
                                    py::array_t<uint64_t> hashes,
                                    int start, int length,
                                    py::array_t<int32_t> slots,
-                                   bool auto_recycle) {
+                                   bool auto_recycle, ComponentType component) {
             auto [ptr, len] = npy_1d(hashes, "hashes");
             auto [sptr, slen] = npy_1d(slots, "slots");
             if (slen < length)
@@ -716,20 +741,46 @@ PYBIND11_MODULE(_core, m) {
             InsertResult res;
             { py::gil_scoped_release rel;
               res = c.remote_insert(rank, ptr, len, start, length, sptr,
-                                    auto_recycle); }
+                                    auto_recycle, component); }
             return res;
         }, py::arg("rank"), py::arg("hashes"), py::arg("start"),
            py::arg("length"), py::arg("slots"),
-           py::arg("auto_recycle") = true,
+           py::arg("auto_recycle") = true, py::arg("component") = ComponentType::FULL,
            "Phase 2: publish `slots` on `rank`; auto_recycle frees the unmatched surplus.")
 
+        .def("remote_insert_path", [](RadixClient& c, int rank, py::array_t<uint64_t> hashes,
+                                      int start, py::array_t<int32_t> full_slots, py::list runs,
+                                      bool auto_recycle) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            auto [fptr, flen] = npy_1d(full_slots, "full_slots");
+            std::vector<ComponentRun> parts;
+            parts.reserve(runs.size());
+            for (const py::handle& run : runs) {
+                auto t = run.cast<py::tuple>();
+                if (t.size() != 3)
+                    throw std::runtime_error("runs entries are (component, end, slots)");
+                auto slots = t[2].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                if (slots.ndim() != 1)
+                    throw std::runtime_error("run slots must be 1-D array");
+                parts.push_back(ComponentRun{t[0].cast<ComponentType>(), t[1].cast<int>(),
+                                             std::vector<int32_t>(slots.data(), slots.data() + slots.size())});
+            }
+            InsertPathResult res;
+            { py::gil_scoped_release rel;
+              res = c.remote_insert_path(rank, ptr, len, start, flen, fptr, parts, auto_recycle); }
+            return res;
+        }, py::arg("rank"), py::arg("hashes"), py::arg("start"), py::arg("full_slots"),
+           py::arg("runs"), py::arg("auto_recycle") = true,
+           "Publish on `rank`, in one request, FULL slots for hashes[start:] and each (component, "
+           "end, slots) run: SWA slots for hashes[end - len(slots):end], or the MAMBA checkpoint at end.")
+
         .def("remote_recycle", [](RadixClient& c, int rank,
-                                  py::array_t<int32_t> slots) {
+                                  py::array_t<int32_t> slots, ComponentType component) {
             auto [sptr, slen] = npy_1d(slots, "slots");
             RemoteStatus st;
-            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen); }
+            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen, component); }
             return st;
-        }, py::arg("rank"), py::arg("slots"),
+        }, py::arg("rank"), py::arg("slots"), py::arg("component") = ComponentType::FULL,
            "Return unpublished slots to `rank`'s pool (abort / surplus); returns RemoteStatus.")
 
         .def("remote_query", [](RadixClient& c, int rank,
@@ -759,6 +810,15 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("error", &AllocateReply::error)
         .def_property_readonly("slots", [](const AllocateReply& r) {
             return vec_to_npy_i32(r.slots);
+        });
+
+    py::class_<AllocateComponentsReply>(m, "AllocateComponentsReply")
+        .def_readonly("status", &AllocateComponentsReply::status)
+        .def_readonly("error", &AllocateComponentsReply::error)
+        .def_property_readonly("slots", [](const AllocateComponentsReply& r) {
+            py::list out;
+            for (const std::vector<int32_t>& s : r.slots) out.append(vec_to_npy_i32(s));
+            return out;
         });
 #endif  // !RADIXSHMEM_NO_RDMA
 

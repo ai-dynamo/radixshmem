@@ -84,6 +84,7 @@ private:
         bool              is_local = false;
         mooncake::BatchID id       = mooncake::INVALID_BATCH_ID;
         uint64_t          bytes    = 0;
+        bool              failed   = false;
     };
 
     // All three want mu_ held.
@@ -422,8 +423,11 @@ BatchHandle MooncakeBackend::submit(const TransferDesc* descs, int n) {
     if (!st.ok()) {
         fprintf(stderr, "[radixshmem] MooncakeBackend: submitTransfer failed: %.*s\n",
                 (int)st.message().size(), st.message().data());
-        engine_->freeBatchID(bid);
-        return INVALID_BATCH;
+        if (engine_->freeBatchID(bid).ok()) return INVALID_BATCH;
+        lk.lock();
+        const BatchHandle h = next_batch_++;
+        batches_[h] = Batch{false, bid, total, true};
+        return h;
     }
     lk.lock();
 
@@ -443,6 +447,10 @@ XferState MooncakeBackend::poll(BatchHandle h, uint64_t* done_bytes) {
     if (b.is_local) {
         if (done_bytes) *done_bytes = b.bytes;
         return XferState::COMPLETED;
+    }
+    if (b.failed) {
+        if (done_bytes) *done_bytes = 0;
+        return XferState::FAILED;
     }
 
     mooncake::TransferStatus st{};

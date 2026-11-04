@@ -97,7 +97,8 @@ public:
     void reset();
 
     // Background eviction: non-blocking write_lock, evict up to target_blocks.
-    // Returns blocks freed (0 if lock was busy).
+    // Returns blocks freed (0 if lock was busy). With `held`, each task is a chain:
+    // the leaf and every ancestor it leaves childless and unpinned.
     // budget: per pool, nullptr = none; a batch stops at the task that uses one up.
     int try_evict_batch(int target_blocks, std::vector<HeldEviction>* held = nullptr,
                         const uint64_t* budget = nullptr);
@@ -283,9 +284,10 @@ private:
     // ---- Eviction internals ----
     // Pin-eligibility: full/swa/mamba ref classes on the node are all zero.
     bool component_refs_zero(uint32_t node_id) const;
-    int  evict_node(uint32_t node_id, std::vector<int32_t>& out,
-                    HeldEviction* hold = nullptr);
-    void hold_path(uint32_t node_id, HeldEviction& h);
+    int  evict_node(uint32_t node_id, std::vector<int32_t>& out, bool hold = false);
+    int  evict_held_chain(uint32_t leaf, std::vector<int32_t>& out, HeldEviction& h);
+    // Path [0, end of leaf) into h; the ancestors above `top` are pinned.
+    void hold_path(uint32_t leaf, uint32_t top, HeldEviction& h);
     // protect: node to pin for the walk (INVALID_NODE_ID = none).
     int  evict(int need, uint32_t protect = INVALID_NODE_ID);
     int  evict_walk(int need, std::vector<HeldEviction>* held = nullptr,

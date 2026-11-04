@@ -226,7 +226,7 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
         swa_ratio=swa_bytes / data_bytes if data_bytes else 0.0,
         mamba_ratio=mamba_bytes / data_bytes if data_bytes else 0.0,
         slot_align=64, transfer_devices=dev, max_nodes=cfg.max_nodes,
-        data_pool_ratio=cfg.data_pool_ratio, writeback=cfg.writeback_delay_ms >= 0, cluster=cluster)
+        data_pool_ratio=cfg.data_pool_ratio, cluster=cluster)
 
 
 class DelayedWriteback(radixshmem.WritebackHandler):
@@ -325,8 +325,13 @@ def create_node(cfg: Config, rank: int):
     """The engine's bootstrap: start the node's server, build the client with
     the geometry (handed to the server at once), wait for the cluster."""
     sc = server_config(cfg, rank)
-    handler = DelayedWriteback(cfg.writeback_delay_ms) if cfg.writeback_delay_ms >= 0 else None
-    server = radixshmem.RadixServer(sc, writeback=handler).start()
+    delay = cfg.writeback_delay_ms
+
+    class Server(radixshmem.RadixServer):
+        def _make_writeback_handler(self):
+            return DelayedWriteback(delay) if delay >= 0 else super()._make_writeback_handler()
+
+    server = Server(sc).start()
     client = radixshmem.RadixClient(sc.name, geometry(cfg))
     client.wait_ready(cfg.bootstrap_timeout + 120)
     return server, client
@@ -553,7 +558,7 @@ class Worker:
             send_msg(sock, MSG_DONE, item)
 
     def drain_writeback(self, timeout: float = 30.0) -> Optional[dict]:
-        if self.cfg.writeback_delay_ms < 0:
+        if self.server.writeback_handler is None:
             return None
         deadline, quiet = time.monotonic() + timeout, 0
         while time.monotonic() < deadline and quiet < 3:

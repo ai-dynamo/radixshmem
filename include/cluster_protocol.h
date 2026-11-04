@@ -8,13 +8,14 @@
 
 #include <cstdint>
 #include <infiniband/verbs.h>
+#include <limits>
 
 #include "cluster_manifest.h"   // CLUSTER_MAX_SHARDS
 #include "types.h"              // RemoteStatus (shared with QueryResult)
 
 namespace radixshmem {
 
-constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 12;  // lockstep with manifest v12
+constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 13;  // lockstep with manifest v13
 constexpr uint32_t CLUSTER_HELLO_MAGIC = 0x52584348; // "RXCH"
 constexpr uint32_t CLUSTER_REPLY_MAGIC = 0x52584352; // "RXCR"
 constexpr uint32_t CLUSTER_SHARDMAP_MAGIC = 0x52584d50; // "RXMP"
@@ -68,6 +69,8 @@ struct ClusterReplyMsg {
     union ibv_gid gid;
 };
 
-constexpr int      MAX_REMOTE_OP_BLOCKS = 512;
+constexpr int      MAX_REMOTE_OP_MESSAGE_BYTES = std::numeric_limits<int>::max();
+constexpr int      MAX_REMOTE_OP_BLOCKS =
+    (MAX_REMOTE_OP_MESSAGE_BYTES - 4096) / (2 * (int)sizeof(uint64_t));
 
 } // namespace radixshmem

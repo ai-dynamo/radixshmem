@@ -21,7 +21,7 @@ namespace radixshmem {
 
 class PeerBreaker {
 public:
-    enum class Op { RHT_WRITE, RHT_REMOVE, RHT_LOOKUP, WALK, COUNT };
+    enum class Op { RHT_WRITE, RHT_REMOVE, RHT_LOOKUP, WALK, REMOTE_OP, COUNT };
     enum class Gate { PASS, SKIP, PROBE };
 
     // who: log prefix, e.g. "[RadixClient rank 0] RHT". shared may be null.

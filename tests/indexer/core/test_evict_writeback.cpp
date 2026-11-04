@@ -67,9 +67,11 @@ static void test_hold_returns_full_prefix() {
     const char* name = "/tewb_prefix";
     shm_unlink(name);
     auto t = RadixShmemTree::create(name, full_cfg(256, 10));
-    auto h = seq(0x1000, 100);
+    auto h = seq(0x1000, 100), g = h;
+    for (int i = 90; i < 100; i++) g[i] = 0x1800 + (uint64_t)i;
     auto head = insert_fresh(t, h, 90);
     auto tail = insert_fresh(t, h, 100, 90);
+    insert_fresh(t, g, 100, 90);                   // a sibling: the chain stops at [80, 90)
     const uint32_t free0 = t.mempool_free();
 
     std::vector<HeldEviction> held;
@@ -86,16 +88,47 @@ static void test_hold_returns_full_prefix() {
     assert((int)t.query_components(h.data(), 100, COMPONENT_MASK_FULL, false, false)
                .topology_match_length == 90);
 
-    // The pinned prefix is evicted neither in the background nor in the foreground.
-    assert(t.try_evict_batch(100) == 0);
+    // Only the sibling goes: the pinned prefix is evicted neither in the background nor in the foreground.
+    assert(t.try_evict_batch(100) == 10);
+    const uint32_t free1 = t.mempool_free();
     std::vector<int32_t> s;
-    assert(t.allocate_slots((int)t.mempool_free() + 1, s) == (int)free0);
+    assert(t.allocate_slots((int)free1 + 1, s) == (int)free1);
     t.recycle_slots(s.data(), (int)s.size());
 
     t.release_held(held);
-    assert(t.mempool_free() == free0 + 10);
+    assert(t.mempool_free() == free1 + 10);
     assert(t.held_slots(ComponentType::FULL) == 0);
     assert(t.try_evict_batch(100) == 90);
+    expect_healthy(t);
+    t.destroy();
+    TEST_PASS();
+}
+
+static void test_hold_chain() {
+    TEST_BEGIN("hold: the leaf and the ancestors it leaves childless go as one chain");
+    const char* name = "/tewb_chain";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, full_cfg(256, 10));
+    auto h = seq(0x1000, 100);
+    insert_fresh(t, h, 90);
+    insert_fresh(t, h, 100, 90);
+    const uint32_t free0 = t.mempool_free();
+
+    auto pin = t.query_components(h.data(), 50, COMPONENT_MASK_FULL, true, false);
+    std::vector<HeldEviction> held;
+    assert(t.try_evict_batch(10, &held) == 50 && held.size() == 1);
+    assert(held[0].end() == 100 && held[0].evicted_from == 50);   // stops at the reader's pin
+    assert(t.dec_ref(h.data(), 50, std::move(pin.pin)));
+    assert(t.try_evict_batch(10, &held) == 0);                    // [0, 50) is pinned by the task
+    t.release_held(held);
+    held.clear();
+    assert(t.try_evict_batch(10, &held) == 50 && held.size() == 1);
+    assert(held[0].end() == 50 && held[0].evicted_from == 0);
+    assert(t.mempool_free() == free0 + 50 && t.held_slots(ComponentType::FULL) == 50);
+    assert((int)t.query_components(h.data(), 100, COMPONENT_MASK_FULL, false, false)
+               .topology_match_length == 0);
+    t.release_held(held);
+    assert(t.mempool_free() == free0 + 100 && t.held_slots(ComponentType::FULL) == 0);
     expect_healthy(t);
     t.destroy();
     TEST_PASS();
@@ -126,9 +159,11 @@ static void test_split_of_pinned_ancestor() {
     const char* name = "/tewb_split";
     shm_unlink(name);
     auto t = RadixShmemTree::create(name, full_cfg(256, 10));
-    auto h = seq(0x4000, 100);
+    auto h = seq(0x4000, 100), g = h;
+    for (int i = 90; i < 100; i++) g[i] = 0x4800 + (uint64_t)i;
     insert_fresh(t, h, 90);
     insert_fresh(t, h, 100, 90);
+    insert_fresh(t, g, 100, 90);
     std::vector<HeldEviction> held;
     assert(t.try_evict_batch(10, &held) == 10 && held.size() == 1);
 
@@ -136,7 +171,7 @@ static void test_split_of_pinned_ancestor() {
     d.resize(55);
     for (int i = 45; i < 55; i++) d[i] = 0x9000 + (uint64_t)i;
     insert_fresh(t, d, 55, 45);                    // splits [40, 50) at 45; new [45, 50), [50, 55)
-    assert(t.try_evict_batch(100) == 10);          // only the new nodes: the halves are pinned
+    assert(t.try_evict_batch(100) == 20);          // the sibling and the new nodes: the halves are pinned
 
     t.release_held(held);
     expect_healthy(t);
@@ -179,31 +214,36 @@ static void test_budget_and_shared_prefix() {
 }
 
 static void test_aux_held_and_pinned() {
-    TEST_BEGIN("hold: SWA lane + Mamba END held, aux pinned");
+    TEST_BEGIN("hold: SWA lanes + Mamba ENDs held, the shared ancestor's aux pinned");
     const char* name = "/tewb_aux";
     shm_unlink(name);
     auto t = RadixShmemTree::create(name, aux_cfg());
-    auto h = seq(0x6000, 8);
+    auto h = seq(0x6000, 8), g = h;
+    for (int i = 4; i < 8; i++) g[i] = 0x6800 + (uint64_t)i;
     insert_fresh(t, h, 8);                         // nodes [0, 4) and [4, 8)
+    insert_fresh(t, g, 8, 4);                      // a sibling [4, 8)
     publish(t, h, 4, ComponentType::SWA, 4);
     publish(t, h, 4, ComponentType::MAMBA, 1);
-    publish(t, h, 8, ComponentType::SWA, 4);
-    publish(t, h, 8, ComponentType::MAMBA, 1);
+    for (const auto* p : {&h, &g}) {
+        publish(t, *p, 8, ComponentType::SWA, 4);
+        publish(t, *p, 8, ComponentType::MAMBA, 1);
+    }
     const uint32_t full0 = t.mempool_free(), swa0 = t.swa_mempool_free(),
                    mamba0 = t.mamba_mempool_free();
 
     std::vector<HeldEviction> held;
-    assert(t.try_evict_batch(4, &held) == 4 && held.size() == 1);
-    const HeldEviction& e = held[0];
-    assert(e.end() == 8 && e.evicted_from == 4);
-    assert(e.swa_slots.size() == 8);
-    for (int32_t s : e.swa_slots) assert(s != INVALID_COMPONENT_SLOT);
-    assert((e.mamba_ends == std::vector<uint32_t>{4, 8}) && e.mamba_slots.size() == 2);
-    uint64_t c[NUM_COMPONENT_TYPES];
-    e.covered(c);
-    assert(c[0] == 8 && c[1] == 8 && c[2] == 2);
-    assert(t.held_slots(ComponentType::FULL) == 4 && t.held_slots(ComponentType::SWA) == 4 &&
-           t.held_slots(ComponentType::MAMBA) == 1);
+    assert(t.try_evict_batch(8, &held) == 8 && held.size() == 2);   // the first pins [0, 4)
+    for (const HeldEviction& e : held) {
+        assert(e.end() == 8 && e.evicted_from == 4);
+        assert(e.swa_slots.size() == 8);
+        for (int32_t s : e.swa_slots) assert(s != INVALID_COMPONENT_SLOT);
+        assert((e.mamba_ends == std::vector<uint32_t>{4, 8}) && e.mamba_slots.size() == 2);
+        uint64_t c[NUM_COMPONENT_TYPES];
+        e.covered(c);
+        assert(c[0] == 8 && c[1] == 8 && c[2] == 2);
+    }
+    assert(t.held_slots(ComponentType::FULL) == 8 && t.held_slots(ComponentType::SWA) == 8 &&
+           t.held_slots(ComponentType::MAMBA) == 2);
     assert(t.mempool_free() == full0 && t.swa_mempool_free() == swa0 &&
            t.mamba_mempool_free() == mamba0);
 
@@ -213,11 +253,40 @@ static void test_aux_held_and_pinned() {
     assert(t.try_evict_batch(100) == 0);
 
     t.release_held(held);
-    assert(t.mempool_free() == full0 + 4 && t.swa_mempool_free() == swa0 + 4 &&
-           t.mamba_mempool_free() == mamba0 + 1);
+    assert(t.mempool_free() == full0 + 8 && t.swa_mempool_free() == swa0 + 8 &&
+           t.mamba_mempool_free() == mamba0 + 2);
     expect_healthy(t);
     assert(t.try_evict_component_batch(ComponentType::SWA, 100) == 4);
     assert(t.try_evict_component_batch(ComponentType::MAMBA, 100) == 1);
+    expect_healthy(t);
+    t.destroy();
+    TEST_PASS();
+}
+
+static void test_aux_chain() {
+    TEST_BEGIN("hold: a chain holds the SWA lanes and checkpoints of all its nodes");
+    const char* name = "/tewb_auxchain";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, aux_cfg());
+    auto h = seq(0x6000, 8);
+    insert_fresh(t, h, 8);                         // nodes [0, 4) and [4, 8)
+    for (int n : {4, 8}) {
+        publish(t, h, n, ComponentType::SWA, 4);
+        publish(t, h, n, ComponentType::MAMBA, 1);
+    }
+    const uint32_t full0 = t.mempool_free(), swa0 = t.swa_mempool_free(),
+                   mamba0 = t.mamba_mempool_free();
+    std::vector<HeldEviction> held;
+    assert(t.try_evict_batch(4, &held) == 8 && held.size() == 1);
+    assert(held[0].evicted_from == 0 && (held[0].mamba_ends == std::vector<uint32_t>{4, 8}));
+    assert(t.held_slots(ComponentType::FULL) == 8 && t.held_slots(ComponentType::SWA) == 8 &&
+           t.held_slots(ComponentType::MAMBA) == 2);
+    assert(t.mempool_free() == full0 && t.swa_mempool_free() == swa0 &&
+           t.mamba_mempool_free() == mamba0);
+    t.release_held(held);
+    assert(t.mempool_free() == full0 + 8 && t.swa_mempool_free() == swa0 + 8 &&
+           t.mamba_mempool_free() == mamba0 + 2);
+    assert(t.held_slots(ComponentType::SWA) == 0 && t.held_slots(ComponentType::MAMBA) == 0);
     expect_healthy(t);
     t.destroy();
     TEST_PASS();
@@ -236,9 +305,9 @@ static void test_mamba_budget() {
     }
     const uint64_t one[NUM_COMPONENT_TYPES] = {UINT64_MAX, UINT64_MAX, 1};
     std::vector<HeldEviction> held;
-    assert(t.try_evict_batch(100, &held, one) == 4);
-    assert(held.size() == 1 && held[0].mamba_slots.size() == 2);   // FULL alone takes both leaves
-    assert(t.try_evict_batch(100, &held) == 4 && held.size() == 2);
+    assert(t.try_evict_batch(100, &held, one) == 8);
+    assert(held.size() == 1 && held[0].mamba_slots.size() == 2);   // one chain uses the budget up
+    assert(t.try_evict_batch(100, &held) == 8 && held.size() == 2);
     t.release_held(held);
     expect_healthy(t);
     t.destroy();
@@ -254,7 +323,7 @@ static void test_release_after_reset() {
     insert_fresh(t, h, 8);
     insert_fresh(t, h, 16, 8);
     std::vector<HeldEviction> held;
-    assert(t.try_evict_batch(8, &held) == 8 && held.size() == 1);
+    assert(t.try_evict_batch(8, &held) == 16 && held.size() == 1);
     t.reset();
     assert(t.held_slots(ComponentType::FULL) == 0 && t.mempool_free() == 32);
     std::vector<int32_t> s;
@@ -308,7 +377,7 @@ static void test_queue() {
     insert_fresh(t, a, 8);
     insert_fresh(t, a, 12, 8);
     held.clear();
-    assert(t.try_evict_batch(4, &held) == 4);
+    assert(t.try_evict_batch(4, &held) == 12);
     q.push(std::move(held));
     t.reset();
     assert(q.pop(8, 0).empty());
@@ -321,10 +390,12 @@ static void test_queue() {
 int main() {
     printf("test_evict_writeback\n");
     test_hold_returns_full_prefix();
+    test_hold_chain();
     test_foreground_never_holds();
     test_split_of_pinned_ancestor();
     test_budget_and_shared_prefix();
     test_aux_held_and_pinned();
+    test_aux_chain();
     test_mamba_budget();
     test_release_after_reset();
     test_queue();
