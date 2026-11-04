@@ -386,6 +386,13 @@ class RadixClient:
         self._work.set()
         if self._completer is not None:
             self._completer.join(2)
+        with self._mu:
+            pushes = {t: j for t, j in self._pending.items() if isinstance(j, PushJob)}
+            for t in pushes:
+                del self._pending[t]
+        for job in pushes.values():
+            job._q.finalize()
+            job._f.set_result(PushResult(job._hit, job._hit, 0, 0, False))
         self._store = None
         self._index = None
         self._t.close()

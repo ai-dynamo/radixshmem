@@ -16,7 +16,8 @@ import numpy as np
 import pytest
 
 import radixshmem
-from radixshmem import ClusterConfig, Geometry, RadixClient, RadixServer, ServerConfig, WritebackHandler, writeback
+from radixshmem import (ClusterConfig, Geometry, PushJob, PushResult, RadixClient, RadixServer, ServerConfig,
+                        WritebackHandler, writeback)
 
 pytestmark = pytest.mark.skipif(not hasattr(radixshmem, "_data"), reason="radixshmem._data not built")
 
@@ -366,3 +367,15 @@ def test_peer_writeback_pushes_nothing_from_a_decode_node(capfd):
     h.write([task(1, 8), task(2, 8, first=2)], done.extend)
     assert done == [1, 2] and h.client.pushes == []
     assert h.stats() == {"pushed": 0, "incomplete": 0, "no_target": 2, "too_long": 0}
+
+
+def test_close_releases_the_pins_of_unfinished_pushes():
+    released = []
+    c = RadixClient.__new__(RadixClient)
+    c._init("/py_wb_stub", SimpleNamespace(close=lambda: None), 4, False)
+    job = PushJob(1, c, 2, np.arange(8, dtype=np.uint64))
+    job._q, job._hit = SimpleNamespace(finalize=lambda: released.append(job.job_id)), 3
+    c._pending[7] = job
+    c.close()
+    assert released == [1] and not c._pending
+    assert job.wait(0) == PushResult(3, 3, 0, 0, False)
