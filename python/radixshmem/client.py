@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import copy
+import sys
 import threading
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -154,6 +155,7 @@ class PushJob:
         self._rank = rank
         self._hashes = hashes
         self._index = None
+        self._store = None
         self._q = None                  # remote_query(lock=True): the target's pin on its hit
         self._hit = 0
         self._want: List[ComponentType] = []
@@ -444,7 +446,7 @@ class RadixClient:
         slots until the job is done."""
         if self.local_read_only:
             raise RuntimeError("local_read_only client: push_async needs the cluster plane")
-        self.store
+        store = self.store
         h = np.ascontiguousarray(hashes, dtype=np.uint64)
         full = np.ascontiguousarray(full_slots, dtype=np.int32)
         swa = [(int(e), np.ascontiguousarray(s, dtype=np.int32)) for e, s in swa]
@@ -458,11 +460,15 @@ class RadixClient:
             job = PushJob(self._next_id, self, int(rank), h)
             self._next_id += 1
             self._jobs[job.job_id] = job
-        job._index, job._valid = index, valid
+        job._index, job._store, job._valid = index, store, valid
         job._q = q = index.remote_query(job._rank, h, lock=True, update_meta=False)
-        if int(q.status) == 0:
-            job._hit = int(q.total_hit_length)
-            self._reserve(job, full, swa, mamba)
+        try:
+            if int(q.status) == 0:
+                job._hit = int(q.total_hit_length)
+                self._reserve(job, full, swa, mamba)
+        except Exception as e:  # noqa: BLE001 - the push gives up; its pin and slots are returned
+            self._complete_push(job, [(False, 0, 0, str(e))] * len(job._items))
+            return job
         if not job._items:
             self._complete_push(job, [])
         else:
@@ -577,6 +583,16 @@ class RadixClient:
             job._parts[kind] = [(e, len(s)) for e, s in parts]
 
     def _complete_push(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
+        try:
+            self._settle_push(job, replies)
+        except Exception as e:  # noqa: BLE001 - wait() never raises: the push completes as not published
+            print(f"radixshmem: push job {job.job_id} to rank {job._rank} failed: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            job._q.finalize()
+            if not job._f.done():
+                job._f.set_result(PushResult(job._hit, job._hit, 0, 0, False))
+
+    def _settle_push(self, job: PushJob, replies: Sequence[TransferReply]) -> None:
         ok = {ComponentType(it[1]): rep[0] for it, rep in zip(job._items, replies)}
         late = {ComponentType(it[1]) for it, rep in zip(job._items, replies) if rep[3] == XFER_IN_FLIGHT}
         self.transfer_failures += sum(not v for v in ok.values())
@@ -593,7 +609,7 @@ class RadixClient:
         landed = self._publish(job, publish) if publish else {}
         whole = [k for k, count in landed.items() if count == len(job._reserved[k])]
         hit = n if FULL in whole else hit
-        nbytes = sum(count * int(self._store.pool(k).slot_bytes) for k, count in landed.items())
+        nbytes = sum(count * int(job._store.pool(k).slot_bytes) for k, count in landed.items())
         job._q.finalize()   # after the inserts: the pin's release covers a node they split
         job._f.set_result(PushResult(hit, job._hit, sum(landed.values()), nbytes,
                                      hit == n and all(k in whole for k in job._want)))

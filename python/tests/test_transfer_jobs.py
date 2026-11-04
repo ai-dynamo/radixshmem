@@ -374,3 +374,51 @@ def test_a_push_cannot_be_cancelled_and_runs_on():
         assert index.log[-1] == ("unlock", 2)
     finally:
         c.close()
+
+
+class FailingIndex(StubIndex):
+    def __init__(self, fail, **kw):
+        super().__init__(**kw)
+        self.fail, self.client = fail, None
+
+    def remote_allocate(self, rank, n, kind):
+        if self.fail == ("allocate", kind):
+            raise RuntimeError("allocate broke")
+        return super().remote_allocate(rank, n, kind)
+
+    def remote_insert_path(self, *args):
+        if self.fail == "insert":
+            raise RuntimeError("insert broke")
+        if self.fail == "store":
+            self.client._store = None
+        return super().remote_insert_path(*args)
+
+
+def test_a_push_whose_completion_raises_still_completes_and_releases_its_pin():
+    index = FailingIndex("insert", hit=3)
+    c = index.client = client(index)
+    try:
+        assert c.push_async(*push_args()).wait(5) == PushResult(3, 3, 0, 0, False)
+        assert index.log == [("unlock", 2)]
+    finally:
+        c.close()
+
+
+def test_a_push_whose_reservation_raises_returns_what_it_reserved():
+    index = FailingIndex(("allocate", SWA), hit=3)
+    c = index.client = client(index)
+    try:
+        job = c.push_async(*push_args())
+        assert job.wait(0) == PushResult(3, 3, 0, 0, False) and c._t.items == []
+        assert index.log == [("recycle", FULL, [100, 101, 102, 103, 104]), ("unlock", 2)]
+    finally:
+        c.close()
+
+
+def test_a_push_counts_its_bytes_with_the_store_it_started_with():
+    index = FailingIndex("store", hit=3)
+    c = index.client = client(index)
+    try:
+        assert c.push_async(*push_args()).wait(5) == PushResult(8, 3, 11, 110, True)
+    finally:
+        c.close()
