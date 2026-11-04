@@ -58,6 +58,7 @@ int grpc_remote_op_timeout_ms() {
 }
 
 struct GrpcRemoteOpClientTransport::Impl {
+    std::shared_ptr<grpc::Channel> channel;
     std::unique_ptr<pb::RemoteOps::Stub> stub;
     std::chrono::milliseconds timeout;
     std::string instance;
@@ -83,9 +84,9 @@ GrpcRemoteOpClientTransport::GrpcRemoteOpClientTransport(
     args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
     args.SetInt(GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS,
                 kGrpcRemoteOpKeepaliveMs);
-    auto channel = grpc::CreateCustomChannel(
+    impl_->channel = grpc::CreateCustomChannel(
         target, grpc::InsecureChannelCredentials(), args);
-    impl_->stub = pb::RemoteOps::NewStub(channel);
+    impl_->stub = pb::RemoteOps::NewStub(impl_->channel);
     impl_->timeout = std::chrono::milliseconds(timeout_ms);
     impl_->instance = std::to_string(instance_id);
 }
@@ -252,6 +253,10 @@ RemoteStatus GrpcRemoteOpClientTransport::unlock(
     grpc::ClientContext ctx;
     impl_->prepare(ctx);
     return to_remote_status(impl_->stub->Unlock(&ctx, req, &rep));
+}
+
+bool GrpcRemoteOpClientTransport::connected() {
+    return impl_->channel->GetState(false) == GRPC_CHANNEL_READY;
 }
 
 }  // namespace radixshmem

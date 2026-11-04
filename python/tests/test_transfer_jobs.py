@@ -261,12 +261,19 @@ def test_pull_keeps_the_staging_slots_a_read_may_still_reach():
     assert c._index.log == [("local recycle", FULL, [10, 11])]
 
 
-def test_close_releases_the_pins_of_unfinished_pushes():
-    released = []
-    c = client(StubIndex())
-    job = PushJob(1, c, 2, np.arange(8, dtype=np.uint64))
-    job._q, job._hit = SimpleNamespace(finalize=lambda: released.append(job.job_id)), 3
-    c._pending[7] = job
+def test_close_releases_the_pins_of_unfinished_pushes_concurrently():
+    released, c = [], client(StubIndex())
+    pushes = []
+    for i in range(8):
+        job = PushJob(i, c, 2, np.arange(8, dtype=np.uint64))
+        job._q, job._hit = SimpleNamespace(finalize=lambda i=i: (time.sleep(0.3), released.append(i))), 3
+        c._pending[100 + i] = job
+        pushes.append(job)
+    pull = PullJob(99, c)
+    c._pending[7] = pull
+    t0 = time.monotonic()
     c.close()
-    assert released == [1] and not c._pending
-    assert job.wait(0) == PushResult(3, 3, 0, 0, False)
+    assert time.monotonic() - t0 < 1.2
+    assert sorted(released) == list(range(8))
+    assert list(c._pending.values()) == [pull] and not pull.done()
+    assert all(job.wait(0) == PushResult(3, 3, 0, 0, False) for job in pushes)

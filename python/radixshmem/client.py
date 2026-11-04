@@ -391,8 +391,10 @@ class RadixClient:
             pushes = {t: j for t, j in self._pending.items() if isinstance(j, PushJob)}
             for t in pushes:
                 del self._pending[t]
+        if pushes:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(pushes), 32)) as pool:
+                list(pool.map(lambda job: job._q.finalize(), pushes.values()))
         for job in pushes.values():
-            job._q.finalize()
             job._f.set_result(PushResult(job._hit, job._hit, 0, 0, False))
         self._store = None
         self._index = None

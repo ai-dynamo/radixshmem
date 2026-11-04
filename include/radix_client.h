@@ -36,6 +36,7 @@ struct PeerFaultCounters;
 struct ShardMapMsg;
 
 class IRemoteOpClientTransport;
+class PeerBreaker;
 
 class RemotePeer {
 public:
@@ -74,11 +75,16 @@ public:
     // The peer rank this session talks to (set by peer_for; -1 when built directly).
     int  peer_rank() const { return peer_rank_; }
     void set_peer_rank(int r) { peer_rank_ = r; }
+    void set_breaker(std::shared_ptr<PeerBreaker> breaker) { breaker_ = std::move(breaker); }
 
 private:
+    bool skipped();
+    void observe(const char* op, RemoteStatus st, double secs);
+
     std::unique_ptr<IRemoteOpClientTransport> transport_;
     std::string endpoint_;
     int         peer_rank_    = -1;
+    std::shared_ptr<PeerBreaker> breaker_;
 };
 
 #endif  // !RADIXSHMEM_NO_RDMA

@@ -24,6 +24,9 @@ PeerConnector::PeerConnector(PeerRegistry& peers, RdmaTransportClient& tx,
     : peers_(peers), tx_(tx), cfg_(cfg),
       breaker_(std::make_unique<PeerBreaker>(
           "[RadixClient rank " + std::to_string(peers.my_rank()) + "] peer index",
+          cfg.faults)),
+      rc_breaker_(std::make_shared<PeerBreaker>(
+          "[RadixClient rank " + std::to_string(peers.my_rank()) + "] remote ops",
           cfg.faults)) {}
 
 static double secs_since(std::chrono::steady_clock::time_point t0) {
@@ -139,7 +142,10 @@ bool PeerConnector::ensure_connected(int rank) {
     return true;
 }
 
-void PeerConnector::peer_changed(int rank) { breaker_->retry_now(rank); }
+void PeerConnector::peer_changed(int rank) {
+    breaker_->retry_now(rank);
+    rc_breaker_->retry_now(rank);
+}
 
 void PeerConnector::peer_left(int rank) {
     {
@@ -149,6 +155,7 @@ void PeerConnector::peer_left(int rank) {
         slots_[rank].info = RemoteTreeInfo{};
     }
     breaker_->left(rank, "left the cluster (etcd entry removed)");
+    rc_breaker_->left(rank, "left the cluster (etcd entry removed)");
 }
 
 void PeerConnector::fault(int rank, const char* op, const std::exception& e,
@@ -282,6 +289,8 @@ std::shared_ptr<RemotePeer> PeerConnector::build_rc_session(int rank) {
     auto t = make_remote_op_client(p, endpoint);
     auto rc = std::make_shared<RemotePeer>(std::move(t), std::move(endpoint));
     rc->set_peer_rank(rank);
+    rc_breaker_->name(rank, p.host);
+    rc->set_breaker(rc_breaker_);
     return rc;
 }
 

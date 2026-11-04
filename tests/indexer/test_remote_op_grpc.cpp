@@ -9,6 +9,7 @@
 #include "remote_op_factory.hpp"
 #include "remote_ops.grpc.pb.h"
 #include "local.h"
+#include "peer_breaker.hpp"
 
 #include <grpcpp/grpcpp.h>
 
@@ -174,6 +175,7 @@ void test_roundtrip() {
            RemoteStatus::BAD_REQUEST);
     assert(cli.recycle(a.slots.data(), 1, bogus) == RemoteStatus::BAD_REQUEST);
     assert(node.used() == (uint32_t)n);
+    assert(cli.connected());
     server.stop();
     TEST_PASS();
 }
@@ -437,6 +439,100 @@ void test_local_limits() {
            RemoteStatus::BAD_REQUEST);
     assert(cli.recycle(s.data(), big) == RemoteStatus::BAD_REQUEST);
     assert(cli.unlock(h.data(), big, 0, 4, 4, {}) == RemoteStatus::BAD_REQUEST);
+    assert(cli.allocate(1).status == RemoteStatus::UNAVAILABLE && !cli.connected());
+    TEST_PASS();
+}
+
+struct FakeTransport final : IRemoteOpClientTransport {
+    RemoteStatus next = RemoteStatus::OK;
+    bool up = true;
+    int calls = 0;
+
+    AllocateReply allocate(int, ComponentType) override {
+        calls++;
+        AllocateReply r;
+        r.status = next;
+        return r;
+    }
+    QueryReply query(const uint64_t*, int, bool, bool) override {
+        calls++;
+        QueryReply r;
+        r.status = next;
+        return r;
+    }
+    InsertResult insert(const uint64_t*, int, int, int, const int32_t*, bool,
+                        ComponentType) override {
+        calls++;
+        InsertResult r;
+        r.remote_status = next;
+        return r;
+    }
+    InsertPathResult insert_path(const uint64_t*, int, int, int, const int32_t*,
+                                 const std::vector<ComponentRun>& runs, bool) override {
+        calls++;
+        InsertPathResult r;
+        r.remote_status = next;
+        r.runs.resize(runs.size());
+        return r;
+    }
+    RemoteStatus recycle(const int32_t*, int, ComponentType) override {
+        calls++;
+        return next;
+    }
+    RemoteStatus unlock(const uint64_t*, int, int, int, int, const std::vector<uint64_t>&) override {
+        calls++;
+        return next;
+    }
+    bool connected() override { return up; }
+};
+
+void test_breaker_gates_remote_ops() {
+    TEST_BEGIN("remote ops: an unreachable peer is skipped until its backoff ends");
+    auto owned = std::make_unique<FakeTransport>();
+    FakeTransport& t = *owned;
+    auto breaker = std::make_shared<PeerBreaker>("[test] remote ops", nullptr, 100, 400);
+    RemotePeer peer(std::move(owned), "fake");
+    peer.set_peer_rank(1);
+    peer.set_breaker(breaker);
+    auto h = make_hashes(100, 4);
+    std::vector<int32_t> s(4, 0);
+
+    t.next = RemoteStatus::TIMEOUT;
+    assert(peer.allocate(1).status == RemoteStatus::TIMEOUT && !breaker->is_down(1));
+    t.next = RemoteStatus::BAD_REQUEST;
+    assert(peer.recycle(s.data(), 4) == RemoteStatus::BAD_REQUEST && !breaker->is_down(1));
+
+    t.next = RemoteStatus::UNAVAILABLE;
+    assert(peer.allocate(1).status == RemoteStatus::UNAVAILABLE && breaker->is_down(1));
+    const int calls = t.calls;
+    assert(peer.allocate(1).status == RemoteStatus::UNAVAILABLE);
+    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE);
+    InsertResult ins = peer.insert(h.data(), 4, 0, 4, s.data());
+    assert(ins.error == InsertError::REMOTE_FAILED && ins.remote_status == RemoteStatus::UNAVAILABLE);
+    InsertPathResult path = peer.insert_path(h.data(), 4, 0, 4, s.data(), {{ComponentType::SWA, 4, {1}}});
+    assert(path.remote_status == RemoteStatus::UNAVAILABLE && path.runs.size() == 1 &&
+           path.full.error == InsertError::REMOTE_FAILED &&
+           path.runs[0].error == InsertError::REMOTE_FAILED);
+    assert(peer.recycle(s.data(), 4) == RemoteStatus::UNAVAILABLE);
+    assert(peer.unlock(h.data(), 4, 0, 4, 4, {}) == RemoteStatus::UNAVAILABLE);
+    assert(t.calls == calls);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 1);
+    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    t.next = RemoteStatus::OK;
+    assert(peer.allocate(1).status == RemoteStatus::OK && t.calls == calls + 2 && !breaker->is_down(1));
+    assert(peer.unlock(h.data(), 4, 0, 4, 4, {}) == RemoteStatus::OK && t.calls == calls + 3);
+
+    t.next = RemoteStatus::TIMEOUT;
+    t.up = false;
+    assert(peer.query(h.data(), 4).status == RemoteStatus::TIMEOUT && breaker->is_down(1));
+    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 4);
+    breaker->retry_now(1);
+    t.next = RemoteStatus::OK;
+    t.up = true;
+    assert(peer.query(h.data(), 4).status == RemoteStatus::OK && !breaker->is_down(1));
     TEST_PASS();
 }
 
@@ -539,6 +635,7 @@ int main() {
     test_unlock_partial_node();
     test_stale_instance();
     test_local_limits();
+    test_breaker_gates_remote_ops();
     test_lifecycle();
     test_bad_reply();
     return tests_report();
