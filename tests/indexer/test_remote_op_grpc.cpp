@@ -170,13 +170,13 @@ void test_roundtrip() {
     TEST_PASS();
 }
 
-void test_largest_request() {
-    TEST_BEGIN("ops of MAX_REMOTE_OP_BLOCKS blocks fit the message limit");
-    Node node("max", MAX_REMOTE_OP_BLOCKS);
+void test_large_request() {
+    TEST_BEGIN("ops past gRPC's default 4 MiB message limit round trip");
+    const int n = 1 << 19;
+    Node node("large", n);
     GrpcRemoteOpServer server(0, kInstance);
     server.start(*node.svc);
     GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
-    const int n = MAX_REMOTE_OP_BLOCKS;
     auto h = make_hashes(100000, n);
     AllocateReply a = cli.allocate(n);
     assert(a.status == RemoteStatus::OK && (int)a.slots.size() == n);
@@ -333,19 +333,15 @@ void test_stale_instance() {
 void test_local_limits() {
     TEST_BEGIN("oversized requests → BAD_REQUEST without a server");
     GrpcRemoteOpClientTransport cli("127.0.0.1:1", 1000, kInstance);
-    const int big = 9000;
-    auto h = make_hashes(1000, big);
-    std::vector<int32_t> s(big, 0);
-    assert(cli.allocate(MAX_REMOTE_OP_BLOCKS + 1).status == RemoteStatus::BAD_REQUEST);
+    const int big = MAX_REMOTE_OP_BLOCKS + 1;
+    auto h = make_hashes(1000, 4);
+    std::vector<int32_t> s(4, 0);
+    assert(cli.allocate(big).status == RemoteStatus::BAD_REQUEST);
     assert(cli.query(h.data(), big, false, false).status == RemoteStatus::BAD_REQUEST);
-    assert(cli.query(h.data(), MAX_REMOTE_OP_BLOCKS + 1, false, false).status ==
-           RemoteStatus::BAD_REQUEST);
     assert(cli.insert(h.data(), big, 0, big, s.data(), true).remote_status ==
            RemoteStatus::BAD_REQUEST);
     assert(cli.recycle(s.data(), big) == RemoteStatus::BAD_REQUEST);
-    std::vector<uint64_t> tail(h.begin(), h.begin() + MAX_REMOTE_OP_BLOCKS + 1);
-    assert(cli.unlock(h.data(), 4, 0, 4, 4 + (int)tail.size(), tail) ==
-           RemoteStatus::BAD_REQUEST);
+    assert(cli.unlock(h.data(), big, 0, 4, 4, {}) == RemoteStatus::BAD_REQUEST);
     TEST_PASS();
 }
 
@@ -421,7 +417,7 @@ int main() {
     printf("test_remote_op_grpc\n");
     test_transport_factory();
     test_roundtrip();
-    test_largest_request();
+    test_large_request();
     test_deadline_no_replay();
     test_no_admission_cap();
     test_deadline_skips_allocate_and_query();

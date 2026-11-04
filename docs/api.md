@@ -105,7 +105,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 
 > **Distributed criterion**: `want_cluster()` = `expected_min_nodes > 1 || num_rht_shards > 1 || world_size > 1`. If any of the three holds, etcd + RDMA bootstrap is used, and in that case **one of** `rpc_address` / `rpc_interface` **must be given**; otherwise `bootstrap()` throws `std::runtime_error`.
 
-> **Concurrency and deadlines**: the gRPC service has no per-op admission limit; allocate and insert queue on the target's insert lock, query and unlock run in parallel. The server's gRPC threads are capped at `RADIXSHMEM_REMOTE_OP_MAX_THREADS` (default 256); past that cap a request is answered with `RESOURCE_EXHAUSTED` without running. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms); an allocate or query that waited until its deadline is not run and returns `TIMEOUT`, while insert, recycle and unlock always run. Clients send gRPC keepalive pings every 10 s, so a dead connection fails with `UNAVAILABLE` instead of waiting for each op's deadline.
+> **Concurrency and deadlines**: the gRPC service has no per-op admission limit; allocate and insert queue on the target's insert lock, query and unlock run in parallel. The server's gRPC threads are capped at `RADIXSHMEM_REMOTE_OP_MAX_THREADS` (default 256); past that cap a request is answered with `RESOURCE_EXHAUSTED` without running. A message may take up to 2 GiB, the most gRPC carries, so an op carries up to `MAX_REMOTE_OP_BLOCKS` (134,217,471) blocks. Each op has a client-side deadline of `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` (default 5000 ms); an allocate or query that waited until its deadline is not run and returns `TIMEOUT`, while insert, recycle and unlock always run. Clients send gRPC keepalive pings every 10 s, so a dead connection fails with `UNAVAILABLE` instead of waiting for each op's deadline.
 
 > **Deployment**: remote ops use gRPC only, and an RDMA build needs gRPC (grpc++, protobuf, protoc, grpc_cpp_plugin). The manifest and cluster protocol versions are 13 (13: remote ops carry the component pool); the former remote-op transport and DCT fields are reserved. All nodes and clients must run the same build; mixed-version rolling upgrades are not supported. RHT and peer-index XRC/DC transport choices are unaffected.
 
@@ -537,7 +537,7 @@ AllocateReply remote_allocate(int rank, int n,
 | Parameter | Type    | Meaning                                          |
 | ------ | ----- | ------------------------------------------- |
 | `rank` | `int` | Target peer (invalid → `status = BAD_TARGET`; not registered → `UNAVAILABLE`). |
-| `n`    | `int` | Number of slots to allocate, **≤ 8192** (`MAX_REMOTE_OP_BLOCKS`; over the limit returns `BAD_REQUEST`; not split). |
+| `n`    | `int` | Number of slots to allocate, **≤ `MAX_REMOTE_OP_BLOCKS`** (over the limit returns `BAD_REQUEST`; not split). |
 | `component` | `ComponentType` | Pool to allocate from. |
 
 
@@ -574,7 +574,7 @@ InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
 | Parameter                    | Type                       | Meaning                                                                                    |
 | --------------------- | ------------------------ | ------------------------------------------------------------------------------------- |
 | `rank`                | `int`                    | Target peer (invalid → `error = REMOTE_FAILED`).                                                 |
-| `hashes` / `n`        | `const uint64_t*` / `int`| Cumulative prefix hash array (the server is stateless and re-walks the path from it), `n ≤ 8192`.                                                   |
+| `hashes` / `n`        | `const uint64_t*` / `int`| Cumulative prefix hash array (the server is stateless and re-walks the path from it), `n ≤ MAX_REMOTE_OP_BLOCKS`.                                                   |
 | `start` / `length`    | `int`                    | Publish range; a new prefix uses `start=0, length=n`. The request carries `length` entries of `slots` (slots follow the hashes).                       |
 | `slots`               | `const int32_t*`         | The slots returned by phase-1 `remote_allocate`.                                                   |
 | `auto_recycle`        | `bool`                   | `true`: the target reclaims the dedup surplus in place; `false`: the surplus stays allocated and the caller reclaims it explicitly with `remote_recycle`.                             |
@@ -635,7 +635,7 @@ Remote-operation query (1 RTT): the peer queries **its own** local tree (this me
 | Parameter             | Type     | Meaning                                                                                       |
 | -------------- | ------ | ---------------------------------------------------------------------------------------- |
 | `rank`         | `int`  | Target peer (invalid → `status = BAD_TARGET`; not registered → `UNAVAILABLE`). |
-| `hashes` / `n` | —      | Cumulative prefix hash array, `n ≤ 8192`.                                                                      |
+| `hashes` / `n` | —      | Cumulative prefix hash array, `n ≤ MAX_REMOTE_OP_BLOCKS`.                                                                      |
 | `lock`         | `bool` | When `true`, the target pins the hit prefix `[0, hit_length)` with inc_ref (it must be released after reading with `result.finalize()`). |
 | `update_meta`  | `bool` | When `false`, the target's LRU metadata is not modified.                                                                    |
 

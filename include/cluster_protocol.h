@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <infiniband/verbs.h>
+#include <limits>
 
 #include "cluster_manifest.h"   // CLUSTER_MAX_SHARDS
 #include "types.h"              // RemoteStatus (shared with QueryResult)
@@ -68,6 +69,8 @@ struct ClusterReplyMsg {
     union ibv_gid gid;
 };
 
-constexpr int      MAX_REMOTE_OP_BLOCKS = 8192;
+constexpr int      MAX_REMOTE_OP_MESSAGE_BYTES = std::numeric_limits<int>::max();
+constexpr int      MAX_REMOTE_OP_BLOCKS =
+    (MAX_REMOTE_OP_MESSAGE_BYTES - 4096) / (2 * (int)sizeof(uint64_t));
 
 } // namespace radixshmem

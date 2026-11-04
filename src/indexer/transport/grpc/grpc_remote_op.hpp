@@ -10,7 +10,6 @@
 #include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
 #include "cluster_protocol.h"
 
-#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -18,8 +17,7 @@
 
 namespace radixshmem {
 
-constexpr int kGrpcRemoteOpMaxMessageBytes =
-    std::max(64 * 1024, 2 * (int)sizeof(uint64_t) * MAX_REMOTE_OP_BLOCKS + 4096);
+constexpr int kGrpcRemoteOpMaxMessageBytes = MAX_REMOTE_OP_MESSAGE_BYTES;
 constexpr int kGrpcRemoteOpKeepaliveMs = 10000;
 constexpr const char* kGrpcRemoteOpInstanceKey = "radixshmem-instance";
 
