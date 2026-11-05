@@ -174,45 +174,28 @@ void RadixClient::bootstrap_cluster() {
 
     int my_rank = peer_reg_->my_rank();
 
-    // Device and GID: explicit config wins (a difference from this node's server is reported, not
-    // overridden); else this node's published choice; else, for observers or old servers, the
-    // local net_discovery rules.
-    std::string dev_str = cfg_.index_dev;
-    int          gid_idx = cfg_.gid_idx;
+    NetSelectionInput net;
+    net.index_dev = cfg_.index_dev;
+    net.gid_idx = cfg_.gid_idx;
     if (my_rank >= 0) {
         PeerEntry self;
         {
             std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
             self = peer_reg_->peers_locked()[my_rank];
         }
-        if (dev_str.empty()) {
-            dev_str = self.index_dev;
-        } else if (self.index_dev[0] != '\0' && dev_str != self.index_dev) {
-            fprintf(stderr, "[RadixClient] index_dev %s differs from this node's server (%s); keeping the client's\n",
-                    dev_str.c_str(), self.index_dev);
-        }
-        if (gid_idx < 0) {
-            gid_idx = self.gid_index;
-        } else if (gid_idx != self.gid_index) {
-            fprintf(stderr, "[RadixClient] gid_idx %d differs from this node's server (%d); keeping the client's\n",
-                    gid_idx, self.gid_index);
-        }
+        net.inherit_index(self.index_dev, self.gid_index);
     }
-    if (dev_str.empty() || gid_idx < 0) {
-        NetSelectionInput in;
-        in.index_dev     = dev_str;
-        in.gid_idx       = gid_idx;
-        in.registry_host = registry_host_of(cfg_.registry);
-        in.need_dc       = peer_index_transport_ == CLUSTER_TRANSPORT_DC;
-        const NetSelection sel = resolve_net(in);
-        dev_str = sel.index.device;
-        gid_idx = sel.index.gid_index;
+    if (net.index_dev.empty() || net.gid_idx < 0) {
+        net.registry_host = registry_host_of(cfg_.registry);
+        net.need_dc = peer_index_transport_ == CLUSTER_TRANSPORT_DC;
+        const NetSelection sel = resolve_net(net);
+        net.index_dev = sel.index.device;
+        net.gid_idx = sel.index.gid_index;
         fprintf(stderr, "[RadixClient] net: %s\n", sel.summary().c_str());
     }
-    const char* dev = dev_str.c_str();
     int ws = peer_reg_->world_size();
     // QoS (rank 0's SL/TC) is adopted inside the transport before any QP connect.
-    tx_ = std::make_unique<RdmaTransportClient>(dev, gid_idx, rdma_sl_, rdma_tc_, ws);
+    tx_ = std::make_unique<RdmaTransportClient>(net.index_dev.c_str(), net.gid_idx, rdma_sl_, rdma_tc_, ws);
 
     // Peer plane: lazy data-plane endpoints + remote-op factory. Its slots track
     // the peer table via the registry grow hook.

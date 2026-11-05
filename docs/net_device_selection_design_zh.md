@@ -140,8 +140,8 @@ GID 与关联接口的全部相关地址/prefix 一起保存，不使用 netdev 
   → 注册后兼容性诊断和正常建链
 ```
 
-- Python 通过 binding 调用同一解析实现，在创建传输后端前完成解析；修改 preflight 的必填检查和 `resolved_transfer_ip()`，不能在分布式自动模式缺地址时静默退到 127.0.0.1。
-- C++ 直接入口也调用同一解析实现。已经解析的选择再核验可用性，不重新套另一套优先级。
+- Python 通过 binding 调用同一解析实现，先应用集群环境覆盖，再选择网络；完整配置写回 Python，确保 registry、节点身份和后端初始化一致。
+- C++ 直接入口也调用同一解析实现。已经解析的选择再核验可用性；底层 `RdmaContext` 只接收已确定的设备、端口和 GID，不自行选卡或推导控制地址。
 - 实际选中的设备和 GID 写回运行时配置，后续 context、`fill_local_entry()`、本机客户端和日志使用同一结果。
 - 保留 `rpc_interface` 优先于 `rpc_address` 的现有约定，两者都给出时明确告知生效项。两者都空时，可从选中索引组合关联的有效 IP 推导；多地址无法消歧或接口不可见时要求显式配置。
 - 显式控制地址与索引网络不同是合法部署，不自动改写。自动发布地址不能是通配地址；显式 0.0.0.0 的既有单机测试行为单独保留，不作为跨机可达地址。
@@ -171,7 +171,7 @@ GID 与关联接口的全部相关地址/prefix 一起保存，不使用 netdev 
 NUMA 注册位置作为独立改动验证：
 
 - 去掉 `register_store("cpu:0")` 的硬编码，优先使用已有空 location / 后端自动探测入口；针对实际 Mooncake 依赖版本检查 wildcard 的行为。
-- 首尾页在同一节点不能证明整个池均在那里；`"*"` 也不代表后端会精确识别混合 NUMA，经典 TE 可能仅按首页标记整段。
+- 仅采样首页的 NUMA 节点作为注册位置，日志明确是首页采样，不宣称整个池均在那里；不再查询不能证明整池分布的尾页。`"*"` 也不代表后端会精确识别混合 NUMA。
 - 覆盖 prefault 开关、页面未驻留、探测权限不足和未知位置的处理，保留明确的回退诊断。
 - 真正的混合 NUMA 分段注册及跨 NUMA 流量分配留作后续优化；页面位置探测属于内存注册路径，不放入网卡选择策略。
 - 修正 server 的生产注册路径，并审查其他注册调用的意图；测试中用于明确模拟 NUMA 位置的参数不机械替换。
@@ -195,7 +195,7 @@ NUMA 注册位置作为独立改动验证：
 
 ### 5.7 客户端
 
-本机客户端没有显式配置时，继承服务端发布的实际 `index_dev / gid_index`，并校验本机同一网络命名空间里的设备、port 1、GID 和能力。
+本机客户端没有显式配置时，继承服务端发布的实际 `index_dev / gid_index`。仅当设备相同时继承缺省 GID；显式换卡但未指定 GID 时，在该卡上自动选择，不把服务端另一张卡的 GID 索引搬过来。
 
 显式配置优先级在服务端、客户端保持一致：客户端指定 GID 时不得被当前 `self.gid_index != gid_idx` 分支静默覆盖。与本机服务端发布结果冲突时明确报错或按已定义的覆盖语义处理，不静默替换成其他设备/GID。
 
@@ -208,7 +208,7 @@ NUMA 注册位置作为独立改动验证：
 ```text
 [RadixServer] net: control 10.6.131.11 (rpc_interface) | index mlx5_bond_0 port 1 gid 3 (10.6.131.11, bond0, numa 0, control-interface hint)
 [radixshmem] MooncakeBackend: transfer devices allowed=all engine=mlx5_0,...,mlx5_bond_0 active=unverified
-[radixshmem] SlotTransfer: pool on NUMA 0, registered as cpu:0
+[radixshmem] SlotTransfer: pool first page on NUMA 0, registered as cpu:0
 ```
 
 `reason` 使用实际命中的规则；设备禁用、环境冲突、prefix 未知和只完成配置检查的项目分别说明。活动设备数量只有在后端确实提供证明时才打印为已验证。

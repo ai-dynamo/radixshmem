@@ -287,6 +287,41 @@ def test_control_address_resolution():
         radixshmem._core.resolve_cluster_net(cc)
 
 
+def test_net_preflight_copies_normalized_cluster_settings(monkeypatch):
+    normalized = dict(registry="etcd://192.0.2.1:2379", cluster_id="normalized", node_name="node-test",
+                      rht_transport="dc", peer_index_transport="dc", rht_slots_per_bucket=12,
+                      index_dev="mlx5_test", gid_idx=7, rpc_address="192.0.2.2")
+
+    def resolve(config):
+        for name, value in normalized.items():
+            setattr(config, name, value)
+        return "normalized test settings"
+
+    monkeypatch.setattr(radixshmem._core, "resolve_cluster_net", resolve, raising=False)
+    config = ServerConfig()
+    RadixServer(config)._resolve_net()
+    for name, value in normalized.items():
+        assert getattr(config.cluster, name) == value
+
+
+def test_core_net_resolver_applies_environment_before_discovery(monkeypatch):
+    if not hasattr(radixshmem._core, "resolve_cluster_net"):
+        pytest.skip("built without RDMA")
+    overrides = dict(RHT_TRANSPORT=("rht_transport", "dc"),
+                     PEER_INDEX_TRANSPORT=("peer_index_transport", "dc"),
+                     RHT_SLOTS=("rht_slots_per_bucket", 12),
+                     REGISTRY=("registry", "etcd://192.0.2.1:2379"),
+                     CLUSTER_ID=("cluster_id", "normalized"), NODE_NAME=("node_name", "node-test"))
+    for name, (_, value) in overrides.items():
+        monkeypatch.setenv(f"RADIXSHMEM_{name}", str(value))
+    config = radixshmem._core.RadixServerConfig()
+    config.index_dev = "radixshmem_missing_test_device"
+    with pytest.raises(RuntimeError, match="not found"):
+        radixshmem._core.resolve_cluster_net(config)
+    for name, value in overrides.values():
+        assert getattr(config, name) == value
+
+
 def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):
     c = cfg(**data())
     srv = up(c, geometry())

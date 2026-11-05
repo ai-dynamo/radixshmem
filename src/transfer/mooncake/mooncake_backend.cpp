@@ -30,6 +30,8 @@
 #include <cstring>
 #include <ctime>
 #include <mutex>
+#include <set>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -140,35 +142,26 @@ std::string join(const std::vector<std::string>& v, const char* empty) {
     return s;
 }
 
-// Comma-separated env list membership (MC_TE_FILTERS syntax).
-bool env_list_has(const char* env, const std::string& name) {
-    std::string s(env), tok;
-    for (size_t i = 0; i <= s.size(); i++) {
-        if (i == s.size() || s[i] == ',') {
-            while (!tok.empty() && tok.front() == ' ') tok.erase(tok.begin());
-            while (!tok.empty() && tok.back() == ' ') tok.pop_back();
-            if (tok == name) return true;
-            tok.clear();
-        } else {
-            tok += s[i];
-        }
-    }
-    return false;
-}
-
 }  // namespace
 
 bool MooncakeBackend::init(const TransferConfig& cfg) {
     publish_ = cfg.publish;
 
     const bool auto_discover = cfg.protocol.empty() || cfg.protocol == "rdma";
-    // The engine intersects this allowlist with its own MC_TE_FILTERS env allowlist; an explicit
-    // list the environment would narrow is a conflict and is reported before the engine starts.
+    // Reject environment filters that would silently narrow the explicit device allowlist.
     if (auto_discover && !cfg.device_filter.empty()) {
         if (const char* env = ::getenv("MC_TE_FILTERS"); env && *env) {
+            std::set<std::string> allowed;
+            std::istringstream filters(env);
+            std::string device;
+            while (std::getline(filters, device, ',')) {
+                const auto first = device.find_first_not_of(" \t\r\n\f\v");
+                if (first != std::string::npos)
+                    allowed.insert(device.substr(first, device.find_last_not_of(" \t\r\n\f\v") - first + 1));
+            }
             std::vector<std::string> dropped;
             for (const auto& d : cfg.device_filter)
-                if (!env_list_has(env, d)) dropped.push_back(d);
+                if (!allowed.empty() && !allowed.count(d)) dropped.push_back(d);
             if (!dropped.empty()) {
                 fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices %s are not in "
                                 "MC_TE_FILTERS='%s'; the engine would drop them silently — fix one side\n",

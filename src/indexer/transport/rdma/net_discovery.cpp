@@ -249,20 +249,6 @@ std::string registry_host_of(const std::string& uri) {
     return s;
 }
 
-std::string describe_net_device(const NetDevice& d) {
-    std::string s = d.name + " port " + std::to_string(d.port) + (d.active ? " ACTIVE" : " not active") +
-                    (d.accessible ? "" : " (uverbs not accessible)") + (d.dc_capable ? "" : " (no mlx5 dv)") +
-                    " " + (d.link_layer.empty() ? "link ?" : d.link_layer) + " numa " +
-                    std::to_string(d.numa_node);
-    if (d.rate_gbps > 0) s += " " + std::to_string(d.rate_gbps) + "G";
-    for (const auto& g : d.gids) {
-        s += " | gid " + std::to_string(g.index) + " " + (g.type.empty() ? "?" : g.type) + " " +
-             (g.ipv4_mapped() ? g.ipv4() : g.gid);
-        if (!g.netdev.empty()) s += " " + g.netdev;
-    }
-    return s;
-}
-
 std::string NetSelection::summary() const {
     std::string s = "control " + (control_ip.empty() ? std::string("-") : control_ip);
     if (!control_source.empty()) s += " (" + control_source + ")";
@@ -340,40 +326,29 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         throw std::runtime_error(msg);
     };
 
-    if (!in.index_dev.empty()) {
-        const NetDevice* d = nullptr;
-        for (const auto& x : devices)
-            if (x.name == in.index_dev) d = &x;
-        if (!d) {
-            std::string names;
-            for (const auto& x : devices) names += (names.empty() ? "" : ", ") + x.name;
-            throw std::runtime_error("net: index_dev '" + in.index_dev + "' not found; devices: " +
-                                     (names.empty() ? "none" : names));
-        }
-        if (!d->active) throw std::runtime_error("net: index_dev '" + d->name + "' port 1 is not ACTIVE");
-        if (!d->accessible) throw std::runtime_error("net: index_dev '" + d->name + "' uverbs node is not accessible");
-        if (in.need_dc && !d->dc_capable)
-            throw std::runtime_error("net: index_dev '" + d->name + "' has no mlx5 direct verbs, DC transport needs them");
-    }
+    bool found = in.index_dev.empty();
+    auto reject = [&](const NetDevice& device, const std::string& why) {
+        const std::string message = device.name + ": " + why;
+        if (!in.index_dev.empty()) throw std::runtime_error("net: " + message);
+        excluded.push_back(message);
+    };
 
     for (const auto& d : devices) {
         if (!in.index_dev.empty() && d.name != in.index_dev) continue;
-        if (!d.active) { excluded.push_back(d.name + ": port 1 not ACTIVE"); continue; }
-        if (!d.accessible) { excluded.push_back(d.name + ": uverbs node not accessible"); continue; }
-        if (in.need_dc && !d.dc_capable) { excluded.push_back(d.name + ": no mlx5 direct verbs (DC)"); continue; }
+        found = true;
+        const char* why_unusable = !d.active ? "port 1 not ACTIVE" :
+            !d.accessible ? "uverbs node not accessible" :
+            in.need_dc && !d.dc_capable ? "no mlx5 direct verbs (DC transport)" : nullptr;
+        if (why_unusable) { reject(d, why_unusable); continue; }
         if (in.gid_idx >= 0) {
             const GidEntry* g = d.gid(in.gid_idx);
             if (!g || g->zero()) {
-                const std::string why = d.name + ": gid " + std::to_string(in.gid_idx) + " is not set";
-                if (!in.index_dev.empty()) throw std::runtime_error("net: " + why);
-                excluded.push_back(why);
+                reject(d, "gid " + std::to_string(in.gid_idx) + " is not set");
                 continue;
             }
             if (d.link_layer == "InfiniBand" ? !g->ib_or_v1() : !(g->roce_v2() || g->ib_or_v1())) {
-                const std::string why = d.name + ": gid " + std::to_string(in.gid_idx) + " type '" + g->type +
-                                        "' does not fit link " + d.link_layer;
-                if (!in.index_dev.empty()) throw std::runtime_error("net: " + why);
-                excluded.push_back(why);
+                reject(d, "gid " + std::to_string(in.gid_idx) + " type '" + g->type +
+                          "' does not fit link " + d.link_layer);
                 continue;
             }
             combos.push_back({&d, g});
@@ -381,10 +356,13 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         }
         std::string why;
         for (const GidEntry* g : auto_gids(d, why)) combos.push_back({&d, g});
-        if (!why.empty()) {
-            if (!in.index_dev.empty()) throw std::runtime_error("net: index_dev '" + d.name + "': " + why);
-            excluded.push_back(d.name + ": " + why);
-        }
+        if (!why.empty()) reject(d, why);
+    }
+    if (!found) {
+        std::string names;
+        for (const auto& device : devices) names += (names.empty() ? "" : ", ") + device.name;
+        throw std::runtime_error("net: index_dev '" + in.index_dev + "' not found; devices: " +
+                                 (names.empty() ? "none" : names));
     }
 
     if (combos.empty()) fail("no usable RDMA device for the index plane", {});

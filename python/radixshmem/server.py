@@ -474,10 +474,7 @@ class RadixServer:
             self._backend = self._make_backend()
 
     def _resolve_net(self) -> None:
-        """Settle index_dev / gid_idx / rpc_address before anything publishes or dials an
-        address: explicit values are validated and kept, the rest is chosen from the local
-        devices; an ambiguous choice raises with the candidates. The same resolver runs again
-        inside the index bootstrap on the settled values."""
+        """Normalize cluster settings before publishing or dialing any address."""
         cl = self.cfg.cluster
         if not hasattr(_core, "resolve_cluster_net"):
             raise RuntimeError("radixshmem was built without RDMA; a cluster needs it")
@@ -485,7 +482,8 @@ class RadixServer:
         for k in _CLUSTER_FIELDS:
             setattr(cc, k, getattr(cl, k))
         summary = _core.resolve_cluster_net(cc)
-        cl.index_dev, cl.gid_idx, cl.rpc_address = cc.index_dev, cc.gid_idx, cc.rpc_address
+        for k in _CLUSTER_FIELDS:
+            setattr(cl, k, getattr(cc, k))
         print(f"[radixshmem] net: {summary}", file=sys.stderr, flush=True)
 
     def _start_monitor(self) -> None:

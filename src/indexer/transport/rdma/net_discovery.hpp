@@ -71,6 +71,11 @@ struct NetSelectionInput {
     std::string rpc_address;      // control-plane IPv4 (explicit); "0.0.0.0" is kept as given
     std::string registry_host;    // host part of the registry uri, route hint only
     bool        need_dc = false;  // DC transport in use: only dc_capable devices qualify
+
+    void inherit_index(const std::string& device, int gid_index) {
+        if (index_dev.empty()) index_dev = device;
+        if (gid_idx < 0 && !device.empty() && index_dev == device) gid_idx = gid_index;
+    }
 };
 
 struct IndexPick {
@@ -100,7 +105,6 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
 // Discovery + selection with the system probe.
 NetSelection resolve_net(const NetSelectionInput& in, const std::string& sys_root = "/sys");
 
-std::string describe_net_device(const NetDevice& d);   // one line: name, state, link, numa, rate, GIDs
 std::string registry_host_of(const std::string& uri);  // "etcd://h:p" -> "h"
 
 }  // namespace radixshmem

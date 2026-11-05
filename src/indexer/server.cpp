@@ -691,6 +691,18 @@ RadixServer::~RadixServer() {
 
 #ifndef RADIXSHMEM_NO_RDMA
 std::string resolve_cluster_net(RadixServerConfig& cfg) {
+    if (const char* value = ::getenv("RADIXSHMEM_RHT_TRANSPORT"))
+        cfg.rht_transport = value;
+    if (const char* value = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
+        cfg.peer_index_transport = value;
+    if (const char* value = ::getenv("RADIXSHMEM_RHT_SLOTS"))
+        cfg.rht_slots_per_bucket = atoi(value);
+    if (const char* value = ::getenv("RADIXSHMEM_REGISTRY"))
+        cfg.registry = value;
+    if (const char* value = ::getenv("RADIXSHMEM_CLUSTER_ID"))
+        cfg.cluster_id = value;
+    if (const char* value = ::getenv("RADIXSHMEM_NODE_NAME"))
+        cfg.node_name = value;
     NetSelectionInput in;
     in.index_dev     = cfg.index_dev;
     in.gid_idx       = cfg.gid_idx;
@@ -719,24 +731,10 @@ bool RadixServer::bootstrap() {
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;
     shm.max_nodes = shm.effective_max_nodes();
 
-    // Distributed: env overrides first, then the index device / GID / control address are settled
-    // (explicit values kept and validated, the rest chosen from the local devices) before anything
-    // publishes or dials an address. The control address also seeds node_name.
+    // Resolve network settings before publishing or dialing any cluster address.
     std::string bind_ip;
 #ifndef RADIXSHMEM_NO_RDMA
     if (distributed) {
-        if (const char* t = ::getenv("RADIXSHMEM_RHT_TRANSPORT"))
-            cfg_.rht_transport = t;
-        if (const char* t = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
-            cfg_.peer_index_transport = t;
-        if (const char* w = ::getenv("RADIXSHMEM_RHT_SLOTS"))
-            cfg_.rht_slots_per_bucket = atoi(w);
-        if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))
-            cfg_.registry = r;
-        if (const char* c = ::getenv("RADIXSHMEM_CLUSTER_ID"))
-            cfg_.cluster_id = c;
-        if (const char* n = ::getenv("RADIXSHMEM_NODE_NAME"))
-            cfg_.node_name = n;
         const std::string net = resolve_cluster_net(cfg_);
         fprintf(stderr, "[RadixServer] net: %s\n", net.c_str());
         bind_ip = cfg_.rpc_address;

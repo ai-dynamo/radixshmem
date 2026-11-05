@@ -15,9 +15,7 @@ namespace radixshmem {
 
 class RdmaContext {
 public:
-    // dev_name is required; gid_idx < 0 = the device's auto choice (net_discovery).
-    explicit RdmaContext(const char* dev_name,
-                         int port = 1, int gid_idx = -1);
+    explicit RdmaContext(const char* dev_name, int port, int gid_idx);
     ~RdmaContext();
 
     RdmaContext(const RdmaContext&) = delete;

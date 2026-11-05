@@ -374,11 +374,45 @@ void test_sysfs() {
     NetSelectionInput in;
     auto s = select_net(devs, in, &p);
     assert(s.index.device == "mlx5_0" && s.index.gid_index == 3 && s.control_ip == "172.18.0.23");
-    const std::string line = describe_net_device(devs[0]);
-    assert(has(line, "mlx5_0 port 1 ACTIVE Ethernet numa 0 400G") && has(line, "gid 3 RoCE v2 172.18.0.23 ens0"));
     assert(has(s.summary(), "index mlx5_0 port 1 gid 3 (172.18.0.23, ens0, numa 0, only candidate)"));
     [[maybe_unused]] int rc = system(("rm -rf " + root).c_str());
     printf("ok sysfs\n");
+}
+
+void test_client_index_inheritance() {
+    struct Case {
+        std::string client_device;
+        int client_gid;
+        std::string server_device;
+        int server_gid;
+        std::string expected_device;
+        int expected_gid;
+    };
+    const Case cases[] = {
+        {"", -1, "mlx5_0", 3, "mlx5_0", 3},
+        {"mlx5_0", -1, "mlx5_0", 3, "mlx5_0", 3},
+        {"mlx5_1", -1, "mlx5_0", 3, "mlx5_1", -1},
+        {"mlx5_1", 7, "mlx5_0", 3, "mlx5_1", 7},
+        {"", 7, "mlx5_0", 3, "mlx5_0", 7},
+        {"", -1, "", 3, "", -1},
+        {"", -1, "mlx5_0", -1, "mlx5_0", -1},
+    };
+    for (const auto& test : cases) {
+        NetSelectionInput input;
+        input.index_dev = test.client_device;
+        input.gid_idx = test.client_gid;
+        input.inherit_index(test.server_device, test.server_gid);
+        assert(input.index_dev == test.expected_device && input.gid_idx == test.expected_gid);
+    }
+    auto device = eth("mlx5_1", "172.18.32.23", "ens1", 0);
+    device.gids = {roce(7, "172.18.32.23", "ens1")};
+    NetSelectionInput input;
+    input.index_dev = "mlx5_1";
+    input.inherit_index("mlx5_0", 3);
+    FakeProbe probe;
+    const auto selected = select_net({device}, input, &probe);
+    assert(selected.index.device == "mlx5_1" && selected.index.gid_index == 7);
+    printf("ok client_index_inheritance\n");
 }
 
 void test_registry_host() {
@@ -398,6 +432,7 @@ int main() {
     test_hints();
     test_infiniband();
     test_sysfs();
+    test_client_index_inheritance();
     test_registry_host();
     printf("test_net_select: all passed\n");
     return 0;
