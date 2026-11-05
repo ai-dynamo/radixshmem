@@ -1,6 +1,6 @@
 # 网络设备发现与选择设计
 
-状态：第 1–4 步已实现（分支 `feat/net-device-discovery`，基线 `feat/pd-support@e98f4be`）：`net_discovery` 模块与 `test_net_select`、服务端/客户端/Python 启动前解析、Mooncake/NIXL 采用诊断、`register_store` 按页所在 NUMA 注册。第 5 步：A 机单机零配置彩排通过，A+B 双机步骤待执行，runbook 和记录见 §7.4。Mooncake 行为分析参考本地 `v0.3.14` 源码。
+状态：第 1–4 步已实现（分支 `feat/net-device-discovery`，基线 `feat/pd-support@e98f4be`）：`net_discovery` 模块与 `test_net_select`、服务端/客户端/Python 启动前解析、Mooncake/NIXL 采用诊断、`register_store` 按页所在 NUMA 注册。第 5 步：A+B 双机零配置与显式基线均通过，记录与 runbook 见 §7.4。Mooncake 行为分析参考本地 `v0.3.14` 源码。
 
 ## 1. 问题
 
@@ -264,7 +264,18 @@ A 机单机彩排（2026-11-04，H20-GPU-12）：etcd 监听 `10.6.131.12:12379`
 - 集群 rank 0/2、1/2 成形；reader 结果 `hits=256 remote_blocks=256 bytes_ok=256`。
 - `--no-prefault` 时槽池页未驻留，`move_pages` 返回 ENOENT，日志为 `NUMA node of the pool unknown`，位置交给后端；默认 prefault 下注册为 `cpu:N`。
 
-A+B 双机步骤在 `scripts/dual_node_net_check.sh`，B 侧经 ssh 执行，顺序：`probe`（B 的设备、地址、GID 3、工具链）→ `sync` → `build_b` → `run`（零配置）→ `run --rpc-interface bond0 --index-dev mlx5_bond_0 --gid-idx 3 --transfer-dev mlx5_bond_0`（显式基线）。通过标准：两台服务端的 net 行各自选到有路由到 registry 的设备和 IPv4 RoCE v2 GID；日志出现 `Cluster ready rank=0/2` 与 `1/2`；B 上 reader 的 `bytes_ok` 等于 256。零配置下数据面设备不受约束，由 Mooncake 自行选卡；若零配置跨机建链失败而显式基线通过，问题在数据面可达性，不在索引面选择。本文撰写时 B 侧步骤尚未执行。
+A+B 双机步骤在 `scripts/dual_node_net_check.sh`，B 侧经 ssh 执行，顺序：`probe`（B 的设备、地址、GID 3、工具链）→ `sync` → `build_b` → `run`（零配置）→ `run --rpc-interface bond0 --index-dev mlx5_bond_0 --gid-idx 3 --transfer-dev mlx5_bond_0`（显式基线）。通过标准：两台服务端的 net 行各自选到有路由到 registry 的设备和 IPv4 RoCE v2 GID；日志出现 `Cluster ready rank=0/2` 与 `1/2`；B 上 reader 的 `bytes_ok` 等于 256。
+
+双机结果（2026-11-04，A = H20-GPU-12 / 10.6.131.12，B = H20-GPU-11 / 10.6.131.11，B 的 mlx5_6/7 为 DOWN）：
+
+| 配置 | A/B 索引设备与 GID | A/B 控制地址 | B reader hits / remote_blocks / bytes_ok |
+|---|---|---|---|
+| 零配置 | mlx5_bond_0 / 3，理由 registry-route hint | 10.6.131.12 / 10.6.131.11 | 256 / 256 / 256 |
+| 显式 bond 基线 | mlx5_bond_0 / 3，理由 explicit | 同上 | 256 / 256 / 256 |
+
+索引面在两种配置下选择相同，两边 writer `InsertError.OK`，reader `source_ranks=[0]`。
+
+零配置数据面有建链重试：Mooncake 的 `allowed=all` 让 B 先用 mlx5_2/mlx5_3（172.18.x 的 /31 rail）向 A 的 mlx5_bond_0（10.6.131.12）发起握手，rail 子网和 bond 子网之间没有三层路径，`Failed to modify QP to RTR ... Connection timed out`；随后 B 的 mlx5_bond_0 依次试 A 的 8 张 rail 卡，同样失败，每次失败记一条 `Rail paused ... pause_ms=30000`，最后 bond 对 bond 成功，数据校验通过。A 日志 8 条、B 日志 11 条 RTR 失败，约 9 秒后收敛。显式基线 `transfer_dev=mlx5_bond_0` 两边零条此类记录。结论：索引面的自动选择在双机上正确；数据面按本设计不加约束，多 rail 且 rail 与控制网不互通的部署要显式给 `transfer_dev`，否则承担首次建链的重试时间。是否把空 `transfer_dev` 默认收敛到索引设备，是单独的取舍（代价是放弃多 rail 带宽），本版不做。
 
 部署注意：
 
