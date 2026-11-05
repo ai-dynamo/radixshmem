@@ -619,14 +619,15 @@ void XrcSendQp::rdma_write_async_inline(uint64_t remote_addr,
     op_count_++;
     bool signal = (infl >= SIGNAL_EVERY);
     wr.send_flags = IBV_SEND_INLINE | (signal ? IBV_SEND_SIGNALED : 0);
-
-    ibv_send_wr* bad_wr = nullptr;
-    if (ibv_post_send(qp_, &wr, &bad_wr) != 0)
-        throw std::runtime_error("XRC async inline post_send failed");
-
     if (signal) {
         state_->inflight_unsignaled.store(0, std::memory_order_relaxed);
-        state_->outstanding_signaled.fetch_add(1, std::memory_order_relaxed);
+        state_->outstanding_signaled.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    ibv_send_wr* bad_wr = nullptr;
+    if (ibv_post_send(qp_, &wr, &bad_wr) != 0) {
+        if (signal) xrc_dec_signaled(state_);
+        throw std::runtime_error("XRC async inline post_send failed");
     }
 }
 
@@ -672,13 +673,14 @@ void XrcSendQp::rdma_write_chain_inline(const InlineWriteOp* ops, int count) {
             wrs[i].qp_type.xrc.remote_srqn = remote_srqn_;
         }
         wrs[chain_len - 1].send_flags = IBV_SEND_INLINE | IBV_SEND_SIGNALED;
+        state_->inflight_unsignaled.store(0, std::memory_order_relaxed);
+        state_->outstanding_signaled.fetch_add(1, std::memory_order_acq_rel);
 
         ibv_send_wr* bad_wr = nullptr;
-        if (ibv_post_send(qp_, &wrs[0], &bad_wr) != 0)
+        if (ibv_post_send(qp_, &wrs[0], &bad_wr) != 0) {
+            xrc_dec_signaled(state_);
             throw std::runtime_error("XRC chain inline post_send failed");
-
-        state_->inflight_unsignaled.store(0, std::memory_order_relaxed);
-        state_->outstanding_signaled.fetch_add(1, std::memory_order_relaxed);
+        }
         op_count_ += chain_len;
         posted += chain_len;
     }
