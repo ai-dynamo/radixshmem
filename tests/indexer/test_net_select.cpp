@@ -126,9 +126,9 @@ void test_explicit() {
 
     in.gid_idx = 7;   // not in the table
     assert(has(throws_with(devs, in, &p), "gid 7 is not set"));
-    in.gid_idx = 0;   // link-local v1 on Ethernet is accepted as an explicit choice (no IPv4 to publish)
-    assert(has(throws_with(devs, in, &p), "no IPv4 address to publish"));
-    in.gid_idx = 0;
+    in.gid_idx = 0;   // link-local v1 on Ethernet: an accepted explicit choice, but nothing to publish
+    s = select_net(devs, in, &p);
+    assert(s.index.gid_index == 0 && s.control_ip.empty() && has(s.notes.at(0), "set rpc_address"));
     in.rpc_address = "10.0.0.5";
     s = select_net(devs, in, &p);
     assert(s.control_ip == "10.0.0.5" && s.control_source == "rpc_address");
@@ -201,6 +201,24 @@ void test_single_and_ambiguous() {
     multi[0].gids.push_back(roce(5, "172.18.0.23", "ens0"));   // same GID again at index 5
     s = select_net(multi, in, &p);
     assert(s.index.gid_index == 3);
+
+    // One interface with two addresses backs two GIDs: the GID carrying the address wins over the
+    // interface's address list, for the control-address hint and for the route hint alike.
+    std::vector<NetDevice> dual = {eth("mlx5_0", "172.18.0.23", "ens0", 0)};
+    dual[0].gids.push_back(roce(5, "192.168.7.23", "ens0"));
+    for (auto& g : dual[0].gids) g.addresses = {{"172.18.0.23", 27}, {"192.168.7.23", 24}};
+    in.rpc_address = "192.168.7.23";
+    s = select_net(dual, in, &p);
+    assert(s.index.gid_index == 5 && s.index.reason == "control-address hint" && s.control_ip == "192.168.7.23");
+    in = NetSelectionInput{};
+    in.registry_host = "192.168.7.1";
+    p.route_ok = true;
+    p.route_src = "192.168.7.23";
+    p.route_if = "ens0";
+    s = select_net(dual, in, &p);
+    assert(s.index.gid_index == 5 && s.index.reason == "registry-route hint");
+    p.route_ok = false;
+    in = NetSelectionInput{};
 
     // Interface not visible (container): the GID still qualifies and the control address comes from it.
     std::vector<NetDevice> hidden = {eth("mlx5_0", "172.18.0.23", "", 0)};
@@ -280,6 +298,10 @@ void test_hints() {
     assert(s.control_ip == "10.6.131.12");
     p.addrs["bond0"] = {{"10.6.131.98", 24}, {"10.6.131.99", 24}};
     assert(has(throws_with(devs, in, &p), "several IPv4 addresses"));
+    in.rpc_address = "10.6.131.99";   // rpc_address picks one of the interface's addresses
+    s = select_net(devs, in, &p);
+    assert(s.control_ip == "10.6.131.99" && s.control_source == "rpc_interface" && s.notes.empty());
+    in.rpc_address = "";
     p.addrs["bond0"] = {};
     assert(has(throws_with(devs, in, &p), "no IPv4 address"));
     printf("ok hints\n");
@@ -289,9 +311,18 @@ void test_infiniband() {
     std::vector<NetDevice> devs = {ib("mlx5_ib0")};
     FakeProbe p;
     NetSelectionInput in;
-    assert(has(throws_with(devs, in, &p), "no IPv4 address to publish"));
-    in.rpc_address = "10.0.0.7";
+    // No IPv4 anywhere: the device is still chosen, the control address stays empty and is noted.
     auto s = select_net(devs, in, &p);
+    assert(s.index.device == "mlx5_ib0" && s.index.gid_index == 0 && s.control_ip.empty() && !s.notes.empty());
+    in.registry_host = "10.0.0.1";   // the route to the registry supplies it
+    p.route_ok = true;
+    p.route_src = "10.0.0.7";
+    p.route_if = "eno1";
+    s = select_net(devs, in, &p);
+    assert(s.control_ip == "10.0.0.7" && s.control_source == "registry route" && s.notes.empty());
+    in = NetSelectionInput{};
+    in.rpc_address = "10.0.0.7";
+    s = select_net(devs, in, &p);
     assert(s.index.device == "mlx5_ib0" && s.index.gid_index == 0 && s.control_ip == "10.0.0.7");
     // A RoCE v2 entry on an IB link is not a fit for an explicit choice.
     GidEntry g = roce(3, "10.0.0.7", "ib0");

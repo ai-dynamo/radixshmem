@@ -191,19 +191,24 @@ std::vector<const GidEntry*> auto_gids(const NetDevice& d, std::string& why_none
     return out;
 }
 
-bool gid_has_address(const GidEntry& g, const std::string& ip) {
-    if (g.ipv4_mapped() && g.ipv4() == ip) return true;
-    for (const auto& a : g.addresses)
-        if (a.address == ip) return true;
-    return false;
-}
-
-std::vector<Combo> narrow(const std::vector<Combo>& all, bool (*pred)(const Combo&, const std::string&),
-                          const std::string& arg) {
+std::vector<Combo> on_interface(const std::vector<Combo>& all, const std::string& netdev) {
     std::vector<Combo> out;
     for (const auto& c : all)
-        if (pred(c, arg)) out.push_back(c);
+        if (c.gid->netdev == netdev) out.push_back(c);
     return out;
+}
+
+// Combinations matching an address: a GID carrying the address itself wins; only when none does,
+// the GIDs whose interface holds the address (or is `oif`) count, as one interface may back several GIDs.
+std::vector<Combo> on_address(const std::vector<Combo>& all, const std::string& ip, const std::string& oif) {
+    std::vector<Combo> exact, loose;
+    for (const auto& c : all) {
+        if (c.gid->ipv4_mapped() && c.gid->ipv4() == ip) { exact.push_back(c); continue; }
+        bool on_if = !oif.empty() && c.gid->netdev == oif;
+        for (const auto& a : c.gid->addresses) on_if |= a.address == ip;
+        if (on_if) loose.push_back(c);
+    }
+    return exact.empty() ? loose : exact;
 }
 
 }  // namespace
@@ -376,12 +381,13 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         // Control-plane hints narrow the set; a hint that matches nothing is noted and skipped.
         std::vector<Combo> cur = combos;
         if (!in.rpc_interface.empty()) {
-            auto n = narrow(cur, [](const Combo& c, const std::string& a) { return c.gid->netdev == a; }, in.rpc_interface);
+            auto n = on_interface(cur, in.rpc_interface);
             if (n.empty()) sel.notes.push_back("rpc_interface " + in.rpc_interface + " carries no RDMA GID");
             else cur = n;
             if (cur.size() == 1 && !n.empty()) reason = "control-interface hint";
-        } else if (!in.rpc_address.empty() && in.rpc_address != "0.0.0.0") {
-            auto n = narrow(cur, [](const Combo& c, const std::string& a) { return gid_has_address(*c.gid, a); }, in.rpc_address);
+        }
+        if (cur.size() > 1 && !in.rpc_address.empty() && in.rpc_address != "0.0.0.0") {
+            auto n = on_address(cur, in.rpc_address, "");
             if (n.empty()) sel.notes.push_back("rpc_address " + in.rpc_address + " is on no RDMA GID");
             else cur = n;
             if (cur.size() == 1 && !n.empty()) reason = "control-address hint";
@@ -389,9 +395,7 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         if (cur.size() > 1 && probe && !in.registry_host.empty()) {
             std::string src, oif;
             if (probe->route_to(in.registry_host, src, oif) && !is_loopback(src)) {
-                std::vector<Combo> n;
-                for (const auto& c : cur)
-                    if ((!oif.empty() && c.gid->netdev == oif) || gid_has_address(*c.gid, src)) n.push_back(c);
+                auto n = on_address(cur, src, oif);
                 if (n.empty()) sel.notes.push_back("route to registry " + in.registry_host + " (" + src + ") is on no RDMA GID");
                 else cur = n;
                 if (cur.size() == 1 && !n.empty()) reason = "registry-route hint";
@@ -415,7 +419,9 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
     sel.index.numa_node = c.dev->numa_node;
     sel.index.reason = reason;
 
-    // Control address: interface wins over address, both over the index GID.
+    // Control address, settled apart from the index pick: interface > address > the index GID's IPv4 >
+    // the source address of the route to the registry. None leaves control_ip empty: the server
+    // refuses that, a client needs no control address.
     if (!in.rpc_interface.empty()) {
         std::vector<NetAddress> addrs;
         if (probe) addrs = probe->interface_addresses(in.rpc_interface);
@@ -425,16 +431,19 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         if (v4.empty())
             throw std::runtime_error("net: rpc_interface '" + in.rpc_interface + "' has no IPv4 address" +
                                      (probe ? "" : " (interface lookup unavailable)"));
+        auto on_if = [&](const std::string& ip) { return std::find(v4.begin(), v4.end(), ip) != v4.end(); };
         std::string pick = v4.front();
         if (v4.size() > 1) {
-            const auto it = std::find(v4.begin(), v4.end(), sel.index.address);
-            if (it == v4.end()) {
+            if (on_if(in.rpc_address)) {
+                pick = in.rpc_address;
+            } else if (on_if(sel.index.address)) {
+                pick = sel.index.address;
+            } else {
                 std::string all;
                 for (const auto& a : v4) all += (all.empty() ? "" : ", ") + a;
                 throw std::runtime_error("net: rpc_interface '" + in.rpc_interface + "' has several IPv4 addresses (" +
-                                         all + "); set rpc_address");
+                                         all + "); set rpc_address to one of them");
             }
-            pick = *it;
         }
         sel.control_ip = pick;
         sel.control_source = "rpc_interface";
@@ -447,8 +456,14 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         sel.control_ip = sel.index.address;
         sel.control_source = "index gid";
     } else {
-        throw std::runtime_error("net: index device " + sel.index.device + " gid " + std::to_string(sel.index.gid_index) +
-                                 " has no IPv4 address to publish; set rpc_address or rpc_interface");
+        std::string src, oif;
+        if (probe && !in.registry_host.empty() && probe->route_to(in.registry_host, src, oif) && !is_loopback(src)) {
+            sel.control_ip = src;
+            sel.control_source = "registry route";
+        } else {
+            sel.notes.push_back("index gid " + sel.index.gid + " has no IPv4 and no route to the registry supplies one; "
+                                "set rpc_address or rpc_interface");
+        }
     }
     return sel;
 }

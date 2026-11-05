@@ -148,7 +148,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
     publish_ = cfg.publish;
 
     const bool auto_discover = cfg.protocol.empty() || cfg.protocol == "rdma";
-    // Reject environment filters that would silently narrow the explicit device allowlist.
+    // MC_TE_FILTERS intersects the allowlist: say what it drops, refuse only an empty result.
     if (auto_discover && !cfg.device_filter.empty()) {
         if (const char* env = ::getenv("MC_TE_FILTERS"); env && *env) {
             std::set<std::string> allowed;
@@ -159,15 +159,18 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
                 if (first != std::string::npos)
                     allowed.insert(device.substr(first, device.find_last_not_of(" \t\r\n\f\v") - first + 1));
             }
-            std::vector<std::string> dropped;
+            std::vector<std::string> kept, dropped;
             for (const auto& d : cfg.device_filter)
-                if (!allowed.empty() && !allowed.count(d)) dropped.push_back(d);
-            if (!dropped.empty()) {
-                fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices %s are not in "
-                                "MC_TE_FILTERS='%s'; the engine would drop them silently — fix one side\n",
+                (allowed.empty() || allowed.count(d) ? kept : dropped).push_back(d);
+            if (kept.empty()) {
+                fprintf(stderr, "[radixshmem] MooncakeBackend: none of the transfer devices %s is in "
+                                "MC_TE_FILTERS='%s'; the engine would have no device, fix one side\n",
                         join(dropped, "-").c_str(), env);
                 return false;
             }
+            if (!dropped.empty())
+                fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices %s dropped by MC_TE_FILTERS='%s'; "
+                                "the allowlist narrows to %s\n", join(dropped, "-").c_str(), env, join(kept, "-").c_str());
         }
     }
     if (!cfg.device_filter.empty()) {

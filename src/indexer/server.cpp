@@ -711,6 +711,9 @@ std::string resolve_cluster_net(RadixServerConfig& cfg) {
     in.registry_host = registry_host_of(cfg.registry);
     in.need_dc       = cfg.rht_transport == "dc" || cfg.peer_index_transport == "dc";
     const NetSelection sel = resolve_net(in);
+    if (sel.control_ip.empty())
+        throw std::runtime_error("net: no IPv4 control address to publish (index " + sel.index.device + " gid " +
+                                 std::to_string(sel.index.gid_index) + "); set rpc_address or rpc_interface");
     cfg.index_dev   = sel.index.device;
     cfg.gid_idx     = sel.index.gid_index;
     cfg.rpc_address = sel.control_ip;

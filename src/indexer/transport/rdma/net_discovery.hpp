@@ -38,7 +38,7 @@ struct NetDevice {
     int         port = 1;       // only port 1 is probed (the index plane uses port 1)
     bool        active = false;
     bool        accessible = true;    // the uverbs node can be opened read/write
-    bool        dc_capable = true;    // mlx5 direct verbs available (DC transport)
+    bool        dc_capable = true;    // mlx5dv_is_supported(): what the DC transport needs, not a full DC check
     std::string link_layer;     // "Ethernet" | "InfiniBand" | ""
     int         numa_node = -1;
     int         rate_gbps = 0;
@@ -91,8 +91,8 @@ struct IndexPick {
 
 struct NetSelection {
     IndexPick   index;
-    std::string control_ip;       // address published to peers
-    std::string control_source;   // "rpc_interface" | "rpc_address" | "index gid"
+    std::string control_ip;       // address published to peers; "" = none found (the server refuses)
+    std::string control_source;   // "rpc_interface" | "rpc_address" | "index gid" | "registry route"
     std::vector<std::string> notes;   // non-fatal diagnostics
     std::string summary() const;  // one line for the bootstrap log
 };
