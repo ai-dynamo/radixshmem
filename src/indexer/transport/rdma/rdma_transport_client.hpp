@@ -24,9 +24,9 @@ class RdmaTransportClient {
 
     // Open the device, size the CQ for `world_size` peers, and register the
     // scratch buffer. QoS is adopted before any QP connect.
-    RdmaTransportClient(const char* dev, int gid_idx, int sl, int tc,
+    RdmaTransportClient(const char* dev, int port, int gid_idx, int sl, int tc,
                         int world_size) {
-        ctx_ = std::make_unique<RdmaContext>(dev, 1, gid_idx);
+        ctx_ = std::make_unique<RdmaContext>(dev, port, gid_idx);
         ctx_->set_qos(sl, tc);
         int cq_depth = std::max(256, world_size * 128);
         cq_ = ibv_create_cq(ctx_->ctx(), cq_depth, nullptr, nullptr, 0);

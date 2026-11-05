@@ -165,8 +165,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--index-dev", default="",
                    help="HCA of the index control plane (default: chosen from the local devices; "
                         "several fitting ones is an error listing them); the data plane's is --transfer-dev")
+    g.add_argument("--index-port", type=int, default=0,
+                   help="HCA port of --index-dev (default: 0 = an ACTIVE port with a usable GID)")
     g.add_argument("--gid-idx", type=int, default=-1,
-                   help="GID index on --index-dev (default: -1 = the RoCE v2 IPv4 entry, or the IB GID)")
+                   help="GID index on --index-dev (default: -1 = RoCE v2 IPv4, else RoCE v2 global IPv6, "
+                        "else RoCE v1 with a global address; the IB GID on an IB link)")
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
@@ -190,7 +193,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
     cluster = ClusterConfig(
         expected_min_nodes=a.expected_min_nodes, settle_ms=a.settle_ms, registry=a.registry,
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
-        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, gid_idx=a.gid_idx,
+        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, index_port=a.index_port,
+        gid_idx=a.gid_idx,
         bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
         peer_index_transport=a.peer_index_transport, remote_op_listen_port=a.remote_op_listen_port)
     return ServerConfig(

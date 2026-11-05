@@ -266,8 +266,9 @@ PYBIND11_MODULE(_core, m) {
         .def_property("rpc_port",
                       [](const RadixServerConfig& c) { return (int)c.rpc_port; },
                       [](RadixServerConfig& c, int v) { c.rpc_port = (uint16_t)v; })
-        // Index-plane device / GID index; "" / -1 = chosen from the local devices.
+        // Index-plane device / port / GID index; "" / 0 / -1 = chosen from the local devices.
         .def_readwrite("index_dev", &RadixServerConfig::index_dev)
+        .def_readwrite("index_port", &RadixServerConfig::index_port)
         .def_readwrite("gid_idx", &RadixServerConfig::gid_idx)
         .def_readwrite("bootstrap_timeout_sec",
                        &RadixServerConfig::bootstrap_timeout_sec)

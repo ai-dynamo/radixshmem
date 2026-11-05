@@ -271,6 +271,7 @@ void RadixServer::fill_local_entry(PeerEntry& e) const {
     e.srq_num = srq_ ? srq_->srq_num() : 0;
 
     std::strncpy(e.index_dev, cfg_.index_dev.c_str(), sizeof(e.index_dev) - 1);
+    e.index_port = (uint8_t)ctx_->port();
 }
 
 void RadixServer::read_rht_env() {
@@ -573,7 +574,7 @@ bool RadixServer::cluster_bootstrap() {
     if (cfg_.registry.empty()) return true;   // standalone — caller bypasses
 
     const char* dev = cfg_.index_dev.empty() ? nullptr : cfg_.index_dev.c_str();
-    ctx_  = std::make_unique<RdmaContext>(dev, 1, cfg_.gid_idx);
+    ctx_  = std::make_unique<RdmaContext>(dev, cfg_.index_port > 0 ? cfg_.index_port : 1, cfg_.gid_idx);
     xrcd_ = std::make_unique<RdmaXrcd>(*ctx_);
     // cq_ dormant under one-sided traffic; exists only because XRC SRQ/RECV QPs need one.
     cq_   = ibv_create_cq(ctx_->ctx(), 256, nullptr, nullptr, 0);
@@ -705,6 +706,7 @@ std::string resolve_cluster_net(RadixServerConfig& cfg) {
         cfg.node_name = value;
     NetSelectionInput in;
     in.index_dev     = cfg.index_dev;
+    in.index_port    = cfg.index_port;
     in.gid_idx       = cfg.gid_idx;
     in.rpc_interface = cfg.rpc_interface;
     in.rpc_address   = cfg.rpc_address;
@@ -715,6 +717,7 @@ std::string resolve_cluster_net(RadixServerConfig& cfg) {
         throw std::runtime_error("net: no IPv4 control address to publish (index " + sel.index.device + " gid " +
                                  std::to_string(sel.index.gid_index) + "); set rpc_address or rpc_interface");
     cfg.index_dev   = sel.index.device;
+    cfg.index_port  = sel.index.port;
     cfg.gid_idx     = sel.index.gid_index;
     cfg.rpc_address = sel.control_ip;
     return sel.summary();
@@ -781,6 +784,7 @@ bool RadixServer::bootstrap() {
         svc_tree_ = std::make_unique<LocalTreeConnector>(shm_name);
         RadixClientConfig cc;
         cc.index_dev = cfg_.index_dev;
+        cc.index_port = cfg_.index_port;
         cc.gid_idx  = cfg_.gid_idx;
         cc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
         cc.rht_only = true;

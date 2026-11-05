@@ -176,6 +176,7 @@ void RadixClient::bootstrap_cluster() {
 
     NetSelectionInput net;
     net.index_dev = cfg_.index_dev;
+    net.index_port = cfg_.index_port;
     net.gid_idx = cfg_.gid_idx;
     if (my_rank >= 0) {
         PeerEntry self;
@@ -183,21 +184,23 @@ void RadixClient::bootstrap_cluster() {
             std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
             self = peer_reg_->peers_locked()[my_rank];
         }
-        net.inherit_index(self.index_dev, self.gid_index);
+        net.inherit_index(self.index_dev, self.index_port, self.gid_index);
     }
-    if (net.index_dev.empty() || net.gid_idx < 0) {
+    if (net.index_dev.empty() || net.index_port <= 0 || net.gid_idx < 0) {
         net.registry_host = registry_host_of(cfg_.registry);
         // The condition under which a DCI is created below.
         net.need_dc = rht_transport_ == CLUSTER_TRANSPORT_DC ||
                       (!cfg_.rht_only && peer_index_transport_ == CLUSTER_TRANSPORT_DC);
         const NetSelection sel = resolve_net(net);
         net.index_dev = sel.index.device;
+        net.index_port = sel.index.port;
         net.gid_idx = sel.index.gid_index;
         fprintf(stderr, "[RadixClient] net: %s\n", sel.summary().c_str());
     }
     int ws = peer_reg_->world_size();
     // QoS (rank 0's SL/TC) is adopted inside the transport before any QP connect.
-    tx_ = std::make_unique<RdmaTransportClient>(net.index_dev.c_str(), net.gid_idx, rdma_sl_, rdma_tc_, ws);
+    tx_ = std::make_unique<RdmaTransportClient>(net.index_dev.c_str(), net.index_port, net.gid_idx, rdma_sl_,
+                                                rdma_tc_, ws);
 
     // Peer plane: lazy data-plane endpoints + remote-op factory. Its slots track
     // the peer table via the registry grow hook.

@@ -30,12 +30,14 @@ struct GidEntry {
     bool        roce_v2() const { return type == "RoCE v2"; }
     bool        ib_or_v1() const { return type == "IB/RoCE v1"; }
     bool        ipv4_mapped() const;     // ::ffff:a.b.c.d
+    bool        link_local() const;      // fe80::/10
     std::string ipv4() const;            // "a.b.c.d" when ipv4_mapped(), else ""
 };
 
+// One entry per (device, port); device-level facts are repeated on every port.
 struct NetDevice {
     std::string name;           // mlx5_0
-    int         port = 1;       // only port 1 is probed (the index plane uses port 1)
+    int         port = 1;
     bool        active = false;
     bool        accessible = true;    // the uverbs node can be opened read/write
     bool        dc_capable = true;    // mlx5dv_is_supported(): what the DC transport needs, not a full DC check
@@ -56,25 +58,33 @@ public:
     virtual bool device_dc_capable(const std::string& dev) = 0;
     // Source address and outgoing interface the kernel would use to reach host; false = unknown.
     virtual bool route_to(const std::string& host, std::string& src_ip, std::string& out_if) = 0;
+    // GID type ("RoCE v2" | "IB/RoCE v1" | "" unknown) when sysfs lacks it; may fill netdev too.
+    virtual std::string gid_type(const std::string&, int, int, std::string*) { return ""; }
 };
 
-// The real probe: getifaddrs, /dev/infiniband/uverbsN access, mlx5dv_is_supported, UDP connect + getsockname.
+// The real probe: getifaddrs, /dev/infiniband/uverbsN access, mlx5dv_is_supported, UDP connect +
+// getsockname, ibv_query_gid_ex.
 std::unique_ptr<NetProbe> system_net_probe(const std::string& sys_root = "/sys");
 
-// Every device under <sys_root>/class/infiniband, sorted by name.
+// Every port of every device under <sys_root>/class/infiniband, sorted by name then port.
 std::vector<NetDevice> discover_net_devices(NetProbe& probe, const std::string& sys_root = "/sys");
 
 struct NetSelectionInput {
     std::string index_dev;        // "" = choose
+    int         index_port = 0;   // 0 = choose; >= 1 is a constraint
     int         gid_idx = -1;     // -1 = choose; >= 0 is a constraint even when index_dev is empty
     std::string rpc_interface;    // control-plane NIC (explicit)
     std::string rpc_address;      // control-plane IPv4 (explicit); "0.0.0.0" is kept as given
     std::string registry_host;    // host part of the registry uri, route hint only
     bool        need_dc = false;  // DC transport in use: only dc_capable devices qualify
 
-    void inherit_index(const std::string& device, int gid_index) {
+    // Take what this node's server published where nothing explicit is set; the GID index belongs
+    // to the published device and port (port 0 = an older server that did not publish it).
+    void inherit_index(const std::string& device, int port, int gid_index) {
         if (index_dev.empty()) index_dev = device;
-        if (gid_idx < 0 && !device.empty() && index_dev == device) gid_idx = gid_index;
+        if (device.empty() || index_dev != device) return;
+        if (index_port <= 0) index_port = port;
+        if (gid_idx < 0 && (port <= 0 || index_port == port)) gid_idx = gid_index;
     }
 };
 

@@ -110,6 +110,28 @@ public:
         return ok;
     }
 
+    std::string gid_type(const std::string& dev, int port, int index, std::string* netdev) override {
+        int n = 0;
+        ibv_device** list = ibv_get_device_list(&n);
+        std::string type;
+        for (int i = 0; list && i < n; i++) {
+            if (dev != ibv_get_device_name(list[i])) continue;
+            if (ibv_context* ctx = ibv_open_device(list[i])) {
+                ibv_gid_entry e{};
+                if (ibv_query_gid_ex(ctx, port, index, &e, 0) == 0) {
+                    type = e.gid_type == IBV_GID_TYPE_ROCE_V2 ? "RoCE v2" : "IB/RoCE v1";
+                    char name[IF_NAMESIZE] = {0};
+                    if (netdev && netdev->empty() && e.ndev_ifindex && if_indextoname(e.ndev_ifindex, name))
+                        *netdev = name;
+                }
+                ibv_close_device(ctx);
+            }
+            break;
+        }
+        if (list) ibv_free_device_list(list);
+        return type;
+    }
+
     bool route_to(const std::string& host, std::string& src_ip, std::string& out_if) override {
         addrinfo hints{};
         hints.ai_family = AF_INET;
@@ -173,21 +195,39 @@ std::string combo_line(const Combo& c) {
     return s;
 }
 
-// The GIDs of one device that the auto rule accepts: on Ethernet the RoCE v2 IPv4 entries, on
-// InfiniBand the IB entries; duplicates of one GID keep the lowest index.
+// Rank of a GID for auto selection on its link; -1 = not an auto candidate (zero, unknown type,
+// type/link mismatch, link-local). On Ethernet: RoCE v2 IPv4, RoCE v2 global IPv6, RoCE v1 IPv4,
+// RoCE v1 global IPv6. The control plane stays IPv4 whatever the GID's family.
+int gid_tier(const GidEntry& g, bool ib) {
+    if (g.zero() || g.type.empty()) return -1;
+    if (ib) return g.ib_or_v1() ? 0 : -1;
+    const bool v4 = g.ipv4_mapped();
+    if (!v4 && g.link_local()) return -1;
+    if (g.roce_v2()) return v4 ? 0 : 1;
+    if (g.ib_or_v1()) return v4 ? 2 : 3;
+    return -1;
+}
+
+// The GIDs of one port that the auto rule accepts: the best tier the port has; duplicates of one
+// GID keep the lowest index.
 std::vector<const GidEntry*> auto_gids(const NetDevice& d, std::string& why_none) {
     std::vector<const GidEntry*> out;
     std::set<std::string> seen;
     const bool ib = d.link_layer == "InfiniBand";
+    int best = -1;
     for (const auto& g : d.gids) {
-        if (g.zero()) continue;
-        const bool ok = ib ? g.ib_or_v1() : (g.roce_v2() && g.ipv4_mapped());
-        if (!ok) continue;
+        const int t = gid_tier(g, ib);
+        if (t >= 0 && (best < 0 || t < best)) best = t;
+    }
+    for (const auto& g : d.gids) {
+        if (gid_tier(g, ib) != best || best < 0) continue;
         if (!seen.insert(g.gid).second) continue;
         out.push_back(&g);
     }
     if (out.empty())
-        why_none = ib ? "no IB GID" : "no RoCE v2 IPv4 GID (auto selection covers IPv4 RoCE v2 and native IB)";
+        why_none = ib ? "no IB GID"
+                      : "no RoCE GID with a global IPv4/IPv6 address (link-local and unknown-type entries "
+                        "need an explicit gid_idx)";
     return out;
 }
 
@@ -224,6 +264,10 @@ bool GidEntry::zero() const {
 bool GidEntry::ipv4_mapped() const {
     // 0000:0000:0000:0000:0000:ffff:xxxx:xxxx
     return gid.size() == 39 && gid.compare(0, 29, "0000:0000:0000:0000:0000:ffff") == 0;
+}
+
+bool GidEntry::link_local() const {
+    return gid.size() == 39 && gid.compare(0, 2, "fe") == 0 && gid[2] >= '8' && gid[2] <= 'b';
 }
 
 std::string GidEntry::ipv4() const {
@@ -276,37 +320,47 @@ std::vector<NetDevice> discover_net_devices(NetProbe& probe, const std::string& 
     const std::string base = sys_root + "/class/infiniband";
     std::map<std::string, std::vector<NetAddress>> addr_cache;
     for (const auto& name : list_dir(base)) {
-        NetDevice d;
-        d.name = name;
-        d.port = 1;
-        const std::string port = base + "/" + name + "/ports/1";
-        const std::string state = read_line(port + "/state");   // "4: ACTIVE"
-        d.active = state.find("ACTIVE") != std::string::npos;
-        d.link_layer = read_line(port + "/link_layer");
-        const std::string rate = read_line(port + "/rate");     // "400 Gb/sec (4X NDR)"
-        if (!rate.empty()) d.rate_gbps = atoi(rate.c_str());
-        const std::string numa = read_line(base + "/" + name + "/device/numa_node");
-        d.numa_node = numa.empty() ? -1 : atoi(numa.c_str());
-        d.accessible = probe.device_accessible(name);
-        d.dc_capable = probe.device_dc_capable(name);
-        for (const auto& idx : list_dir(port + "/gids")) {
-            GidEntry g;
-            g.index = atoi(idx.c_str());
-            g.gid = read_line(port + "/gids/" + idx);
-            if (g.gid.empty() || g.zero()) continue;
-            g.type = read_line(port + "/gid_attrs/types/" + idx);
-            g.netdev = read_line(port + "/gid_attrs/ndevs/" + idx);
-            if (!g.netdev.empty()) {
-                auto it = addr_cache.find(g.netdev);
-                if (it == addr_cache.end())
-                    it = addr_cache.emplace(g.netdev, probe.interface_addresses(g.netdev)).first;
-                g.addresses = it->second;
+        const std::string dev = base + "/" + name;
+        const std::string numa = read_line(dev + "/device/numa_node");
+        const bool accessible = probe.device_accessible(name);
+        const bool dc_capable = probe.device_dc_capable(name);
+        for (const auto& pnum : list_dir(dev + "/ports")) {
+            NetDevice d;
+            d.name = name;
+            d.port = atoi(pnum.c_str());
+            if (d.port <= 0) continue;
+            const std::string port = dev + "/ports/" + pnum;
+            const std::string state = read_line(port + "/state");   // "4: ACTIVE"
+            d.active = state.find("ACTIVE") != std::string::npos;
+            d.link_layer = read_line(port + "/link_layer");
+            const std::string rate = read_line(port + "/rate");     // "400 Gb/sec (4X NDR)"
+            if (!rate.empty()) d.rate_gbps = atoi(rate.c_str());
+            d.numa_node = numa.empty() ? -1 : atoi(numa.c_str());
+            d.accessible = accessible;
+            d.dc_capable = dc_capable;
+            for (const auto& idx : list_dir(port + "/gids")) {
+                GidEntry g;
+                g.index = atoi(idx.c_str());
+                g.gid = read_line(port + "/gids/" + idx);
+                if (g.gid.empty() || g.zero()) continue;
+                g.type = read_line(port + "/gid_attrs/types/" + idx);
+                g.netdev = read_line(port + "/gid_attrs/ndevs/" + idx);
+                if (g.type.empty()) g.type = probe.gid_type(name, d.port, g.index, &g.netdev);   // sysfs attr missing
+                if (!g.netdev.empty()) {
+                    auto it = addr_cache.find(g.netdev);
+                    if (it == addr_cache.end())
+                        it = addr_cache.emplace(g.netdev, probe.interface_addresses(g.netdev)).first;
+                    g.addresses = it->second;
+                }
+                d.gids.push_back(std::move(g));
             }
-            d.gids.push_back(std::move(g));
+            std::sort(d.gids.begin(), d.gids.end(), [](const GidEntry& a, const GidEntry& b) { return a.index < b.index; });
+            out.push_back(std::move(d));
         }
-        std::sort(d.gids.begin(), d.gids.end(), [](const GidEntry& a, const GidEntry& b) { return a.index < b.index; });
-        out.push_back(std::move(d));
     }
+    std::sort(out.begin(), out.end(), [](const NetDevice& a, const NetDevice& b) {
+        return a.name != b.name ? a.name < b.name : a.port < b.port;
+    });
     return out;
 }
 
@@ -320,28 +374,33 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
     auto fail = [&](const std::string& head, const std::vector<Combo>& shown) {
         std::string msg = "net: " + head;
         if (!shown.empty()) {
-            msg += "\n candidates (port 1):";
+            msg += "\n candidates:";
             for (const auto& c : shown) msg += "\n" + combo_line(c);
         }
         if (!excluded.empty()) {
             msg += "\n excluded:";
             for (const auto& e : excluded) msg += "\n  " + e;
         }
-        msg += "\n set index_dev / gid_idx (and rpc_address or rpc_interface) to settle it";
+        msg += "\n set index_dev / index_port / gid_idx (and rpc_address or rpc_interface) to settle it";
         throw std::runtime_error(msg);
     };
 
-    bool found = in.index_dev.empty();
+    // An explicit device and port is a constraint whose first failure is the error; with the port
+    // left open, the device's unusable ports are skipped and reported only if none is usable.
+    const bool pinned = !in.index_dev.empty();
+    bool found_dev = !pinned, found_port = !pinned || in.index_port <= 0;
     auto reject = [&](const NetDevice& device, const std::string& why) {
-        const std::string message = device.name + ": " + why;
-        if (!in.index_dev.empty()) throw std::runtime_error("net: " + message);
+        const std::string message = device.name + " port " + std::to_string(device.port) + ": " + why;
+        if (pinned && in.index_port > 0) throw std::runtime_error("net: " + message);
         excluded.push_back(message);
     };
 
     for (const auto& d : devices) {
-        if (!in.index_dev.empty() && d.name != in.index_dev) continue;
-        found = true;
-        const char* why_unusable = !d.active ? "port 1 not ACTIVE" :
+        if (pinned && d.name != in.index_dev) continue;
+        found_dev = true;
+        if (in.index_port > 0 && d.port != in.index_port) continue;
+        found_port = true;
+        const char* why_unusable = !d.active ? "not ACTIVE" :
             !d.accessible ? "uverbs node not accessible" :
             in.need_dc && !d.dc_capable ? "no mlx5 direct verbs (DC transport)" : nullptr;
         if (why_unusable) { reject(d, why_unusable); continue; }
@@ -351,7 +410,11 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
                 reject(d, "gid " + std::to_string(in.gid_idx) + " is not set");
                 continue;
             }
-            if (d.link_layer == "InfiniBand" ? !g->ib_or_v1() : !(g->roce_v2() || g->ib_or_v1())) {
+            if (g->type.empty()) {   // unknown is not incompatible: an explicit choice stands, flagged
+                sel.notes.push_back(d.name + " port " + std::to_string(d.port) + " gid " + std::to_string(in.gid_idx) +
+                                    ": type unknown (no sysfs attribute, verbs query failed); not checked against link " +
+                                    (d.link_layer.empty() ? "?" : d.link_layer));
+            } else if (d.link_layer == "InfiniBand" ? !g->ib_or_v1() : !(g->roce_v2() || g->ib_or_v1())) {
                 reject(d, "gid " + std::to_string(in.gid_idx) + " type '" + g->type +
                           "' does not fit link " + d.link_layer);
                 continue;
@@ -363,14 +426,18 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         for (const GidEntry* g : auto_gids(d, why)) combos.push_back({&d, g});
         if (!why.empty()) reject(d, why);
     }
-    if (!found) {
+    if (!found_dev) {
         std::string names;
-        for (const auto& device : devices) names += (names.empty() ? "" : ", ") + device.name;
+        for (const auto& device : devices)
+            if (names.find(device.name) == std::string::npos) names += (names.empty() ? "" : ", ") + device.name;
         throw std::runtime_error("net: index_dev '" + in.index_dev + "' not found; devices: " +
                                  (names.empty() ? "none" : names));
     }
+    if (!found_port)
+        throw std::runtime_error("net: index_dev '" + in.index_dev + "' has no port " + std::to_string(in.index_port));
 
-    if (combos.empty()) fail("no usable RDMA device for the index plane", {});
+    if (combos.empty())
+        fail(pinned ? "index_dev '" + in.index_dev + "' has no usable port / GID" : "no usable RDMA device for the index plane", {});
 
     std::string reason;
     if (!in.index_dev.empty() && in.gid_idx >= 0) {

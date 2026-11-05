@@ -56,9 +56,10 @@ struct RadixServerConfig {
     // rank: etcd-assigned dense rank, filled after bootstrap.
     int          rank        = 0;
     int          world_size  = 1;   // observed count(/peers) overrides at bootstrap
-    // Index-plane RDMA device and GID index. Empty / -1 = chosen from the local devices at
-    // bootstrap (net_discovery); explicit values are constraints. Both are written back resolved.
+    // Index-plane RDMA device, port and GID index. Empty / 0 / -1 = chosen from the local devices at
+    // bootstrap (net_discovery); explicit values are constraints. All are written back resolved.
     std::string  index_dev;
+    int          index_port  = 0;
     int          gid_idx     = -1;
     int          bootstrap_timeout_sec = 60;
     // TTL of this node's etcd lease and of the shared cluster lease: how long a

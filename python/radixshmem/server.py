@@ -46,7 +46,7 @@ from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
-    "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec",
+    "rpc_interface", "rpc_port", "index_dev", "index_port", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec",
     "peer_index_transport", "remote_op_listen_port")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
@@ -71,7 +71,9 @@ class ClusterConfig:
     rpc_port: int = 0
     index_dev: str = ""              # HCA of the index control plane, "" = chosen from the local devices
                                      # at preflight; the data plane's HCAs are ServerConfig.transfer_devices
-    gid_idx: int = -1                # -1 = chosen with the device (RoCE v2 IPv4 entry, or the IB GID)
+    index_port: int = 0              # 0 = chosen with the device (an ACTIVE port with a usable GID)
+    gid_idx: int = -1                # -1 = chosen with the device: RoCE v2 IPv4, else RoCE v2 global IPv6,
+                                     # else RoCE v1 with a global address; the IB GID on an IB link
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
     peer_index_transport: str = "xrc" # remote walk into peer trees: "xrc" | "dc"

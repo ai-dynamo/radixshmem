@@ -27,6 +27,7 @@ struct FakeProbe final : NetProbe {
     bool route_ok = false;
     std::string route_src, route_if;
     int route_calls = 0;
+    std::map<std::string, std::pair<std::string, std::string>> gid_types;   // "dev:port:idx" -> type, netdev
 
     std::vector<NetAddress> interface_addresses(const std::string& n) override {
         auto it = addrs.find(n);
@@ -40,6 +41,12 @@ struct FakeProbe final : NetProbe {
         src = route_src;
         oif = route_if;
         return true;
+    }
+    std::string gid_type(const std::string& d, int port, int idx, std::string* ndev) override {
+        auto it = gid_types.find(d + ":" + std::to_string(port) + ":" + std::to_string(idx));
+        if (it == gid_types.end()) return "";
+        if (ndev && ndev->empty()) *ndev = it->second.second;
+        return it->second.first;
     }
 };
 
@@ -190,7 +197,7 @@ void test_single_and_ambiguous() {
     none[0].active = false;
     none[1].gids.clear();
     m = throws_with(none, in, &p);
-    assert(has(m, "no usable RDMA device") && has(m, "mlx5_0: port 1 not ACTIVE") && has(m, "mlx5_1: no RoCE v2 IPv4 GID"));
+    assert(has(m, "no usable RDMA device") && has(m, "mlx5_0 port 1: not ACTIVE") && has(m, "mlx5_1 port 1: no RoCE GID"));
 
     // Two IPv4 GIDs on one device are two combinations; a duplicate GID is one.
     std::vector<NetDevice> multi = {eth("mlx5_0", "172.18.0.23", "ens0", 0)};
@@ -333,6 +340,51 @@ void test_infiniband() {
     printf("ok infiniband\n");
 }
 
+void test_gid_tiers() {
+    FakeProbe p;
+    NetSelectionInput in;
+    // RoCE v1 IPv4 alone is usable; eth() also has the v2 entry, which wins (test_single_and_ambiguous).
+    NetDevice v1only = eth("mlx5_0", "172.18.0.23", "ens0", 0);
+    v1only.gids.pop_back();   // idx 3 (v2 IPv4) gone, idx 2 (v1 IPv4) stays
+    auto s = select_net({v1only}, in, &p);
+    assert(s.index.gid_index == 2 && s.control_ip == "172.18.0.23");
+
+    // RoCE v2 with a global IPv6: chosen; no IPv4 to publish, so the control address needs rpc_address.
+    NetDevice v6 = eth("mlx5_1", "172.18.32.23", "ens1", 0);
+    v6.gids = {linklocal(0, "IB/RoCE v1", "ens1"), linklocal(1, "RoCE v2", "ens1")};
+    GidEntry g6;
+    g6.index = 4;
+    g6.gid = "2001:0db8:0000:0000:0000:0000:0000:0017";
+    g6.type = "RoCE v2";
+    g6.netdev = "ens1";
+    v6.gids.push_back(g6);
+    s = select_net({v6}, in, &p);
+    assert(s.index.gid_index == 4 && s.index.address.empty() && s.control_ip.empty());
+    in.rpc_address = "10.0.0.9";
+    s = select_net({v6}, in, &p);
+    assert(s.index.gid_index == 4 && s.control_ip == "10.0.0.9" && s.control_source == "rpc_address");
+
+    // Link-local only: no auto candidate; an explicit index is still accepted.
+    in = NetSelectionInput{};
+    NetDevice ll = v6;
+    ll.gids.pop_back();
+    assert(has(throws_with({ll}, in, &p), "link-local and unknown-type entries need an explicit gid_idx"));
+    in.gid_idx = 1;
+    s = select_net({ll}, in, &p);
+    assert(s.index.gid_index == 1);
+
+    // Unknown type: not an auto candidate; explicit is accepted and flagged, not rejected.
+    in = NetSelectionInput{};
+    NetDevice unk = eth("mlx5_2", "172.18.64.23", "ens2", 0);
+    for (auto& g : unk.gids) g.type = "";
+    assert(has(throws_with({unk}, in, &p), "mlx5_2 port 1: no RoCE GID"));
+    in.index_dev = "mlx5_2";
+    in.gid_idx = 3;
+    s = select_net({unk}, in, &p);
+    assert(s.index.gid_index == 3 && has(s.notes.at(0), "gid 3: type unknown"));
+    printf("ok gid_tiers\n");
+}
+
 // ------------------------------------------------------------------ sysfs parser
 
 void write(const std::string& path, const std::string& text) {
@@ -352,21 +404,23 @@ void mkdirs(const std::string& path) {
 
 void fake_device(const std::string& root, const std::string& name, const std::string& state,
                  const std::string& link, const std::string& rate, int numa,
-                 const std::vector<std::pair<std::string, std::string>>& gids, const std::string& ndev) {
+                 const std::vector<std::pair<std::string, std::string>>& gids, const std::string& ndev,
+                 int port = 1) {
     const std::string dev = root + "/class/infiniband/" + name;
-    mkdirs(dev + "/ports/1/gids");
-    mkdirs(dev + "/ports/1/gid_attrs/types");
-    mkdirs(dev + "/ports/1/gid_attrs/ndevs");
+    const std::string p = dev + "/ports/" + std::to_string(port);
+    mkdirs(p + "/gids");
+    mkdirs(p + "/gid_attrs/types");
+    mkdirs(p + "/gid_attrs/ndevs");
     mkdirs(dev + "/device/infiniband_verbs/uverbs" + name.substr(name.size() - 1));
-    write(dev + "/ports/1/state", state);
-    write(dev + "/ports/1/link_layer", link);
-    write(dev + "/ports/1/rate", rate);
+    write(p + "/state", state);
+    write(p + "/link_layer", link);
+    write(p + "/rate", rate);
     write(dev + "/device/numa_node", std::to_string(numa));
     for (size_t i = 0; i < gids.size(); i++) {
-        write(dev + "/ports/1/gids/" + std::to_string(i), gids[i].first);
-        if (!gids[i].second.empty()) {
-            write(dev + "/ports/1/gid_attrs/types/" + std::to_string(i), gids[i].second);
-            write(dev + "/ports/1/gid_attrs/ndevs/" + std::to_string(i), ndev);
+        write(p + "/gids/" + std::to_string(i), gids[i].first);
+        if (!gids[i].second.empty()) {   // a GID without the type attribute, as an old kernel shows it
+            write(p + "/gid_attrs/types/" + std::to_string(i), gids[i].second);
+            write(p + "/gid_attrs/ndevs/" + std::to_string(i), ndev);
         }
     }
 }
@@ -383,29 +437,51 @@ void test_sysfs() {
                  {zero, ""}},
                 "ens0");
     fake_device(root, "mlx5_1", "1: DOWN", "Ethernet", "200 Gb/sec (4X HDR)", 1, {{v4gid("172.18.32.23"), "RoCE v2"}}, "ens1");
-    // Port 2 active, port 1 missing: not a candidate (only port 1 is probed).
+    // Only a port 2, active but without GIDs or link layer.
     mkdirs(root + "/class/infiniband/mlx5_2/ports/2/gids");
     write(root + "/class/infiniband/mlx5_2/ports/2/state", "4: ACTIVE");
+    // Two ports: port 1 down, port 2 up with a GID whose type attribute is missing (verbs supplies it).
+    fake_device(root, "mlx5_3", "1: DOWN", "Ethernet", "100 Gb/sec (4X EDR)", 1, {{v4gid("10.9.0.5"), "RoCE v2"}}, "ens3", 1);
+    fake_device(root, "mlx5_3", "4: ACTIVE", "Ethernet", "100 Gb/sec (4X EDR)", 1, {{v4gid("10.9.1.5"), ""}}, "", 2);
 
     FakeProbe p;
     p.addrs["ens0"] = {{"172.18.0.23", 27}, {"fe80::c670:bdff:fe1f:5c2a", 64}};
+    p.addrs["ens3b"] = {{"10.9.1.5", 24}};
     p.inaccessible["mlx5_1"] = true;
     p.no_dc["mlx5_2"] = true;
+    p.gid_types["mlx5_3:2:0"] = {"RoCE v2", "ens3b"};
     auto devs = discover_net_devices(p, root);
-    assert(devs.size() == 3);
-    assert(devs[0].name == "mlx5_0" && devs[0].active && devs[0].link_layer == "Ethernet" && devs[0].rate_gbps == 400 &&
-           devs[0].numa_node == 0 && devs[0].accessible && devs[0].dc_capable);
+    assert(devs.size() == 5);
+    assert(devs[0].name == "mlx5_0" && devs[0].port == 1 && devs[0].active && devs[0].link_layer == "Ethernet" &&
+           devs[0].rate_gbps == 400 && devs[0].numa_node == 0 && devs[0].accessible && devs[0].dc_capable);
     assert(devs[0].gids.size() == 4);   // the zero entry is dropped
     assert(devs[0].gids[3].index == 3 && devs[0].gids[3].roce_v2() && devs[0].gids[3].ipv4() == "172.18.0.23" &&
            devs[0].gids[3].netdev == "ens0" && devs[0].gids[3].addresses.size() == 2 &&
            devs[0].gids[3].addresses[0].prefix_length == 27);
     assert(devs[1].name == "mlx5_1" && !devs[1].active && devs[1].rate_gbps == 200 && devs[1].numa_node == 1 && !devs[1].accessible);
-    assert(devs[2].name == "mlx5_2" && !devs[2].active && devs[2].gids.empty() && devs[2].numa_node == -1 && !devs[2].dc_capable);
+    assert(devs[2].name == "mlx5_2" && devs[2].port == 2 && devs[2].active && devs[2].gids.empty() &&
+           devs[2].numa_node == -1 && !devs[2].dc_capable);
+    assert(devs[3].name == "mlx5_3" && devs[3].port == 1 && !devs[3].active);
+    assert(devs[4].name == "mlx5_3" && devs[4].port == 2 && devs[4].active && devs[4].gids.size() == 1 &&
+           devs[4].gids[0].type == "RoCE v2" && devs[4].gids[0].netdev == "ens3b" && devs[4].gids[0].addresses.size() == 1);
 
+    // mlx5_0 port 1 and mlx5_3 port 2 both qualify; a hint settles it, an explicit device takes its live port.
     NetSelectionInput in;
+    std::string m = throws_with(devs, in, &p);
+    assert(has(m, "2 device/GID combinations") && has(m, "mlx5_3 port 2 gid 0 RoCE v2 10.9.1.5") &&
+           has(m, "mlx5_2 port 2: no RoCE GID") && has(m, "mlx5_3 port 1: not ACTIVE"));
+    in.rpc_address = "172.18.0.23";
     auto s = select_net(devs, in, &p);
     assert(s.index.device == "mlx5_0" && s.index.gid_index == 3 && s.control_ip == "172.18.0.23");
-    assert(has(s.summary(), "index mlx5_0 port 1 gid 3 (172.18.0.23, ens0, numa 0, only candidate)"));
+    assert(has(s.summary(), "index mlx5_0 port 1 gid 3 (172.18.0.23, ens0, numa 0, control-address hint)"));
+    in = NetSelectionInput{};
+    in.index_dev = "mlx5_3";
+    s = select_net(devs, in, &p);
+    assert(s.index.port == 2 && s.index.gid_index == 0 && s.control_ip == "10.9.1.5" && s.index.reason == "explicit device, only gid");
+    in.index_port = 1;
+    assert(has(throws_with(devs, in, &p), "mlx5_3 port 1: not ACTIVE"));
+    in.index_port = 3;
+    assert(has(throws_with(devs, in, &p), "has no port 3"));
     [[maybe_unused]] int rc = system(("rm -rf " + root).c_str());
     printf("ok sysfs\n");
 }
@@ -413,33 +489,37 @@ void test_sysfs() {
 void test_client_index_inheritance() {
     struct Case {
         std::string client_device;
-        int client_gid;
+        int client_port, client_gid;
         std::string server_device;
-        int server_gid;
+        int server_port, server_gid;
         std::string expected_device;
-        int expected_gid;
+        int expected_port, expected_gid;
     };
     const Case cases[] = {
-        {"", -1, "mlx5_0", 3, "mlx5_0", 3},
-        {"mlx5_0", -1, "mlx5_0", 3, "mlx5_0", 3},
-        {"mlx5_1", -1, "mlx5_0", 3, "mlx5_1", -1},
-        {"mlx5_1", 7, "mlx5_0", 3, "mlx5_1", 7},
-        {"", 7, "mlx5_0", 3, "mlx5_0", 7},
-        {"", -1, "", 3, "", -1},
-        {"", -1, "mlx5_0", -1, "mlx5_0", -1},
+        {"", 0, -1, "mlx5_0", 1, 3, "mlx5_0", 1, 3},
+        {"mlx5_0", 0, -1, "mlx5_0", 1, 3, "mlx5_0", 1, 3},
+        {"mlx5_1", 0, -1, "mlx5_0", 1, 3, "mlx5_1", 0, -1},
+        {"mlx5_1", 0, 7, "mlx5_0", 1, 3, "mlx5_1", 0, 7},
+        {"", 0, 7, "mlx5_0", 1, 3, "mlx5_0", 1, 7},
+        {"", 0, -1, "", 1, 3, "", 0, -1},
+        {"", 0, -1, "mlx5_0", 1, -1, "mlx5_0", 1, -1},
+        {"", 0, -1, "mlx5_0", 0, 3, "mlx5_0", 0, 3},       // older server: no port published
+        {"mlx5_0", 2, -1, "mlx5_0", 1, 3, "mlx5_0", 2, -1},   // another port: its GID index does not carry over
     };
     for (const auto& test : cases) {
         NetSelectionInput input;
         input.index_dev = test.client_device;
+        input.index_port = test.client_port;
         input.gid_idx = test.client_gid;
-        input.inherit_index(test.server_device, test.server_gid);
-        assert(input.index_dev == test.expected_device && input.gid_idx == test.expected_gid);
+        input.inherit_index(test.server_device, test.server_port, test.server_gid);
+        assert(input.index_dev == test.expected_device && input.index_port == test.expected_port &&
+               input.gid_idx == test.expected_gid);
     }
     auto device = eth("mlx5_1", "172.18.32.23", "ens1", 0);
     device.gids = {roce(7, "172.18.32.23", "ens1")};
     NetSelectionInput input;
     input.index_dev = "mlx5_1";
-    input.inherit_index("mlx5_0", 3);
+    input.inherit_index("mlx5_0", 1, 3);
     FakeProbe probe;
     const auto selected = select_net({device}, input, &probe);
     assert(selected.index.device == "mlx5_1" && selected.index.gid_index == 7);
@@ -462,6 +542,7 @@ int main() {
     test_single_and_ambiguous();
     test_hints();
     test_infiniband();
+    test_gid_tiers();
     test_sysfs();
     test_client_index_inheritance();
     test_registry_host();

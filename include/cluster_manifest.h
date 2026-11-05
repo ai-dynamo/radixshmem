@@ -102,7 +102,7 @@ struct PeerEntry {
     int32_t  gid_index;
     uint16_t lid;
     uint8_t  link_layer;
-    uint8_t  _pad5;
+    uint8_t  index_port;                       // HCA port of gid_raw; 0 = not published (older peers)
 
     // XRC bootstrap-time hints
     uint32_t srq_num;                          // peer's SRQ number
