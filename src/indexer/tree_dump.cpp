@@ -86,10 +86,13 @@ public:
                     for (uint32_t b = 0; b < nb; b++)
                         swa += ss[b] != INVALID_COMPONENT_SLOT;
             }
-            int64_t refs = node->ref_count.load(std::memory_order_relaxed);
+            int64_t refs = node->local_ref_count.load(std::memory_order_relaxed) +
+                           node->remote_ref_count.load(std::memory_order_relaxed);
             if (const NodeComponentState* cs = t.nodes_.component_state(ids[i])) {
-                refs += cs->swa_ref_count.load(std::memory_order_relaxed);
-                refs += cs->mamba_ref_count.load(std::memory_order_relaxed);
+                refs += cs->local_swa_ref_count.load(std::memory_order_relaxed) +
+                        cs->remote_swa_ref_count.load(std::memory_order_relaxed);
+                refs += cs->local_mamba_ref_count.load(std::memory_order_relaxed) +
+                        cs->remote_mamba_ref_count.load(std::memory_order_relaxed);
             }
             d.num_blocks.push_back(nb);
             d.swa_blocks.push_back(swa);

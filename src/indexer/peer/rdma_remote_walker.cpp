@@ -53,7 +53,7 @@ uint64_t RdmaRemoteWalker::data_addr(const RemoteTreeInfo& r,
 
 uint64_t RdmaRemoteWalker::ref_count_addr(const RemoteTreeInfo& r,
                                            uint32_t node_id) const {
-    return node_addr(r, node_id) + offsetof(TreeNode, ref_count);
+    return node_addr(r, node_id) + offsetof(TreeNode, remote_ref_count);
 }
 
 // The peer's payload carries a SWA lane iff its config enables SWA.
@@ -63,9 +63,9 @@ static inline bool remote_swa_lane(const RemoteTreeInfo& r) {
 
 // Lane refcount words inside NodeComponentState: the FAA targets peers hit.
 static constexpr uint64_t SWA_REF_OFF =
-    offsetof(NodeComponentState, swa_ref_count);
+    offsetof(NodeComponentState, remote_swa_ref_count);
 static constexpr uint64_t MAMBA_REF_OFF =
-    offsetof(NodeComponentState, mamba_ref_count);
+    offsetof(NodeComponentState, remote_mamba_ref_count);
 
 uint64_t RdmaRemoteWalker::cst_addr(const RemoteTreeInfo& r,
                                     uint32_t node_id) const {

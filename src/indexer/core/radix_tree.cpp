@@ -772,20 +772,25 @@ uint32_t RadixShmemTree::split_node(uint32_t node_id, int prefix_length) {
     TreeNode* prefix_node = nodes_.get(prefix_id);
     node = nodes_.get(node_id);
 
-    int64_t orig_rc = node->ref_count.load(std::memory_order_relaxed);
+    int64_t orig_local = node->local_ref_count.load(std::memory_order_relaxed);
+    int64_t orig_remote = node->remote_ref_count.load(std::memory_order_relaxed);
     uint64_t orig_at = node->last_access_time.load(std::memory_order_relaxed);
 
     prefix_node->num_blocks = prefix_length;
     prefix_node->data_offset = prefix_data;
     prefix_node->parent_id = parent_id;
-    prefix_node->ref_count.fetch_add(orig_rc, std::memory_order_relaxed);
+    prefix_node->local_ref_count.fetch_add(orig_local, std::memory_order_relaxed);
+    prefix_node->remote_ref_count.fetch_add(orig_remote, std::memory_order_relaxed);
     // Whole-node component pins follow the split: Full/SWA refs copy to the
     // prefix, Mamba stays with the suffix END; live counts follow the lanes.
     if (has_aux_) {
         NodeComponentState* pre_cs = nodes_.component_state(prefix_id);
         NodeComponentState* suf_cs = nodes_.component_state(node_id);
-        pre_cs->swa_ref_count.store(
-            suf_cs->swa_ref_count.load(std::memory_order_relaxed),
+        pre_cs->local_swa_ref_count.store(
+            suf_cs->local_swa_ref_count.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        pre_cs->remote_swa_ref_count.store(
+            suf_cs->remote_swa_ref_count.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
     }
     // Inherit access_time from split node to preserve strict LRU ordering.
@@ -813,12 +818,16 @@ uint32_t RadixShmemTree::split_node(uint32_t node_id, int prefix_length) {
 // Pin-eligibility for restructuring/eviction: all three component ref
 // classes (full/swa/mamba) on the node must be zero.
 bool RadixShmemTree::component_refs_zero(uint32_t node_id) const {
-    if (nodes_.get(node_id)->ref_count.load(std::memory_order_relaxed) != 0)
+    const TreeNode* node = nodes_.get(node_id);
+    if (node->local_ref_count.load(std::memory_order_relaxed) != 0 ||
+        node->remote_ref_count.load(std::memory_order_relaxed) != 0)
         return false;
     if (!has_aux_) return true;
     NodeComponentState* cs = nodes_.component_state(node_id);
-    return cs->swa_ref_count.load(std::memory_order_relaxed) == 0 &&
-           cs->mamba_ref_count.load(std::memory_order_relaxed) == 0;
+    return cs->local_swa_ref_count.load(std::memory_order_relaxed) == 0 &&
+           cs->remote_swa_ref_count.load(std::memory_order_relaxed) == 0 &&
+           cs->local_mamba_ref_count.load(std::memory_order_relaxed) == 0 &&
+           cs->remote_mamba_ref_count.load(std::memory_order_relaxed) == 0;
 }
 
 // Fold an only-child ready leaf up into its ready parent (inverse of split_node,
@@ -1140,11 +1149,11 @@ void RadixShmemTree::hold_path(uint32_t leaf, uint32_t top, HeldEviction& h) {
             h.mamba_slots.push_back(nd->mamba_checkpoint_slot);
         }
         if (!pin) continue;
-        nd->ref_count.fetch_add(1, std::memory_order_relaxed);
+        nd->local_ref_count.fetch_add(1, std::memory_order_relaxed);
         if (has_aux_) {
             NodeComponentState* cs = nodes_.component_state(id);
-            if (has_swa_) cs->swa_ref_count.fetch_add(1, std::memory_order_relaxed);
-            if (ckpt) cs->mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
+            if (has_swa_) cs->local_swa_ref_count.fetch_add(1, std::memory_order_relaxed);
+            if (ckpt) cs->local_mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
@@ -1193,13 +1202,13 @@ void RadixShmemTree::release_held(const std::vector<HeldEviction>& hs) {
         for (const MatchedNodeSpanView& v : path_spans(m)) {
             const uint32_t e = v.absolute_start + v.node_blocks;
             if (e > a) break;
-            (void)dec_ref(nodes_.get(v.node_id)->ref_count);
+            (void)dec_ref(nodes_.get(v.node_id)->local_ref_count);
             if (!has_aux_) continue;
             NodeComponentState* cs = nodes_.component_state(v.node_id);
-            if (has_swa_) (void)dec_ref(cs->swa_ref_count);
+            if (has_swa_) (void)dec_ref(cs->local_swa_ref_count);
             if (has_mamba_ &&
                 std::binary_search(h.mamba_ends.begin(), h.mamba_ends.end(), e))
-                (void)dec_ref(cs->mamba_ref_count);
+                (void)dec_ref(cs->local_mamba_ref_count);
         }
     }
     write_unlock();
@@ -1292,13 +1301,13 @@ void RadixShmemTree::inc_ref(const std::vector<MatchedNodeSpanView>& spans,
     if (cov.has_full)
         for (size_t i = cov.full_from; i <= cov.full_k; i++)
             nodes_.get(spans[i].node_id)
-                ->ref_count.fetch_add(1, std::memory_order_relaxed);
+                ->local_ref_count.fetch_add(1, std::memory_order_relaxed);
     for (size_t i = cov.swa_from; i <= cov.aux_k && i < spans.size(); i++)
         nodes_.component_state(spans[i].node_id)
-            ->swa_ref_count.fetch_add(1, std::memory_order_relaxed);
+            ->local_swa_ref_count.fetch_add(1, std::memory_order_relaxed);
     if (cov.pin_mamba)
         nodes_.component_state(spans[cov.aux_k].node_id)
-            ->mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
+            ->local_mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RadixShmemTree::touch_full(const std::vector<MatchedNodeSpanView>& spans,
@@ -1374,11 +1383,11 @@ bool RadixShmemTree::dec_ref(const uint64_t* hashes, int n,
         const uint32_t e = s + v.node_blocks;
         if (e > end) break;   // only nodes fully inside [0, end)
         if (full_present && s >= pin.full.start && s < pin.full.end)
-            (void)dec_ref(nodes_.get(v.node_id)->ref_count);
+            (void)dec_ref(nodes_.get(v.node_id)->local_ref_count);
         if (swa_present && s >= pin.swa.start && s < pin.swa.end)
-            (void)dec_ref(nodes_.component_state(v.node_id)->swa_ref_count);
+            (void)dec_ref(nodes_.component_state(v.node_id)->local_swa_ref_count);
         if (mamba_present && e == (uint32_t)pin.mamba_end)
-            (void)dec_ref(nodes_.component_state(v.node_id)->mamba_ref_count);
+            (void)dec_ref(nodes_.component_state(v.node_id)->local_mamba_ref_count);
     }
     read_unlock();
     return true;
@@ -1477,7 +1486,7 @@ std::vector<MatchedNodeSpanView> RadixShmemTree::path_spans(
 
 
 void RadixShmemTree::inc_ref(uint32_t node_id) {
-    nodes_.get(node_id)->ref_count.fetch_add(1, std::memory_order_relaxed);
+    nodes_.get(node_id)->local_ref_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool RadixShmemTree::dec_ref(std::atomic<int64_t>& ref) noexcept {
@@ -1491,7 +1500,7 @@ bool RadixShmemTree::dec_ref(std::atomic<int64_t>& ref) noexcept {
 
 void RadixShmemTree::dec_ref(uint32_t node_id) {
     // Legacy semantics: silently clamp at zero.
-    (void)dec_ref(nodes_.get(node_id)->ref_count);
+    (void)dec_ref(nodes_.get(node_id)->local_ref_count);
 }
 
 std::vector<NodeBoundary> RadixShmemTree::get_node_boundaries(

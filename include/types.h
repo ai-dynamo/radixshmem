@@ -22,7 +22,7 @@ using HashType = uint64_t;
 static constexpr uint32_t INVALID_NODE_ID = UINT32_MAX;
 static constexpr uint64_t INVALID_OFFSET = UINT64_MAX;
 static constexpr uint64_t SHM_MAGIC = 0x534852444958ULL;
-static constexpr uint32_t SHM_VERSION = 28;
+static constexpr uint32_t SHM_VERSION = 29;
 // cluster_ready_magic sentinel — same-host clients spin on it as a local ready flag.
 static constexpr uint64_t CLUSTER_MANIFEST_MAGIC = 0x434c5354524d4644ULL; // "CLSTRMFD"
 static constexpr size_t HUGEPAGE_SIZE = 2ULL * 1024 * 1024;
@@ -58,10 +58,12 @@ struct ComponentConfig {
 static_assert(sizeof(ComponentConfig) == 24, "ComponentConfig must be 24 bytes");
 
 struct alignas(64) NodeComponentState {
-    std::atomic<int64_t>  swa_ref_count;
-    std::atomic<int64_t>  mamba_ref_count;
+    std::atomic<int64_t>  remote_swa_ref_count;
+    std::atomic<int64_t>  remote_mamba_ref_count;
     uint32_t swa_live_blocks;
-    uint8_t  reserved[44];
+    std::atomic<int64_t>  local_swa_ref_count;
+    std::atomic<int64_t>  local_mamba_ref_count;
+    uint8_t  reserved[24];
 };
 
 static constexpr uint32_t INVALID_SLOT_LINK = UINT32_MAX;
@@ -294,13 +296,13 @@ struct alignas(64) TreeNode {
     uint64_t data_offset;                   // into DataPool data blocks
     std::atomic<uint64_t> last_access_time;
 
-    std::atomic<int64_t> ref_count;         // 8B aligned for RDMA Fetch-and-Add
+    std::atomic<int64_t> remote_ref_count;  // 8B aligned for RDMA Fetch-and-Add
 
     uint32_t next_free;
     uint32_t leaf_prev;
     uint32_t leaf_next;
     uint32_t first_child_entry;   // head of per-parent sibling chain in HT entry pool
-    uint64_t _pad_version;
+    std::atomic<int64_t> local_ref_count;
 };
 static_assert(sizeof(TreeNode) == 64, "TreeNode must be 64 bytes");
 
