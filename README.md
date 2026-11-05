@@ -72,6 +72,26 @@ radix-server --name /my_kv_cache --data-bytes 1024G --mamba-ratio 0.2 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
+Prefill/decode disaggregation: decode nodes run the same command with `--decode` and join the same cluster,
+so `--expected-min-nodes` counts both roles. A prefill node writes the KV its background eviction takes
+(`--background-evict-ratio`, default 0.05) back to a ready decode node instead of dropping it, and pauses
+eviction while unfinished write-backs hold `--writeback-max-held` of a pool (default 0.05); with no decode
+node ready it recycles the slots at once. Decode nodes write nothing back. 2 prefill + 2 decode nodes:
+
+```bash
+# Prefill nodes 10.0.0.10 and 10.0.0.11
+radix-server --name /my_kv_cache --data-bytes 1024G \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+
+# Decode nodes 10.0.0.20 and 10.0.0.21
+radix-server --name /my_kv_cache --data-bytes 1024G --decode \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.20 --index-dev mlx5_bond_0 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+```
+
 ### Client API
 
 A client connects to the local server by name and provides `query`, `pull_async`, `push_async`, and `insert`.
