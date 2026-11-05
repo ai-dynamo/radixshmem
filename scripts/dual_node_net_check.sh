@@ -45,9 +45,10 @@ server_cmd() {   # $1 = node name, $2 = socket path, rest = extra server flags
 }
 
 wait_for() {     # $1 = needle, $2 = seconds; both server logs must contain it
-    local i
+    local i needle
+    printf -v needle '%q' "$1"
     for ((i = 0; i < $2; i++)); do
-        grep -q "$1" "$WORK/server_a.log" 2>/dev/null && b "grep -q '$1' $WORK/server_b.log" && return 0
+        grep -q "$1" "$WORK/server_a.log" 2>/dev/null && b "grep -q -- $needle $WORK/server_b.log" && return 0
         if grep -q "Start FAILED\|Traceback" "$WORK/server_a.log" 2>/dev/null; then echo "server A failed"; return 1; fi
         if b "grep -q 'Start FAILED\|Traceback' $WORK/server_b.log 2>/dev/null"; then echo "server B failed"; return 1; fi
         sleep 1
@@ -96,7 +97,7 @@ run)
 
     echo "server flags: ${*:-(none: zero-config)}"
     $(server_cmd a "$WORK/node.sock" "$@") > "$WORK/server_a.log" 2>&1 &
-    b "cd $DIR && nohup $(server_cmd b "$WORK/node.sock" "$@") > $WORK/server_b.log 2>&1 < /dev/null &"
+    b "cd $DIR || exit 1; nohup $(server_cmd b "$WORK/node.sock" "$@") > $WORK/server_b.log 2>&1 < /dev/null &"
     wait_for "Waiting for a client's geometry" 60 || { show_logs; exit 1; }
     echo "both servers resolved their network; sending the geometry to A"
     python3 -c "
