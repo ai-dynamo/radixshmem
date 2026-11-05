@@ -439,9 +439,9 @@ struct ComponentCheckpoint {
 
 #### `lock` semantics
 
-- **Full**: inc_ref on **whole nodes** for every node intersecting `[0, f)` (`f` = topology hit length), including the partial terminal in which `f` falls — every returned Full slot is under pin protection. The hashes of the terminal beyond `f` are recorded in the release credential; at release they are concatenated with the caller's hashes to re-walk the full path, so the release is symmetric even if the terminal is later split after `f`.
-- **SWA**: `swa_ref_count` +1 on nodes intersecting `[A, common_hit)`; **Mamba**: `mamba_ref_count` +1 on the node with `END == common_hit`.
-- When a remote continuation extends the hit, the nodes on the remote suffix are pinned via RDMA FAA (only when the remote `L >` the local hit; on a tie the local result is kept, with zero remote pins).
+- **Full**: `local_ref_count` +1 on **whole nodes** for every node intersecting `[0, f)` (`f` = topology hit length), including the partial terminal in which `f` falls — every returned Full slot is under pin protection. The hashes of the terminal beyond `f` are recorded in the release credential; at release they are concatenated with the caller's hashes to re-walk the full path, so the release is symmetric even if the terminal is later split after `f`.
+- **SWA**: `local_swa_ref_count` +1 on nodes intersecting `[A, common_hit)`; **Mamba**: `local_mamba_ref_count` +1 on the node with `END == common_hit`.
+- When a remote continuation extends the hit, the nodes on the remote suffix are pinned via RDMA FAA on `remote_ref_count` / `remote_swa_ref_count` / `remote_mamba_ref_count` (only when the remote `L >` the local hit; on a tie the local result is kept, with zero remote pins). The NICs' atomics are not atomic with CPU atomics (`ATOMIC_HCA`), so the CPU only ever updates the `local_*` counters and the NIC only the `remote_*` ones; a node is pinned while any of them is non-zero.
 - **Release**: call `result.finalize()` after reading (one-shot; re-walks the hash path by the internally recorded lane ranges to release). Forgetting to call it leaks the pins obtained. `query` does not expose the internal `PinRecord`; regular callers should not assemble release ranges by hand.
 
 #### Query flow (when `local_only=false`)
@@ -941,7 +941,7 @@ The implementation is separate, in `src/indexer/health_check.cpp`; it only reads
 | `HEALTH_FULL_SLOT_LEAK` | Slots allocated in the FULL mempool and slots referenced in the tree **do not correspond one to one** | mempool used-bitmap ⟷ `full_slots` collected by traversing the whole tree from root |
 | `HEALTH_SWA_SLOT_LEAK` | Same for the SWA pool (only counts lane entries `!= INVALID_COMPONENT_SLOT`) | SWA mempool ⟷ SWA lane of each node |
 | `HEALTH_MAMBA_SLOT_LEAK` | Same for the Mamba pool | Mamba mempool ⟷ `mamba_checkpoint_slot` of each node |
-| `HEALTH_REF_LEAK` | `ref_count` / `swa_ref_count` / `mamba_ref_count` of any node is not 0 (pin not released) | Traverse all reachable nodes |
+| `HEALTH_REF_LEAK` | a `local_*` or `remote_*` Full / SWA / Mamba ref count of any node is not 0 (pin not released) | Traverse all reachable nodes |
 | `HEALTH_NODE_LEAK` | Number of nodes reachable from root ≠ `node_pool_size` (node leak / dangling) | Root traversal count ⟷ `ShmHeader::node_pool_size` |
 | `HEALTH_NOT_ATTACHED` | No local tree to check (observer client `no_local_tree`, or server not yet bootstrapped) | — |
 

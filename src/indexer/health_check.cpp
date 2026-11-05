@@ -108,10 +108,13 @@ public:
             if (++r.nodes_reachable > capacity) break;    // cycle guard, same cause
             const TreeNode* node = t.nodes_.get(id);
 
-            int64_t refs = node->ref_count.load(std::memory_order_relaxed);
+            int64_t refs = node->local_ref_count.load(std::memory_order_relaxed) +
+                           node->remote_ref_count.load(std::memory_order_relaxed);
             if (const NodeComponentState* cs = t.nodes_.component_state(id)) {
-                refs += cs->swa_ref_count.load(std::memory_order_relaxed);
-                refs += cs->mamba_ref_count.load(std::memory_order_relaxed);
+                refs += cs->local_swa_ref_count.load(std::memory_order_relaxed) +
+                        cs->remote_swa_ref_count.load(std::memory_order_relaxed);
+                refs += cs->local_mamba_ref_count.load(std::memory_order_relaxed) +
+                        cs->remote_mamba_ref_count.load(std::memory_order_relaxed);
             }
             if (refs != 0) { r.nodes_with_refs++; r.ref_total += refs; }
 

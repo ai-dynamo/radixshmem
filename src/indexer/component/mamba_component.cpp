@@ -105,8 +105,9 @@ int RadixShmemTree::evict_mamba_walk(int need_slots) {
         const int32_t slot = (int32_t)cur;
         const SlotLruEntry e = mamba_lru_.entry(slot);
         cur = e.next;
-        if (nodes_.component_state(e.node_id)->mamba_ref_count.load(
-                std::memory_order_relaxed) != 0)
+        const NodeComponentState* cs = nodes_.component_state(e.node_id);
+        if (cs->local_mamba_ref_count.load(std::memory_order_relaxed) != 0 ||
+            cs->remote_mamba_ref_count.load(std::memory_order_relaxed) != 0)
             continue;
         nodes_.get(e.node_id)->mamba_checkpoint_slot = INVALID_COMPONENT_SLOT;
         mamba_lru_.unlink(slot);

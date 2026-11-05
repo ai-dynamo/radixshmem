@@ -1662,6 +1662,61 @@ static void test_remote_multinode_cut_and_release_guards() {
     TEST_PASS();
 }
 
+static void test_local_and_remote_refs_are_separate() {
+    TEST_BEGIN("remote: CPU pins use local_*, RDMA pins remote_*; split copies both");
+
+    const char* name = "/test_cq_split_refs";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 8));
+    auto h = seq(2600, 4);
+    insert_fresh(t, h.data(), 4);
+    publish_at(t, h.data(), 4, 4);
+    mamba_ok(t, h.data(), 4);
+
+    auto* base = static_cast<char*>(t.shm_base());
+    auto* hdr = reinterpret_cast<ShmHeader*>(base);
+    auto* nodes = reinterpret_cast<TreeNode*>(base + hdr->node_pool_offset);
+    auto* cst = reinterpret_cast<NodeComponentState*>(base + hdr->component_state_offset);
+    const uint32_t id = hdr->leaf_list_head;
+    auto refs = [&](uint32_t n) {
+        return std::vector<int64_t>{nodes[n].local_ref_count.load(), nodes[n].remote_ref_count.load(),
+                                    cst[n].local_swa_ref_count.load(), cst[n].remote_swa_ref_count.load(),
+                                    cst[n].local_mamba_ref_count.load(), cst[n].remote_mamba_ref_count.load()};
+    };
+
+    auto q = qp(t, h.data(), 4, FSM);
+    assert(q.common_hit == 4);
+    assert(refs(id) == (std::vector<int64_t>{1, 0, 1, 0, 1, 0}));
+
+    Rig r(t);
+    auto res = r.walker.walk_components(r.info, h.data(), 4, FSM, /*lock=*/true);
+    assert(res.tree.common_hit == 4 && !res.remote_pin.empty());
+    assert(refs(id) == (std::vector<int64_t>{1, 1, 1, 1, 1, 1}));
+
+    auto g = h;
+    g[2] = 2690;
+    g[3] = 2691;
+    insert_fresh(t, g.data(), 4, 2);
+    const uint32_t pre = nodes[id].parent_id;
+    assert(pre != hdr->root_node_id && nodes[pre].num_blocks == 2 && nodes[id].num_blocks == 2);
+    assert(refs(pre) == (std::vector<int64_t>{1, 1, 1, 1, 0, 0}));
+    assert(refs(id) == (std::vector<int64_t>{1, 1, 1, 1, 1, 1}));
+
+    assert(t.dec_ref(h.data(), 4, std::move(q.pin)));
+    assert(refs(pre) == (std::vector<int64_t>{0, 1, 0, 1, 0, 0}));
+    assert(refs(id) == (std::vector<int64_t>{0, 1, 0, 1, 0, 1}));
+    assert(t.dedup_prefix(h.data(), 4) == 0 && hit(t, h.data(), 4) == 4);
+
+    assert(r.walker.dec_ref_components_remote(r.info, h.data(), 4, std::move(res.remote_pin)));
+    assert(refs(pre) == (std::vector<int64_t>{0, 0, 0, 0, 0, 0}));
+    assert(refs(id) == (std::vector<int64_t>{0, 0, 0, 0, 0, 0}));
+    assert(t.dedup_prefix(h.data(), 4) == 2 && hit(t, h.data(), 4) == 2);
+
+    expect_healthy(t);
+    t.destroy();
+    TEST_PASS();
+}
+
 #endif
 
 int main() {
@@ -1702,6 +1757,7 @@ int main() {
     test_remote_hints_and_failstop();
     test_remote_hint_chain_is_the_walk();
     test_remote_multinode_cut_and_release_guards();
+    test_local_and_remote_refs_are_separate();
 #endif
     return tests_report();
 }
