@@ -10,7 +10,7 @@ import pytest
 
 import radixshmem
 from radixshmem import ComponentType, PullJob, PushJob, PushResult, RadixClient, RadixServer, ServerConfig
-from radixshmem.client import XFER_IN_FLIGHT, XFER_READ, XFER_WRITE
+from radixshmem.client import MODE_READY, XFER_IN_FLIGHT, XFER_READ, XFER_WRITE, NodeInfo
 from radixshmem.server import _Job
 
 _data = getattr(radixshmem, "_data", None)
@@ -160,10 +160,11 @@ class StubTransport:
         pass
 
 
-def client(index, replies=None):
+def client(index, replies=None, role="prefill"):
     c = RadixClient.__new__(RadixClient)
     c._init("/py_tj", StubTransport(replies or {}), 4, False)
     c._index, c._store = index, SimpleNamespace(pool=lambda kind: SimpleNamespace(slot_bytes=10))
+    c.info = NodeInfo(MODE_READY, role=role)
     return c
 
 
@@ -298,6 +299,75 @@ def test_pull_keeps_the_staging_slots_a_read_may_still_reach():
     c = client(StubIndex())
     pull_job(c, [(False, 0, 0, "XferState.FAILED"), (False, 0, 0, XFER_IN_FLIGHT)])
     assert c._index.log == [("local recycle", FULL, [10, 11])]
+
+
+class DedupIndex(StubIndex):
+    def __init__(self, common, gate=None):
+        super().__init__()
+        self.common, self.gate, self.dedups = common, gate, []
+
+    def insert(self, hashes, slots, start=0, component=FULL):
+        pass
+
+    def query(self, hashes, mask, local_only, lock, update_meta):
+        n = min(self.common, len(hashes))
+        return SimpleNamespace(status=0, common_hit=n, full_fragments=[(0, 0, np.arange(n, dtype=np.int32))],
+                               swa_start=0, swa_slots=[], mamba=None, finalize=lambda: None)
+
+    def remote_dedup_prefix(self, rank, hashes):
+        if self.gate is not None:
+            self.gate.wait(5)
+        self.dedups.append((rank, [int(x) for x in hashes]))
+
+
+def full_pull(c):
+    job = PullJob(1, c)
+    job._q, job._hashes, job._hit = SimpleNamespace(finalize=lambda: None), np.arange(8, dtype=np.uint64), 8
+    job._items = [(1, int(FULL), [5, 6], [10, 11]), (2, int(SWA), [7], [12])]
+    job._staged = {FULL: (6, np.array([10, 11], dtype=np.int32)), SWA: (0, np.array([12], dtype=np.int32))}
+    c._complete(job, [(True, 64, 1, ""), (True, 64, 1, "")])
+    return job.wait(0).common_hit
+
+
+def wait_for(cond, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while not cond():
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+def test_a_full_pull_asks_every_source_to_drop_its_copy():
+    index = DedupIndex(common=8)
+    c = client(index)
+    try:
+        assert full_pull(c) == 8
+        wait_for(lambda: len(index.dedups) == 2)
+        assert sorted(index.dedups) == [(1, list(range(8))), (2, list(range(8)))]
+    finally:
+        c.close()
+
+
+@pytest.mark.parametrize("common, env, role", [(6, "0", "prefill"), (8, "1", "prefill"), (8, "0", "decode")])
+def test_no_dedup_after_a_short_pull_when_disabled_or_on_a_decode_node(monkeypatch, common, env, role):
+    monkeypatch.setenv("RADIXSHMEM_DISABLE_AUTO_DEDUP", env)
+    index = DedupIndex(common=common)
+    c = client(index, role=role)
+    try:
+        assert full_pull(c) == common
+        assert c._deduper is None and index.dedups == []
+    finally:
+        c.close()
+
+
+def test_close_drops_queued_dedups_and_waits_for_the_one_in_flight():
+    gate = threading.Event()
+    index = DedupIndex(common=8, gate=gate)
+    c = client(index)
+    full_pull(c)
+    wait_for(lambda: len(c._dedups) == 1)
+    threading.Timer(0.2, gate.set).start()
+    c.close()
+    assert len(index.dedups) == 1 and not c._deduper.is_alive() and not c._dedups
 
 
 def test_close_releases_the_pins_of_unfinished_pushes_concurrently():

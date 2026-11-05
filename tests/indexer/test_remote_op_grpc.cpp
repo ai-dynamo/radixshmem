@@ -369,6 +369,38 @@ void test_allocate_components() {
 }
 
 // ---- deadline: TIMEOUT, the op still runs once, the client never replays ----
+void test_dedup_prefix() {
+    TEST_BEGIN("DedupPrefix drops a covered leaf; RADIXSHMEM_DISABLE_AUTO_DEDUP=1 keeps it");
+    auto h = make_hashes(300, 8);
+    auto longer = make_hashes(300, 12);
+    {
+        Node node("dedup");
+        GrpcRemoteOpServer server(0, kInstance);
+        server.start(*node.svc);
+        GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+        insert_auto(*node.client, h.data(), 8);
+        DedupReply r = cli.dedup_prefix(longer.data(), 12);
+        assert(r.status == RemoteStatus::OK && r.freed == 8 && node.used() == 0);
+        r = cli.dedup_prefix(longer.data(), 12);
+        assert(r.status == RemoteStatus::OK && r.freed == 0);
+        assert(cli.dedup_prefix(nullptr, 3).status == RemoteStatus::BAD_REQUEST);
+        server.stop();
+        expect_healthy(*node.client);
+    }
+    ::setenv("RADIXSHMEM_DISABLE_AUTO_DEDUP", "1", 1);
+    Node node("dedupoff");
+    ::unsetenv("RADIXSHMEM_DISABLE_AUTO_DEDUP");
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    insert_auto(*node.client, h.data(), 8);
+    DedupReply r = cli.dedup_prefix(h.data(), 8);
+    assert(r.status == RemoteStatus::OK && r.freed == 0 && node.used() == 8);
+    server.stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
 void test_deadline_no_replay() {
     TEST_BEGIN("deadline → TIMEOUT, op runs exactly once");
     Node node("dl");
@@ -573,6 +605,12 @@ struct FakeTransport final : IRemoteOpClientTransport {
         calls++;
         return next;
     }
+    DedupReply dedup_prefix(const uint64_t*, int) override {
+        calls++;
+        DedupReply r;
+        r.status = next;
+        return r;
+    }
     bool connected() override { return up; }
 };
 
@@ -606,6 +644,7 @@ void test_breaker_gates_remote_ops() {
            path.runs[0].error == InsertError::REMOTE_FAILED);
     assert(peer.recycle(s.data(), 4) == RemoteStatus::UNAVAILABLE);
     assert(peer.unlock(h.data(), 4, 0, 4, 4, {}) == RemoteStatus::UNAVAILABLE);
+    assert(peer.dedup_prefix(h.data(), 4).status == RemoteStatus::UNAVAILABLE);
     assert(t.calls == calls);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -741,6 +780,7 @@ int main() {
     test_insert_path();
     test_insert_path_rejects_bad_runs();
     test_allocate_components();
+    test_dedup_prefix();
     test_deadline_no_replay();
     test_no_admission_cap();
     test_deadline_skips_allocate_and_query();

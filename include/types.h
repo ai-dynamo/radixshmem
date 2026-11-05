@@ -399,6 +399,11 @@ struct AllocateComponentsReply {
     std::vector<std::vector<int32_t>> slots;
 };
 
+struct DedupReply {
+    RemoteStatus status = RemoteStatus::OK;
+    int freed = 0;
+};
+
 struct QueryReply {
     RemoteStatus status = RemoteStatus::OK;
     int hit_length       = 0;   // B local-tree total matched blocks

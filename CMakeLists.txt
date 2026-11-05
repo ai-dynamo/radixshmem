@@ -355,6 +355,7 @@ set(_core_unit_tests
     test_component_evict
     # Background eviction with write-back: held slots, pinned prefixes, queue.
     test_evict_writeback
+    test_tree_dedup
     # RhtEngine over a fake one-sided endpoint: scratch-bounded lookup rounds,
     # remote insert/remove plumbing (self-gates on RADIXSHMEM_NO_RDMA).
     test_rht_engine

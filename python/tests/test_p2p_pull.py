@@ -67,6 +67,11 @@ def client_main(role: str, endpoint: str) -> int:
             r.finalize()
         out["local_hit_after"] = sum(int(c.query(h, local_only=True, update_meta=False).common_hit)
                                      for h in hs)
+        src, left, deadline = results[0].source_rank, -1, time.monotonic() + 10
+        while left != 0 and time.monotonic() < deadline:
+            left = sum(int(c.remote_query(src, h, False, False).total_hit_length) for h in hs)
+            time.sleep(0.05)
+        out["source_hit_after"] = left
     elif role == "health":
         out["health"] = int(c.check_health())
         out["report"] = c.health_report().describe().strip()
@@ -231,6 +236,7 @@ def orchestrate(a) -> int:
               f"all blocks came from rank {ranks[0]}")
         check(r["bytes_ok"] == total, "every slot holds the writer's bytes")
         check(r["local_hit_after"] == total, "node1 now serves the prefixes locally")
+        check(r["source_hit_after"] == 0, "node0 dropped the prefixes node1 pulled")
 
         print("\n[5] both trees are leak-free")
         for i, h in enumerate(run_clients([("health", endpoints[0]), ("health", endpoints[1])])):

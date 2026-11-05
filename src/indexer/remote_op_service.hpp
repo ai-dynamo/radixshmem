@@ -20,8 +20,7 @@ public:
 
     // `insert_mu` serializes allocate and insert (the svc client's RHT publish).
     RemoteOpService(LocalTreeConnector& tree, RadixClient& client,
-                    std::mutex& insert_mu)
-        : tree_(tree), client_(client), insert_mu_(insert_mu) {}
+                    std::mutex& insert_mu);
 
     // All-or-nothing: on a short pool, error = MEMPOOL_FULL and no slots.
     AllocateReply allocate(int n, Deadline deadline = Deadline::max(),
@@ -42,11 +41,13 @@ public:
     // Drop a query(lock=true) pin over hashes[start, start + length).
     RemoteStatus  unlock(const uint64_t* hashes, int n, int start, int length,
                          int pin_end, const uint64_t* pin_tail, int pin_tail_n);
+    DedupReply    dedup_prefix(const uint64_t* hashes, int n);
 
 private:
     LocalTreeConnector& tree_;
     RadixClient&        client_;
     std::mutex&         insert_mu_;
+    bool                dedup_off_;
 };
 
 }  // namespace radixshmem

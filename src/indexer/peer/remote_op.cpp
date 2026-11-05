@@ -142,6 +142,18 @@ RemoteStatus RemotePeer::unlock(const uint64_t* hashes, int n, int start,
     return st;
 }
 
+DedupReply RemotePeer::dedup_prefix(const uint64_t* hashes, int n) {
+    DedupReply r;
+    if (skipped()) {
+        r.status = RemoteStatus::UNAVAILABLE;
+        return r;
+    }
+    const auto t0 = Clock::now();
+    r = transport_->dedup_prefix(hashes, n);
+    observe("dedup prefix", r.status, since(t0));
+    return r;
+}
+
 }  // namespace radixshmem
 
 #endif  // !RADIXSHMEM_NO_RDMA

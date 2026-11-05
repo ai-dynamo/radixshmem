@@ -291,6 +291,19 @@ RemoteStatus GrpcRemoteOpClientTransport::unlock(
     return to_remote_status(impl_->stub->Unlock(&ctx, req, &rep));
 }
 
+DedupReply GrpcRemoteOpClientTransport::dedup_prefix(const uint64_t* hashes, int n) {
+    DedupReply out;
+    if (!copyable(hashes, n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
+    pb::DedupPrefixRequest req;
+    req.mutable_hashes()->Add(hashes, hashes + n);
+    pb::DedupPrefixResponse rep;
+    grpc::ClientContext ctx;
+    impl_->prepare(ctx);
+    out.status = to_remote_status(impl_->stub->DedupPrefix(&ctx, req, &rep));
+    if (out.status == RemoteStatus::OK) out.freed = rep.freed();
+    return out;
+}
+
 bool GrpcRemoteOpClientTransport::connected() {
     return impl_->channel->GetState(false) == GRPC_CHANNEL_READY;
 }

@@ -186,6 +186,16 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
                                           : to_grpc_status(st);
         });
     }
+
+    grpc::Status DedupPrefix(grpc::ServerContext* ctx, const pb::DedupPrefixRequest* req,
+                             pb::DedupPrefixResponse* rep) override {
+        return run(ctx, [&] {
+            DedupReply r = svc->dedup_prefix(req->hashes().data(), req->hashes_size());
+            if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
+            rep->set_freed(r.freed);
+            return grpc::Status::OK;
+        });
+    }
 };
 
 GrpcRemoteOpServer::GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id)

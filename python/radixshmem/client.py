@@ -16,12 +16,14 @@ while the server is still waiting or configuring."""
 
 from __future__ import annotations
 
+import collections
 import concurrent.futures
 import copy
+import os
 import sys
 import threading
 from dataclasses import dataclass, replace
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -47,6 +49,7 @@ XFER_READ, XFER_WRITE = "r", "w"
 XFER_IN_FLIGHT = "in flight"
 CLIENT_CLOSED = "client closed"
 PUSH_SETTLE_THREADS = 16
+DEDUP_QUEUE = 1024
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -314,6 +317,10 @@ class RadixClient:
         self._work = threading.Event()
         self._completer: Optional[threading.Thread] = None
         self._settlers: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._auto_dedup = os.environ.get("RADIXSHMEM_DISABLE_AUTO_DEDUP", "0") != "1"
+        self._dedup_cv = threading.Condition()
+        self._dedups: Deque[Tuple[int, np.ndarray]] = collections.deque()
+        self._deduper: Optional[threading.Thread] = None
         self._closed = False
 
     # ------------------------------------------------------------- control
@@ -409,6 +416,11 @@ class RadixClient:
             job._f.set_result(PushResult(job._hit, job._hit, 0, 0, False))
         if settlers is not None:
             settlers.shutdown(wait=True)
+        with self._dedup_cv:
+            self._dedups.clear()
+            self._dedup_cv.notify_all()
+        if self._deduper is not None:
+            self._deduper.join()
         self._store = None
         self._index = None
         self._t.close()
@@ -714,9 +726,11 @@ class RadixClient:
                 nbytes += len(st) * int(self._store.pool(kind).slot_bytes)
             elif kind not in late:
                 self._recycle(st, kind)
-        self._finish(job, hit, pulled, nbytes)
+        common = self._finish(job, hit, pulled, nbytes)
+        if pulled and common == job._hit:
+            self._dedup(job, common)
 
-    def _finish(self, job: PullJob, hit: int, pulled: int = 0, nbytes: int = 0) -> None:
+    def _finish(self, job: PullJob, hit: int, pulled: int = 0, nbytes: int = 0) -> int:
         lock = job._lock and not job._cancelled
         r = (self._index.query(job._hashes[:hit], mask=job._mask, local_only=True,
                                lock=lock, update_meta=False) if hit > 0 else None)
@@ -738,6 +752,33 @@ class RadixClient:
             job._f.set_result(res)
             if job._cancelled:      # cancelled between the pin above and here
                 res.finalize()
+        return common
+
+    def _dedup(self, job: PullJob, common: int) -> None:
+        if not self._auto_dedup or self.info.role == "decode":
+            return
+        hashes = job._hashes[:common]
+        with self._dedup_cv:
+            if self._closed:
+                return
+            for rank in {int(item[0]) for item in job._items}:
+                if len(self._dedups) < DEDUP_QUEUE:
+                    self._dedups.append((rank, hashes))
+            if self._deduper is None:
+                self._deduper = threading.Thread(target=self._run_dedup, name="radixshmem-dedup",
+                                                 daemon=True)
+                self._deduper.start()
+            self._dedup_cv.notify()
+
+    def _run_dedup(self) -> None:
+        while True:
+            with self._dedup_cv:
+                while not self._dedups and not self._closed:
+                    self._dedup_cv.wait()
+                if self._closed:
+                    return
+                rank, hashes = self._dedups.popleft()
+            self._index.remote_dedup_prefix(rank, hashes)
 
     def _recycle(self, slots, kind: ComponentType) -> None:
         if len(slots):

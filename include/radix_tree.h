@@ -108,6 +108,8 @@ public:
 
     int try_evict_component_batch(ComponentType component, int target_slots);
 
+    int dedup_prefix(const uint64_t* hashes, int n);
+
     std::vector<NodeBoundary> get_node_boundaries(const uint64_t* hashes, int n);
 
     // Component-aware peer of query(): mask selects enabled components, lock
@@ -285,6 +287,8 @@ private:
     // Pin-eligibility: full/swa/mamba ref classes on the node are all zero.
     bool component_refs_zero(uint32_t node_id) const;
     int  evict_node(uint32_t node_id, std::vector<int32_t>& out, bool hold = false);
+    int  detach_node(uint32_t node_id, std::vector<int32_t>& out, bool hold = false);
+    std::vector<uint32_t> dedup_chain(const uint64_t* hashes, int n);
     int  evict_held_chain(uint32_t leaf, std::vector<int32_t>& out, HeldEviction& h);
     // Path [0, end of leaf) into h; the ancestors above `top` are pinned.
     void hold_path(uint32_t leaf, uint32_t top, HeldEviction& h);

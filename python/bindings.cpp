@@ -796,6 +796,13 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("rank"), py::arg("hashes"), py::arg("lock") = false,
            py::arg("update_meta") = true,
            "Query `rank`'s own tree (1 RTT); lock=True releases via finalize().")
+
+        .def("remote_dedup_prefix", [](RadixClient& c, int rank, py::array_t<uint64_t> hashes) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            DedupReply rep;
+            { py::gil_scoped_release rel; rep = c.remote_dedup_prefix(rank, ptr, len); }
+            return rep;
+        }, py::arg("rank"), py::arg("hashes"))
 #endif
 
         .def_static("compute_hashes", &py_compute_hashes,
@@ -820,6 +827,10 @@ PYBIND11_MODULE(_core, m) {
             for (const std::vector<int32_t>& s : r.slots) out.append(vec_to_npy_i32(s));
             return out;
         });
+
+    py::class_<DedupReply>(m, "DedupReply")
+        .def_readonly("status", &DedupReply::status)
+        .def_readonly("freed", &DedupReply::freed);
 #endif  // !RADIXSHMEM_NO_RDMA
 
     // ==================== Free functions ====================
