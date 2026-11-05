@@ -1579,7 +1579,8 @@ InsertResult RadixShmemTree::insert(const uint64_t* hashes, int n,
 InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
                                        const int32_t* ext_slots,
                                        int ext_num_slots,
-                                       int start, bool auto_recycle) {
+                                       int start, bool auto_recycle,
+                                       const uint64_t* ts) {
     set_write_op("insert");
     InsertResult result;
 
@@ -1601,10 +1602,10 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
     }
 
     write_lock();
-    QueryInternalDetail match = query_internal(hashes, n, now_ts());
+    QueryInternalDetail match = query_internal(hashes, n, ts ? 0 : now_ts(), ts == nullptr);
 
     // Strict-LRU: promote terminal leaf to tail (safe under write_lock).
-    if (match.last_node_id != INVALID_NODE_ID &&
+    if (!ts && match.last_node_id != INVALID_NODE_ID &&
         is_in_leaf_list(match.last_node_id))
         leaf_list_move_to_tail(match.last_node_id);
 
@@ -1745,9 +1746,14 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
         header()->total_blocks.fetch_add(chunk, std::memory_order_relaxed);
 
         // Only the last chunk is a real leaf.
-        new_node->last_access_time.store(now_ts(), std::memory_order_relaxed);
-        if (chunk == remaining)
-            leaf_list_add(new_id);
+        uint64_t at = ts ? 0 : now_ts();
+        for (int i = 0; ts && i < chunk; i++)
+            at = std::max(at, ts[skip + slot_idx + i]);
+        new_node->last_access_time.store(at, std::memory_order_relaxed);
+        if (chunk == remaining) {
+            if (ts) leaf_list_insert_by_access_time(new_id);
+            else leaf_list_add(new_id);
+        }
 
         new_leaf_ids.push_back(new_id);
 
@@ -1778,7 +1784,7 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
     }
 
     // Auto-merge (single-chunk extension): fold only-child leaf into its parent.
-    if (result.error == InsertError::OK && new_leaf_ids.size() == 1) {
+    if (!ts && result.error == InsertError::OK && new_leaf_ids.size() == 1) {
         uint32_t leaf_id = new_leaf_ids.back();
         uint32_t p_id = nodes_.get(leaf_id)->parent_id;
         if (p_id != header()->root_node_id &&
@@ -1950,7 +1956,7 @@ Mempool* RadixShmemTree::try_component_pool(ComponentType component) noexcept {
 }
 
 int RadixShmemTree::allocate_slots(int num_slots, std::vector<int32_t>& out,
-                                 ComponentType component) {
+                                 ComponentType component, bool may_evict) {
     set_write_op("alloc");
     out.clear();
     Mempool* pool = try_component_pool(component);
@@ -1958,11 +1964,17 @@ int RadixShmemTree::allocate_slots(int num_slots, std::vector<int32_t>& out,
     if (!pool->enabled()) return 0;
     // Bad args: non-positive, or larger than the pool can ever hold. Signal -1
     // rather than silently returning 0 / a truncated set.
-    if (num_slots <= 0 || (uint32_t)num_slots > pool->total()) return -1;
+    if (num_slots <= 0 || (may_evict && (uint32_t)num_slots > pool->total())) return -1;
 
     write_lock();
     int free_now = (int)pool->num_free();
-    if (free_now < num_slots) {
+    if (!may_evict) {
+        num_slots = std::min(num_slots, free_now);
+        if (num_slots == 0) {
+            write_unlock();
+            return 0;
+        }
+    } else if (free_now < num_slots) {
         if (component != ComponentType::FULL) {
             // All-or-none: evict from this component's own chain, then retry
             // the same request exactly once.

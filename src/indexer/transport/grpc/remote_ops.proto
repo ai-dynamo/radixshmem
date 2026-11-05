@@ -122,9 +122,35 @@ message UnlockRequest {
 }
 message UnlockResponse {}
 
+// An SWA cell at block `pos`, or a Mamba checkpoint at the END pos + 1.
+message MovedCell {
+  Component component = 1;
+  int32 pos = 2;
+  int32 slot = 3;
+  uint64 age_ns = 4;
+}
+// The request's [0, base) plus `hashes`; FULL slots cover [full_from, base + len(hashes)).
+message MovedPath {
+  int32 base = 1;
+  repeated fixed64 hashes = 2;
+  int32 full_from = 3;
+  repeated int32 full = 4;
+  repeated uint64 full_age_ns = 5;
+  repeated MovedCell cells = 6;
+}
+
+// Drop the copy the caller now holds too. With landing slots (free slots of the
+// caller's pools, one entry per Component) the target also writes what blocks the
+// drop into them and lists it in `moved`.
 message DedupPrefixRequest {
   repeated fixed64 hashes = 1;
+  int32 rank = 2;
+  int32 tail_cap = 3;
+  int32 branch_cap = 4;
+  repeated ComponentSlots landing = 5;
 }
 message DedupPrefixResponse {
   int32 freed = 1;
+  repeated MovedPath moved = 2;
+  repeated ComponentSlots unused = 3;   // landing slots nothing was written to
 }

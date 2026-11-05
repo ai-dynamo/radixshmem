@@ -5,6 +5,7 @@
 
 #include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "health_check.h"
+#include "dedup_writer.h"
 #include "types.h"
 #include "writeback.h"
 
@@ -142,6 +143,7 @@ public:
     int check_health(HealthReport* report = nullptr) const;
 
     WritebackQueue* writeback() { return writeback_.get(); }
+    DedupWriteQueue* dedup_writes() { return dedup_writes_.get(); }
 
 private:
     RadixServerConfig cfg_;
@@ -152,6 +154,7 @@ private:
     std::thread evictor_thread_;
     std::atomic<bool> evictor_running_{false};
     std::unique_ptr<WritebackQueue> writeback_;   // refers to *tree_: reset before it
+    std::unique_ptr<DedupWriteQueue> dedup_writes_ = std::make_unique<DedupWriteQueue>();
 
     void start_evictor();
     void stop_evictor();

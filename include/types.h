@@ -401,9 +401,40 @@ struct AllocateComponentsReply {
     std::vector<std::vector<int32_t>> slots;
 };
 
+// An SWA cell at block `pos`, or a Mamba checkpoint at the END pos + 1.
+struct MovedCell {
+    ComponentType component = ComponentType::SWA;
+    int32_t pos = 0;
+    int32_t slot = INVALID_COMPONENT_SLOT;
+    uint64_t age_ns = 0;
+};
+
+// A path a dedup source hands to the puller: the request's [0, base) plus `hashes`;
+// FULL slots cover [full_from, base + hashes.size()).
+struct MovedPath {
+    int32_t base = 0;
+    std::vector<uint64_t> hashes;
+    int32_t full_from = 0;
+    std::vector<int32_t> full;
+    std::vector<uint64_t> full_age_ns;
+    std::vector<MovedCell> cells;
+};
+
+// Without landing slots the source only drops; with them it also moves what blocks
+// the drop into those slots of the puller's pools.
+struct DedupRequest {
+    int32_t rank = -1;
+    int32_t tail_cap = 0;
+    int32_t branch_cap = 0;
+    std::vector<int32_t> landing[NUM_COMPONENT_TYPES];
+};
+
 struct DedupReply {
     RemoteStatus status = RemoteStatus::OK;
     int freed = 0;
+    std::vector<MovedPath> moved;                       // slots are landing slots
+    // Landing slots nothing was written to; the others not in `moved` may still be.
+    std::vector<int32_t> unused[NUM_COMPONENT_TYPES];
 };
 
 struct QueryReply {

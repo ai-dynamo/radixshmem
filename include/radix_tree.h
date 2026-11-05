@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace radixshmem {
@@ -41,6 +42,16 @@ struct HeldEviction {
 
     uint32_t end() const { return (uint32_t)hashes.size(); }
     void covered(uint64_t out[NUM_COMPONENT_TYPES]) const;
+};
+
+// What plan_dedup() moves, pinned until finish_dedup(); `moved` holds the source's slots.
+struct DedupPlan {
+    std::vector<MovedPath> moved;
+    uint64_t top_hash = 0;                  // first block of the topmost dropped node
+    uint64_t generation = 0;
+    std::unordered_set<uint64_t> blocks;    // every block below and in that node
+    std::unordered_set<uint64_t> swa;       // blocks whose SWA cell moves
+    std::unordered_set<int32_t> mamba;      // checkpoints that move
 };
 
 // Result of one merge_leaf_into_parent() call.
@@ -110,6 +121,18 @@ public:
 
     int dedup_prefix(const uint64_t* hashes, int n);
 
+    // Dedup that moves what would block it: the subtree below the match (<= tail_cap
+    // blocks), each fork's side subtrees (<= branch_cap blocks) and the cells of the
+    // dropped path, within budget[component] slots. False when nothing can be dropped.
+    bool plan_dedup(const uint64_t* hashes, int n, int tail_cap, int branch_cap,
+                    const uint32_t budget[NUM_COMPONENT_TYPES], DedupPlan& plan);
+    // Unpins the plan; with `commit`, drops its subtree unless it changed. Returns blocks freed.
+    int finish_dedup(DedupPlan& plan, bool commit);
+    // Publishes a moved path [0, n) and leaves what is already there untouched; new
+    // entries take now - age as their access time. Slots not taken go to `unused`.
+    InsertResult adopt(const uint64_t* hashes, int n, const MovedPath& p,
+                       std::vector<int32_t> unused[NUM_COMPONENT_TYPES]);
+
     std::vector<NodeBoundary> get_node_boundaries(const uint64_t* hashes, int n);
 
     // Component-aware peer of query(): mask selects enabled components, lock
@@ -146,8 +169,9 @@ public:
 
     // Allocate slot IDs from the component's pool (FULL auto-evicts LRU and may
     // return fewer; SWA/Mamba are all-or-none — insufficient capacity returns 0).
+    // Without `may_evict`, takes up to num_slots of the free ones.
     int allocate_slots(int num_slots, std::vector<int32_t>& out,
-                       ComponentType component = ComponentType::FULL);
+                       ComponentType component = ComponentType::FULL, bool may_evict = true);
 
     // Return allocated slot IDs to the component's pool; safe on never-inserted slots.
     void recycle_slots(const int32_t* slots, int num,
@@ -215,9 +239,12 @@ private:
     void alloc_root();
 
     // Core insert; ext_slots positionally bound from `start`, new nodes align to cs_.
+    // With `ts` (parallel to ext_slots) nothing on the path is touched and new nodes
+    // take those access times.
     InsertResult insert_impl(const uint64_t* hashes, int n,
                              const int32_t* ext_slots, int ext_num_slots,
-                             int start, bool auto_recycle);
+                             int start, bool auto_recycle,
+                             const uint64_t* ts = nullptr);
 
     void* base_ = nullptr;
     size_t size_ = 0;
@@ -289,6 +316,11 @@ private:
     int  evict_node(uint32_t node_id, std::vector<int32_t>& out, bool hold = false);
     int  detach_node(uint32_t node_id, std::vector<int32_t>& out, bool hold = false);
     std::vector<uint32_t> dedup_chain(const uint64_t* hashes, int n);
+    struct MoveCost;
+    // Paths of the subtree from block `skip` of `top` down, hanging at request position
+    // `base`; stops once cost.blocks passes `cap`.
+    void scan_moved(uint32_t top, int skip, int base, int cap, uint64_t now,
+                    MoveCost& cost, std::vector<MovedPath>& out);
     int  evict_held_chain(uint32_t leaf, std::vector<int32_t>& out, HeldEviction& h);
     // Path [0, end of leaf) into h; the ancestors above `top` are pinned.
     void hold_path(uint32_t leaf, uint32_t top, HeldEviction& h);

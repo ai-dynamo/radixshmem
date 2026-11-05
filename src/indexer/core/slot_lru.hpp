@@ -29,6 +29,10 @@ public:
     uint32_t head() const { return anchors_->head; }
 
     void push_tail(int32_t slot, uint32_t node_id, uint32_t idx, uint64_t ts);
+    // Links after the newest entry not newer than ts, searched back from the tail;
+    // past max_steps it goes to the head.
+    void insert_by_ts(int32_t slot, uint32_t node_id, uint32_t idx, uint64_t ts,
+                      uint32_t max_steps);
     void move_tail(int32_t slot, uint64_t ts);
     void unlink(int32_t slot);
 

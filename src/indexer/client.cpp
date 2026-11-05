@@ -359,33 +359,36 @@ InsertResult RadixClient::dist_insert(const uint64_t* hashes, int n,
     // Node boundaries align to cs so peer RHT probes land on a node first_hash.
     InsertResult result = tree.insert(hashes, n, slots, num_slots,
                                       start, auto_recycle);
-
-    int my_rank = peer_reg_->my_rank();
     // Republish the whole root→leaf chain (idempotent), so merge/collision can't leave any node unrouted.
-    if (rht_conn_ && my_rank >= 0 && result.error == InsertError::OK) {
-        std::vector<NodeBoundary> chain = tree.get_node_boundaries(hashes, n);
-        if (!chain.empty()) {
-            std::vector<RhtInsertEntry> entries;
-            entries.reserve(chain.size() + 1);
-            for (const auto& b : chain)
-                entries.push_back({b.first_hash, (int32_t)my_rank,
-                                   b.tree_node_id, b.node_blocks});
-            if (result.split_node_id != INVALID_NODE_ID)   // suffix off the path
-                entries.push_back({result.split_first_hash, (int32_t)my_rank,
-                                   result.split_node_id, result.split_num_blocks});
-            rht_conn_->insert_batch(entries.data(), (int)entries.size());
-            if (debug_route_) {
-                fprintf(stderr, "[pub r%d] n=%d start=%d h0=%08llx chain:",
-                        my_rank, n, start, (unsigned long long)(hashes[0] & 0xffffffffu));
-                for (const auto& b : chain)
-                    fprintf(stderr, " %d+%d:%08llx:t%u/%u", b.offset, b.num_blocks,
-                            (unsigned long long)(b.first_hash & 0xffffffffu),
-                            b.tree_node_id, b.node_blocks);
-                fprintf(stderr, "\n");
-            }
-        }
-    }
+    if (result.error == InsertError::OK)
+        publish_chain(hashes, n, result, start);
     return result;
+}
+
+void RadixClient::publish_chain(const uint64_t* hashes, int n, const InsertResult& r,
+                                int start) {
+    int my_rank = peer_reg_->my_rank();
+    if (!rht_conn_ || my_rank < 0) return;
+    std::vector<NodeBoundary> chain = local_->tree().get_node_boundaries(hashes, n);
+    if (chain.empty()) return;
+    std::vector<RhtInsertEntry> entries;
+    entries.reserve(chain.size() + 1);
+    for (const auto& b : chain)
+        entries.push_back({b.first_hash, (int32_t)my_rank,
+                           b.tree_node_id, b.node_blocks});
+    if (r.split_node_id != INVALID_NODE_ID)   // suffix off the path
+        entries.push_back({r.split_first_hash, (int32_t)my_rank,
+                           r.split_node_id, r.split_num_blocks});
+    rht_conn_->insert_batch(entries.data(), (int)entries.size());
+    if (debug_route_) {
+        fprintf(stderr, "[pub r%d] n=%d start=%d h0=%08llx chain:",
+                my_rank, n, start, (unsigned long long)(hashes[0] & 0xffffffffu));
+        for (const auto& b : chain)
+            fprintf(stderr, " %d+%d:%08llx:t%u/%u", b.offset, b.num_blocks,
+                    (unsigned long long)(b.first_hash & 0xffffffffu),
+                    b.tree_node_id, b.node_blocks);
+        fprintf(stderr, "\n");
+    }
 }
 
 void RadixClient::dist_flush() { if (rht_conn_) rht_conn_->flush(); }
@@ -1036,12 +1039,50 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
     return out;
 }
 
-DedupReply RadixClient::remote_dedup_prefix(int rank, const uint64_t* hashes, int n) {
+DedupReply RadixClient::remote_dedup_prefix(int rank, const uint64_t* hashes, int n,
+                                            const DedupRequest& req) {
     DedupReply out;
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) out.unused[k] = req.landing[k];
     if (n <= 0) return out;
     auto p = peer_for(rank);
     if (!p) { out.status = missing_peer_status(rank); return out; }
-    return p->dedup_prefix(hashes, n);
+    return p->dedup_prefix(hashes, n, req);
+}
+
+int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_cap,
+                            int branch_cap, const int landing[NUM_COMPONENT_TYPES]) {
+    if (n <= 0 || !local_ || !distributed_) return 0;
+    RadixShmemTree& tree = local_->tree();
+    // Our copy must outlive the source's: hold it until what moves has landed.
+    TreeComponentQueryResult held =
+        tree.query_components(hashes, n, COMPONENT_MASK_FULL, true, false);
+    if ((int)held.topology_match_length < n) {
+        (void)tree.dec_ref(hashes, n, std::move(held.pin));
+        return 0;
+    }
+    DedupRequest req;
+    req.rank = peer_reg_->my_rank();
+    req.tail_cap = tail_cap;
+    req.branch_cap = branch_cap;
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+        if (landing[k] > 0)
+            (void)tree.allocate_slots(landing[k], req.landing[k], (ComponentType)k, false);
+    DedupReply rep = remote_dedup_prefix(rank, hashes, n, req);
+    std::vector<int32_t> unused[NUM_COMPONENT_TYPES];
+    std::vector<uint64_t> path;
+    for (const MovedPath& m : rep.moved) {
+        path.assign(hashes, hashes + std::min(m.base, n));
+        path.insert(path.end(), m.hashes.begin(), m.hashes.end());
+        InsertResult r = tree.adopt(path.data(), (int)path.size(), m, unused);
+        publish_chain(path.data(), (int)path.size(), r, m.full_from);
+    }
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
+        unused[k].insert(unused[k].end(), rep.unused[k].begin(), rep.unused[k].end());
+        if (!unused[k].empty())
+            tree.recycle_slots(unused[k].data(), (int)unused[k].size(), (ComponentType)k);
+    }
+    (void)tree.dec_ref(hashes, n, std::move(held.pin));
+    return rep.status == RemoteStatus::OK ? rep.freed : 0;
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA

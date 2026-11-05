@@ -10,7 +10,7 @@ import pytest
 
 import radixshmem
 from radixshmem import ComponentType, PullJob, PushJob, PushResult, RadixClient, RadixServer, ServerConfig
-from radixshmem.client import MODE_READY, XFER_IN_FLIGHT, XFER_READ, XFER_WRITE, NodeInfo
+from radixshmem.client import DEDUP_LANDING, MODE_READY, XFER_IN_FLIGHT, XFER_READ, XFER_WRITE, NodeInfo
 from radixshmem.server import _Job
 
 _data = getattr(radixshmem, "_data", None)
@@ -304,7 +304,7 @@ def test_pull_keeps_the_staging_slots_a_read_may_still_reach():
 class DedupIndex(StubIndex):
     def __init__(self, common, gate=None):
         super().__init__()
-        self.common, self.gate, self.dedups = common, gate, []
+        self.common, self.gate, self.dedups, self.moves = common, gate, [], []
 
     def insert(self, hashes, slots, start=0, component=FULL):
         pass
@@ -318,6 +318,10 @@ class DedupIndex(StubIndex):
         if self.gate is not None:
             self.gate.wait(5)
         self.dedups.append((rank, [int(x) for x in hashes]))
+
+    def dedup_move(self, rank, hashes, tail_cap, branch_cap, landing):
+        self.moves.append((tail_cap, branch_cap, tuple(landing)))
+        self.remote_dedup_prefix(rank, hashes)
 
 
 def full_pull(c):
@@ -336,13 +340,17 @@ def wait_for(cond, timeout=5.0):
         time.sleep(0.01)
 
 
-def test_a_full_pull_asks_every_source_to_drop_its_copy():
+@pytest.mark.parametrize("move", ["1", "0"])
+def test_a_full_pull_asks_every_source_to_drop_its_copy(monkeypatch, move):
+    monkeypatch.setenv("RADIXSHMEM_DEDUP_MOVE", move)
+    monkeypatch.setenv("RADIXSHMEM_DEDUP_BRANCH_BLOCKS", "8")
     index = DedupIndex(common=8)
     c = client(index)
     try:
         assert full_pull(c) == 8
         wait_for(lambda: len(index.dedups) == 2)
         assert sorted(index.dedups) == [(1, list(range(8))), (2, list(range(8)))]
+        assert index.moves == ([(256, 8, DEDUP_LANDING)] * 2 if move == "1" else [])
     finally:
         c.close()
 

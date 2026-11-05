@@ -32,7 +32,8 @@ public:
     virtual RemoteStatus unlock(const uint64_t* hashes, int n, int start,
                                 int length, int pin_end,
                                 const std::vector<uint64_t>& pin_tail) = 0;
-    virtual DedupReply dedup_prefix(const uint64_t* hashes, int n) = 0;
+    virtual DedupReply dedup_prefix(const uint64_t* hashes, int n,
+                                    const DedupRequest& req = {}) = 0;
     virtual bool connected() = 0;
 };
 
