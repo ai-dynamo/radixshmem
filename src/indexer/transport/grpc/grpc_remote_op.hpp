@@ -51,7 +51,8 @@ public:
     RemoteStatus unlock(const uint64_t* hashes, int n, int start,
                         int length, int pin_end,
                         const std::vector<uint64_t>& pin_tail) override;
-    DedupReply dedup_prefix(const uint64_t* hashes, int n) override;
+    DedupReply dedup_prefix(const uint64_t* hashes, int n,
+                            const DedupRequest& req = {}) override;
     bool connected() override;
 
 private:

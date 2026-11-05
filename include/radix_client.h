@@ -71,7 +71,7 @@ public:
                          ComponentType component = ComponentType::FULL);
     RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length,
                         int pin_end, const std::vector<uint64_t>& pin_tail);
-    DedupReply dedup_prefix(const uint64_t* hashes, int n);
+    DedupReply dedup_prefix(const uint64_t* hashes, int n, const DedupRequest& req = {});
 
     const std::string& endpoint() const { return endpoint_; }
 
@@ -209,7 +209,14 @@ public:
     QueryResult remote_query(int rank, const uint64_t* hashes, int n,
                              bool lock = false, bool update_meta = true);
 
-    DedupReply remote_dedup_prefix(int rank, const uint64_t* hashes, int n);
+    DedupReply remote_dedup_prefix(int rank, const uint64_t* hashes, int n,
+                                   const DedupRequest& req = {});
+
+    // After pulling [0, n) from `rank`: it drops its copy and writes what blocks the
+    // drop into landing slots taken from our free ones, which we adopt. Returns the
+    // blocks it freed.
+    int dedup_move(int rank, const uint64_t* hashes, int n, int tail_cap, int branch_cap,
+                   const int landing[NUM_COMPONENT_TYPES]);
 #endif
 
     // ==================== Stats / accessors ====================
@@ -281,6 +288,8 @@ private:
     InsertResult dist_insert(const uint64_t* hashes, int n,
                              const int32_t* slots, int num_slots,
                              int start, bool auto_recycle);
+    // Republish the root→leaf chain of [0, n) plus a split suffix off it (idempotent).
+    void publish_chain(const uint64_t* hashes, int n, const InsertResult& r, int start);
     void         dist_flush();
     // Cached per-rank session; nullptr on illegal rank (self/oob/negative).
     std::shared_ptr<RemotePeer> peer_for(int rank);

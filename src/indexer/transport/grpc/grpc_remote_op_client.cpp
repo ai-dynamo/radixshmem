@@ -291,16 +291,51 @@ RemoteStatus GrpcRemoteOpClientTransport::unlock(
     return to_remote_status(impl_->stub->Unlock(&ctx, req, &rep));
 }
 
-DedupReply GrpcRemoteOpClientTransport::dedup_prefix(const uint64_t* hashes, int n) {
+DedupReply GrpcRemoteOpClientTransport::dedup_prefix(const uint64_t* hashes, int n,
+                                                     const DedupRequest& in) {
     DedupReply out;
-    if (!copyable(hashes, n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
+    // Not sent or refused before it ran: no landing slot was written.
+    auto unsent = [&](RemoteStatus st) {
+        out.status = st;
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++) out.unused[k] = in.landing[k];
+        return out;
+    };
+    if (!copyable(hashes, n)) return unsent(RemoteStatus::BAD_REQUEST);
     pb::DedupPrefixRequest req;
     req.mutable_hashes()->Add(hashes, hashes + n);
+    req.set_rank(in.rank);
+    req.set_tail_cap(in.tail_cap);
+    req.set_branch_cap(in.branch_cap);
+    bool landing = false;
+    for (const std::vector<int32_t>& l : in.landing) landing |= !l.empty();
+    if (landing)
+        for (const std::vector<int32_t>& l : in.landing)
+            req.add_landing()->mutable_slots()->Add(l.begin(), l.end());
     pb::DedupPrefixResponse rep;
     grpc::ClientContext ctx;
     impl_->prepare(ctx);
-    out.status = to_remote_status(impl_->stub->DedupPrefix(&ctx, req, &rep));
-    if (out.status == RemoteStatus::OK) out.freed = rep.freed();
+    const RemoteStatus st = to_remote_status(impl_->stub->DedupPrefix(&ctx, req, &rep));
+    if (st == RemoteStatus::BAD_REQUEST || st == RemoteStatus::UNKNOWN_OP ||
+        st == RemoteStatus::RESOURCE_EXHAUSTED)
+        return unsent(st);
+    out.status = st;
+    if (st != RemoteStatus::OK) return out;
+    out.freed = rep.freed();
+    for (int k = 0; k < NUM_COMPONENT_TYPES && k < rep.unused_size(); k++)
+        out.unused[k].assign(rep.unused(k).slots().begin(), rep.unused(k).slots().end());
+    out.moved.resize(rep.moved_size());
+    for (int i = 0; i < rep.moved_size(); i++) {
+        const pb::MovedPath& m = rep.moved(i);
+        MovedPath& p = out.moved[i];
+        p.base = m.base();
+        p.hashes.assign(m.hashes().begin(), m.hashes().end());
+        p.full_from = m.full_from();
+        p.full.assign(m.full().begin(), m.full().end());
+        p.full_age_ns.assign(m.full_age_ns().begin(), m.full_age_ns().end());
+        for (const pb::MovedCell& c : m.cells())
+            p.cells.push_back({static_cast<ComponentType>(c.component()), c.pos(), c.slot(),
+                               c.age_ns()});
+    }
     return out;
 }
 

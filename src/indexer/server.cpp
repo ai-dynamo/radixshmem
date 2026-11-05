@@ -590,6 +590,7 @@ RadixServer::RadixServer(const std::string& name, const ShmConfig& shm) {
 }
 
 RadixServer::~RadixServer() {
+    dedup_writes_->set_active(false);
 #ifndef RADIXSHMEM_NO_RDMA
     // Stop remote-op serving before tearing down svc_*.
     rc_stop();

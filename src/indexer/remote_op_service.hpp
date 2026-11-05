@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "dedup_writer.h"
 #include "radix_client.h"   // RadixClient
 
 #include <chrono>
@@ -41,13 +42,18 @@ public:
     // Drop a query(lock=true) pin over hashes[start, start + length).
     RemoteStatus  unlock(const uint64_t* hashes, int n, int start, int length,
                          int pin_end, const uint64_t* pin_tail, int pin_tail_n);
-    DedupReply    dedup_prefix(const uint64_t* hashes, int n);
+    // With landing slots in `req`, also writes what blocks the drop into them through
+    // the dedup writer; without an active writer it only drops.
+    DedupReply    dedup_prefix(const uint64_t* hashes, int n, const DedupRequest& req = {},
+                               Deadline deadline = Deadline::max());
+    void set_dedup_writer(DedupWriter* w) { writer_ = w; }
 
 private:
     LocalTreeConnector& tree_;
     RadixClient&        client_;
     std::mutex&         insert_mu_;
     bool                dedup_off_;
+    DedupWriter*        writer_ = nullptr;
 };
 
 }  // namespace radixshmem

@@ -190,9 +190,34 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     grpc::Status DedupPrefix(grpc::ServerContext* ctx, const pb::DedupPrefixRequest* req,
                              pb::DedupPrefixResponse* rep) override {
         return run(ctx, [&] {
-            DedupReply r = svc->dedup_prefix(req->hashes().data(), req->hashes_size());
+            DedupRequest in;
+            in.rank = req->rank();
+            in.tail_cap = req->tail_cap();
+            in.branch_cap = req->branch_cap();
+            for (int k = 0; k < NUM_COMPONENT_TYPES && k < req->landing_size(); k++)
+                in.landing[k].assign(req->landing(k).slots().begin(),
+                                     req->landing(k).slots().end());
+            DedupReply r = svc->dedup_prefix(req->hashes().data(), req->hashes_size(), in,
+                                             ctx->deadline());
             if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
             rep->set_freed(r.freed);
+            for (const MovedPath& p : r.moved) {
+                pb::MovedPath* m = rep->add_moved();
+                m->set_base(p.base);
+                m->mutable_hashes()->Add(p.hashes.begin(), p.hashes.end());
+                m->set_full_from(p.full_from);
+                m->mutable_full()->Add(p.full.begin(), p.full.end());
+                m->mutable_full_age_ns()->Add(p.full_age_ns.begin(), p.full_age_ns.end());
+                for (const MovedCell& c : p.cells) {
+                    pb::MovedCell* x = m->add_cells();
+                    x->set_component(static_cast<pb::Component>(c.component));
+                    x->set_pos(c.pos);
+                    x->set_slot(c.slot);
+                    x->set_age_ns(c.age_ns);
+                }
+            }
+            for (const std::vector<int32_t>& u : r.unused)
+                rep->add_unused()->mutable_slots()->Add(u.begin(), u.end());
             return grpc::Status::OK;
         });
     }

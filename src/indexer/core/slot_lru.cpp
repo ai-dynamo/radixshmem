@@ -42,6 +42,28 @@ void SlotLru::push_tail(int32_t slot, uint32_t node_id, uint32_t idx,
     link_tail(slot);
 }
 
+void SlotLru::insert_by_ts(int32_t slot, uint32_t node_id, uint32_t idx,
+                           uint64_t ts, uint32_t max_steps) {
+    if (linked(slot)) unlink(slot);
+    uint32_t after = anchors_->tail;
+    for (uint32_t steps = 0; after != INVALID_SLOT_LINK && entries_[after].ts > ts;
+         after = entries_[after].prev)
+        if (++steps > max_steps) {
+            after = INVALID_SLOT_LINK;
+            break;
+        }
+    SlotLruEntry& e = entries_[slot];
+    e.node_id = node_id;
+    e.idx = idx;
+    e.ts = ts;
+    e.prev = after;
+    e.next = after == INVALID_SLOT_LINK ? anchors_->head : entries_[after].next;
+    if (e.prev != INVALID_SLOT_LINK) entries_[e.prev].next = (uint32_t)slot;
+    else anchors_->head = (uint32_t)slot;
+    if (e.next != INVALID_SLOT_LINK) entries_[e.next].prev = (uint32_t)slot;
+    else anchors_->tail = (uint32_t)slot;
+}
+
 void SlotLru::move_tail(int32_t slot, uint64_t ts) {
     if (!linked(slot)) return;
     SlotLruEntry& e = entries_[slot];

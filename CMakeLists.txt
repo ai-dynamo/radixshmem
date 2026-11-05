@@ -43,6 +43,7 @@ set(_radixshmem_sources
     src/indexer/core/child_table.cpp
     src/indexer/core/mempool.cpp
     src/indexer/core/radix_tree.cpp
+    src/indexer/core/dedup_move.cpp
     # component match semantics (Full/SWA/Mamba), shared by local + RDMA walkers
     src/indexer/component/component_set.cpp
     src/indexer/component/swa_component.cpp
@@ -54,6 +55,7 @@ set(_radixshmem_sources
     src/indexer/server.cpp
     # Write-back queue between the background evictor and the write-back side.
     src/indexer/writeback.cpp
+    src/indexer/dedup_writer.cpp
     src/indexer/local.cpp
     src/indexer/client.cpp
     # Lock-free leak audit (check_health); friend of RadixShmemTree, no other coupling.
@@ -356,6 +358,7 @@ set(_core_unit_tests
     # Background eviction with write-back: held slots, pinned prefixes, queue.
     test_evict_writeback
     test_tree_dedup
+    test_dedup_move
     # RhtEngine over a fake one-sided endpoint: scratch-bounded lookup rounds,
     # remote insert/remove plumbing (self-gates on RADIXSHMEM_NO_RDMA).
     test_rht_engine

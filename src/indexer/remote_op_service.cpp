@@ -38,6 +38,9 @@ bool valid_range(int start, int length, int n) {
     return start >= 0 && length >= 0 && start <= n - length;
 }
 
+constexpr int64_t DEDUP_WRITE_TIMEOUT_MS = 3000;
+constexpr int64_t DEDUP_WRITE_MARGIN_MS = 1500;
+
 bool expired(RemoteOpService::Deadline deadline) {
     return std::chrono::system_clock::now() + std::chrono::milliseconds(10) >= deadline;
 }
@@ -192,15 +195,59 @@ RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, int start,
                                                            : RemoteStatus::BAD_REQUEST;
 }
 
-DedupReply RemoteOpService::dedup_prefix(const uint64_t* hashes, int n) {
+DedupReply RemoteOpService::dedup_prefix(const uint64_t* hashes, int n,
+                                         const DedupRequest& req, Deadline deadline) {
     DedupReply out;
-    if (!valid_count(n) || (n > 0 && !hashes)) {
+    size_t landing = 0;
+    for (const std::vector<int32_t>& l : req.landing) landing += l.size();
+    if (!valid_count(n) || (n > 0 && !hashes) || landing > (size_t)MAX_REMOTE_OP_BLOCKS) {
         out.status = RemoteStatus::BAD_REQUEST;
         return out;
     }
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) out.unused[k] = req.landing[k];
     if (dedup_off_ || n == 0) return out;
+    if (landing == 0 || writer_ == nullptr || !writer_->active() || req.rank < 0) {
+        std::lock_guard<std::mutex> g(insert_mu_);
+        out.freed = tree_.tree().dedup_prefix(hashes, n);
+        return out;
+    }
+    uint32_t budget[NUM_COMPONENT_TYPES];
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) budget[k] = (uint32_t)req.landing[k].size();
+    DedupPlan plan;
+    {
+        std::lock_guard<std::mutex> g(insert_mu_);
+        if (!tree_.tree().plan_dedup(hashes, n, req.tail_cap, req.branch_cap, budget, plan))
+            return out;
+    }
+    std::vector<int32_t> local[NUM_COMPONENT_TYPES], remote[NUM_COMPONENT_TYPES];
+    auto land = [&](int k, int32_t& slot) {
+        local[k].push_back(slot);
+        slot = req.landing[k][remote[k].size()];
+        remote[k].push_back(slot);
+    };
+    for (MovedPath& p : plan.moved) {
+        for (int32_t& s : p.full) land((int)ComponentType::FULL, s);
+        for (MovedCell& c : p.cells) land((int)c.component, c.slot);
+    }
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+        out.unused[k].assign(req.landing[k].begin() + remote[k].size(), req.landing[k].end());
+    DedupWriter::Result r = DedupWriter::OK;
+    if (!plan.moved.empty()) {
+        // The writer may wait past its timeout; the caller's deadline must still hold.
+        int64_t ms = DEDUP_WRITE_TIMEOUT_MS;
+        if (deadline != Deadline::max())
+            ms = std::min<int64_t>(ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           deadline - std::chrono::system_clock::now()).count() -
+                                           DEDUP_WRITE_MARGIN_MS);
+        r = ms > 0 ? writer_->write(req.rank, local, remote, (int)ms) : DedupWriter::FAILED;
+    }
     std::lock_guard<std::mutex> g(insert_mu_);
-    out.freed = tree_.tree().dedup_prefix(hashes, n);
+    out.freed = tree_.tree().finish_dedup(plan, r == DedupWriter::OK);
+    if (r == DedupWriter::OK)
+        out.moved = std::move(plan.moved);
+    else if (r == DedupWriter::FAILED)
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            out.unused[k].insert(out.unused[k].end(), remote[k].begin(), remote[k].end());
     return out;
 }
 
@@ -222,6 +269,7 @@ void RadixServer::rc_spawn() {
     }
     rc_service_ = std::make_unique<RemoteOpService>(*svc_tree_, *svc_client_,
                                                     svc_client_mu_);
+    rc_service_->set_dedup_writer(dedup_writes_.get());
     rc_server_->start(*rc_service_);
 }
 

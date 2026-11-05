@@ -50,6 +50,7 @@ XFER_IN_FLIGHT = "in flight"
 CLIENT_CLOSED = "client closed"
 PUSH_SETTLE_THREADS = 16
 DEDUP_QUEUE = 1024
+DEDUP_LANDING = (256, 512, 64)   # slots per pool a dedup source may move into
 TransferReply = Tuple[bool, int, int, str]
 
 
@@ -318,6 +319,9 @@ class RadixClient:
         self._completer: Optional[threading.Thread] = None
         self._settlers: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._auto_dedup = os.environ.get("RADIXSHMEM_DISABLE_AUTO_DEDUP", "0") != "1"
+        self._dedup_move = os.environ.get("RADIXSHMEM_DEDUP_MOVE", "1") != "0"
+        self._dedup_caps = (int(os.environ.get("RADIXSHMEM_DEDUP_TAIL_BLOCKS", "256")),
+                            int(os.environ.get("RADIXSHMEM_DEDUP_BRANCH_BLOCKS", "16")))
         self._dedup_cv = threading.Condition()
         self._dedups: Deque[Tuple[int, np.ndarray]] = collections.deque()
         self._deduper: Optional[threading.Thread] = None
@@ -778,7 +782,10 @@ class RadixClient:
                 if self._closed:
                     return
                 rank, hashes = self._dedups.popleft()
-            self._index.remote_dedup_prefix(rank, hashes)
+            if self._dedup_move:
+                self._index.dedup_move(rank, hashes, *self._dedup_caps, DEDUP_LANDING)
+            else:
+                self._index.remote_dedup_prefix(rank, hashes)
 
     def _recycle(self, slots, kind: ComponentType) -> None:
         if len(slots):

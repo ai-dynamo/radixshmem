@@ -401,6 +401,78 @@ void test_dedup_prefix() {
     TEST_PASS();
 }
 
+// Stands in for the server's transfer loop.
+struct FakeWriter : DedupWriter {
+    Result next = OK;
+    int calls = 0, rank = -1;
+    std::vector<int32_t> local[NUM_COMPONENT_TYPES], remote[NUM_COMPONENT_TYPES];
+    bool active() override { return true; }
+    Result write(int r, const std::vector<int32_t> (&l)[NUM_COMPONENT_TYPES],
+                 const std::vector<int32_t> (&rm)[NUM_COMPONENT_TYPES], int) override {
+        calls++;
+        rank = r;
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
+            local[k] = l[k];
+            remote[k] = rm[k];
+        }
+        return next;
+    }
+};
+
+void test_dedup_move() {
+    TEST_BEGIN("DedupPrefix with landing slots moves a side branch; failed and late writes keep it");
+    Node node("dmove");
+    FakeWriter w;
+    node.svc->set_dedup_writer(&w);
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    std::vector<int64_t> tok(8), side_tok(6);
+    std::iota(tok.begin(), tok.end(), 500);
+    std::iota(side_tok.begin(), side_tok.end(), 500);
+    side_tok[4] = 900;
+    side_tok[5] = 901;
+    auto h = RadixClient::compute_hashes(tok.data(), 8, 1);
+    auto side = RadixClient::compute_hashes(side_tok.data(), 6, 1);
+    DedupRequest req;
+    req.rank = 3;
+    req.tail_cap = 16;
+    req.branch_cap = 16;
+    req.landing[0] = {40, 41, 42, 43};
+    auto both = [&] {
+        insert_auto(*node.client, h.data(), 8);
+        insert_auto(*node.client, side.data(), 6);
+    };
+
+    both();
+    DedupReply r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.status == RemoteStatus::OK && r.freed == 10 && node.used() == 0);
+    assert(w.calls == 1 && w.rank == 3 && w.local[0].size() == 2 &&
+           w.remote[0] == (std::vector<int32_t>{40, 41}));
+    assert(r.moved.size() == 1 && r.moved[0].base == 4 && r.moved[0].full_from == 4 &&
+           r.moved[0].full == (std::vector<int32_t>{40, 41}) &&
+           r.moved[0].hashes == std::vector<uint64_t>(side.begin() + 4, side.end()) &&
+           r.moved[0].full_age_ns.size() == 2);
+    assert(r.unused[0] == (std::vector<int32_t>{42, 43}) && r.unused[1].empty());
+
+    both();
+    w.next = DedupWriter::FAILED;
+    r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.status == RemoteStatus::OK && r.freed == 0 && node.used() == 10 && r.moved.empty());
+    assert(r.unused[0] == (std::vector<int32_t>{42, 43, 40, 41}));
+    w.next = DedupWriter::LATE;
+    r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.freed == 0 && node.used() == 10 && r.moved.empty() &&
+           r.unused[0] == (std::vector<int32_t>{42, 43}));
+
+    DedupRequest drop_only;
+    r = cli.dedup_prefix(h.data(), 8, drop_only);
+    assert(r.freed == 4 && w.calls == 3 && node.used() == 6);
+    server.stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
 void test_deadline_no_replay() {
     TEST_BEGIN("deadline → TIMEOUT, op runs exactly once");
     Node node("dl");
@@ -605,7 +677,7 @@ struct FakeTransport final : IRemoteOpClientTransport {
         calls++;
         return next;
     }
-    DedupReply dedup_prefix(const uint64_t*, int) override {
+    DedupReply dedup_prefix(const uint64_t*, int, const DedupRequest&) override {
         calls++;
         DedupReply r;
         r.status = next;
@@ -781,6 +853,7 @@ int main() {
     test_insert_path_rejects_bad_runs();
     test_allocate_components();
     test_dedup_prefix();
+    test_dedup_move();
     test_deadline_no_replay();
     test_no_admission_cap();
     test_deadline_skips_allocate_and_query();

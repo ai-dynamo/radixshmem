@@ -429,6 +429,7 @@ class RadixServer:
         self.transfers = self.transfer_failures = self.transfer_bytes = 0
         self._xlog: Optional[_TransferLog] = None
         self.monitor = None
+        self._dw: Optional[Tuple[threading.Thread, threading.Event, Any]] = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -514,6 +515,7 @@ class RadixServer:
 
     def close(self) -> None:
         self._stop_writeback(closing=True)   # first: its handler may still pull while it stops
+        self._stop_dedup_writes()
         self._stop.set()
         if self.monitor is not None:
             self.monitor.close()
@@ -574,11 +576,62 @@ class RadixServer:
         if wb is not None:
             wb.stop()
 
+    def _start_dedup_writes(self) -> None:
+        with self._cv:
+            index = self._index
+            if index is None or self._xfer is None or self._dw is not None:
+                return
+            stop = threading.Event()
+            t = threading.Thread(target=self._dedup_write_loop, args=(index, stop),
+                                 name="radixshmem-dedup-write", daemon=True)
+            self._dw = (t, stop, index)
+        index.set_dedup_writer_active(True)
+        t.start()
+
+    def _stop_dedup_writes(self) -> None:
+        with self._cv:
+            dw, self._dw = self._dw, None
+        if dw is not None:
+            t, stop, index = dw
+            stop.set()
+            index.set_dedup_writer_active(False)
+            t.join(10)
+
+    def _dedup_write_loop(self, index, stop: threading.Event) -> None:
+        """Runs the RDMA writes DedupPrefix handlers wait for (moves to the puller)."""
+        while not stop.is_set():
+            tickets: Dict[int, int] = {}
+            try:
+                batch = index.pop_dedup_writes(16, 200)
+            except Exception as e:  # noqa: BLE001 - handlers fall back to dropping only
+                print(f"radixshmem: dedup writes stopped: {type(e).__name__}: {e}", file=sys.stderr)
+                index.set_dedup_writer_active(False)
+                return
+            for wid, rank, timeout_ms, local, remote in batch:
+                items = [(rank, k, remote[k], local[k], XFER_WRITE) for k in range(len(local)) if local[k]]
+                try:
+                    tickets[self.submit(items, timeout_ms)] = wid
+                except Exception:  # noqa: BLE001 - not issued: the handler keeps its copy
+                    index.complete_dedup_write(wid, 1)
+            while tickets:
+                if stop.is_set():
+                    for wid in tickets.values():
+                        index.complete_dedup_write(wid, 2)
+                    return
+                r = self.wait_any(list(tickets), 1000)
+                for t, replies in r["done"].items():
+                    ok = all(rep[0] for rep in replies)
+                    late = any(rep[3] == XFER_IN_FLIGHT for rep in replies)
+                    index.complete_dedup_write(tickets.pop(t), 0 if ok else 2 if late else 1)
+                for t in r["unknown"]:
+                    index.complete_dedup_write(tickets.pop(t), 2)
+
     def _teardown_regions(self) -> None:
         """Drop the index, the SlotStore and the data-plane entry; the transfer
         engine and the etcd connection stay (they are the server's, not the
         geometry's)."""
         self._stop_writeback()
+        self._stop_dedup_writes()
         with self._cv:
             index, store, dreg = self._index, self._store, self._dreg
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
@@ -711,6 +764,7 @@ class RadixServer:
                 self._cv.notify_all()
             self._publish_node()
             self._start_writeback()
+            self._start_dedup_writes()
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:

@@ -17,6 +17,7 @@
 #include "etcd_client.hpp"   // src/registry: the Go-wrapper etcd client, bound as _core.EtcdKv
 #endif
 
+#include <array>
 #include <optional>
 
 namespace py = pybind11;
@@ -499,6 +500,31 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("task_ids"))
         .def("set_writeback_active", [](RadixServer& s, bool on) { writeback_of(s).set_active(on); },
              py::arg("on"), "Whether background eviction holds what it takes for write-back.")
+        .def("pop_dedup_writes", [](RadixServer& s, size_t max_writes, int timeout_ms) {
+            std::vector<DedupWrite> ws;
+            {
+                py::gil_scoped_release nogil;
+                ws = s.dedup_writes()->pop(max_writes, timeout_ms);
+            }
+            py::list out;
+            for (const DedupWrite& w : ws) {
+                py::list local, remote;
+                for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
+                    local.append(py::cast(w.local[k]));
+                    remote.append(py::cast(w.remote[k]));
+                }
+                out.append(py::make_tuple(w.id, w.rank, w.timeout_ms, local, remote));
+            }
+            return out;
+        }, py::arg("max_writes") = 16, py::arg("timeout_ms") = 200,
+           "Copies DedupPrefix handlers wait for: (id, rank, timeout_ms, local[k], remote[k]).")
+        .def("complete_dedup_write", [](RadixServer& s, uint64_t id, int result) {
+            s.dedup_writes()->complete(id, result);
+        }, py::arg("id"), py::arg("result"), "0 copied, 1 failed, 2 failed and may still land.")
+        .def("set_dedup_writer_active", [](RadixServer& s, bool on) {
+            s.dedup_writes()->set_active(on);
+        }, py::arg("on"), py::call_guard<py::gil_scoped_release>(),
+           "Off: DedupPrefix handlers stop waiting and only drop.")
         .def("drop_writeback", [](RadixServer& s) {
             WritebackQueue& q = writeback_of(s);
             py::gil_scoped_release nogil;
@@ -803,6 +829,18 @@ PYBIND11_MODULE(_core, m) {
             { py::gil_scoped_release rel; rep = c.remote_dedup_prefix(rank, ptr, len); }
             return rep;
         }, py::arg("rank"), py::arg("hashes"))
+        .def("dedup_move", [](RadixClient& c, int rank, py::array_t<uint64_t> hashes, int tail_cap,
+                              int branch_cap, std::array<int, NUM_COMPONENT_TYPES> landing) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            int freed;
+            {
+                py::gil_scoped_release rel;
+                freed = c.dedup_move(rank, ptr, len, tail_cap, branch_cap, landing.data());
+            }
+            return freed;
+        }, py::arg("rank"), py::arg("hashes"), py::arg("tail_cap"), py::arg("branch_cap"),
+           py::arg("landing"),
+           "Dedup on `rank` that also moves what blocks the drop into `landing` (per pool) slots.")
 #endif
 
         .def_static("compute_hashes", &py_compute_hashes,
