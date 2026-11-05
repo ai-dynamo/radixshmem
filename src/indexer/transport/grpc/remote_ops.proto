@@ -15,6 +15,7 @@ service RemoteOps {
   rpc InsertPath(InsertPathRequest) returns (InsertPathResponse);
   rpc Recycle(RecycleRequest) returns (RecycleResponse);
   rpc Unlock(UnlockRequest) returns (UnlockResponse);
+  rpc DedupPrefix(DedupPrefixRequest) returns (DedupPrefixResponse);
 }
 
 // Mirrors radixshmem::InsertError (types.h); values are the same.
@@ -120,3 +121,10 @@ message UnlockRequest {
   repeated fixed64 pin_tail = 5;
 }
 message UnlockResponse {}
+
+message DedupPrefixRequest {
+  repeated fixed64 hashes = 1;
+}
+message DedupPrefixResponse {
+  int32 freed = 1;
+}

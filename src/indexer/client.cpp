@@ -1036,6 +1036,14 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
     return out;
 }
 
+DedupReply RadixClient::remote_dedup_prefix(int rank, const uint64_t* hashes, int n) {
+    DedupReply out;
+    if (n <= 0) return out;
+    auto p = peer_for(rank);
+    if (!p) { out.status = missing_peer_status(rank); return out; }
+    return p->dedup_prefix(hashes, n);
+}
+
 #endif  // !RADIXSHMEM_NO_RDMA
 
 bool RadixClient::is_distributed() const {

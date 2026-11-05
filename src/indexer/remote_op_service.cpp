@@ -46,6 +46,13 @@ bool expired(RemoteOpService::Deadline deadline) {
 
 // ==================== RemoteOpService ====================
 
+RemoteOpService::RemoteOpService(LocalTreeConnector& tree, RadixClient& client,
+                                 std::mutex& insert_mu)
+    : tree_(tree), client_(client), insert_mu_(insert_mu) {
+    const char* e = ::getenv("RADIXSHMEM_DISABLE_AUTO_DEDUP");
+    dedup_off_ = e != nullptr && std::string(e) == "1";
+}
+
 AllocateReply RemoteOpService::allocate(int n, Deadline deadline,
                                         ComponentType component) {
     // Allocate without hashes or dedup; insert consumes only the unmatched tail.
@@ -183,6 +190,18 @@ RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, int start,
     pin.tail.assign(pin_tail, pin_tail + pin_tail_n);
     return tree_.tree().dec_ref(hashes, n, std::move(pin)) ? RemoteStatus::OK
                                                            : RemoteStatus::BAD_REQUEST;
+}
+
+DedupReply RemoteOpService::dedup_prefix(const uint64_t* hashes, int n) {
+    DedupReply out;
+    if (!valid_count(n) || (n > 0 && !hashes)) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    if (dedup_off_ || n == 0) return out;
+    std::lock_guard<std::mutex> g(insert_mu_);
+    out.freed = tree_.tree().dedup_prefix(hashes, n);
+    return out;
 }
 
 // ==================== RadixServer remote-op endpoint ====================

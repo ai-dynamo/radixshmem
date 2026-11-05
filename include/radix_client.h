@@ -71,6 +71,7 @@ public:
                          ComponentType component = ComponentType::FULL);
     RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length,
                         int pin_end, const std::vector<uint64_t>& pin_tail);
+    DedupReply dedup_prefix(const uint64_t* hashes, int n);
 
     const std::string& endpoint() const { return endpoint_; }
 
@@ -207,6 +208,8 @@ public:
 
     QueryResult remote_query(int rank, const uint64_t* hashes, int n,
                              bool lock = false, bool update_meta = true);
+
+    DedupReply remote_dedup_prefix(int rank, const uint64_t* hashes, int n);
 #endif
 
     // ==================== Stats / accessors ====================

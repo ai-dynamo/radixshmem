@@ -1033,6 +1033,13 @@ bool RadixShmemTree::is_in_leaf_list(uint32_t node_id) const {
 // ==================== Eviction internals ====================
 
 int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out, bool hold) {
+    const uint32_t parent_id = nodes_.get(node_id)->parent_id;
+    const int n = detach_node(node_id, out, hold);
+    post_evict_fixup(parent_id);
+    return n;
+}
+
+int RadixShmemTree::detach_node(uint32_t node_id, std::vector<int32_t>& out, bool hold) {
     TreeNode* node = nodes_.get(node_id);
     int n = (int)node->num_blocks;
     uint32_t parent_id = node->parent_id;
@@ -1082,8 +1089,6 @@ int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out, bool
         else
             mempool_.recycle(out.data() + recycle_start, n);
     }
-
-    post_evict_fixup(parent_id);
     return n;
 }
 
@@ -1883,6 +1888,42 @@ int RadixShmemTree::try_evict_component_batch(ComponentType component,
                     : evict_mamba_walk(target_slots);
     write_unlock();
     return freed;
+}
+
+int RadixShmemTree::dedup_prefix(const uint64_t* hashes, int n) {
+    if (n <= 0 || hashes == nullptr) return 0;
+    set_write_op("dedup");
+    write_lock();
+    const std::vector<uint32_t> chain = dedup_chain(hashes, n);
+    int freed = 0;
+    if (!chain.empty()) {
+        const uint32_t stop = nodes_.get(chain.back())->parent_id;
+        std::vector<int32_t> slots;
+        for (uint32_t id : chain)
+            freed += detach_node(id, slots);
+        post_evict_fixup(stop);
+    }
+    write_unlock();
+    flush_evicted();
+    return freed;
+}
+
+std::vector<uint32_t> RadixShmemTree::dedup_chain(const uint64_t* hashes, int n) {
+    std::vector<uint32_t> chain;
+    const std::vector<MatchedNodeSpanView> spans =
+        path_spans(query_internal(hashes, n, 0, false));
+    if (spans.empty()) return chain;
+    const MatchedNodeSpanView& leaf = spans.back();
+    if (leaf.matched_blocks != leaf.node_blocks ||
+        nodes_.get(leaf.node_id)->children_count != 0 || !component_refs_zero(leaf.node_id))
+        return chain;
+    chain.push_back(leaf.node_id);
+    for (int i = (int)spans.size() - 2; i >= 0; i--) {
+        const uint32_t id = spans[i].node_id;
+        if (nodes_.get(id)->children_count != 1 || !component_refs_zero(id)) break;
+        chain.push_back(id);
+    }
+    return chain;
 }
 
 // ==================== Slot allocation (for external slot mgmt)
