@@ -1,10 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// test_rht_redis_faults — the Redis RHT while masters hang and while async
-// replies pile up. Starts its own 3-master cluster on 127.0.0.1:7351 with
-// RADIXSHMEM_REDIS_SCRIPT and the binaries in RADIXSHMEM_TEST_REDIS_BIN;
-// skips (77) when unset.
+// test_rht_redis_faults — the Redis RHT while masters hang, fail over and
+// while async replies pile up. Starts its own cluster of 3 masters with one
+// replica each on 127.0.0.1:7351 with RADIXSHMEM_REDIS_SCRIPT and the
+// binaries in RADIXSHMEM_TEST_REDIS_BIN; skips (77) when unset.
 
 #include "test_utils.h"
 
@@ -28,12 +28,13 @@
 using namespace radixshmem;
 using Clock = std::chrono::steady_clock;
 
-static const int kPort = 7351, kMasters = 3, kKeys = 3000;
+static const int kPort = 7351, kMasters = 3, kReplicas = 1, kKeys = 3000;
 static std::string g_bin, g_script;
 
 static void cluster(const char* verb) {
     std::string cmd = "REDIS_BIN=" + g_bin + " bash " + g_script + " " + verb + " " +
-                      std::to_string(kPort) + " " + std::to_string(kMasters) + " >/dev/null 2>&1";
+                      std::to_string(kPort) + " " + std::to_string(kMasters) + " " +
+                      std::to_string(kReplicas) + " >/dev/null 2>&1";
     if (std::system(cmd.c_str()) != 0) fprintf(stderr, "  %s failed\n", cmd.c_str());
 }
 
@@ -174,6 +175,25 @@ static void test_unread_replies() {
     TEST_PASS();
 }
 
+static void test_failover() {
+    TEST_BEGIN("a killed master's replica takes over with every route");
+    PeerFaultCounters c{};
+    auto rht = filled("127.0.0.1:" + std::to_string(kPort), "failover", &c);
+    auto calls = probe(*rht, 12.0, [] {
+        pause_for(1.0);
+        signal_masters(SIGKILL, 1, 1);
+    });
+    assert(slowest_ms(calls) < 250);
+    assert(found_share(calls, 1.3, 5.0) < 0.9);
+    assert(found_share(calls, 10.5, 12.0) == 1.0);
+    std::vector<uint64_t> keys(kKeys);
+    std::vector<std::vector<RHTValue>> res(kKeys);
+    for (int i = 0; i < kKeys; i++) keys[i] = key_of(i);
+    rht->lookup_batch(keys.data(), kKeys, res.data());
+    for (auto& r : res) assert(r.size() == 1);
+    TEST_PASS();
+}
+
 int main() {
     printf("=== test_rht_redis_faults ===\n\n");
     const char* bin = std::getenv("RADIXSHMEM_TEST_REDIS_BIN");
@@ -202,6 +222,7 @@ int main() {
     test_hung_master();
     test_hung_cluster();
     test_unread_replies();
+    test_failover();
     cluster("stop");
     return tests_report();
 }

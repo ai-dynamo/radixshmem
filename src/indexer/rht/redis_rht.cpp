@@ -198,14 +198,18 @@ private:
             cv_.wait_for(lk, std::chrono::milliseconds(100));
             if (stop_) break;
             lk.unlock();
-            if (stale_.load() && Clock::now() >= next_refresh) {
+            std::vector<int> down = down_serving();
+            // While a master that owns slots is down, look for its failover every second.
+            if ((stale_.load() || !down.empty()) && Clock::now() >= next_refresh) {
                 stale_ = false;
                 bool ok = refresh();
                 if (!ok) stale_ = true;
-                backoff_ms = ok ? 200 : std::min(backoff_ms * 2, 5000);
+                if (ok) down = down_serving();
+                backoff_ms = !ok ? std::min(backoff_ms * 2, 5000) : down.empty() ? 200 : 1000;
                 next_refresh = Clock::now() + std::chrono::milliseconds(backoff_ms);
             }
-            probe_down();
+            for (int id : down)
+                if (breaker_.gate(id) == PeerBreaker::Gate::PROBE) probe(id);
             lk.lock();
         }
     }
@@ -251,17 +255,18 @@ private:
         return false;
     }
 
-    // Probes each down master that serves slots once its backoff runs out.
-    void probe_down() {
+    // Masters that are down and still own slots.
+    std::vector<int> down_serving() const {
         int n = count_.load(std::memory_order_acquire);
         std::vector<int> ids;
         for (int id = 0; id < n; id++)
             if (down(id)) ids.push_back(id);
-        if (ids.empty()) return;
+        if (ids.empty()) return ids;
         std::vector<char> serving(n, 0);
         for (int16_t m : *slots()) if (m >= 0) serving[m] = 1;
-        for (int id : ids)
-            if (serving[id] && breaker_.gate(id) == PeerBreaker::Gate::PROBE) probe(id);
+        ids.erase(std::remove_if(ids.begin(), ids.end(), [&](int id) { return !serving[id]; }),
+                  ids.end());
+        return ids;
     }
 
     void probe(int id) {

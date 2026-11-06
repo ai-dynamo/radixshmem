@@ -2,21 +2,23 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Local Redis Cluster for the Redis RHT tests: N masters on 127.0.0.1, no replicas.
-#   REDIS_BIN=<dir of redis-server, redis-cli> scripts/redis_test_cluster.sh start [port] [masters]
-#   scripts/redis_test_cluster.sh stop [port] [masters]
+# Local Redis Cluster for the Redis RHT tests: N masters on 127.0.0.1, each with R replicas (default 0).
+#   REDIS_BIN=<dir of redis-server, redis-cli> scripts/redis_test_cluster.sh start [port] [masters] [replicas]
+#   scripts/redis_test_cluster.sh stop [port] [masters] [replicas]
 # Then configure with -DRADIXSHMEM_TEST_REDIS=127.0.0.1:<port>.
 set -eu
 cmd=${1:-}
 port=${2:-7301}
 n=${3:-3}
+r=${4:-0}
+nodes_total=$((n * (1 + r)))
 bin=${REDIS_BIN:-$(dirname "$(command -v redis-server)")}
 run=/tmp/radixshmem-redis-test
 
 case "$cmd" in
 start)
   nodes=""
-  for ((i = 0; i < n; i++)); do
+  for ((i = 0; i < nodes_total; i++)); do
     p=$((port + i))
     d=$run/$p
     mkdir -p "$d"
@@ -29,18 +31,18 @@ start)
     nodes="$nodes 127.0.0.1:$p"
   done
   sleep 1
-  "$bin/redis-cli" --cluster create $nodes --cluster-replicas 0 --cluster-yes
+  "$bin/redis-cli" --cluster create $nodes --cluster-replicas "$r" --cluster-yes
   ;;
 stop)
-  for ((i = 0; i < n; i++)); do
+  for ((i = 0; i < nodes_total; i++)); do
     f=$run/$((port + i))/redis.pid
     if [ -f "$f" ]; then kill -CONT "$(cat "$f")" 2>/dev/null || true; kill "$(cat "$f")" || true; fi
   done
   sleep 1
-  for ((i = 0; i < n; i++)); do rm -rf "$run/$((port + i))"; done
+  for ((i = 0; i < nodes_total; i++)); do rm -rf "$run/$((port + i))"; done
   ;;
 *)
-  echo "usage: $0 start|stop [port] [masters]" >&2
+  echo "usage: $0 start|stop [port] [masters] [replicas]" >&2
   exit 2
   ;;
 esac
