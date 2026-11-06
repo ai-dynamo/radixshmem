@@ -77,6 +77,9 @@ struct ComponentQueryResult {
     std::optional<ComponentCheckpoint> mamba;
     int rdma_read_count = 0;
     int rdma_atomic_count = 0;
+    uint64_t pinned_full_blocks = 0;
+    uint64_t pinned_swa_slots = 0;
+    uint64_t pinned_mamba_slots = 0;
     FinalizeFn finalize;
 };
 

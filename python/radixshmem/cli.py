@@ -60,6 +60,10 @@ _DATA_FLAGS = {
     "max_reserved_bytes": ("max_reserved_bytes", "--max-reserved-bytes"),
     "max_sessions": ("max_sessions", "--max-sessions"),
     "reservation_ttl": ("reservation_ttl_s", "--reservation-ttl"),
+    "protection_file": ("protection_file", "--protection-file"),
+    "fault_domain": ("fault_domain", "--fault-domain"),
+    "protected_bytes": ("protected_bytes", "--protected-bytes"),
+    "repair_bytes_per_s": ("repair_bytes_per_s", "--repair-bytes-per-s"),
 }
 
 
@@ -133,6 +137,10 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="maximum client sessions per server epoch (default: 4096)")
     g.add_argument("--reservation-ttl", type=float, default=None,
                    help="unused reservation TTL; submitted operations never expire (default: 10)")
+    g.add_argument("--protection-file", default=None, help="manual protected prefix JSON; opt-in")
+    g.add_argument("--fault-domain", default=None, help="independent host/rack failure domain")
+    g.add_argument("--protected-bytes", type=parse_size, default=None, help="per-node protection quota")
+    g.add_argument("--repair-bytes-per-s", type=parse_size, default=None, help="repair pacing budget")
 
     g = p.add_argument_group("server")
     g.add_argument("--endpoint", default="",

@@ -195,6 +195,19 @@ struct Client {
     }
 
     // returns false if key absent; else fills out.
+    bool compare_put(const std::string& conditions, const std::string& k,
+                     const std::string& v, int64_t lease = 0) {
+        char* err = nullptr;
+        int succeeded = 0;
+        int rc = RadixEtcdComparePut(const_cast<char*>(conditions.c_str()),
+                                     const_cast<char*>(k.c_str()),
+                                     const_cast<char*>(v.data()), (int)v.size(),
+                                     (long long)lease, &succeeded, &err);
+        check(rc, err, "RadixEtcdComparePut");
+        return succeeded != 0;
+    }
+
+    // returns false if key absent; else fills out.
     bool get(const std::string& k, std::string& out) {
         char* err = nullptr;
         int found = 0;

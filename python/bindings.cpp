@@ -285,6 +285,9 @@ PYBIND11_MODULE(_core, m) {
         })
         .def_readonly("rdma_read_count",   &ComponentQueryResult::rdma_read_count)
         .def_readonly("rdma_atomic_count", &ComponentQueryResult::rdma_atomic_count)
+        .def_readonly("pinned_full_blocks", &ComponentQueryResult::pinned_full_blocks)
+        .def_readonly("pinned_swa_slots", &ComponentQueryResult::pinned_swa_slots)
+        .def_readonly("pinned_mamba_slots", &ComponentQueryResult::pinned_mamba_slots)
         .def_property_readonly("finalize",
             [](ComponentQueryResult& r) -> FinalizeFn& { return r.finalize; },
             py::return_value_policy::reference_internal);
@@ -461,6 +464,10 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("prefix"), "[(key, value), ...] sorted by key.")
         .def("count", [](etcd::Client& c, const std::string& prefix) { return c.count(prefix); },
              py::arg("prefix"), py::call_guard<py::gil_scoped_release>())
+        .def("compare_put", &etcd::Client::compare_put,
+             py::arg("conditions_json"), py::arg("key"), py::arg("value"), py::arg("lease") = 0,
+             py::call_guard<py::gil_scoped_release>(),
+             "Atomically compare {key: expected value or null} and write one key.")
         .def("delete", [](etcd::Client& c, const std::string& k) { c.del(k); },
              py::arg("key"), py::call_guard<py::gil_scoped_release>(), "Exactly this key.")
         .def("grant_lease", [](etcd::Client& c, int64_t ttl_s) { return c.grant_lease(ttl_s); },
@@ -515,7 +522,7 @@ PYBIND11_MODULE(_core, m) {
         // keep_alive: the result's finalize releases through this client.
         .def("query", [](RadixClient& c, py::array_t<uint64_t> hashes,
                          py::object mask, bool local_only,
-                         bool lock, bool update_meta) {
+                         bool lock, bool update_meta, int source_rank) {
             if (py::isinstance<ComponentType>(mask))
                 throw py::type_error(
                     "mask must be a bitwise-OR of COMPONENT_MASK_* constants, "
@@ -526,12 +533,12 @@ PYBIND11_MODULE(_core, m) {
             {
                 py::gil_scoped_release rel;
                 result = c.query(ptr, len, m32, local_only, lock,
-                                 update_meta);
+                                 update_meta, source_rank);
             }
             return result;
         }, py::arg("hashes"), py::arg("mask") = COMPONENT_MASK_FULL,
            py::arg("local_only") = false,
-           py::arg("lock") = false, py::arg("update_meta") = true,
+           py::arg("lock") = false, py::arg("update_meta") = true, py::arg("source_rank") = -1,
            py::keep_alive<0, 1>())
 
         // Empty array on a component-pool shortfall (all-or-none); bad args raise.

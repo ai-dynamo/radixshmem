@@ -24,6 +24,8 @@ class Operation:
     state: str = "RESERVED"
     fingerprint: str = ""
     ticket: int = -1
+    key: str = ""
+    leader: tuple = ()
 
 
 class Operations:
@@ -34,6 +36,7 @@ class Operations:
         self.max_jobs, self.max_bytes = max_jobs, max_bytes
         self.max_sessions, self.reservation_s = max_sessions, reservation_s
         self.sessions, self.active = {}, {}
+        self.flights = {}
         self.reserved_bytes = 0
         self.refused = 0
         self.accepting = True
@@ -58,38 +61,51 @@ class Operations:
         self.expire()
         op = self.active.get((session, sequence))
         if op is not None:
+            if op.leader and op.leader not in self.active:
+                self.retire(session, sequence)
+                return "RETIRED", None
             return op.state, op
         # Never use UNKNOWN to authorize recycling after Submit.
         return ("RETIRED" if sequence <= self.sessions.get(session, 0) else "UNKNOWN"), None
 
-    def reserve(self, epoch, session, sequence, nbytes):
+    def reserve(self, epoch, session, sequence, nbytes, key=""):
         state, op = self.lookup(epoch, session, sequence)
         if state != "UNKNOWN":
-            if op is not None and op.nbytes != nbytes:
+            if op is not None and (op.nbytes != nbytes or op.key != key):
                 raise ValueError("operation reservation changed on retry")
             return state, op
         if not isinstance(nbytes, int) or nbytes < 0:
             raise ValueError("invalid reservation size")
+        if not isinstance(key, str) or len(key) > 128:
+            raise ValueError("invalid flight key")
         if session not in self.sessions and len(self.sessions) >= self.max_sessions:
             self.refused += 1
             return "BUSY", None
         # Advance even on refusal, making delayed retries unable to acquire
         # resources after the consumer already fell back to its local hit.
         self.sessions[session] = sequence
+        leader = self.flights.get(key, ()) if key else ()
         if (not self.accepting or len(self.active) >= self.max_jobs
-                or self.reserved_bytes + nbytes > self.max_bytes):
+                or self.reserved_bytes + (0 if leader else nbytes) > self.max_bytes):
             self.refused += 1
             return "RETIRED", None
         now = time.monotonic()
         op = Operation(session, sequence, nbytes, now, now + self.reservation_s)
+        op.key, op.leader = key, leader
+        if leader:
+            op.state = "FOLLOWING"
+        elif key:
+            self.flights[key] = (session, sequence)
         self.active[session, sequence] = op
-        self.reserved_bytes += nbytes
+        self.reserved_bytes += 0 if leader else nbytes
         return op.state, op
 
     def retire(self, session, sequence):
         op = self.active.pop((session, sequence), None)
         if op is not None:
-            self.reserved_bytes -= op.nbytes
+            self.reserved_bytes -= 0 if op.leader else op.nbytes
+            if op.key and self.flights.get(op.key) == (session, sequence):
+                del self.flights[op.key]
         return op
 
     def stats(self):

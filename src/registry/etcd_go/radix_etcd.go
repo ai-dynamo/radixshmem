@@ -22,6 +22,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,42 @@ var (
 	cli   *clientv3.Client
 	cliMu sync.Mutex
 )
+
+// RadixEtcdComparePut atomically compares exact values (null means absent)
+// before writing one key. Used for versioned replica records and leader/member
+// fencing in the SAME etcd transaction, never a read-then-unconditional-put.
+//
+//export RadixEtcdComparePut
+func RadixEtcdComparePut(conditions *C.char, key *C.char, value *C.char, valueLen C.int,
+	lease C.longlong, succeeded *C.int, errMsg **C.char) C.int {
+	if cli == nil {
+		return fail(errMsg, "etcd not initialized")
+	}
+	var expected map[string]*string
+	if err := json.Unmarshal([]byte(C.GoString(conditions)), &expected); err != nil {
+		return fail(errMsg, err.Error())
+	}
+	compares := make([]clientv3.Cmp, 0, len(expected))
+	for k, v := range expected {
+		if v == nil {
+			compares = append(compares, clientv3.Compare(clientv3.Version(k), "=", 0))
+		} else {
+			compares = append(compares, clientv3.Compare(clientv3.Value(k), "=", *v))
+		}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	op := clientv3.OpPut(C.GoString(key), C.GoStringN(value, valueLen), clientv3.WithLease(clientv3.LeaseID(lease)))
+	resp, err := cli.Txn(ctx).If(compares...).Then(op).Commit()
+	if err != nil {
+		return fail(errMsg, err.Error())
+	}
+	*succeeded = 0
+	if resp.Succeeded {
+		*succeeded = 1
+	}
+	return 0
+}
 
 // A watch event delivered from a background goroutine to the C++ consumer.
 type watchEvent struct {

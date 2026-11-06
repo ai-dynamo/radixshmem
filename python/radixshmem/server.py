@@ -118,6 +118,10 @@ class ServerConfig:
     max_reserved_bytes: int = 0     # 0 = data_bytes; includes draining/unacknowledged operations
     max_sessions: int = 4096        # high-water marks live for this server epoch
     reservation_ttl_s: float = 10.0 # only unsubmitted reservations can expire
+    protection_file: str = ""       # optional JSON list of {identity, hashes, mask}
+    fault_domain: str = ""
+    protected_bytes: int = 0
+    repair_bytes_per_s: int = 64 << 20
     # index tuning
     max_nodes: int = 0               # radix node pool, 0 = auto
     register_chunk_tokens: int = 4096  # RHT registration granularity unless the geometry brings its own
@@ -136,6 +140,9 @@ class ServerConfig:
             raise ValueError("job limits must be positive")
         if self.max_reserved_bytes < 0:
             raise ValueError("max_reserved_bytes must be >= 0")
+        if self.protection_file and (not self.distributed or not self.fault_domain
+                                     or self.protected_bytes <= 0 or self.repair_bytes_per_s <= 0):
+            raise ValueError("protection requires a cluster, fault_domain and positive byte limits")
         for k in ("swa_ratio", "mamba_ratio"):
             if not 0.0 <= float(getattr(self, k)) < 1.0:
                 raise ValueError(f"{k} must be in [0, 1)")
@@ -270,6 +277,11 @@ class RadixServer:
                                cfg.max_sessions, cfg.reservation_ttl_s)
         self._draining = False
         self._inflight_count = self._release_pending_count = 0
+        self._protection = None
+        self._protection_thread = None
+        self._protection_stop = threading.Event()
+        self._protection_error = ""
+        self._protected_snapshot = ({}, {}, {})
 
     # ------------------------------------------------------------ lifecycle
 
@@ -284,6 +296,7 @@ class RadixServer:
             "Configure": lambda r: vars(self.configure(r["geometry"])),
             "Submit": self._legacy_submit,
             "Operation": self.operation,
+            "ProtectedCandidates": self.protected_candidates,
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
         }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
@@ -337,6 +350,14 @@ class RadixServer:
         return backend
 
     def close(self, timeout_s: float = 30.0) -> None:
+        self._protection_stop.set()
+        if self._protection_thread is not None:
+            self._protection_thread.join(timeout_s)
+            if self._protection_thread.is_alive():
+                raise TimeoutError("protection worker still running; regions retained")
+        if self._protection is not None:
+            self._protection.close(timeout_s=timeout_s)
+            self._protection = None
         # Keep RPC, polling, regions and registrations alive until consumers
         # acknowledge completion. A failed close is retryable, not a fence.
         with self._jobs_mu:
@@ -436,7 +457,8 @@ class RadixServer:
                 data_bytes=c.data_bytes,
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
-                mamba_ratio=float(c.mamba_ratio), epoch=self.epoch, pull_protocol=2)
+                mamba_ratio=float(c.mamba_ratio), epoch=self.epoch, pull_protocol=2,
+                protection_enabled=bool(c.protection_file))
 
     def configure(self, geometry) -> NodeInfo:
         """Take a client's geometry: validate it, plan the pools, check it
@@ -484,6 +506,10 @@ class RadixServer:
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
+            if self.cfg.protection_file:
+                self._protection_thread = threading.Thread(target=self._run_protection,
+                                                           name="radixshmem-protection", daemon=True)
+                self._protection_thread.start()
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:
@@ -548,6 +574,13 @@ class RadixServer:
             out.update(self._ops.stats(), epoch=self.epoch, draining=self._draining,
                        inflight_batches=self._inflight_count,
                        release_pending_batches=self._release_pending_count)
+            _, members, objects = self._protected_snapshot
+            from radixshmem.protection import ProtectedCatalog
+            out.update(protection_error=self._protection_error,
+                       protected_objects=len(objects),
+                       protected_healthy=sum(len({r["domain"] for r in
+                           ProtectedCatalog.ready(o, members).values()}) >= o["replicas"]
+                           for o in objects.values()))
         if idx is not None:
             out.update(rank=idx.rank(), world_size=idx.world_size(),
                        total_radix_nodes=idx.total_radix_nodes(), total_blocks=idx.total_blocks(),
@@ -613,6 +646,50 @@ class RadixServer:
 
     # ---------------------------------------------------------------- jobs
 
+    def _run_protection(self):
+        from radixshmem.client import RadixClient
+        from radixshmem.protection import PrefixSpec, ProtectedAgent, ProtectedCatalog
+
+        client = None
+        try:
+            with open(self.cfg.protection_file) as f:
+                specs = [PrefixSpec(**item) for item in json.load(f)]
+            if len(specs) > 32 or len({s.key for s in specs}) != len(specs):
+                raise ValueError("protection file must contain at most 32 unique objects")
+            catalog = ProtectedCatalog(_core.EtcdKv(self.cfg.cluster.registry), self.cfg.cluster.cluster_id)
+            client = RadixClient(self.cfg.name, endpoint=self.endpoint)
+            self._protection = ProtectedAgent(catalog, client, specs, self._node_key(),
+                self.cfg.fault_domain, self.cfg.protected_bytes, self.cfg.repair_bytes_per_s)
+            while not self._protection_stop.is_set():
+                try:
+                    self._protection.tick()
+                    self._protected_snapshot = catalog.snapshot()
+                    self._protection_error = ""
+                except Exception as e:
+                    # A partition disables discovery and eviction, not pin
+                    # ownership. No stale READY snapshot is served as live.
+                    self._protected_snapshot = ({}, {}, {})
+                    self._protection_error = str(e)
+                self._protection_stop.wait(1)
+        except Exception as e:
+            self._protection_error = str(e)
+            if client is not None and self._protection is None:
+                client.close()
+
+    def protected_candidates(self, request):
+        from radixshmem.protection import ProtectedCatalog
+        _, members, objects = self._protected_snapshot
+        hashes, mask = request["hashes"], request["mask"]
+        matches = [o for o in objects.values() if o["spec"]["mask"] & mask == mask
+                   and len(o["spec"]["hashes"]) <= len(hashes)
+                   and o["spec"]["hashes"] == hashes[:len(o["spec"]["hashes"])]]
+        for obj in sorted(matches, key=lambda o: len(o["spec"]["hashes"]), reverse=True):
+            ranks = [r["rank"] for n, r in ProtectedCatalog.ready(obj, members).items()
+                     if n != self._node_key()]
+            if ranks:
+                return {"ranks": ranks[:2]}
+        return {"ranks": []}
+
     def _legacy_submit(self, _):
         raise DataPlaneUnavailable("peer pulls require operation protocol v2; upgrade the client")
 
@@ -626,11 +703,16 @@ class RadixServer:
         command = request["command"]
         with self._jobs_mu:
             if command == "reserve":
-                state, op = self._ops.reserve(epoch, session, seq, request["nbytes"])
+                state, op = self._ops.reserve(epoch, session, seq, request["nbytes"], request.get("key", ""))
             else:
                 state, op = self._ops.lookup(epoch, session, seq)
             if op is None:
                 return {"state": state, "epoch": self.epoch}
+            if op.state == "FOLLOWING":
+                if command == "ack":
+                    self._ops.retire(session, seq)
+                    return {"state": "RETIRED", "epoch": self.epoch}
+                return {"state": "FOLLOWING", "epoch": self.epoch}
             if command == "submit":
                 fingerprint = json.dumps([request["items"], request["timeout_ms"]], separators=(",", ":"))
                 if op.fingerprint and op.fingerprint != fingerprint:
