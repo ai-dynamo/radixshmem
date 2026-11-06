@@ -8,6 +8,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      flexkv_ref:
+        description: Optional immutable taco-project/FlexKV commit for CPU integration tests
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -78,3 +83,20 @@ jobs:
         run: pip install --no-build-isolation -e python
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - uses: actions/checkout@v4
+        if: ${{ inputs.flexkv_ref != '' }}
+        with:
+          repository: taco-project/FlexKV
+          ref: ${{ inputs.flexkv_ref }}
+          path: flexkv-contract
+      - name: FlexKV CPU dependencies
+        if: ${{ inputs.flexkv_ref != '' }}
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install pyyaml nvtx pyzmq msgpack psutil
+      - name: FlexKV shared-cache CPU contract
+        if: ${{ inputs.flexkv_ref != '' }}
+        run: |
+          cd flexkv-contract
+          PYTHONPATH="$PWD" python -m pytest -q --confcutdir=tests/radixshmem \
+            tests/radixshmem/test_prefetch_waiter.py tests/radixshmem/test_radix_shmem_engine.py

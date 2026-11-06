@@ -652,7 +652,7 @@ def test_timed_out_pull_keeps_pins_slots_and_budget_until_release(cfg, cancel, r
         srv.close()
 
 
-@pytest.mark.parametrize("lost_command", ["submit", "query", "ack"])
+@pytest.mark.parametrize("lost_command", ["submit", "query", "ack", "unknown", "epoch"])
 def test_operation_reply_loss_is_retried_without_releasing_live_memory(cfg, lost_command):
     from radixshmem import _data
 
@@ -673,6 +673,9 @@ def test_operation_reply_loss_is_retried_without_releasing_live_memory(cfg, lost
 
     def operation(command, *args, **kw):
         reply = original(command, *args, **kw)
+        if command == "query" and lost_command in ("unknown", "epoch") and not dropped.is_set():
+            dropped.set()
+            return {"state": "UNKNOWN" if lost_command == "unknown" else "EPOCH_MISMATCH"}
         if command == lost_command and not dropped.is_set():
             dropped.set()
             raise TimeoutError("reply lost after server processed the operation")
@@ -752,4 +755,183 @@ def test_each_component_consumes_backend_admission(cfg):
         assert x.n == 1
     finally:
         x.hang.clear()
+        srv.close()
+
+
+def test_protected_agents_repair_real_slot_contents_after_one_node_leaves(tmp_path):
+    """Real local index/SlotStore/pins and operation RPCs; memcpy backend, fake etcd.
+
+    This exercises the agent loop and handoffs, not NIC failure recovery.
+    """
+    from types import SimpleNamespace
+    from radixshmem import _data
+    from radixshmem.protection import PrefixSpec, ProtectedAgent, ProtectedCatalog
+    from test_protection import MemoryKv
+
+    class LeasedKv(MemoryKv):
+        def __init__(self):
+            super().__init__()
+            self.leases, self.next_lease = {}, 0
+
+        def grant_lease(self, ttl):
+            self.next_lease += 1
+            return self.next_lease
+
+        def keep_alive(self, lease):
+            pass
+
+        def compare_put(self, conditions, key, value, lease=0):
+            with self.mu:
+                result = super().compare_put(conditions, key, value, lease)
+                if result and lease:
+                    self.leases[key] = lease
+                return result
+
+        def revoke(self, lease):
+            with self.mu:
+                for key, owner in list(self.leases.items()):
+                    if owner == lease:
+                        self.data.pop(key, None)
+                        del self.leases[key]
+
+    servers, clients, agents, real_indices = {}, {}, {}, {}
+    kv = LeasedKv()
+    h = hashes(2)
+    spec = PrefixSpec("cpu-fixture/namespace", tuple(int(x) for x in h))
+    payload = [b"prefix-A", b"prefix-B"]
+    try:
+        for rank in (1, 2, 3):
+            tag = uuid.uuid4().hex[:8]
+            cfg = ServerConfig(name=f"/protect_{tag}", endpoint=f"unix://{tmp_path}/{tag}.sock",
+                               **data(data_bytes=1 << 20, background_evict_ratio=0))
+            servers[rank] = up(cfg, geometry())
+            clients[rank] = cl = client(cfg)
+            cl.info.rank = rank
+            real_indices[rank] = cl.index
+
+        slots = clients[1].allocate_slots(2)
+        for i, slot in enumerate(slots):
+            clients[1].slot_view(int(slot))[:8] = payload[i]
+        assert clients[1].insert(h, slots).error == OK
+
+        class Index:
+            def __init__(self, rank):
+                self.me, self.real = rank, real_indices[rank]
+
+            def __getattr__(self, key):
+                return getattr(self.real, key)
+
+            def rank(self):
+                return self.me
+
+            def query(self, hs, **kw):
+                source = kw.pop("source_rank", None)
+                if source is None or kw.get("local_only"):
+                    return self.real.query(hs, **kw)
+                q = real_indices[source].query(hs, mask=kw["mask"], local_only=True, lock=kw["lock"])
+                return SimpleNamespace(status=q.status, common_hit=q.common_hit,
+                    full_fragments=[(source, 0, q.full_fragments[0][2])] if q.full_fragments else [],
+                    swa_source_rank=-1, swa_slots=np.empty(0, np.int32), mamba=None, finalize=q.finalize)
+
+        class Copy:
+            def __init__(self, rank):
+                self.rank, self.n = rank, 0
+
+            def read(self, source, remote, local, kind):
+                self.n += 1
+                for src, dst in zip(remote, local):
+                    clients[self.rank].slot_view(int(dst))[:] = bytes(clients[int(source)].slot_view(int(src)))
+                return self.n, len(local)
+
+            def poll(self, handle):
+                return _data.XferState.COMPLETED, 2 * 8192
+
+            def release(self, handle):
+                return _data.XFER_OK
+
+        for rank in (1, 2, 3):
+            clients[rank]._index = Index(rank)
+            servers[rank]._xfer, servers[rank]._peer = Copy(rank), str
+            agents[rank] = ProtectedAgent(ProtectedCatalog(kv, "native"), clients[rank], [spec],
+                                         f"n{rank}", f"rack{rank}", 1 << 20, 1 << 20)
+
+        def settle(active, expected):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                for rank in active:
+                    agents[rank].tick()
+                c = agents[active[0]].catalog
+                if set(c.candidates(spec)) == expected:
+                    return
+                time.sleep(0.02)
+            raise AssertionError("replica repair did not settle")
+
+        settle([1, 2, 3], {1, 2})
+        agents[1].close()
+        del agents[1]
+        settle([2, 3], {2, 3})
+        for rank in (2, 3):
+            q = real_indices[rank].query(h, local_only=True)
+            assert q.common_hit == 2
+            for i, slot in enumerate(q.full_fragments[0][2]):
+                assert bytes(clients[rank].slot_view(int(slot))[:8]) == payload[i]
+    finally:
+        for agent in agents.values():
+            agent.close(timeout_s=5)
+        for cl in clients.values():
+            cl.close(timeout_s=5)
+        for srv in servers.values():
+            srv.close(timeout_s=5)
+
+
+def test_server_close_waits_for_idle_attached_client(cfg):
+    c = cfg(**data())
+    srv = up(c, geometry())
+    cl = client(c)
+    try:
+        with pytest.raises(TimeoutError, match="retained"):
+            srv.close(timeout_s=0)
+        assert srv.index is not None and srv.stats()["attached_clients"] == 1
+        cl.close()
+        srv.close()
+        assert srv.mode == "closed"
+    finally:
+        cl.close()
+        srv.close()
+
+
+def test_duplicate_server_cannot_unlink_live_socket(cfg):
+    c = cfg(**data())
+    srv = up(c, geometry())
+    duplicate = RadixServer(c)
+    try:
+        with pytest.raises(BlockingIOError):
+            duplicate.start()
+        cl = client(c)
+        assert cl.status().mode == "ready"
+        cl.close()
+    finally:
+        duplicate.close()
+        srv.close()
+
+
+def test_metrics_endpoint_distinguishes_local_and_protected_readiness(cfg):
+    import json
+    from urllib.request import urlopen
+    from radixshmem.monitoring import start
+
+    c = cfg(**data())
+    srv = up(c, geometry())
+    http = start(srv, "127.0.0.1", 0)
+    try:
+        base = f"http://127.0.0.1:{http.server_port}"
+        with urlopen(base + "/ready") as response:
+            assert json.load(response) == {"local": True, "remote": False, "protected": False}
+        with urlopen(base + "/metrics") as response:
+            text = response.read().decode()
+        assert "radixshmem_reserved_bytes 0" in text
+        assert "# TYPE radixshmem_transfer_bytes_total counter" in text
+    finally:
+        http.shutdown()
+        http.server_close()
         srv.close()
