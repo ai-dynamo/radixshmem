@@ -30,7 +30,6 @@ class RdmaContext;
 class PeerRegistry;
 class PeerConnector;
 class RhtBackend;    // include/rht_backend.h
-class IRdmaEndpoint;
 struct PeerEntry;
 struct PeerFaultCounters;
 struct ShardMapMsg;
@@ -276,11 +275,9 @@ private:
     // Ordered teardown of the RDMA/RHT plane (watcher → peers → RHT → transport).
     void teardown_cluster();
     bool wait_for_ready();
-    void read_topology();
-    IRdmaEndpoint* connect_rht_holder(int holder);
+    ShardMapMsg read_topology();
     void admit_peer(const PeerEntry& e);
     void remove_peer(int rank);
-    void setup_rht();
     void update_rht(const uint64_t* hashes, int n, const InsertResult& r);
     // Distributed datapath (renamed to avoid colliding with the public facade).
     InsertResult dist_insert(const uint64_t* hashes, int n,
@@ -330,17 +327,10 @@ private:
                          ::getenv("RADIXSHMEM_LAZY_CONNECT")[0] == '1';
     void preconnect_peers();
 
-    uint32_t rht_transport_ = 0;         // ClusterTransport, client -> RHT holders
     uint32_t peer_index_transport_ = 0;  // ClusterTransport, remote walks
     uint64_t dc_access_key_ = 0;
     int64_t  peers_snapshot_rev_ = 0;
 
-    // ---- RHT plane (from /config) ----
-    int              num_shards_ = 0;
-    uint32_t         rht_capacity_ = 0;
-    uint32_t         rht_slots_ = 4;
-    std::vector<int> holder_of_shard_;
-    std::unordered_map<int, std::unique_ptr<IRdmaEndpoint>> rht_holder_qps_;
     std::unique_ptr<RhtBackend> rht_;
 #endif
 };

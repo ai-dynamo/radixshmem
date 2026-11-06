@@ -8,7 +8,6 @@
 #include "rht_types.h"
 
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -17,8 +16,10 @@ struct ibv_pd;
 
 namespace radixshmem {
 
-class IRdmaEndpoint;   // src/indexer/transport/rdma/endpoint.hpp
+class PeerRegistry;
+class RdmaTransportClient;
 struct PeerFaultCounters;
+struct ShardMapMsg;
 
 // ==================== RhtHolder — write side ====================
 
@@ -49,31 +50,14 @@ private:
 
 // ==================== RdmaRht — read/write side ====================
 
-// Resolved shard map + peer table the cluster read from etcd.
-struct RhtTopology {
-    int      num_shards       = 0;
-    uint32_t capacity         = 0;   // requested per-shard buckets (ShardManifest value)
-    uint32_t slots_per_bucket = 0;   // W
-    int      my_rank          = -1;
-    std::vector<int>              holder_of_shard;   // size M: shard s → holder rank
-    const std::vector<PeerEntry>* peers = nullptr;   // rank-indexed, holds rht_shard_*
-    PeerFaultCounters*            faults = nullptr;  // node-wide fault counters, may be null
-};
-
-// "Connect an RHT-plane endpoint to `holder`", returning a non-owning pointer
-// (QP ownership stays with the caller). nullptr on failure.
-using RhtEndpointFactory = std::function<IRdmaEndpoint*(int holder)>;
-// "Destroy the endpoint to `holder`": it failed; the factory builds a new one.
-using RhtEndpointRelease = std::function<void(int holder)>;
-
 // Shards on the holder ranks, read and written with one-sided RDMA (the own
 // shard through shm). A holder that fails an op is skipped for a while.
 class RdmaRht final : public RhtBackend {
 public:
-    RdmaRht(const RhtTopology& topo, ibv_pd* pd,
-            const RhtEndpointFactory& connect_holder,
-            const RhtEndpointRelease& release_holder,
-            int bootstrap_timeout_sec);
+    // Connects to the holders `sm` names; tx is shared with the peer plane
+    // under peers.mutex().
+    RdmaRht(const ShardMapMsg& sm, RdmaTransportClient& tx, PeerRegistry& peers,
+            PeerFaultCounters* faults, int bootstrap_timeout_sec);
     ~RdmaRht() override;
 
     RdmaRht(const RdmaRht&) = delete;
