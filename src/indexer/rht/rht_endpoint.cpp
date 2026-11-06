@@ -20,7 +20,7 @@ namespace radixshmem {
 //
 // The only place the rht_shard_* field mapping is spelled out. capacity and
 // slots_per_bucket are cluster-global (ShardManifest), not per-peer, so from()
-// leaves them 0; RhtConsumer takes them from RhtTopology.
+// leaves them 0; RdmaRht takes them from RhtTopology.
 
 void RhtShardAddr::publish_to(PeerEntry& e) const {
     e.rht_shard_base_addr = base_addr;
@@ -84,14 +84,14 @@ const RhtShardAddr& RhtHolder::addr() const { return impl_->addr; }
 
 void RhtHolder::reset() { impl_->shard.reset(); }
 
-// ==================== RhtConsumer — read/write side ====================
+// ==================== RdmaRht — read/write side ====================
 
 // Private scratch for remote bucket reads. 64 KiB holds 512 probes per round
 // at W=8 (4096 at W=1); RhtEngine::lookup_batch splits larger batches into
 // rounds, so this bounds per-round work, not batch size.
-static constexpr size_t RHT_CONSUMER_SCRATCH_BYTES = 64 * 1024;
+static constexpr size_t RDMA_RHT_SCRATCH_BYTES = 64 * 1024;
 
-struct RhtConsumer::Impl {
+struct RdmaRht::Impl {
     int my_rank = -1;
     // This rank's own shard attached over shm, keyed by shard id (empty on
     // non-holder ranks).
@@ -126,27 +126,27 @@ struct RhtConsumer::Impl {
     }
 };
 
-RhtConsumer::RhtConsumer(const RhtTopology& topo, ibv_pd* pd,
-                         const RhtEndpointFactory& connect_holder,
-                         const RhtEndpointRelease& release_holder,
-                         int bootstrap_timeout_sec)
+RdmaRht::RdmaRht(const RhtTopology& topo, ibv_pd* pd,
+                 const RhtEndpointFactory& connect_holder,
+                 const RhtEndpointRelease& release_holder,
+                 int bootstrap_timeout_sec)
     : impl_(std::make_unique<Impl>()) {
     impl_->my_rank = topo.my_rank;
     if (topo.num_shards <= 0)
-        throw std::runtime_error("RhtConsumer: num_shards == 0");
+        throw std::runtime_error("RdmaRht: num_shards == 0");
     if (!pd)
-        throw std::runtime_error("RhtConsumer: null protection domain");
+        throw std::runtime_error("RdmaRht: null protection domain");
     const std::vector<PeerEntry>& peers = *topo.peers;
 
-    impl_->scratch = std::aligned_alloc(4096, RHT_CONSUMER_SCRATCH_BYTES);
+    impl_->scratch = std::aligned_alloc(4096, RDMA_RHT_SCRATCH_BYTES);
     if (!impl_->scratch)
-        throw std::runtime_error("RhtConsumer: scratch allocation failed");
-    std::memset(impl_->scratch, 0, RHT_CONSUMER_SCRATCH_BYTES);
+        throw std::runtime_error("RdmaRht: scratch allocation failed");
+    std::memset(impl_->scratch, 0, RDMA_RHT_SCRATCH_BYTES);
     impl_->scratch_mr = RdmaMemoryRegion(pd, impl_->scratch,
-                                         RHT_CONSUMER_SCRATCH_BYTES,
+                                         RDMA_RHT_SCRATCH_BYTES,
                                          IBV_ACCESS_LOCAL_WRITE);
     if (!impl_->scratch_mr.valid())
-        throw std::runtime_error("RhtConsumer: scratch MR registration failed");
+        throw std::runtime_error("RdmaRht: scratch MR registration failed");
 
     // The bucket count the engine will route over. Every holder built its
     // shard from the same manifest value through the same normalization, so
@@ -180,7 +180,7 @@ RhtConsumer::RhtConsumer(const RhtTopology& topo, ibv_pd* pd,
                 continue;
             }
             throw std::runtime_error(
-                "RhtConsumer: failed to attach own RHT shard");
+                "RdmaRht: failed to attach own RHT shard");
         }
 
         // Peer shard: RHT-plane QP + RDMA. A holder that is not registered
@@ -192,7 +192,7 @@ RhtConsumer::RhtConsumer(const RhtTopology& topo, ibv_pd* pd,
         }
         if (h.size != shard_bytes)
             throw std::runtime_error(
-                "RhtConsumer: holder rank " + std::to_string(holder) +
+                "RdmaRht: holder rank " + std::to_string(holder) +
                 " published RHT shard of " + std::to_string(h.size) +
                 " bytes, expected " + std::to_string(shard_bytes));
         if (std::find(unreachable.begin(), unreachable.end(), holder) == unreachable.end()) {
@@ -209,7 +209,7 @@ RhtConsumer::RhtConsumer(const RhtTopology& topo, ibv_pd* pd,
         std::move(shard_ptrs));
     impl_->rht->enable_rdma(std::move(eps), std::move(mrs),
                             impl_->scratch, impl_->scratch_mr.lkey(),
-                            RHT_CONSUMER_SCRATCH_BYTES);
+                            RDMA_RHT_SCRATCH_BYTES);
 
     impl_->breaker = std::make_unique<PeerBreaker>(
         "[RadixClient rank " + std::to_string(topo.my_rank) + "] RHT", topo.faults);
@@ -226,7 +226,7 @@ RhtConsumer::RhtConsumer(const RhtTopology& topo, ibv_pd* pd,
     impl_->shard_bytes = shard_bytes;
 }
 
-void RhtConsumer::Impl::apply_changes() {
+void RdmaRht::Impl::apply_changes() {
     std::vector<Change> todo;
     {
         std::lock_guard<std::mutex> g(changes_mu);
@@ -248,61 +248,66 @@ void RhtConsumer::Impl::apply_changes() {
     }
 }
 
-void RhtConsumer::holder_changed(const PeerEntry& e) {
+void RdmaRht::peer_changed(const PeerEntry& e) {
     if (!impl_->holds_shard(e.rank)) return;
     std::lock_guard<std::mutex> g(impl_->changes_mu);
     impl_->changes.push_back({e.rank, false, e});
     impl_->has_changes.store(true, std::memory_order_release);
 }
 
-void RhtConsumer::holder_left(int rank) {
+void RdmaRht::peer_left(int rank) {
     if (!impl_->holds_shard(rank)) return;
     std::lock_guard<std::mutex> g(impl_->changes_mu);
     impl_->changes.push_back({rank, true, PeerEntry{}});
     impl_->has_changes.store(true, std::memory_order_release);
 }
 
-void RhtConsumer::sync_changes() {
+void RdmaRht::sync_changes() {
     if (impl_->has_changes.load(std::memory_order_acquire)) impl_->apply_changes();
 }
 
-RhtConsumer::~RhtConsumer() = default;
+RdmaRht::~RdmaRht() = default;
 
-void RhtConsumer::insert_batch(const RhtInsertEntry* entries, int count) {
+void RdmaRht::insert_batch(const RhtInsertEntry* entries, int count) {
     std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->insert_batch(entries, count);
 }
 
-void RhtConsumer::lookup_batch(const uint64_t* keys, int count,
-                               std::vector<RHTValue>* results) {
+void RdmaRht::lookup_batch(const uint64_t* keys, int count,
+                           std::vector<RHTValue>* results) {
     std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->lookup_batch(keys, count, results);
 }
 
-void RhtConsumer::remove_batch(const RhtRemoveEntry* entries, int count) {
+void RdmaRht::remove_batch(const RhtRemoveEntry* entries, int count) {
     std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->remove_batch(entries, count);
 }
 
-void RhtConsumer::dump_bucket(uint64_t key, std::vector<RhtRawCell>& out) {
+void RdmaRht::dump(uint64_t key, std::vector<std::string>& lines) {
     std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     std::vector<RhtSlot> raw;
     impl_->rht->dump_bucket(key, raw);
-    out.clear();
-    for (const RhtSlot& c : raw) out.push_back({c.head, c.ext});
+    lines.clear();
+    char buf[40];
+    for (const RhtSlot& c : raw) {
+        snprintf(buf, sizeof(buf), "%016llx/%016llx", (unsigned long long)c.head,
+                 (unsigned long long)c.ext);
+        lines.emplace_back(buf);
+    }
 }
 
-void RhtConsumer::flush() {
+void RdmaRht::flush() {
     std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->flush();
 }
 
-void RhtConsumer::reset_owned_shard() {
+void RdmaRht::reset() {
     // local_shards only ever holds this rank's own shard (see ctor).
     for (auto& kv : impl_->local_shards)
         if (kv.second.valid()) kv.second.reset();

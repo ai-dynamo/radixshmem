@@ -65,7 +65,7 @@ set(_radixshmem_sources
 if(ENABLE_RDMA)
     list(APPEND _radixshmem_sources
         # RHT (router hash table): shard shm + routing engine (core), holder +
-        # consumer endpoints.
+        # RdmaRht endpoints.
         src/indexer/rht/rht_core.cpp
         src/indexer/rht/rht_endpoint.cpp
         # RDMA transport plane: verbs primitives split by connection model.

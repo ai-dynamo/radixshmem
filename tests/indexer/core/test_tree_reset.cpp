@@ -168,9 +168,7 @@ static void test_reset_then_fill_and_reset_slots_recycled() {
 
 #ifndef RADIXSHMEM_NO_RDMA
 // ==================================================================
-// Standalone RhtShard::reset() — the holder-side memset that
-// ClientCluster::reset_owned_rht_shard() drives. Verifies every slot is zeroed
-// and the header/identity survives.
+// RhtShard::reset() (run by RdmaRht::reset): every slot zeroed, header kept.
 static void test_rht_shard_reset() {
     TEST_BEGIN("RhtShard::reset zeros all slots, keeps identity");
 
