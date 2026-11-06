@@ -130,7 +130,8 @@ redisContext* open_conn(const Endpoint& ep, int timeout_ms, std::string& err) {
     return c;
 }
 
-constexpr int kMaxMasters = 4096;   // endpoint ids are never reused
+constexpr int kMaxMasters = 4096;    // endpoint ids are never reused
+constexpr size_t kMaxOwed = 16384;   // async replies a connection may leave unread
 
 struct Master {
     Endpoint ep;
@@ -386,10 +387,10 @@ public:
     }
 
     // Sends this batch; with wait its replies go to on_reply, else they are
-    // owed and read before the node's next batch.
+    // owed and read as they arrive, waiting only once kMaxOwed pile up.
     void send(Op op, bool wait, const OnReply& on_reply) {
         t0_ = Clock::now();
-        std::vector<int> live;
+        std::vector<int> live, backlog;
         for (int m : touched_) {
             Node& n = nodes_[m];
             int done = 0;
@@ -401,10 +402,16 @@ public:
             } else {
                 n.owed.insert(n.owed.end(), n.tags.size(), op);
                 n.tags.clear();
+                absorb(m, op);
+                if (n.c && n.owed.size() > kMaxOwed) backlog.push_back(m);
             }
         }
         touched_.clear();
         read(live, op, on_reply);
+        if (!backlog.empty()) {
+            t0_ = Clock::now();
+            read(backlog, op, nullptr);
+        }
     }
 
     void drain() {
@@ -446,6 +453,14 @@ private:
         std::string err = n.c && n.c->err ? n.c->errstr : what;
         if (n.c) close(m, op);
         view_.failed(m, what, err, secs_since(t0_));
+    }
+
+    // Reads the replies that already arrived, without waiting.
+    void absorb(int m, Op op) {
+        pollfd p{nodes_[m].c->fd, POLLIN, 0};
+        if (::poll(&p, 1, 0) <= 0) return;
+        if (redisBufferRead(nodes_[m].c) != REDIS_OK) fail(m, "read", op);
+        else consume(m, op, nullptr);
     }
 
     // 1: every reply read, 0: more to come, -1: the node failed.

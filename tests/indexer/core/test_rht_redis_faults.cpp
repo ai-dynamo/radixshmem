@@ -1,9 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// test_rht_redis_faults — the Redis RHT while masters hang. Starts its own
-// 3-master cluster on 127.0.0.1:7351 with RADIXSHMEM_REDIS_SCRIPT and the
-// binaries in RADIXSHMEM_TEST_REDIS_BIN; skips (77) when unset.
+// test_rht_redis_faults — the Redis RHT while masters hang and while async
+// replies pile up. Starts its own 3-master cluster on 127.0.0.1:7351 with
+// RADIXSHMEM_REDIS_SCRIPT and the binaries in RADIXSHMEM_TEST_REDIS_BIN;
+// skips (77) when unset.
 
 #include "test_utils.h"
 
@@ -159,6 +160,20 @@ static void test_hung_cluster() {
     TEST_PASS();
 }
 
+static void test_unread_replies() {
+    TEST_BEGIN("unflushed writes keep their replies drained; flush drops nothing");
+    PeerFaultCounters c{};
+    auto rht = filled("127.0.0.1:" + std::to_string(kPort), "backlog", &c);
+    std::vector<RhtInsertEntry> e(1000);
+    for (int round = 0; round < 2000; round++) {
+        for (int i = 0; i < 1000; i++) e[i] = {key_of(round * 1000 + i), 1, (uint32_t)i, 4};
+        rht->insert_batch(e.data(), 1000);
+    }
+    rht->flush();
+    assert(c.rht_writes.load() == 0 && c.down_events.load() == 0);
+    TEST_PASS();
+}
+
 int main() {
     printf("=== test_rht_redis_faults ===\n\n");
     const char* bin = std::getenv("RADIXSHMEM_TEST_REDIS_BIN");
@@ -186,6 +201,7 @@ int main() {
     }
     test_hung_master();
     test_hung_cluster();
+    test_unread_replies();
     cluster("stop");
     return tests_report();
 }
