@@ -20,6 +20,10 @@ option(ENABLE_RDMA "Build RDMA-dependent sources (requires libibverbs)" ON)
 
 option(ENABLE_ETCD "Build the etcd cluster-bootstrap registry (requires Go toolchain)" ON)
 
+option(ENABLE_REDIS_RHT "Build the Redis Cluster RHT backend (requires hiredis)" ON)
+set(RADIXSHMEM_TEST_REDIS "" CACHE STRING
+    "host:port of a Redis Cluster for the Redis RHT tests; empty skips them")
+
 # Mooncake TransferEngine backs the data plane's transfer backend (src/transfer).
 option(ENABLE_MOONCAKE "Build the Mooncake transfer backend (requires Mooncake headers + lib)" ON)
 set(MOONCAKE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mooncake" CACHE PATH
@@ -68,6 +72,7 @@ if(ENABLE_RDMA)
         # RdmaRht endpoints.
         src/indexer/rht/rht_core.cpp
         src/indexer/rht/rht_endpoint.cpp
+        src/indexer/rht/redis_rht.cpp
         # RDMA transport plane: verbs primitives split by connection model.
         src/indexer/transport/rdma/context.cpp
         src/indexer/transport/rdma/rc_endpoint.cpp
@@ -116,6 +121,20 @@ else()
     set(RADIXSHMEM_NO_RDMA ON)
 endif()
 target_link_libraries(radixshmem PUBLIC ${_radixshmem_link_libs})
+
+# Redis RHT backend: static hiredis when available, so nothing extra is needed at runtime.
+if(ENABLE_RDMA AND ENABLE_REDIS_RHT)
+    find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
+    find_library(HIREDIS_LIBRARY NAMES libhiredis.a hiredis)
+    if(HIREDIS_INCLUDE_DIR AND HIREDIS_LIBRARY)
+        target_include_directories(radixshmem PRIVATE ${HIREDIS_INCLUDE_DIR})
+        target_link_libraries(radixshmem PRIVATE ${HIREDIS_LIBRARY})
+        target_compile_definitions(radixshmem PRIVATE RADIXSHMEM_HAS_REDIS)
+        message(STATUS "Redis RHT backend: ${HIREDIS_LIBRARY}")
+    else()
+        message(STATUS "Redis RHT backend: hiredis not found, disabled")
+    endif()
+endif()
 
 # ==================== gRPC (remote-op control plane) ====================
 # grpc++/protobuf via pkg-config plus protoc/grpc_cpp_plugin; the generated code is a static library only transport/grpc sees.
@@ -445,6 +464,15 @@ if(ENABLE_RDMA)
     add_test(NAME test_cluster_shards_w4 COMMAND test_cluster_shards)
     set_tests_properties(test_cluster_shards_w4 PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_SLOTS=4")
+
+    # Redis RHT against a live cluster at RADIXSHMEM_TEST_REDIS; skips without one.
+    add_executable(test_rht_redis tests/indexer/core/test_rht_redis.cpp)
+    target_link_libraries(test_rht_redis PRIVATE radixshmem)
+    target_include_directories(test_rht_redis PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
+    radixshmem_enable_asserts(test_rht_redis)
+    add_test(NAME test_rht_redis COMMAND test_rht_redis)
+    set_tests_properties(test_rht_redis PROPERTIES SKIP_RETURN_CODE 77
+        ENVIRONMENT "RADIXSHMEM_TEST_REDIS=${RADIXSHMEM_TEST_REDIS}")
 endif()
 
 # ==================== Remote-op e2e gate ====================
