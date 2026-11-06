@@ -403,6 +403,10 @@ class RadixServer:
                 raise TimeoutError("server still draining; regions and transfer engine retained")
             self._wake.set()
             time.sleep(0.01)
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(max(0, deadline - time.monotonic()))
+            if self._worker.is_alive():
+                raise TimeoutError("configuration still running; RPC and regions retained")
         self._stop.set()
         if self._metrics_http is not None:
             self._metrics_http.shutdown()
@@ -414,8 +418,6 @@ class RadixServer:
         if self._rpc is not None:
             self._rpc.stop(grace=1).wait()
             self._rpc = None
-        if self._worker is not None and self._worker.is_alive():
-            self._worker.join(self.cfg.cluster.bootstrap_timeout_sec + 30)
         self._running = False
         self._wake.set()
         if self._thread is not None:
@@ -510,7 +512,7 @@ class RadixServer:
         spec = _geometry.as_spec(geometry)
         with self._cv:
             self._cv.wait_for(lambda: self._mode != MODE_STARTING)
-            if self._mode == MODE_CLOSED:
+            if self._mode == MODE_CLOSED or self._draining:
                 raise RuntimeError("server is closed")
             planned = _geometry.plan(spec, self.cfg)
             if self._mode in (MODE_CONFIGURING, MODE_READY):
@@ -546,7 +548,7 @@ class RadixServer:
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
-            if self.cfg.protection_file:
+            if self.cfg.protection_file and not self._protection_stop.is_set():
                 self._protection_thread = threading.Thread(target=self._run_protection,
                                                            name="radixshmem-protection", daemon=True)
                 self._protection_thread.start()
