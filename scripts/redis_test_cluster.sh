@@ -34,10 +34,10 @@ start)
 stop)
   for ((i = 0; i < n; i++)); do
     f=$run/$((port + i))/redis.pid
-    if [ -f "$f" ]; then kill "$(cat "$f")" || true; fi
+    if [ -f "$f" ]; then kill -CONT "$(cat "$f")" 2>/dev/null || true; kill "$(cat "$f")" || true; fi
   done
   sleep 1
-  rm -rf "$run"
+  for ((i = 0; i < n; i++)); do rm -rf "$run/$((port + i))"; done
   ;;
 *)
   echo "usage: $0 start|stop [port] [masters]" >&2

@@ -17,14 +17,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace radixshmem {
@@ -126,53 +130,252 @@ redisContext* open_conn(const Endpoint& ep, int timeout_ms, std::string& err) {
     return c;
 }
 
-// A cluster node: its connection, this batch's commands and the replies its
-// async writes still owe.
-struct Node {
+constexpr int kMaxMasters = 4096;   // endpoint ids are never reused
+
+struct Master {
     Endpoint ep;
+    std::atomic<bool> down{false};
+    std::atomic<uint32_t> gen{0};    // bumped each time the master goes down
+};
+
+// Masters, slot owners and health, shared by every connection of one RedisRht.
+// A maintenance thread refreshes the slot map and probes the masters that are
+// down; requests only read.
+class ClusterView {
+public:
+    using SlotMap = std::vector<int16_t>;
+
+    ClusterView(const RedisRhtConfig& cfg, PeerBreaker& breaker)
+        : seeds_(parse_seeds(cfg.seeds)), timeout_ms_(std::max(cfg.timeout_ms, 200)),
+          breaker_(breaker), masters_(new Master[kMaxMasters]),
+          slots_(std::make_shared<SlotMap>(16384, -1)) {
+        stale_ = !refresh();
+        thread_ = std::thread([this] { run(); });
+    }
+
+    ~ClusterView() {
+        {
+            std::lock_guard<std::mutex> g(mu_);
+            stop_ = true;
+        }
+        cv_.notify_one();
+        thread_.join();
+    }
+
+    ClusterView(const ClusterView&) = delete;
+    ClusterView& operator=(const ClusterView&) = delete;
+
+    std::shared_ptr<const SlotMap> slots() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return slots_;
+    }
+
+    const Endpoint& endpoint(int id) const { return masters_[id].ep; }
+    bool down(int id) const { return masters_[id].down.load(std::memory_order_acquire); }
+    uint32_t generation(int id) const { return masters_[id].gen.load(std::memory_order_acquire); }
+
+    // A request failed on master id: the first failure marks it down; only
+    // failed probes lengthen the backoff.
+    void failed(int id, const char* what, const std::string& err, double secs) {
+        if (!masters_[id].down.exchange(true, std::memory_order_acq_rel)) {
+            masters_[id].gen.fetch_add(1, std::memory_order_acq_rel);
+            breaker_.failed(id, what, err.c_str(), secs);
+        }
+        mark_stale();   // a failover moves the slots
+    }
+
+    void mark_stale() {
+        if (!stale_.exchange(true)) cv_.notify_one();
+    }
+
+private:
+    void run() {
+        auto next_refresh = Clock::now();
+        int backoff_ms = 200;
+        std::unique_lock<std::mutex> lk(mu_);
+        while (!stop_) {
+            cv_.wait_for(lk, std::chrono::milliseconds(100));
+            if (stop_) break;
+            lk.unlock();
+            if (stale_.load() && Clock::now() >= next_refresh) {
+                stale_ = false;
+                bool ok = refresh();
+                if (!ok) stale_ = true;
+                backoff_ms = ok ? 200 : std::min(backoff_ms * 2, 5000);
+                next_refresh = Clock::now() + std::chrono::milliseconds(backoff_ms);
+            }
+            probe_down();
+            lk.lock();
+        }
+    }
+
+    // Loads the slot map from the first node that answers: masters that are
+    // up, then the seeds.
+    bool refresh() {
+        std::vector<Endpoint> cand;
+        int n = count_.load(std::memory_order_acquire);
+        for (int id = 0; id < n; id++)
+            if (!down(id)) cand.push_back(masters_[id].ep);
+        for (const Endpoint& s : seeds_)
+            if (std::find(cand.begin(), cand.end(), s) == cand.end()) cand.push_back(s);
+        for (const Endpoint& ep : cand) {
+            std::string err;
+            redisContext* c = open_conn(ep, timeout_ms_, err);
+            if (!c) continue;
+            redisReply* r = (redisReply*)redisCommand(c, "CLUSTER SLOTS");
+            bool ok = r && r->type == REDIS_REPLY_ARRAY && r->elements > 0;
+            if (ok) {
+                auto map = std::make_shared<SlotMap>(16384, -1);
+                for (size_t i = 0; i < r->elements; i++) {
+                    redisReply* e = r->element[i];
+                    if (e->type != REDIS_REPLY_ARRAY || e->elements < 3) continue;
+                    redisReply* a = e->element[2];
+                    if (a->type != REDIS_REPLY_ARRAY || a->elements < 2 ||
+                        a->element[0]->type != REDIS_REPLY_STRING || !a->element[0]->len)
+                        continue;
+                    int id = id_of({std::string(a->element[0]->str, a->element[0]->len),
+                                    (int)a->element[1]->integer});
+                    if (id < 0) continue;
+                    long long lo = std::max(0LL, e->element[0]->integer);
+                    long long hi = std::min(16383LL, e->element[1]->integer);
+                    for (long long s = lo; s <= hi; s++) (*map)[s] = (int16_t)id;
+                }
+                std::lock_guard<std::mutex> g(mu_);
+                slots_ = std::move(map);
+            }
+            if (r) freeReplyObject(r);
+            redisFree(c);
+            if (ok) return true;
+        }
+        return false;
+    }
+
+    // Probes each down master that serves slots once its backoff runs out.
+    void probe_down() {
+        int n = count_.load(std::memory_order_acquire);
+        std::vector<int> ids;
+        for (int id = 0; id < n; id++)
+            if (down(id)) ids.push_back(id);
+        if (ids.empty()) return;
+        std::vector<char> serving(n, 0);
+        for (int16_t m : *slots()) if (m >= 0) serving[m] = 1;
+        for (int id : ids)
+            if (serving[id] && breaker_.gate(id) == PeerBreaker::Gate::PROBE) probe(id);
+    }
+
+    void probe(int id) {
+        auto t0 = Clock::now();
+        std::string err;
+        bool ok = false;
+        if (redisContext* c = open_conn(masters_[id].ep, timeout_ms_, err)) {
+            redisReply* r = (redisReply*)redisCommand(c, "PING");
+            ok = r && r->type == REDIS_REPLY_STATUS;
+            if (!ok) err = reply_error(r, c->err ? c->errstr : "PING failed");
+            if (r) freeReplyObject(r);
+            redisFree(c);
+        }
+        if (!ok) {
+            breaker_.failed(id, "probe", err.c_str(), secs_since(t0));
+            return;
+        }
+        breaker_.succeeded(id);
+        masters_[id].down.store(false, std::memory_order_release);
+    }
+
+    // Only the maintenance thread (and the constructor before it) adds masters.
+    int id_of(const Endpoint& ep) {
+        int n = count_.load(std::memory_order_relaxed);
+        for (int i = 0; i < n; i++)
+            if (masters_[i].ep == ep) return i;
+        if (n == kMaxMasters) return -1;
+        masters_[n].ep = ep;
+        breaker_.name(n, ep.str());
+        count_.store(n + 1, std::memory_order_release);
+        return n;
+    }
+
+    const std::vector<Endpoint> seeds_;
+    const int timeout_ms_;   // background connects and commands
+    PeerBreaker& breaker_;
+    std::unique_ptr<Master[]> masters_;
+    std::atomic<int> count_{0};
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    std::shared_ptr<const SlotMap> slots_;
+    std::atomic<bool> stale_{false};
+    bool stop_ = false;
+    std::thread thread_;
+};
+
+// A master's connection, this batch's commands and the replies its async
+// writes still owe.
+struct Node {
     redisContext* c = nullptr;
+    uint32_t gen = 0;
     std::vector<int> tags;
     size_t next = 0;
     std::deque<Op> owed;
 };
 
-// Slot routing over hiredis: one pipeline per node per batch, every node's
-// replies read with one deadline. Not thread-safe.
-class RedisCluster {
+// One caller's connections: one pipeline per master per batch, every master's
+// replies read under one deadline. Not thread-safe.
+class Conn {
 public:
     using OnReply = std::function<void(int tag, redisReply* r)>;
 
-    RedisCluster(const RedisRhtConfig& cfg, PeerBreaker& breaker)
-        : seeds_(parse_seeds(cfg.seeds)), timeout_ms_(cfg.timeout_ms), breaker_(breaker) {
-        refresh();
-    }
+    Conn(ClusterView& view, const RedisRhtConfig& cfg, PeerBreaker& breaker)
+        : view_(view), breaker_(breaker), timeout_ms_(cfg.timeout_ms),
+          key_(cfg.key_prefix + std::string(16, '0')), slots_(view.slots()) {}
 
-    ~RedisCluster() {
+    ~Conn() {
         for (Node& n : nodes_)
             if (n.c) redisFree(n.c);
     }
 
-    RedisCluster(const RedisCluster&) = delete;
-    RedisCluster& operator=(const RedisCluster&) = delete;
+    Conn(const Conn&) = delete;
+    Conn& operator=(const Conn&) = delete;
 
-    // The connected node serving key, or -1 with the op counted as dropped.
-    int route(const char* key, size_t len, Op op) {
-        if (stale_ && Clock::now() - refreshed_ > std::chrono::milliseconds(200)) refresh();
-        int m = owner_[key_slot(key, len)];
+    // Takes the current slot map for the next batch.
+    void begin() { slots_ = view_.slots(); }
+
+    const std::string& key() const { return key_; }
+
+    // The master serving k, whose Redis key is left in key(), or -1 with the
+    // op counted as dropped.
+    int route(uint64_t k, Op op) {
+        static const char hex[] = "0123456789abcdef";
+        char* p = &key_[key_.size() - 16];
+        for (int i = 15; i >= 0; i--, k >>= 4) p[i] = hex[k & 15];
+        int m = (*slots_)[key_slot(key_.data(), key_.size())];
         if (m < 0) {
-            stale_ = true;
+            view_.mark_stale();
             breaker_.skipped(-1, op);
             return -1;
         }
         return usable(m, op) ? m : -1;
     }
 
+    // Master m is up and connected; else the op is counted as dropped.
     bool usable(int m, Op op) {
-        if (nodes_[m].c) return true;
-        if (breaker_.gate(m) != PeerBreaker::Gate::SKIP && connect(m)) return true;
-        stale_ = true;   // a failover moves the slots: look again soon
-        breaker_.skipped(m, op);
-        return false;
+        if (view_.down(m)) {
+            breaker_.skipped(m, op);
+            return false;
+        }
+        Node& n = node(m);
+        uint32_t gen = view_.generation(m);
+        if (n.c && n.gen != gen) close(m, op);   // opened before m last went down
+        if (!n.c) {
+            auto t0 = Clock::now();
+            std::string err;
+            n.c = open_conn(view_.endpoint(m), timeout_ms_, err);
+            if (!n.c) {
+                view_.failed(m, "connect", err, secs_since(t0));
+                breaker_.skipped(m, op);
+                return false;
+            }
+            n.gen = gen;
+        }
+        return true;
     }
 
     void append(int m, int argc, const char** argv, const size_t* lens, int tag) {
@@ -213,52 +416,36 @@ public:
     }
 
     std::vector<int> masters() const {
-        std::vector<int> v(owner_.begin(), owner_.end());
+        std::vector<int> v(slots_->begin(), slots_->end());
         std::sort(v.begin(), v.end());
         v.erase(std::unique(v.begin(), v.end()), v.end());
         v.erase(std::remove(v.begin(), v.end(), -1), v.end());
         return v;
     }
 
-    const std::string& sha() const { return sha_; }
-
 private:
-    bool connect(int m) {
-        Node& n = nodes_[m];
-        auto t0 = Clock::now();
-        std::string err;
-        n.c = open_conn(n.ep, timeout_ms_, err);
-        if (n.c) {
-            redisReply* r = (redisReply*)redisCommand(n.c, "SCRIPT LOAD %s", kRemoveScript);
-            if (r && r->type == REDIS_REPLY_STRING) {
-                sha_.assign(r->str, r->len);
-            } else {
-                err = reply_error(r, n.c->err ? n.c->errstr : "SCRIPT LOAD failed");
-                redisFree(n.c);
-                n.c = nullptr;
-            }
-            if (r) freeReplyObject(r);
-        }
-        if (!n.c) {
-            breaker_.failed(m, "connect", err.c_str(), secs_since(t0));
-            return false;
-        }
-        breaker_.succeeded(m);
-        return true;
+    Node& node(int m) {
+        while ((int)nodes_.size() <= m) nodes_.emplace_back();
+        return nodes_[m];
     }
 
-    void fail(int m, const char* what, Op op) {
+    // Drops m's connection; the replies it still owes count as dropped ops.
+    void close(int m, Op op) {
         Node& n = nodes_[m];
-        std::string err = n.c && n.c->err ? n.c->errstr : what;
         for (Op o : n.owed) breaker_.skipped(m, o);
         if (n.next < n.tags.size()) breaker_.skipped(m, op, n.tags.size() - n.next);
         n.owed.clear();
         n.tags.clear();
         n.next = 0;
-        if (n.c) redisFree(n.c);
+        redisFree(n.c);
         n.c = nullptr;
-        breaker_.failed(m, what, err.c_str(), secs_since(t0_));
-        stale_ = true;
+    }
+
+    void fail(int m, const char* what, Op op) {
+        Node& n = nodes_[m];
+        std::string err = n.c && n.c->err ? n.c->errstr : what;
+        if (n.c) close(m, op);
+        view_.failed(m, what, err, secs_since(t0_));
     }
 
     // 1: every reply read, 0: more to come, -1: the node failed.
@@ -275,7 +462,7 @@ private:
             redisReply* r = (redisReply*)raw;
             bool err = r->type == REDIS_REPLY_ERROR;
             if (err && (!std::strncmp(r->str, "MOVED", 5) || !std::strncmp(r->str, "ASK", 3)))
-                stale_ = true;
+                view_.mark_stale();
             if (!n.owed.empty()) {
                 if (err) breaker_.skipped(m, n.owed.front());
                 n.owed.pop_front();
@@ -288,7 +475,6 @@ private:
         }
         n.tags.clear();
         n.next = 0;
-        breaker_.succeeded(m);
         return 1;
     }
 
@@ -319,90 +505,30 @@ private:
         }
     }
 
-    // Reloads the slot map from any node that answers; nodes are only added.
-    void refresh() {
-        refreshed_ = Clock::now();
-        std::vector<Endpoint> cand;
-        for (const Node& n : nodes_) cand.push_back(n.ep);
-        cand.insert(cand.end(), seeds_.begin(), seeds_.end());
-        for (const Endpoint& ep : cand) {
-            std::string err;
-            redisContext* c = open_conn(ep, timeout_ms_, err);
-            if (!c) continue;
-            redisReply* r = (redisReply*)redisCommand(c, "CLUSTER SLOTS");
-            bool ok = r && r->type == REDIS_REPLY_ARRAY && r->elements > 0;
-            if (ok) {
-                std::vector<int> owner(16384, -1);
-                for (size_t i = 0; i < r->elements; i++) {
-                    redisReply* e = r->element[i];
-                    if (e->type != REDIS_REPLY_ARRAY || e->elements < 3) continue;
-                    redisReply* a = e->element[2];
-                    if (a->type != REDIS_REPLY_ARRAY || a->elements < 2 ||
-                        a->element[0]->type != REDIS_REPLY_STRING || !a->element[0]->len)
-                        continue;
-                    int idx = node_of({std::string(a->element[0]->str, a->element[0]->len),
-                                       (int)a->element[1]->integer});
-                    long long lo = std::max(0LL, e->element[0]->integer);
-                    long long hi = std::min(16383LL, e->element[1]->integer);
-                    for (long long s = lo; s <= hi; s++) owner[s] = idx;
-                }
-                owner_.swap(owner);
-                stale_ = false;
-            }
-            if (r) freeReplyObject(r);
-            redisFree(c);
-            if (ok) return;
-        }
-    }
-
-    int node_of(const Endpoint& ep) {
-        for (size_t i = 0; i < nodes_.size(); i++)
-            if (nodes_[i].ep == ep) return (int)i;
-        nodes_.push_back(Node{ep});
-        breaker_.name((int)nodes_.size() - 1, ep.str());
-        return (int)nodes_.size() - 1;
-    }
-
-    std::vector<Endpoint> seeds_;
-    int timeout_ms_;
+    ClusterView& view_;
     PeerBreaker& breaker_;
-    std::deque<Node> nodes_;   // index = breaker id; references stay valid
-    std::vector<int> owner_ = std::vector<int>(16384, -1);
+    const int timeout_ms_;
+    std::string key_;
+    std::shared_ptr<const ClusterView::SlotMap> slots_;
+    std::deque<Node> nodes_;   // by master id; references stay valid
     std::vector<int> touched_;
-    std::string sha_;
-    bool stale_ = true;
-    Clock::time_point refreshed_{};
     Clock::time_point t0_{};
 };
 
-// A cluster client plus the buffer a key's name is written into.
-struct Conn {
-    RedisCluster cluster;
-    std::string key;
-
-    Conn(const RedisRhtConfig& cfg, PeerBreaker& breaker)
-        : cluster(cfg, breaker), key(cfg.key_prefix + std::string(16, '0')) {}
-
-    int route(uint64_t k, Op op) {
-        static const char hex[] = "0123456789abcdef";
-        char* p = &key[key.size() - 16];
-        for (int i = 15; i >= 0; i--, k >>= 4) p[i] = hex[k & 15];
-        return cluster.route(key.data(), key.size(), op);
-    }
-};
-
-// Writes share one client so flush() drains them all; lookups take an idle
-// client, so concurrent callers do not wait on each other's round trips.
+// Writes share one connection set so flush() drains them all; lookups take an
+// idle one, so concurrent callers do not wait on each other's round trips.
 class RedisRht final : public RhtBackend {
 public:
     RedisRht(const RedisRhtConfig& cfg, int my_rank, PeerFaultCounters* faults)
         : cfg_(cfg), my_rank_(my_rank),
-          breaker_("[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT", faults),
-          writer_(cfg, breaker_) {}
+          breaker_("[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT", faults,
+                   200, 2000),
+          view_(cfg, breaker_), writer_(view_, cfg, breaker_) {}
 
     void insert_batch(const RhtInsertEntry* e, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
         Conn& w = writer_;
+        w.begin();
         for (int i = 0; i < count; i++) {
             int m = w.route(e[i].key, Op::RHT_WRITE);
             if (m < 0) continue;
@@ -410,42 +536,44 @@ public:
             char val[8];
             put_u32(val, e[i].tree_node_id);
             put_u32(val + 4, e[i].num_blocks);
-            const char* argv[] = {"HSET", w.key.data(), field.c_str(), val};
-            const size_t lens[] = {4, w.key.size(), field.size(), sizeof(val)};
-            w.cluster.append(m, 4, argv, lens, i);
+            const char* argv[] = {"HSET", w.key().data(), field.c_str(), val};
+            const size_t lens[] = {4, w.key().size(), field.size(), sizeof(val)};
+            w.append(m, 4, argv, lens, i);
         }
-        w.cluster.send(Op::RHT_WRITE, false, nullptr);
+        w.send(Op::RHT_WRITE, false, nullptr);
     }
 
     void remove_batch(const RhtRemoveEntry* e, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
         Conn& w = writer_;
+        w.begin();
         for (int i = 0; i < count; i++) {
             int m = w.route(e[i].key, Op::RHT_REMOVE);
             if (m < 0) continue;
             std::string field = std::to_string(e[i].node_id);
             char tnid[4];
             put_u32(tnid, e[i].tree_node_id);
-            const std::string& sha = w.cluster.sha();
-            const char* argv[] = {"EVALSHA", sha.c_str(), "1", w.key.data(), field.c_str(), tnid};
-            const size_t lens[] = {7, sha.size(), 1, w.key.size(), field.size(), sizeof(tnid)};
-            w.cluster.append(m, 6, argv, lens, i);
+            const char* argv[] = {"EVAL", kRemoveScript, "1", w.key().data(), field.c_str(), tnid};
+            const size_t lens[] = {4, std::strlen(kRemoveScript), 1, w.key().size(),
+                                   field.size(), sizeof(tnid)};
+            w.append(m, 6, argv, lens, i);
         }
-        w.cluster.send(Op::RHT_REMOVE, false, nullptr);
+        w.send(Op::RHT_REMOVE, false, nullptr);
     }
 
     void lookup_batch(const uint64_t* keys, int count,
                       std::vector<RHTValue>* results) override {
         std::unique_ptr<Conn> c = acquire();
+        c->begin();
         for (int i = 0; i < count; i++) {
             results[i].clear();
             int m = c->route(keys[i], Op::RHT_LOOKUP);
             if (m < 0) continue;
-            const char* argv[] = {"HGETALL", c->key.data()};
-            const size_t lens[] = {7, c->key.size()};
-            c->cluster.append(m, 2, argv, lens, i);
+            const char* argv[] = {"HGETALL", c->key().data()};
+            const size_t lens[] = {7, c->key().size()};
+            c->append(m, 2, argv, lens, i);
         }
-        c->cluster.send(Op::RHT_LOOKUP, true, [&](int i, redisReply* r) {
+        c->send(Op::RHT_LOOKUP, true, [&](int i, redisReply* r) {
             if (r->type != REDIS_REPLY_ARRAY) return;
             for (size_t j = 0; j + 1 < r->elements; j += 2) {
                 redisReply* f = r->element[j];
@@ -460,13 +588,14 @@ public:
 
     void flush() override {
         std::lock_guard<std::mutex> g(write_mu_);
-        writer_.cluster.drain();
+        writer_.drain();
     }
 
     // Drops this rank's field from every key under the prefix.
     void reset() override {
         std::lock_guard<std::mutex> g(write_mu_);
-        RedisCluster& w = writer_.cluster;
+        Conn& w = writer_;
+        w.begin();
         w.drain();
         const std::string field = std::to_string(my_rank_);
         const std::string match = cfg_.key_prefix + "*";
@@ -503,12 +632,13 @@ public:
     void dump(uint64_t key, std::vector<std::string>& lines) override {
         lines.clear();
         std::unique_ptr<Conn> c = acquire();
+        c->begin();
         int m = c->route(key, Op::RHT_LOOKUP);
         if (m >= 0) {
-            const char* argv[] = {"HGETALL", c->key.data()};
-            const size_t lens[] = {7, c->key.size()};
-            c->cluster.append(m, 2, argv, lens, 0);
-            c->cluster.send(Op::RHT_LOOKUP, true, [&](int, redisReply* r) {
+            const char* argv[] = {"HGETALL", c->key().data()};
+            const size_t lens[] = {7, c->key().size()};
+            c->append(m, 2, argv, lens, 0);
+            c->send(Op::RHT_LOOKUP, true, [&](int, redisReply* r) {
                 if (r->type != REDIS_REPLY_ARRAY) return;
                 for (size_t j = 0; j + 1 < r->elements; j += 2) {
                     redisReply* v = r->element[j + 1];
@@ -536,7 +666,7 @@ private:
                 return c;
             }
         }
-        return std::make_unique<Conn>(cfg_, breaker_);
+        return std::make_unique<Conn>(view_, cfg_, breaker_);
     }
 
     void release(std::unique_ptr<Conn> c) {
@@ -547,6 +677,7 @@ private:
     const RedisRhtConfig cfg_;
     const int my_rank_;
     PeerBreaker breaker_;
+    ClusterView view_;
     std::mutex write_mu_;
     Conn writer_;
     std::mutex pool_mu_;

@@ -118,7 +118,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 > |---|---|---|
 > | `RADIXSHMEM_RHT_BACKEND` | `redis` | `redis`: the RHT lives in a Redis Cluster. `rdma`: in shards on holder ranks, read and written with one-sided RDMA. |
 > | `RADIXSHMEM_RHT_REDIS` | | redis, required: `host:port,...` of any nodes of the cluster. |
-> | `RADIXSHMEM_RHT_REDIS_TIMEOUT_MS` | `50` | redis: deadline of one batch of RHT ops; a node that misses it is skipped for a while and its ops count as dropped. |
+> | `RADIXSHMEM_RHT_REDIS_TIMEOUT_MS` | `50` | redis: deadline of one batch of RHT ops. A master that misses it is skipped, its ops counted as dropped, until a background probe reaches it again (after 0.2 s, backing off to 2 s). |
 > | `RADIXSHMEM_RHT_REDIS_PASSWORD` | | redis: `AUTH` password. Every server **and client** process needs it; it is not put in etcd. |
 > | `RADIXSHMEM_RHT_SHARDS` | `0` | rdma: shard count M, `0` = one per node. The leader also waits for M nodes. |
 > | `RADIXSHMEM_RHT_SHARD_HOLDERS` | | rdma: candidate holder ranks, e.g. `0,2,4,6`; default ranks `[0, M)`. |
