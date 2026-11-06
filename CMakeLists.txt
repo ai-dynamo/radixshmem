@@ -644,7 +644,7 @@ if(BUILD_PYTHON_MODULES)
 
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
             RESULT_VARIABLE _pytest_rc OUTPUT_QUIET ERROR_QUIET)
-        foreach(_t test_geometry test_server_rpc test_radixshmem)
+        foreach(_t test_geometry test_server_rpc test_radixshmem test_operations)
             if(_pytest_rc EQUAL 0)
                 add_test(NAME py_${_t}
                          COMMAND ${Python3_EXECUTABLE} -m pytest -q tests/${_t}.py)

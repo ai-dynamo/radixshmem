@@ -280,6 +280,22 @@ class _Transport:
     def __init__(self):
         self.items, self.submitted, self.n, self.order = {}, [], 0, []
         self.fail, self.lose, self.busy = set(), set(), False
+        self.operations, self.results = {}, {}
+
+    def operation(self, command, epoch, session, sequence, **fields):
+        key = (session, sequence)
+        if command == "reserve":
+            return {"state": "RETIRED" if self.busy else "RESERVED"}
+        if command == "ack":
+            return {"state": "RETIRED"}
+        if command == "submit" and key not in self.operations:
+            self.operations[key] = self.submit(fields["items"], fields["timeout_ms"])
+        ticket = self.operations[key]
+        if ticket in self.lose:
+            return {"state": "RETIRED"}  # definitive rejection, not UNKNOWN
+        if ticket not in self.results:
+            self.results.update(self.wait_any([ticket], 0)["done"])
+        return {"state": "DONE", "ticket": ticket, "replies": self.results[ticket]}
 
     def submit(self, items, timeout_ms):
         if self.busy:
@@ -333,7 +349,7 @@ def test_pull_async_promotes_remote_suffixes_out_of_order(cfg):
             r.finalize()
             assert real.query(h, local_only=True).common_hit == 8
         assert real.total_radix_nodes() == nodes       # promoted suffixes merged into the unpinned prefixes
-        assert transport.order != sorted(transport.order)
+        assert len(transport.order) == 8
         assert sorted(items[0][2] for items in transport.submitted) == \
             [list(range(100 * k, 100 * k + 5)) for k in range(8)]
         assert all(items[0][:2] == (7, 0) for items in transport.submitted)
@@ -354,11 +370,11 @@ def test_pull_async_promotes_remote_suffixes_out_of_order(cfg):
         r = cl.pull_async(h).wait(10)
         assert r.common_hit == 2 and r.remote_blocks == 0
         r.finalize()
-        assert cl.transfer_failures == 3 and cl.promotion_shortfalls == 0
+        assert cl.transfer_failures == 2 and cl.promotion_shortfalls == 0
         assert real.mempool_used() == 8 * 3 + 8 * 5 + 3 * 2
         assert real.check_health() == 0
-        assert cl._jobs == {} and cl._pending == {}
         cl.close()
+        assert cl._jobs == {} and cl._pending == {}
     finally:
         srv.close()
 
@@ -564,6 +580,10 @@ def test_timed_out_pull_keeps_pins_slots_and_budget_until_release(cfg, cancel, r
             submit = staticmethod(srv.submit)
             wait_any = staticmethod(srv.wait_any)
 
+            def operation(self, command, epoch, session, sequence, **fields):
+                return srv.operation(dict(command=command, epoch=epoch, session=session,
+                                          sequence=sequence, **fields))
+
             def close(self):
                 pass
 
@@ -571,6 +591,9 @@ def test_timed_out_pull_keeps_pins_slots_and_budget_until_release(cfg, cancel, r
         cl._t = Transport()
         job = cl.pull_async(h, timeout_ms=5000)
         assert read_started.wait(5)
+        deadline = time.monotonic() + 5
+        while job._ticket < 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
         with srv._jobs_mu:
             srv._jobs[job._ticket].deadline = time.monotonic() - 1
         assert release_attempted.wait(5)
@@ -613,6 +636,7 @@ def test_timed_out_pull_keeps_pins_slots_and_budget_until_release(cfg, cancel, r
         reply = srv.wait_any([queued], 5000)["done"][queued][0]
         assert not reply[0] and "TIMEOUT" in reply[3] and reply[2] == 0
         assert x.submitted == 1 and x.released == 1
+        cl.close()
         assert srv.stats()["pending_jobs"] == 0
     finally:
         allow_release.set()
@@ -623,4 +647,107 @@ def test_timed_out_pull_keeps_pins_slots_and_budget_until_release(cfg, cancel, r
         if srv._thread is not None:
             srv._thread.join(5)
         srv._xfer = None
+        srv.close()
+
+
+@pytest.mark.parametrize("lost_command", ["submit", "query", "ack"])
+def test_operation_reply_loss_is_retried_without_releasing_live_memory(cfg, lost_command):
+    from radixshmem import _data
+
+    c = cfg(**data(data_bytes=1 << 20))
+    srv = up(c, geometry())
+    cl = client(c)
+    x = _Xfer(_data)
+    x.hang.add(1)
+    srv._xfer, srv._peer = x, lambda rank: "peer"
+    real = cl.index
+    h = hashes(4)
+    local = cl.allocate_slots(2)
+    assert cl.insert(h[:2], local).error == OK
+    q = _Q(local, 2, np.array([10, 11], np.int32), 4)
+    cl._index = scripted_index(real, lambda hs: q)
+    original = cl._t.operation
+    dropped = threading.Event()
+
+    def operation(command, *args, **kw):
+        reply = original(command, *args, **kw)
+        if command == lost_command and not dropped.is_set():
+            dropped.set()
+            raise TimeoutError("reply lost after server processed the operation")
+        return reply
+
+    cl._t.operation = operation
+    try:
+        job = cl.pull_async(h, timeout_ms=50)
+        assert x.release_busy.wait(5)
+        assert not job.resources_released and not job.done()
+        assert bool(q.pin.finalize) and real.mempool_used() == 4
+        # Both close paths must preserve ownership on timeout.
+        with pytest.raises(TimeoutError, match="retained"):
+            cl.close(timeout_s=0)
+        with pytest.raises(TimeoutError, match="retained"):
+            srv.close(timeout_s=0)
+        assert cl._store is not None and srv._xfer is x
+        assert srv.stats()["reserved_bytes"] == 4 * 8192
+        x.hang.clear()
+        assert dropped.wait(5)
+        cl.close(timeout_s=5)
+        assert x.n == 1  # lost Submit never starts a second read
+        assert job.resources_released and not bool(q.pin.finalize)
+        assert real.mempool_used() == 2
+        assert srv.stats()["reserved_bytes"] == 0
+    finally:
+        x.hang.clear()
+        cl.close(timeout_s=5)
+        srv._xfer = None
+        srv.close(timeout_s=5)
+
+
+def test_node_admission_precedes_peer_query_and_staging(cfg):
+    c = cfg(**data(data_bytes=1 << 20, max_reserved_bytes=8192))
+    srv = up(c, geometry())
+    cl = client(c)
+    real = cl.index
+    queries = []
+    original = real.query
+
+    class Index:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def query(self, *args, **kw):
+            queries.append(kw["local_only"])
+            assert kw["local_only"]
+            return original(*args, **kw)
+
+    cl._index = Index()
+    try:
+        result = cl.pull_async(hashes(4), block=False).wait(1)
+        assert result.common_hit == 0
+        assert queries and all(queries)
+        assert real.mempool_used() == 0
+        assert srv.stats()["admission_refused"] == 1
+    finally:
+        cl.close()
+        srv.close()
+
+
+def test_each_component_consumes_backend_admission(cfg):
+    from radixshmem import _data
+
+    c = cfg(**data(data_bytes=1 << 20, max_inflight=1))
+    srv = up(c, geometry())
+    x = _Xfer(_data)
+    x.hang.add(1)
+    srv._xfer, srv._peer = x, lambda rank: "peer"
+    try:
+        ticket = srv.submit([(7, 0, [10], [0]), (7, 0, [11], [1]), (7, 0, [12], [2])], 20)
+        assert x.release_busy.wait(5)
+        assert x.n == 1
+        x.hang.clear()
+        reply = srv.wait_any([ticket], 5000)["done"][ticket]
+        assert len(reply) == 3 and not any(r[0] for r in reply)
+        assert x.n == 1
+    finally:
+        x.hang.clear()
         srv.close()

@@ -57,6 +57,9 @@ _DATA_FLAGS = {
     "max_inflight": ("max_inflight", "--max-inflight"),
     "max_pending_jobs": ("max_pending_jobs", "--max-pending-jobs"),
     "job_ttl": ("job_ttl_s", "--job-ttl"),
+    "max_reserved_bytes": ("max_reserved_bytes", "--max-reserved-bytes"),
+    "max_sessions": ("max_sessions", "--max-sessions"),
+    "reservation_ttl": ("reservation_ttl_s", "--reservation-ttl"),
 }
 
 
@@ -124,6 +127,12 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="queued + running + uncollected jobs before Submit is refused (default: 4096)")
     g.add_argument("--job-ttl", type=float, default=None,
                    help="seconds an uncollected job is kept (default: 60)")
+    g.add_argument("--max-reserved-bytes", type=parse_size, default=None,
+                   help="node staging admission budget, including draining jobs; 0 = data budget")
+    g.add_argument("--max-sessions", type=int, default=None,
+                   help="maximum client sessions per server epoch (default: 4096)")
+    g.add_argument("--reservation-ttl", type=float, default=None,
+                   help="unused reservation TTL; submitted operations never expire (default: 10)")
 
     g = p.add_argument_group("server")
     g.add_argument("--endpoint", default="",
@@ -268,7 +277,13 @@ def main(argv=None) -> None:
                 sys.stdout.flush()
     finally:
         print("\nShutting down ...", flush=True)
-        srv.close()
+        while True:
+            try:
+                srv.close()
+                break
+            except TimeoutError as e:
+                print(f"Drain pending: {e}; stop clients first. No memory has been force-reclaimed.",
+                      file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

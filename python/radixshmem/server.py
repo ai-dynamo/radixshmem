@@ -31,11 +31,13 @@ import socket
 import struct
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from radixshmem import _core, _geometry, rpc
+from radixshmem._operations import Operations
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
                              NodeInfo, TransferItem, TransferReply)
@@ -113,6 +115,9 @@ class ServerConfig:
     max_inflight: int = 256          # batches in flight at the engine
     max_pending_jobs: int = 4096     # queued + running + uncollected jobs before Submit is refused
     job_ttl_s: float = 60.0          # seconds an uncollected job is kept
+    max_reserved_bytes: int = 0     # 0 = data_bytes; includes draining/unacknowledged operations
+    max_sessions: int = 4096        # high-water marks live for this server epoch
+    reservation_ttl_s: float = 10.0 # only unsubmitted reservations can expire
     # index tuning
     max_nodes: int = 0               # radix node pool, 0 = auto
     register_chunk_tokens: int = 4096  # RHT registration granularity unless the geometry brings its own
@@ -127,6 +132,10 @@ class ServerConfig:
     def __post_init__(self) -> None:
         if self.data_bytes < 0:
             raise ValueError("data_bytes must be >= 0")
+        if min(self.max_inflight, self.max_pending_jobs, self.max_sessions, self.reservation_ttl_s) <= 0:
+            raise ValueError("job limits must be positive")
+        if self.max_reserved_bytes < 0:
+            raise ValueError("max_reserved_bytes must be >= 0")
         for k in ("swa_ratio", "mamba_ratio"):
             if not 0.0 <= float(getattr(self, k)) < 1.0:
                 raise ValueError(f"{k} must be in [0, 1)")
@@ -215,7 +224,8 @@ class _GeometryRegistry:
 
 
 class _Job:
-    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters")
+    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at",
+                 "waiters", "started", "managed")
 
     def __init__(self, items: List[TransferItem], deadline: float):
         self.ticket = 0
@@ -227,6 +237,8 @@ class _Job:
         self.done = False
         self.done_at = 0.0
         self.waiters: List[threading.Event] = []
+        self.started = set()
+        self.managed = False
 
 
 class RadixServer:
@@ -244,7 +256,7 @@ class RadixServer:
         self._stop = threading.Event()
         self._poller: Optional[threading.Thread] = None
         self._worker: Optional[threading.Thread] = None
-        self._jobs_mu = threading.Lock()
+        self._jobs_mu = threading.RLock()
         self._jobs: Dict[int, _Job] = {}
         self._queue: Deque[_Job] = deque()
         self._next_ticket = 1
@@ -252,6 +264,12 @@ class RadixServer:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self.transfers = self.transfer_failures = self.transfer_bytes = 0
+        self.epoch = uuid.uuid4().hex
+        self._ops = Operations(self.epoch, cfg.max_pending_jobs,
+                               cfg.max_reserved_bytes or max(1, cfg.data_bytes),
+                               cfg.max_sessions, cfg.reservation_ttl_s)
+        self._draining = False
+        self._inflight_count = self._release_pending_count = 0
 
     # ------------------------------------------------------------ lifecycle
 
@@ -264,7 +282,8 @@ class RadixServer:
             "Describe": lambda _: vars(self.describe()),
             "WaitReady": lambda r: vars(self.wait_ready(r["timeout_ms"] / 1000)),
             "Configure": lambda r: vars(self.configure(r["geometry"])),
-            "Submit": lambda r: {"ticket": self.submit(r["items"], r["timeout_ms"])},
+            "Submit": self._legacy_submit,
+            "Operation": self.operation,
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
         }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
@@ -317,7 +336,23 @@ class RadixServer:
                 f"device, or that backend not built — see ENABLE_MOONCAKE/ENABLE_NIXL)")
         return backend
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = 30.0) -> None:
+        # Keep RPC, polling, regions and registrations alive until consumers
+        # acknowledge completion. A failed close is retryable, not a fence.
+        with self._jobs_mu:
+            self._draining = True
+            self._ops.accepting = False
+        deadline = time.monotonic() + max(0, timeout_s)
+        while True:
+            with self._jobs_mu:
+                self._ops.expire()
+                drained = not self._ops.active and all(j.done for j in self._jobs.values())
+            if drained:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("server still draining; regions and transfer engine retained")
+            self._wake.set()
+            time.sleep(0.01)
         self._stop.set()
         if self._poller is not None:
             self._poller.join(2)
@@ -401,7 +436,7 @@ class RadixServer:
                 data_bytes=c.data_bytes,
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
-                mamba_ratio=float(c.mamba_ratio))
+                mamba_ratio=float(c.mamba_ratio), epoch=self.epoch, pull_protocol=2)
 
     def configure(self, geometry) -> NodeInfo:
         """Take a client's geometry: validate it, plan the pools, check it
@@ -510,6 +545,9 @@ class RadixServer:
             out = {"mode": self._mode, "transfers": self.transfers,
                    "transfer_failures": self.transfer_failures, "transfer_bytes": self.transfer_bytes,
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
+            out.update(self._ops.stats(), epoch=self.epoch, draining=self._draining,
+                       inflight_batches=self._inflight_count,
+                       release_pending_batches=self._release_pending_count)
         if idx is not None:
             out.update(rank=idx.rank(), world_size=idx.world_size(),
                        total_radix_nodes=idx.total_radix_nodes(), total_blocks=idx.total_blocks(),
@@ -575,7 +613,60 @@ class RadixServer:
 
     # ---------------------------------------------------------------- jobs
 
+    def _legacy_submit(self, _):
+        raise DataPlaneUnavailable("peer pulls require operation protocol v2; upgrade the client")
+
+    def operation(self, request):
+        """All decisions and high-water updates are atomic with job admission.
+
+        UNKNOWN and EPOCH_MISMATCH never authorize releasing client memory.
+        RETIRED means this epoch can no longer accept that operation number.
+        """
+        epoch, session, seq = request["epoch"], request["session"], int(request["sequence"])
+        command = request["command"]
+        with self._jobs_mu:
+            if command == "reserve":
+                state, op = self._ops.reserve(epoch, session, seq, request["nbytes"])
+            else:
+                state, op = self._ops.lookup(epoch, session, seq)
+            if op is None:
+                return {"state": state, "epoch": self.epoch}
+            if command == "submit":
+                fingerprint = json.dumps([request["items"], request["timeout_ms"]], separators=(",", ":"))
+                if op.fingerprint and op.fingerprint != fingerprint:
+                    raise ValueError("operation payload changed on retry")
+                if op.state == "RESERVED":
+                    # Validate all descriptors before any transfer can start.
+                    try:
+                        nbytes = 0
+                        for rank, kind, remote, local in request["items"]:
+                            pool = self._store.pool(ComponentType(kind))
+                            if (not remote or len(remote) != len(local) or int(rank) < 0
+                                    or any(int(s) < 0 for s in remote)
+                                    or any(not 0 <= int(s) < pool.num_slots for s in local)):
+                                raise ValueError("invalid transfer slots")
+                            nbytes += len(local) * int(pool.slot_bytes)
+                        if nbytes > op.nbytes or not request["items"]:
+                            raise ValueError("transfer exceeds reservation")
+                        ticket = self.submit(request["items"], request["timeout_ms"])
+                    except Exception as e:
+                        self._ops.retire(session, seq)
+                        return {"state": "RETIRED", "epoch": self.epoch, "error": str(e)}
+                    op.ticket, op.fingerprint, op.state = ticket, fingerprint, "SUBMITTED"
+                    self._jobs[ticket].managed = True
+            job = self._jobs.get(op.ticket)
+            if command == "ack":
+                if op.state == "RESERVED" or (job is not None and job.done):
+                    self._ops.retire(session, seq)
+                    self._jobs.pop(op.ticket, None)
+                    return {"state": "RETIRED", "epoch": self.epoch}
+            state = "DONE" if job is not None and job.done else op.state
+            return {"state": state, "epoch": self.epoch, "ticket": op.ticket,
+                    "replies": job.replies if state == "DONE" else []}
+
     def submit(self, items: Sequence[TransferItem], timeout_ms: int) -> int:
+        if self._draining:
+            raise DataPlaneUnavailable("server is draining")
         if self._mode != MODE_READY:
             raise DataPlaneUnavailable(f"server is {self._mode}")
         if self._store is None:
@@ -627,7 +718,8 @@ class RadixServer:
                     continue
                 if j.done:
                     done[t] = j.replies
-                    del self._jobs[t]
+                    if not j.managed:
+                        del self._jobs[t]
                 elif ev in j.waiters:
                     j.waiters.remove(ev)
         return {"done": done, "unknown": unknown}
@@ -661,8 +753,13 @@ class RadixServer:
                 if job is None:
                     break
                 for i, (rank, kind, remote, local) in enumerate(job.items):
-                    if job.replies[i] is not None:
+                    if job.replies[i] is not None or i in job.started:
                         continue
+                    if len(inflight) >= c.max_inflight:
+                        with self._jobs_mu:
+                            self._queue.appendleft(job)
+                        break
+                    job.started.add(i)
                     if time.monotonic() >= job.deadline:
                         self._resolve(job, i, (False, 0, 0, str(_data.XferState.TIMEOUT)))
                         continue
@@ -700,11 +797,13 @@ class RadixServer:
                 self._resolve(job, i, reply)
                 progressed = True
             inflight = still
+            self._inflight_count = len(inflight)
+            self._release_pending_count = sum(reply is not None for *_, reply in inflight)
             if now - last_gc > 1.0:
                 last_gc = now
                 with self._jobs_mu:
                     for t in [t for t, j in self._jobs.items()
-                              if j.done and now - j.done_at > c.job_ttl_s]:
+                              if j.done and not j.managed and now - j.done_at > c.job_ttl_s]:
                         del self._jobs[t]
             if inflight:
                 time.sleep(0 if progressed else 0.00005)
