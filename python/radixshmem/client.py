@@ -462,13 +462,20 @@ class RadixClient:
                     self._complete(job, [])
         except Exception as e:
             # Nothing has been submitted. Release only known staged resources.
-            if job._q is not None:
-                job._q.finalize()
-            for kind, (_, slots) in job._staged.items():
-                self._recycle(slots, kind)
-            job._resources_released = True
+            try:
+                if job._q is not None:
+                    job._q.finalize()
+                for kind, (_, slots) in job._staged.items():
+                    self._recycle(slots, kind)
+                job._resources_released = True
+            except Exception:
+                job._publication_failed = True
+                job._state = "LOCAL_ERROR"
             if not job._f.done():
-                self._failing_local_result(job, e)
+                if job._publication_failed:
+                    job._f.set_exception(e)
+                else:
+                    self._failing_local_result(job, e)
         with self._mu:
             self._pending[job.job_id] = job
             if self._completer is None:
@@ -517,7 +524,7 @@ class RadixClient:
         with self._mu:
             pending = list(self._pending.values())
         return {"pending": len(pending), "draining": sum(j.cancelled for j in pending),
-                "quarantined": sum(j._state in ("UNKNOWN", "EPOCH_MISMATCH") for j in pending),
+                "quarantined": sum(j._state in ("UNKNOWN", "EPOCH_MISMATCH", "LOCAL_ERROR") for j in pending),
                 "oldest_pending_s": max((time.monotonic() - j._created for j in pending), default=0),
                 "rpc_errors": self.rpc_errors, "epoch_mismatches": self.epoch_mismatches,
                 "saturated": self.saturated, "transfer_failures": self.transfer_failures}
@@ -592,6 +599,7 @@ class RadixClient:
                     # is not completion. Hold ownership and retry with the same
                     # operation identity; admission bounds this quarantine.
                     self.rpc_errors += 1
+                    job._state = "UNKNOWN"
                     self._remote_retry_at = time.monotonic() + 1
             self._work.wait(0.05)
             self._work.clear()
