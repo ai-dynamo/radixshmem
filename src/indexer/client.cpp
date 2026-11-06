@@ -634,6 +634,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                     remote_hits.push_back({h.pos, h.tnid});
                     known.emplace(hashes[h.pos], h);
                 }
+            std::unordered_set<uint64_t> probed(probe_keys.begin(), probe_keys.end());
             auto lookup = [&](uint64_t key, RhtHop& hop) {
                 auto it = known.find(key);
                 if (it != known.end()) {
@@ -641,6 +642,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                     hop.num_blocks = it->second.len;
                     return true;
                 }
+                if (probed.count(key)) return false;   // the batch found no route of this peer
                 std::vector<RHTValue> vals;
                 rht_->lookup_batch(&key, 1, &vals);
                 for (auto& v : vals)
