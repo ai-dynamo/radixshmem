@@ -64,7 +64,7 @@ set(_radixshmem_sources
     src/indexer/tree_dump.cpp)
 if(ENABLE_RDMA)
     list(APPEND _radixshmem_sources
-        # RHT (router hash table): shard shm + routing engine (core), holder +
+        # RHT (Radix Hash Table): shard shm + routing engine (core), holder +
         # RdmaRht endpoints.
         src/indexer/rht/rht_core.cpp
         src/indexer/rht/rht_endpoint.cpp
