@@ -18,7 +18,9 @@ cluster (``configuring`` -> ``ready``, or back to ``waiting`` with
 
 Transfers are jobs: ``submit`` queues one, a single transfer thread feeds the
 engine and polls completions, ``wait_any`` sleeps on an Event until one of the
-caller's jobs is done. Nothing else polls.
+caller's jobs is done. A transfer deadline records failure, but completion is
+not delivered until the backend releases the batch: the client owns the source
+pin and destination slots until it receives that completion. Nothing else polls.
 """
 
 from __future__ import annotations
@@ -238,7 +240,6 @@ class RadixServer:
         self._greg: Optional[_GeometryRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
-        self._zombies: List[int] = []
         self._rpc = None
         self._stop = threading.Event()
         self._poller: Optional[threading.Thread] = None
@@ -356,7 +357,6 @@ class RadixServer:
                 dreg.unpublish(index.node_name())
             except Exception:  # noqa: BLE001
                 pass
-        self._reap()
         if store is not None:
             from radixshmem import _data
 
@@ -663,6 +663,9 @@ class RadixServer:
                 for i, (rank, kind, remote, local) in enumerate(job.items):
                     if job.replies[i] is not None:
                         continue
+                    if time.monotonic() >= job.deadline:
+                        self._resolve(job, i, (False, 0, 0, str(_data.XferState.TIMEOUT)))
+                        continue
                     try:
                         h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
                     except Exception as e:  # noqa: BLE001
@@ -671,26 +674,34 @@ class RadixServer:
                         self._peers.pop(rank, None)
                         self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
                     else:
-                        inflight.append((job, i, h, nd))
+                        inflight.append((job, i, h, nd, None))
             progressed, now, still = False, time.monotonic(), []
-            for job, i, h, nd in inflight:
-                st, done = self._xfer.poll(h)
-                if st == _data.XferState.PENDING and now < job.deadline:
-                    still.append((job, i, h, nd))
+            for job, i, h, nd, reply in inflight:
+                if reply is None:
+                    st, done = self._xfer.poll(h)
+                    if st == _data.XferState.PENDING and now < job.deadline:
+                        still.append((job, i, h, nd, None))
+                        continue
+                    if st == _data.XferState.PENDING:
+                        st = _data.XferState.TIMEOUT
+                    ok = st == _data.XferState.COMPLETED
+                    if not ok:
+                        self._peers.pop(job.items[i][0], None)
+                    reply = (ok, int(done), int(nd), "" if ok else str(st))
+                # A timeout is not an abort. Keep the whole job (and its
+                # inflight budget) until release confirms the backend is done.
+                # Delivering even a failure lets the client unpin/recycle the
+                # memory. Preserve the first outcome so a late completion is
+                # never promoted after a timeout. Other release errors are
+                # also not proof that the memory is safe to reuse.
+                if self._xfer.release(h) != _data.XFER_OK:
+                    still.append((job, i, h, nd, reply))
                     continue
-                if st == _data.XferState.PENDING:
-                    st = _data.XferState.TIMEOUT
-                if self._xfer.release(h) == _data.XFER_EBUSY:
-                    self._zombies.append(h)
-                ok = st == _data.XferState.COMPLETED
-                if not ok:
-                    self._peers.pop(job.items[i][0], None)
-                self._resolve(job, i, (ok, int(done), int(nd), "" if ok else str(st)))
+                self._resolve(job, i, reply)
                 progressed = True
             inflight = still
             if now - last_gc > 1.0:
                 last_gc = now
-                self._reap()
                 with self._jobs_mu:
                     for t in [t for t, j in self._jobs.items()
                               if j.done and now - j.done_at > c.job_ttl_s]:
@@ -721,9 +732,3 @@ class RadixServer:
                 raise RuntimeError(f"attach_peer({e.segment}) rc={rc}")
             self._peers[rank] = e.segment
             return e.segment
-
-    def _reap(self) -> None:
-        from radixshmem import _data
-
-        if self._xfer is not None:
-            self._zombies = [h for h in self._zombies if self._xfer.release(h) == _data.XFER_EBUSY]
