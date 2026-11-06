@@ -57,6 +57,13 @@ _DATA_FLAGS = {
     "max_inflight": ("max_inflight", "--max-inflight"),
     "max_pending_jobs": ("max_pending_jobs", "--max-pending-jobs"),
     "job_ttl": ("job_ttl_s", "--job-ttl"),
+    "max_reserved_bytes": ("max_reserved_bytes", "--max-reserved-bytes"),
+    "max_sessions": ("max_sessions", "--max-sessions"),
+    "reservation_ttl": ("reservation_ttl_s", "--reservation-ttl"),
+    "protection_file": ("protection_file", "--protection-file"),
+    "fault_domain": ("fault_domain", "--fault-domain"),
+    "protected_bytes": ("protected_bytes", "--protected-bytes"),
+    "repair_bytes_per_s": ("repair_bytes_per_s", "--repair-bytes-per-s"),
 }
 
 
@@ -124,8 +131,20 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="queued + running + uncollected jobs before Submit is refused (default: 4096)")
     g.add_argument("--job-ttl", type=float, default=None,
                    help="seconds an uncollected job is kept (default: 60)")
+    g.add_argument("--max-reserved-bytes", type=parse_size, default=None,
+                   help="node staging admission budget, including draining jobs; 0 = data budget")
+    g.add_argument("--max-sessions", type=int, default=None,
+                   help="maximum client sessions per server epoch (default: 4096)")
+    g.add_argument("--reservation-ttl", type=float, default=None,
+                   help="unused reservation TTL; submitted operations never expire (default: 10)")
+    g.add_argument("--protection-file", default=None, help="manual protected prefix JSON; opt-in")
+    g.add_argument("--fault-domain", default=None, help="independent host/rack failure domain")
+    g.add_argument("--protected-bytes", type=parse_size, default=None, help="per-node protection quota")
+    g.add_argument("--repair-bytes-per-s", type=parse_size, default=None, help="repair pacing budget")
 
     g = p.add_argument_group("server")
+    g.add_argument("--metrics-port", type=int, default=0, help="HTTP /metrics and /ready; 0 disables")
+    g.add_argument("--metrics-host", default="127.0.0.1")
     g.add_argument("--endpoint", default="",
                    help="gRPC endpoint clients connect to (default: unix:///dev/shm/<name>.sock)")
     g.add_argument("--rpc-workers", type=int, default=32,
@@ -189,7 +208,7 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
         evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
-        cluster=cluster, **kw)
+        metrics_port=a.metrics_port, metrics_host=a.metrics_host, cluster=cluster, **kw)
 
 
 def _stats_line(srv: RadixServer) -> str:
@@ -268,7 +287,13 @@ def main(argv=None) -> None:
                 sys.stdout.flush()
     finally:
         print("\nShutting down ...", flush=True)
-        srv.close()
+        while True:
+            try:
+                srv.close()
+                break
+            except TimeoutError as e:
+                print(f"Drain pending: {e}; stop clients first. No memory has been force-reclaimed.",
+                      file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":

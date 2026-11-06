@@ -167,7 +167,8 @@ public:
                                uint32_t component_mask = COMPONENT_MASK_FULL,
                                bool local_only  = false,
                                bool lock        = false,
-                               bool update_meta = true);
+                               bool update_meta = true,
+                               int source_rank = -1);
 
     int allocate_slots(int num_slots, std::vector<int32_t>& out,
                        ComponentType component = ComponentType::FULL);

@@ -986,6 +986,19 @@ enum class ComponentType : uint32_t { FULL = 0, SWA = 1, MAMBA = 2 };  // Identi
 
 The public surface of the Python package is two pure-Python classes: `radixshmem.RadixServer` (one process per node, holding the index, SlotStore, transfer engine, and gRPC service; started with the operator parameters `ServerConfig`, it starts in `waiting`, and the geometry is sent by a client) and `radixshmem.RadixClient` (can be constructed before the server is ready; `RadixClient(name, Geometry)` also hands the geometry to the server; `status()` / `configure()` do not block, `wait_ready()` blocks; the index and SlotStore are attached on the first index / data call, raising `ServerNotReady` if not ready; index operations pass through to the underlying `_core.RadixClient`, plus `pull_async()`: query, hand the transfer to the server, publish locally on completion, and `PullJob.wait()` returns local slots). The classes aligned with C++ described below live in the pybind modules `radixshmem._core` (index surface) and `radixshmem._data` (SlotStore / transfer surface), for tests and advanced users to use directly.
 
+For `pull_async(..., timeout_ms=...)`, a transfer deadline marks the operation
+as failed, but its completion is not delivered until the backend successfully
+releases the batch. The source pins and destination slots stay reserved while
+it drains, and the batch continues to count against the server's in-flight
+limit. A late transfer completion does not turn the timed-out operation into
+a successful cache promotion. Work whose deadline expires in the queue is
+rejected without submitting I/O.
+
+Use `PullJob.wait(timeout=...)` to bound the caller's wait; it does not release
+the transfer's resources. `PullJob.cancel()` abandons the result while cleanup
+continues in the background. A backend that cannot release a batch keeps the
+job pending; clients must remain open until their outstanding transfers drain.
+
 `radixshmem._core` matches the C++ API names and signatures nearly one to one. Differences:
 
 - `compute_hashes` is available both at module top level (`radixshmem.compute_hashes(...)`) and as a class static method (`radixshmem.RadixClient.compute_hashes(...)`); the two are equivalent.

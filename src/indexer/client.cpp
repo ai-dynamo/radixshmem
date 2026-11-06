@@ -751,7 +751,7 @@ static ComponentQueryResult to_public(TreeComponentQueryResult&& r,
 ComponentQueryResult RadixClient::query(const uint64_t* hashes, int n,
                                         uint32_t component_mask,
                                         bool local_only, bool lock,
-                                        bool update_meta) {
+                                        bool update_meta, int source_rank) {
     ComponentQueryResult result;
     std::vector<PinRecord> pins;
     if (component_mask == 0 ||
@@ -762,8 +762,24 @@ ComponentQueryResult RadixClient::query(const uint64_t* hashes, int n,
     }
 #ifndef RADIXSHMEM_NO_RDMA
     if (distributed_ && !local_only) {
-        result = dist_query_components(hashes, n, component_mask, lock,
-                                       update_meta, pins);
+        if (source_rank >= 0) {
+            // A validated directory candidate is only a routing hint. Walk
+            // its current tree from the root and take the normal component
+            // pins; never trust cached slot ids or an old publication epoch.
+            if (local_)
+                result = to_public(local_->tree().query_components(
+                    hashes, n, component_mask, lock, update_meta), (int32_t)rank(), pins);
+            if (source_rank != rank() && source_rank < peer_reg_->world_size()) {
+                const int h = result.common_hit;
+                const int f = result.full_fragments.empty() ? 0 : result.full_fragments[0].slot_ids.size();
+                if (h < n)
+                    result = peer_conn_->walk_components(source_rank, hashes, n, component_mask,
+                                                         lock, h, f, {}, std::move(result), pins);
+            }
+        } else {
+            result = dist_query_components(hashes, n, component_mask, lock,
+                                           update_meta, pins);
+        }
     } else
 #endif
     {
@@ -788,6 +804,11 @@ ComponentQueryResult RadixClient::query(const uint64_t* hashes, int n,
     }
 
     if (lock && !pins.empty()) {
+        for (const auto& p : pins) {
+            result.pinned_full_blocks += p.full.end - p.full.start;
+            result.pinned_swa_slots += p.swa.end - p.swa.start;
+            result.pinned_mamba_slots += p.mamba_end != INVALID_COMPONENT_SLOT;
+        }
         // finalize dec_refs every pinned tree, routed by source_rank.
         std::vector<uint64_t> hashes_copy(hashes, hashes + n);
         auto* self = this;

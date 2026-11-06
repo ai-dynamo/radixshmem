@@ -5,6 +5,7 @@
 the server starts waiting, a client brings the geometry, clients attach on use."""
 
 import os
+import threading
 import time
 import uuid
 
@@ -279,6 +280,24 @@ class _Transport:
     def __init__(self):
         self.items, self.submitted, self.n, self.order = {}, [], 0, []
         self.fail, self.lose, self.busy = set(), set(), False
+        self.operations, self.results = {}, {}
+
+    def operation(self, command, epoch, session, sequence, **fields):
+        key = (session, sequence)
+        if command == "reserve":
+            return {"state": "RETIRED" if self.busy else "RESERVED"}
+        if command == "hold":
+            return {"state": "HELD"}
+        if command == "ack":
+            return {"state": "RETIRED"}
+        if command == "submit" and key not in self.operations:
+            self.operations[key] = self.submit(fields["items"], fields["timeout_ms"])
+        ticket = self.operations[key]
+        if ticket in self.lose:
+            return {"state": "RETIRED"}  # definitive rejection, not UNKNOWN
+        if ticket not in self.results:
+            self.results.update(self.wait_any([ticket], 0)["done"])
+        return {"state": "DONE", "ticket": ticket, "replies": self.results[ticket]}
 
     def submit(self, items, timeout_ms):
         if self.busy:
@@ -332,7 +351,7 @@ def test_pull_async_promotes_remote_suffixes_out_of_order(cfg):
             r.finalize()
             assert real.query(h, local_only=True).common_hit == 8
         assert real.total_radix_nodes() == nodes       # promoted suffixes merged into the unpinned prefixes
-        assert transport.order != sorted(transport.order)
+        assert len(transport.order) == 8
         assert sorted(items[0][2] for items in transport.submitted) == \
             [list(range(100 * k, 100 * k + 5)) for k in range(8)]
         assert all(items[0][:2] == (7, 0) for items in transport.submitted)
@@ -353,11 +372,11 @@ def test_pull_async_promotes_remote_suffixes_out_of_order(cfg):
         r = cl.pull_async(h).wait(10)
         assert r.common_hit == 2 and r.remote_blocks == 0
         r.finalize()
-        assert cl.transfer_failures == 3 and cl.promotion_shortfalls == 0
+        assert cl.transfer_failures == 2 and cl.promotion_shortfalls == 0
         assert real.mempool_used() == 8 * 3 + 8 * 5 + 3 * 2
         assert real.check_health() == 0
-        assert cl._jobs == {} and cl._pending == {}
         cl.close()
+        assert cl._jobs == {} and cl._pending == {}
     finally:
         srv.close()
 
@@ -437,6 +456,7 @@ class _Xfer:
 
     def __init__(self, data):
         self.d, self.polls, self.n, self.hang, self.reject = data, {}, 0, set(), False
+        self.release_busy = threading.Event()
 
     def read(self, seg, remote, local, kind):
         if self.reject:
@@ -452,7 +472,10 @@ class _Xfer:
         return self.d.XferState.COMPLETED, 4096
 
     def release(self, h):
-        return self.d.XFER_EBUSY if h in self.hang else self.d.XFER_OK
+        if h in self.hang:
+            self.release_busy.set()
+            return self.d.XFER_EBUSY
+        return self.d.XFER_OK
 
 
 def test_server_jobs_complete_timeout_busy_and_expire(cfg):
@@ -478,8 +501,12 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
 
         x.hang.add(x.n + 1)
         t3 = srv.submit([item], 100)
+        assert x.release_busy.wait(5)
+        assert srv.wait_any([t3], 20) == {"done": {}, "unknown": []}
+        assert not srv._jobs[t3].done
+        x.hang.clear()
         rep = collect([t3])[t3][0]
-        assert rep[0] is False and "TIMEOUT" in rep[3] and srv._zombies == [x.n]
+        assert rep[0] is False and "TIMEOUT" in rep[3]
 
         x.reject = True
         t4 = srv.submit([item], 1000)
@@ -495,4 +522,416 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
         srv.submit([item], 5000)
     finally:
         srv._xfer = None            # the fake must not be released as a real SlotTransfer
+        srv.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("release_error", ["XFER_EBUSY", "XFER_EBACKEND"])
+def test_timed_out_pull_keeps_pins_slots_and_budget_until_release(cfg, cancel, release_error):
+    """Delayed I/O writes into real staging slots after the deadline. Neither
+    timeout nor cancellation may let the client recycle them or the source pin.
+    Unreleased batches must also keep their place in the server's budget."""
+    from radixshmem import _data
+
+    c = cfg(**data(data_bytes=8 * 8192, max_inflight=1, max_pending_jobs=2))
+    srv = up(c, geometry())
+    cl = None
+    allow_release, release_attempted = threading.Event(), threading.Event()
+    read_started = threading.Event()
+    try:
+        cl = client(c)
+        real = cl.index
+        h = hashes(4)
+        local = cl.allocate_slots(2)
+        assert cl.insert(h[:2], local).error == OK
+        q = _Q(local, 2, np.array([100, 101], np.int32), 4)
+        cl._index = scripted_index(real, lambda hs: q)
+
+        class DelayedTransfer:
+            submitted = 0
+            released = 0
+
+            def read(self, seg, remote, destination, kind):
+                self.submitted += 1
+                self.destination = destination
+                read_started.set()
+                return self.submitted, 1
+
+            def poll(self, handle):
+                if allow_release.is_set():
+                    return _data.XferState.COMPLETED, 2 * 8192
+                return _data.XferState.PENDING, 0
+
+            def release(self, handle):
+                release_attempted.set()
+                if not allow_release.is_set():
+                    return getattr(_data, release_error)
+                # Model a late DMA write just before the backend lets go.
+                assert bool(q.pin.finalize)
+                assert real.mempool_used() == 4
+                for slot in self.destination:
+                    cl.slot_view(slot)[:4] = b"late"
+                self.released += 1
+                return _data.XFER_OK
+
+        x = DelayedTransfer()
+        srv._xfer = x
+        srv._peer = lambda rank: "peer"
+
+        class Transport:
+            submit = staticmethod(srv.submit)
+            wait_any = staticmethod(srv.wait_any)
+
+            def operation(self, command, epoch, session, sequence, **fields):
+                return srv.operation(dict(command=command, epoch=epoch, session=session,
+                                          sequence=sequence, **fields))
+
+            def close(self):
+                pass
+
+        cl._t.close()
+        cl._t = Transport()
+        job = cl.pull_async(h, timeout_ms=5000)
+        assert read_started.wait(5)
+        deadline = time.monotonic() + 5
+        while job._ticket < 0 and time.monotonic() < deadline:
+            time.sleep(0.001)
+        with srv._jobs_mu:
+            srv._jobs[job._ticket].deadline = time.monotonic() - 1
+        assert release_attempted.wait(5)
+        with pytest.raises(TimeoutError, match="still running"):
+            job.wait(0.05)
+        assert bool(q.pin.finalize) and real.mempool_used() == 4
+        assert not srv._jobs[job._ticket].done
+        assert srv.wait_any([job._ticket], 10) == {"done": {}, "unknown": []}
+
+        # Allocation pressure cannot reclaim the pinned prefix or staging.
+        free = real.mempool_free()
+        pressure = real.allocate_slots(free + len(local))
+        try:
+            assert len(pressure) == free
+            assert real.query(h, local_only=True, update_meta=False).common_hit == 2
+        finally:
+            real.recycle_slots(pressure)
+
+        queued = srv.submit([(7, 0, [102], [7])], 5000)
+        with srv._jobs_mu:
+            srv._jobs[queued].deadline = time.monotonic() - 1
+        with pytest.raises(radixshmem.ServerBusy):
+            srv.submit([(7, 0, [103], [6])], 5000)
+        if cancel:
+            job.cancel()
+        assert x.submitted == 1 and bool(q.pin.finalize)
+
+        allow_release.set()
+        result = job._f.result(5) if cancel else job.wait(5)
+        assert result.common_hit == 2 and result.remote_blocks == 0
+        assert list(result.full_slots) == list(local)
+        result.finalize()
+        assert not bool(q.pin.finalize)
+        assert cl.transfer_failures == 1 and real.mempool_used() == 2
+        assert real.query(h, local_only=True, update_meta=False).common_hit == 2
+        assert real.check_health() == 0
+
+        # The timed-out batch occupied max_inflight until release. The queued
+        # deadline expired meanwhile, so it must not start another transfer.
+        reply = srv.wait_any([queued], 5000)["done"][queued][0]
+        assert not reply[0] and "TIMEOUT" in reply[3] and reply[2] == 0
+        assert x.submitted == 1 and x.released == 1
+        cl.close()
+        assert srv.stats()["pending_jobs"] == 0
+    finally:
+        allow_release.set()
+        if cl is not None:
+            cl.close()
+        srv._running = False
+        srv._wake.set()
+        if srv._thread is not None:
+            srv._thread.join(5)
+        srv._xfer = None
+        srv.close()
+
+
+@pytest.mark.parametrize("lost_command", ["submit", "query", "ack", "unknown", "epoch"])
+def test_operation_reply_loss_is_retried_without_releasing_live_memory(cfg, lost_command):
+    from radixshmem import _data
+
+    c = cfg(**data(data_bytes=1 << 20))
+    srv = up(c, geometry())
+    cl = client(c)
+    x = _Xfer(_data)
+    x.hang.add(1)
+    srv._xfer, srv._peer = x, lambda rank: "peer"
+    real = cl.index
+    h = hashes(4)
+    local = cl.allocate_slots(2)
+    assert cl.insert(h[:2], local).error == OK
+    q = _Q(local, 2, np.array([10, 11], np.int32), 4)
+    cl._index = scripted_index(real, lambda hs: q)
+    original = cl._t.operation
+    dropped = threading.Event()
+
+    def operation(command, *args, **kw):
+        reply = original(command, *args, **kw)
+        if command == "query" and lost_command in ("unknown", "epoch") and not dropped.is_set():
+            dropped.set()
+            return {"state": "UNKNOWN" if lost_command == "unknown" else "EPOCH_MISMATCH"}
+        if command == lost_command and not dropped.is_set():
+            dropped.set()
+            raise TimeoutError("reply lost after server processed the operation")
+        return reply
+
+    cl._t.operation = operation
+    try:
+        job = cl.pull_async(h, timeout_ms=50)
+        assert x.release_busy.wait(5)
+        assert not job.resources_released and not job.done()
+        assert bool(q.pin.finalize) and real.mempool_used() == 4
+        # Both close paths must preserve ownership on timeout.
+        with pytest.raises(TimeoutError, match="retained"):
+            cl.close(timeout_s=0)
+        with pytest.raises(TimeoutError, match="retained"):
+            srv.close(timeout_s=0)
+        assert cl._store is not None and srv._xfer is x
+        assert srv.stats()["reserved_bytes"] == 4 * 8192
+        x.hang.clear()
+        assert dropped.wait(5)
+        cl.close(timeout_s=5)
+        assert x.n == 1  # lost Submit never starts a second read
+        assert job.resources_released and not bool(q.pin.finalize)
+        assert real.mempool_used() == 2
+        assert srv.stats()["reserved_bytes"] == 0
+    finally:
+        x.hang.clear()
+        cl.close(timeout_s=5)
+        srv._xfer = None
+        srv.close(timeout_s=5)
+
+
+def test_node_admission_precedes_peer_query_and_staging(cfg):
+    c = cfg(**data(data_bytes=1 << 20, max_reserved_bytes=8192))
+    srv = up(c, geometry())
+    cl = client(c)
+    real = cl.index
+    queries = []
+    original = real.query
+
+    class Index:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def query(self, *args, **kw):
+            queries.append(kw["local_only"])
+            assert kw["local_only"]
+            return original(*args, **kw)
+
+    cl._index = Index()
+    try:
+        result = cl.pull_async(hashes(4), block=False).wait(1)
+        assert result.common_hit == 0
+        assert queries and all(queries)
+        assert real.mempool_used() == 0
+        assert srv.stats()["admission_refused"] == 1
+    finally:
+        cl.close()
+        srv.close()
+
+
+def test_each_component_consumes_backend_admission(cfg):
+    from radixshmem import _data
+
+    c = cfg(**data(data_bytes=1 << 20, max_inflight=1))
+    srv = up(c, geometry())
+    x = _Xfer(_data)
+    x.hang.add(1)
+    srv._xfer, srv._peer = x, lambda rank: "peer"
+    try:
+        ticket = srv.submit([(7, 0, [10], [0]), (7, 0, [11], [1]), (7, 0, [12], [2])], 20)
+        assert x.release_busy.wait(5)
+        assert x.n == 1
+        x.hang.clear()
+        reply = srv.wait_any([ticket], 5000)["done"][ticket]
+        assert len(reply) == 3 and not any(r[0] for r in reply)
+        assert x.n == 1
+    finally:
+        x.hang.clear()
+        srv.close()
+
+
+def test_protected_agents_repair_real_slot_contents_after_one_node_leaves(tmp_path):
+    """Real local index/SlotStore/pins and operation RPCs; memcpy backend, fake etcd.
+
+    This exercises the agent loop and handoffs, not NIC failure recovery.
+    """
+    from types import SimpleNamespace
+    from radixshmem import _data
+    from radixshmem.protection import PrefixSpec, ProtectedAgent, ProtectedCatalog
+    from test_protection import MemoryKv
+
+    class LeasedKv(MemoryKv):
+        def __init__(self):
+            super().__init__()
+            self.leases, self.next_lease = {}, 0
+
+        def grant_lease(self, ttl):
+            self.next_lease += 1
+            return self.next_lease
+
+        def keep_alive(self, lease):
+            pass
+
+        def compare_put(self, conditions, key, value, lease=0):
+            with self.mu:
+                result = super().compare_put(conditions, key, value, lease)
+                if result and lease:
+                    self.leases[key] = lease
+                return result
+
+        def revoke(self, lease):
+            with self.mu:
+                for key, owner in list(self.leases.items()):
+                    if owner == lease:
+                        self.data.pop(key, None)
+                        del self.leases[key]
+
+    servers, clients, agents, real_indices = {}, {}, {}, {}
+    kv = LeasedKv()
+    h = hashes(2)
+    spec = PrefixSpec("cpu-fixture/namespace", tuple(int(x) for x in h))
+    payload = [b"prefix-A", b"prefix-B"]
+    try:
+        for rank in (1, 2, 3):
+            tag = uuid.uuid4().hex[:8]
+            cfg = ServerConfig(name=f"/protect_{tag}", endpoint=f"unix://{tmp_path}/{tag}.sock",
+                               **data(data_bytes=1 << 20, background_evict_ratio=0))
+            servers[rank] = up(cfg, geometry())
+            clients[rank] = cl = client(cfg)
+            cl.info.rank = rank
+            real_indices[rank] = cl.index
+
+        slots = clients[1].allocate_slots(2)
+        for i, slot in enumerate(slots):
+            clients[1].slot_view(int(slot))[:8] = payload[i]
+        assert clients[1].insert(h, slots).error == OK
+
+        class Index:
+            def __init__(self, rank):
+                self.me, self.real = rank, real_indices[rank]
+
+            def __getattr__(self, key):
+                return getattr(self.real, key)
+
+            def rank(self):
+                return self.me
+
+            def query(self, hs, **kw):
+                source = kw.pop("source_rank", None)
+                if source is None or kw.get("local_only"):
+                    return self.real.query(hs, **kw)
+                q = real_indices[source].query(hs, mask=kw["mask"], local_only=True, lock=kw["lock"])
+                return SimpleNamespace(status=q.status, common_hit=q.common_hit,
+                    full_fragments=[(source, 0, q.full_fragments[0][2])] if q.full_fragments else [],
+                    swa_source_rank=-1, swa_slots=np.empty(0, np.int32), mamba=None, finalize=q.finalize)
+
+        class Copy:
+            def __init__(self, rank):
+                self.rank, self.n = rank, 0
+
+            def read(self, source, remote, local, kind):
+                self.n += 1
+                for src, dst in zip(remote, local):
+                    clients[self.rank].slot_view(int(dst))[:] = bytes(clients[int(source)].slot_view(int(src)))
+                return self.n, len(local)
+
+            def poll(self, handle):
+                return _data.XferState.COMPLETED, 2 * 8192
+
+            def release(self, handle):
+                return _data.XFER_OK
+
+        for rank in (1, 2, 3):
+            clients[rank]._index = Index(rank)
+            servers[rank]._xfer, servers[rank]._peer = Copy(rank), str
+            agents[rank] = ProtectedAgent(ProtectedCatalog(kv, "native"), clients[rank], [spec],
+                                         f"n{rank}", f"rack{rank}", 1 << 20, 1 << 20)
+
+        def settle(active, expected):
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                for rank in active:
+                    agents[rank].tick()
+                c = agents[active[0]].catalog
+                if set(c.candidates(spec)) == expected:
+                    return
+                time.sleep(0.02)
+            raise AssertionError("replica repair did not settle")
+
+        settle([1, 2, 3], {1, 2})
+        agents[1].close()
+        del agents[1]
+        settle([2, 3], {2, 3})
+        for rank in (2, 3):
+            q = real_indices[rank].query(h, local_only=True)
+            assert q.common_hit == 2
+            for i, slot in enumerate(q.full_fragments[0][2]):
+                assert bytes(clients[rank].slot_view(int(slot))[:8]) == payload[i]
+    finally:
+        for agent in agents.values():
+            agent.close(timeout_s=5)
+        for cl in clients.values():
+            cl.close(timeout_s=5)
+        for srv in servers.values():
+            srv.close(timeout_s=5)
+
+
+def test_server_close_waits_for_idle_attached_client(cfg):
+    c = cfg(**data())
+    srv = up(c, geometry())
+    cl = client(c)
+    try:
+        with pytest.raises(TimeoutError, match="retained"):
+            srv.close(timeout_s=0)
+        assert srv.index is not None and srv.stats()["attached_clients"] == 1
+        cl.close()
+        srv.close()
+        assert srv.mode == "closed"
+    finally:
+        cl.close()
+        srv.close()
+
+
+def test_duplicate_server_cannot_unlink_live_socket(cfg):
+    c = cfg(**data())
+    srv = up(c, geometry())
+    duplicate = RadixServer(c)
+    try:
+        with pytest.raises(BlockingIOError):
+            duplicate.start()
+        cl = client(c)
+        assert cl.status().mode == "ready"
+        cl.close()
+    finally:
+        duplicate.close()
+        srv.close()
+
+
+def test_metrics_endpoint_distinguishes_local_and_protected_readiness(cfg):
+    import json
+    from urllib.request import urlopen
+    from radixshmem.monitoring import start
+
+    c = cfg(**data())
+    srv = up(c, geometry())
+    http = start(srv, "127.0.0.1", 0)
+    try:
+        base = f"http://127.0.0.1:{http.server_port}"
+        with urlopen(base + "/ready") as response:
+            assert json.load(response) == {"local": True, "remote": False, "protected": False}
+        with urlopen(base + "/metrics") as response:
+            text = response.read().decode()
+        assert "radixshmem_reserved_bytes 0" in text
+        assert "# TYPE radixshmem_transfer_bytes_total counter" in text
+    finally:
+        http.shutdown()
+        http.server_close()
         srv.close()

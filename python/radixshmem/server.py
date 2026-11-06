@@ -18,22 +18,27 @@ cluster (``configuring`` -> ``ready``, or back to ``waiting`` with
 
 Transfers are jobs: ``submit`` queues one, a single transfer thread feeds the
 engine and polls completions, ``wait_any`` sleeps on an Event until one of the
-caller's jobs is done. Nothing else polls.
+caller's jobs is done. A transfer deadline records failure, but completion is
+not delivered until the backend releases the batch: the client owns the source
+pin and destination slots until it receives that completion. Nothing else polls.
 """
 
 from __future__ import annotations
 
 import fcntl
 import json
+import os
 import socket
 import struct
 import threading
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from radixshmem import _core, _geometry, rpc
+from radixshmem._operations import Operations
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
                              NodeInfo, TransferItem, TransferReply)
@@ -111,6 +116,13 @@ class ServerConfig:
     max_inflight: int = 256          # batches in flight at the engine
     max_pending_jobs: int = 4096     # queued + running + uncollected jobs before Submit is refused
     job_ttl_s: float = 60.0          # seconds an uncollected job is kept
+    max_reserved_bytes: int = 0     # 0 = data_bytes; includes draining/unacknowledged operations
+    max_sessions: int = 4096        # high-water marks live for this server epoch
+    reservation_ttl_s: float = 10.0 # only unsubmitted reservations can expire
+    protection_file: str = ""       # optional JSON list of {identity, hashes, mask}
+    fault_domain: str = ""
+    protected_bytes: int = 0
+    repair_bytes_per_s: int = 64 << 20
     # index tuning
     max_nodes: int = 0               # radix node pool, 0 = auto
     register_chunk_tokens: int = 4096  # RHT registration granularity unless the geometry brings its own
@@ -120,11 +132,20 @@ class ServerConfig:
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     rpc_workers: int = 32            # one blocks per client with jobs in flight
+    metrics_port: int = 0            # 0 disables HTTP exporter
+    metrics_host: str = "127.0.0.1"
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
 
     def __post_init__(self) -> None:
         if self.data_bytes < 0:
             raise ValueError("data_bytes must be >= 0")
+        if min(self.max_inflight, self.max_pending_jobs, self.max_sessions, self.reservation_ttl_s) <= 0:
+            raise ValueError("job limits must be positive")
+        if self.max_reserved_bytes < 0:
+            raise ValueError("max_reserved_bytes must be >= 0")
+        if self.protection_file and (not self.distributed or not self.fault_domain
+                                     or self.protected_bytes <= 0 or self.repair_bytes_per_s <= 0):
+            raise ValueError("protection requires a cluster, fault_domain and positive byte limits")
         for k in ("swa_ratio", "mamba_ratio"):
             if not 0.0 <= float(getattr(self, k)) < 1.0:
                 raise ValueError(f"{k} must be in [0, 1)")
@@ -213,7 +234,8 @@ class _GeometryRegistry:
 
 
 class _Job:
-    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters")
+    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at",
+                 "waiters", "started", "managed")
 
     def __init__(self, items: List[TransferItem], deadline: float):
         self.ticket = 0
@@ -225,6 +247,8 @@ class _Job:
         self.done = False
         self.done_at = 0.0
         self.waiters: List[threading.Event] = []
+        self.started = set()
+        self.managed = False
 
 
 class RadixServer:
@@ -238,12 +262,11 @@ class RadixServer:
         self._greg: Optional[_GeometryRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
-        self._zombies: List[int] = []
         self._rpc = None
         self._stop = threading.Event()
         self._poller: Optional[threading.Thread] = None
         self._worker: Optional[threading.Thread] = None
-        self._jobs_mu = threading.Lock()
+        self._jobs_mu = threading.RLock()
         self._jobs: Dict[int, _Job] = {}
         self._queue: Deque[_Job] = deque()
         self._next_ticket = 1
@@ -251,6 +274,21 @@ class RadixServer:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self.transfers = self.transfer_failures = self.transfer_bytes = 0
+        self.epoch = uuid.uuid4().hex
+        self._ops = Operations(self.epoch, cfg.max_pending_jobs,
+                               cfg.max_reserved_bytes or max(1, cfg.data_bytes),
+                               cfg.max_sessions, cfg.reservation_ttl_s)
+        self._draining = False
+        self._inflight_count = self._release_pending_count = 0
+        self._protection = None
+        self._protection_thread = None
+        self._protection_stop = threading.Event()
+        self._protection_error = ""
+        self._protected_snapshot = ({}, {}, {})
+        self._guard = None
+        self._clients = set()
+        self._closed_sessions = set()
+        self._metrics_http = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -259,11 +297,31 @@ class RadixServer:
         transfer engine); ``waiting`` on return. A cluster node with a data
         plane then follows the geometry its peers publish; every server takes
         a client's ``configure``."""
+        # Refuse an overlapping server before unlinking its RPC socket. A
+        # dirty epoch survives process death and requires operator fencing;
+        # automatically recreating a pool is not crash recovery.
+        path = "/dev/shm/" + self.cfg.name.lstrip("/").replace("/", "_") + ".owner"
+        self._guard = open(path, "a+")
+        try:
+            fcntl.flock(self._guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._guard.seek(0)
+            if self._guard.read():
+                raise RuntimeError(f"unclean pool epoch in {path}; fence old clients and DMA before clearing it")
+            self._guard.write(self.epoch)
+            self._guard.flush()
+            os.fsync(self._guard.fileno())
+        except BaseException:
+            self._guard.close()
+            self._guard = None
+            raise
         self._rpc = rpc.serve({
             "Describe": lambda _: vars(self.describe()),
             "WaitReady": lambda r: vars(self.wait_ready(r["timeout_ms"] / 1000)),
             "Configure": lambda r: vars(self.configure(r["geometry"])),
-            "Submit": lambda r: {"ticket": self.submit(r["items"], r["timeout_ms"])},
+            "Submit": self._legacy_submit,
+            "Operation": self.operation,
+            "Session": self.session,
+            "ProtectedCandidates": self.protected_candidates,
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
         }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
@@ -283,6 +341,9 @@ class RadixServer:
             self._poller = threading.Thread(target=self._follow_cluster, name="radixshmem-geometry",
                                             daemon=True)
             self._poller.start()
+        if self.cfg.metrics_port:
+            from radixshmem.monitoring import start
+            self._metrics_http = start(self, self.cfg.metrics_host, self.cfg.metrics_port)
         return self
 
     def _preflight(self) -> None:
@@ -316,16 +377,47 @@ class RadixServer:
                 f"device, or that backend not built — see ENABLE_MOONCAKE/ENABLE_NIXL)")
         return backend
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = 30.0) -> None:
+        self._protection_stop.set()
+        if self._protection_thread is not None:
+            self._protection_thread.join(timeout_s)
+            if self._protection_thread.is_alive():
+                raise TimeoutError("protection worker still running; regions retained")
+        if self._protection is not None:
+            self._protection.close(timeout_s=timeout_s)
+            self._protection = None
+        # Keep RPC, polling, regions and registrations alive until consumers
+        # acknowledge completion. A failed close is retryable, not a fence.
+        with self._jobs_mu:
+            self._draining = True
+            self._ops.accepting = False
+        deadline = time.monotonic() + max(0, timeout_s)
+        while True:
+            with self._jobs_mu:
+                self._ops.expire()
+                drained = (not self._clients and not self._ops.active
+                           and all(j.done for j in self._jobs.values()))
+            if drained:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("server still draining; regions and transfer engine retained")
+            self._wake.set()
+            time.sleep(0.01)
+        if self._worker is not None and self._worker.is_alive():
+            self._worker.join(max(0, deadline - time.monotonic()))
+            if self._worker.is_alive():
+                raise TimeoutError("configuration still running; RPC and regions retained")
         self._stop.set()
+        if self._metrics_http is not None:
+            self._metrics_http.shutdown()
+            self._metrics_http.server_close()
+            self._metrics_http = None
         if self._poller is not None:
             self._poller.join(2)
             self._poller = None
         if self._rpc is not None:
             self._rpc.stop(grace=1).wait()
             self._rpc = None
-        if self._worker is not None and self._worker.is_alive():
-            self._worker.join(self.cfg.cluster.bootstrap_timeout_sec + 30)
         self._running = False
         self._wake.set()
         if self._thread is not None:
@@ -342,6 +434,13 @@ class RadixServer:
         with self._cv:
             self._mode = MODE_CLOSED
             self._cv.notify_all()
+        if self._guard is not None:
+            self._guard.seek(0)
+            self._guard.truncate()
+            self._guard.flush()
+            os.fsync(self._guard.fileno())
+            self._guard.close()
+            self._guard = None
 
     def _teardown_regions(self) -> None:
         """Drop the index, the SlotStore and the data-plane entry; the transfer
@@ -356,7 +455,6 @@ class RadixServer:
                 dreg.unpublish(index.node_name())
             except Exception:  # noqa: BLE001
                 pass
-        self._reap()
         if store is not None:
             from radixshmem import _data
 
@@ -401,7 +499,8 @@ class RadixServer:
                 data_bytes=c.data_bytes,
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
-                mamba_ratio=float(c.mamba_ratio))
+                mamba_ratio=float(c.mamba_ratio), epoch=self.epoch, pull_protocol=2,
+                protection_enabled=bool(c.protection_file))
 
     def configure(self, geometry) -> NodeInfo:
         """Take a client's geometry: validate it, plan the pools, check it
@@ -413,7 +512,7 @@ class RadixServer:
         spec = _geometry.as_spec(geometry)
         with self._cv:
             self._cv.wait_for(lambda: self._mode != MODE_STARTING)
-            if self._mode == MODE_CLOSED:
+            if self._mode == MODE_CLOSED or self._draining:
                 raise RuntimeError("server is closed")
             planned = _geometry.plan(spec, self.cfg)
             if self._mode in (MODE_CONFIGURING, MODE_READY):
@@ -449,6 +548,10 @@ class RadixServer:
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
+            if self.cfg.protection_file and not self._protection_stop.is_set():
+                self._protection_thread = threading.Thread(target=self._run_protection,
+                                                           name="radixshmem-protection", daemon=True)
+                self._protection_thread.start()
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:
@@ -510,6 +613,17 @@ class RadixServer:
             out = {"mode": self._mode, "transfers": self.transfers,
                    "transfer_failures": self.transfer_failures, "transfer_bytes": self.transfer_bytes,
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
+            out.update(self._ops.stats(), epoch=self.epoch, draining=self._draining,
+                       attached_clients=len(self._clients),
+                       inflight_batches=self._inflight_count,
+                       release_pending_batches=self._release_pending_count)
+            _, members, objects = self._protected_snapshot
+            from radixshmem.protection import ProtectedCatalog
+            out.update(protection_error=self._protection_error,
+                       protected_objects=len(objects),
+                       protected_healthy=sum(len({r["domain"] for r in
+                           ProtectedCatalog.ready(o, members).values()}) >= o["replicas"]
+                           for o in objects.values()))
         if idx is not None:
             out.update(rank=idx.rank(), world_size=idx.world_size(),
                        total_radix_nodes=idx.total_radix_nodes(), total_blocks=idx.total_blocks(),
@@ -575,7 +689,138 @@ class RadixServer:
 
     # ---------------------------------------------------------------- jobs
 
+    def session(self, request):
+        with self._jobs_mu:
+            if request["epoch"] != self.epoch:
+                return {"state": "EPOCH_MISMATCH"}
+            session = request["session"]
+            if not isinstance(session, str) or not 1 <= len(session) <= 128:
+                raise ValueError("invalid session")
+            if request["command"] == "open":
+                if session in self._closed_sessions:
+                    return {"state": "CLOSED"}
+                if self._draining or (session not in self._ops.sessions and len(self._ops.sessions) >= self.cfg.max_sessions):
+                    raise ServerBusy("session admission stopped")
+                self._clients.add(session)
+                self._ops.sessions.setdefault(session, 0)
+                return {"state": "OPEN"}
+            if request["command"] != "close":
+                raise ValueError("invalid session command")
+            self._ops.expire()
+            if any(s == session for s, _ in self._ops.active):
+                return {"state": "DRAINING"}
+            self._clients.discard(session)
+            if session in self._ops.sessions:
+                self._closed_sessions.add(session)
+            return {"state": "CLOSED"}
+
+    def _run_protection(self):
+        from radixshmem.client import RadixClient
+        from radixshmem.protection import PrefixSpec, ProtectedAgent, ProtectedCatalog
+
+        client = None
+        try:
+            with open(self.cfg.protection_file) as f:
+                specs = [PrefixSpec(**item) for item in json.load(f)]
+            if len(specs) > 32 or len({s.key for s in specs}) != len(specs):
+                raise ValueError("protection file must contain at most 32 unique objects")
+            catalog = ProtectedCatalog(_core.EtcdKv(self.cfg.cluster.registry), self.cfg.cluster.cluster_id)
+            client = RadixClient(self.cfg.name, endpoint=self.endpoint)
+            self._protection = ProtectedAgent(catalog, client, specs, self._node_key(),
+                self.cfg.fault_domain, self.cfg.protected_bytes, self.cfg.repair_bytes_per_s)
+            while not self._protection_stop.is_set():
+                try:
+                    self._protection.tick()
+                    self._protected_snapshot = catalog.snapshot()
+                    self._protection_error = ""
+                except Exception as e:
+                    # A partition disables discovery and eviction, not pin
+                    # ownership. No stale READY snapshot is served as live.
+                    self._protected_snapshot = ({}, {}, {})
+                    self._protection_error = str(e)
+                self._protection_stop.wait(1)
+        except Exception as e:
+            self._protection_error = str(e)
+            if client is not None and self._protection is None:
+                client.close()
+
+    def protected_candidates(self, request):
+        from radixshmem.protection import ProtectedCatalog
+        _, members, objects = self._protected_snapshot
+        hashes, mask = request["hashes"], request["mask"]
+        matches = [o for o in objects.values() if o["spec"]["mask"] & mask == mask
+                   and len(o["spec"]["hashes"]) <= len(hashes)
+                   and o["spec"]["hashes"] == hashes[:len(o["spec"]["hashes"])]]
+        for obj in sorted(matches, key=lambda o: len(o["spec"]["hashes"]), reverse=True):
+            ranks = [r["rank"] for n, r in ProtectedCatalog.ready(obj, members).items()
+                     if n != self._node_key()]
+            if ranks:
+                return {"ranks": ranks[:2]}
+        return {"ranks": []}
+
+    def _legacy_submit(self, _):
+        raise DataPlaneUnavailable("peer pulls require operation protocol v2; upgrade the client")
+
+    def operation(self, request):
+        """All decisions and high-water updates are atomic with job admission.
+
+        UNKNOWN and EPOCH_MISMATCH never authorize releasing client memory.
+        RETIRED means this epoch can no longer accept that operation number.
+        """
+        epoch, session, seq = request["epoch"], request["session"], int(request["sequence"])
+        command = request["command"]
+        with self._jobs_mu:
+            if epoch == self.epoch and session in self._closed_sessions:
+                return {"state": "RETIRED", "epoch": self.epoch}
+            if command == "reserve":
+                state, op = self._ops.reserve(epoch, session, seq, request["nbytes"], request.get("key", ""))
+            else:
+                state, op = self._ops.lookup(epoch, session, seq)
+            if op is None:
+                return {"state": state, "epoch": self.epoch}
+            if op.state == "FOLLOWING":
+                if command == "ack":
+                    self._ops.retire(session, seq)
+                    return {"state": "RETIRED", "epoch": self.epoch}
+                return {"state": "FOLLOWING", "epoch": self.epoch}
+            if command == "hold" and op.state == "RESERVED":
+                op.state = "HELD"
+            if command == "submit":
+                fingerprint = json.dumps([request["items"], request["timeout_ms"]], separators=(",", ":"))
+                if op.fingerprint and op.fingerprint != fingerprint:
+                    raise ValueError("operation payload changed on retry")
+                if op.state == "HELD":
+                    # Validate all descriptors before any transfer can start.
+                    try:
+                        nbytes = 0
+                        for rank, kind, remote, local in request["items"]:
+                            pool = self._store.pool(ComponentType(kind))
+                            if (not remote or len(remote) != len(local) or int(rank) < 0
+                                    or any(int(s) < 0 for s in remote)
+                                    or any(not 0 <= int(s) < pool.num_slots for s in local)):
+                                raise ValueError("invalid transfer slots")
+                            nbytes += len(local) * int(pool.slot_bytes)
+                        if nbytes > op.nbytes or not request["items"]:
+                            raise ValueError("transfer exceeds reservation")
+                        ticket = self.submit(request["items"], request["timeout_ms"])
+                    except Exception as e:
+                        self._ops.retire(session, seq)
+                        return {"state": "RETIRED", "epoch": self.epoch, "error": str(e)}
+                    op.ticket, op.fingerprint, op.state = ticket, fingerprint, "SUBMITTED"
+                    self._jobs[ticket].managed = True
+            job = self._jobs.get(op.ticket)
+            if command == "ack":
+                if op.state in ("RESERVED", "HELD") or (job is not None and job.done):
+                    self._ops.retire(session, seq)
+                    self._jobs.pop(op.ticket, None)
+                    return {"state": "RETIRED", "epoch": self.epoch}
+            state = "DONE" if job is not None and job.done else op.state
+            return {"state": state, "epoch": self.epoch, "ticket": op.ticket,
+                    "replies": job.replies if state == "DONE" else []}
+
     def submit(self, items: Sequence[TransferItem], timeout_ms: int) -> int:
+        if self._draining:
+            raise DataPlaneUnavailable("server is draining")
         if self._mode != MODE_READY:
             raise DataPlaneUnavailable(f"server is {self._mode}")
         if self._store is None:
@@ -605,7 +850,15 @@ class RadixServer:
                 self._running = True
                 self._thread = threading.Thread(target=self._transfer_loop, name="radixshmem-transfer",
                                                 daemon=True)
-                self._thread.start()
+                try:
+                    self._thread.start()
+                except BaseException:
+                    self._thread = None
+                    self._running = False
+                    self._jobs.pop(job.ticket, None)
+                    if job in self._queue:
+                        self._queue.remove(job)
+                    raise
         self._wake.set()
         return job.ticket
 
@@ -627,7 +880,8 @@ class RadixServer:
                     continue
                 if j.done:
                     done[t] = j.replies
-                    del self._jobs[t]
+                    if not j.managed:
+                        del self._jobs[t]
                 elif ev in j.waiters:
                     j.waiters.remove(ev)
         return {"done": done, "unknown": unknown}
@@ -661,7 +915,15 @@ class RadixServer:
                 if job is None:
                     break
                 for i, (rank, kind, remote, local) in enumerate(job.items):
-                    if job.replies[i] is not None:
+                    if job.replies[i] is not None or i in job.started:
+                        continue
+                    if len(inflight) >= c.max_inflight:
+                        with self._jobs_mu:
+                            self._queue.appendleft(job)
+                        break
+                    job.started.add(i)
+                    if time.monotonic() >= job.deadline:
+                        self._resolve(job, i, (False, 0, 0, str(_data.XferState.TIMEOUT)))
                         continue
                     try:
                         h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
@@ -671,29 +933,39 @@ class RadixServer:
                         self._peers.pop(rank, None)
                         self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
                     else:
-                        inflight.append((job, i, h, nd))
+                        inflight.append((job, i, h, nd, None))
             progressed, now, still = False, time.monotonic(), []
-            for job, i, h, nd in inflight:
-                st, done = self._xfer.poll(h)
-                if st == _data.XferState.PENDING and now < job.deadline:
-                    still.append((job, i, h, nd))
+            for job, i, h, nd, reply in inflight:
+                if reply is None:
+                    st, done = self._xfer.poll(h)
+                    if st == _data.XferState.PENDING and now < job.deadline:
+                        still.append((job, i, h, nd, None))
+                        continue
+                    if st == _data.XferState.PENDING:
+                        st = _data.XferState.TIMEOUT
+                    ok = st == _data.XferState.COMPLETED
+                    if not ok:
+                        self._peers.pop(job.items[i][0], None)
+                    reply = (ok, int(done), int(nd), "" if ok else str(st))
+                # A timeout is not an abort. Keep the whole job (and its
+                # inflight budget) until release confirms the backend is done.
+                # Delivering even a failure lets the client unpin/recycle the
+                # memory. Preserve the first outcome so a late completion is
+                # never promoted after a timeout. Other release errors are
+                # also not proof that the memory is safe to reuse.
+                if self._xfer.release(h) != _data.XFER_OK:
+                    still.append((job, i, h, nd, reply))
                     continue
-                if st == _data.XferState.PENDING:
-                    st = _data.XferState.TIMEOUT
-                if self._xfer.release(h) == _data.XFER_EBUSY:
-                    self._zombies.append(h)
-                ok = st == _data.XferState.COMPLETED
-                if not ok:
-                    self._peers.pop(job.items[i][0], None)
-                self._resolve(job, i, (ok, int(done), int(nd), "" if ok else str(st)))
+                self._resolve(job, i, reply)
                 progressed = True
             inflight = still
+            self._inflight_count = len(inflight)
+            self._release_pending_count = sum(reply is not None for *_, reply in inflight)
             if now - last_gc > 1.0:
                 last_gc = now
-                self._reap()
                 with self._jobs_mu:
                     for t in [t for t, j in self._jobs.items()
-                              if j.done and now - j.done_at > c.job_ttl_s]:
+                              if j.done and not j.managed and now - j.done_at > c.job_ttl_s]:
                         del self._jobs[t]
             if inflight:
                 time.sleep(0 if progressed else 0.00005)
@@ -721,9 +993,3 @@ class RadixServer:
                 raise RuntimeError(f"attach_peer({e.segment}) rc={rc}")
             self._peers[rank] = e.segment
             return e.segment
-
-    def _reap(self) -> None:
-        from radixshmem import _data
-
-        if self._xfer is not None:
-            self._zombies = [h for h in self._zombies if self._xfer.release(h) == _data.XFER_EBUSY]

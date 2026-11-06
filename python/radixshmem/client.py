@@ -16,7 +16,10 @@ while the server is still waiting or configuring."""
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import threading
+import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -58,6 +61,9 @@ class NodeInfo:
     last_error: str = ""            # why the last configuration failed; "" when none did
     swa_ratio: float = 0.0
     mamba_ratio: float = 0.0
+    epoch: str = ""
+    pull_protocol: int = 1
+    protection_enabled: bool = False
 
 
 @dataclass
@@ -95,6 +101,12 @@ class PullJob:
         self._src = -1
         self._ticket = -1
         self._cancelled = False
+        self._resources_released = False
+        self._created = time.monotonic()
+        self._timeout_ms = 30000
+        self._state = "LOCAL"
+        self._publication_failed = False
+        self._following = False
         # Known when pull_async() returns: blocks the local tree already held, and
         # that plus the remote run being pulled (equal when nothing is pulled).
         self.local_hit = 0
@@ -102,6 +114,11 @@ class PullJob:
 
     def done(self) -> bool:
         return self._f.done()
+
+    @property
+    def resources_released(self) -> bool:
+        """Transfer resources released, independently of caller cancellation."""
+        return self._resources_released
 
     @property
     def cancelled(self) -> bool:
@@ -157,6 +174,14 @@ class _Rpc:
     def close(self) -> None:
         self._stub.close()
 
+    def operation(self, command, epoch, session, sequence, **fields):
+        return self._stub.call("Operation", {"command": command, "epoch": epoch,
+                               "session": session, "sequence": sequence, **fields}, timeout=1)
+
+    def protected_candidates(self, hashes, mask):
+        return self._stub.call("ProtectedCandidates", {"hashes": [int(h) for h in hashes],
+                               "mask": int(mask)}, timeout=1)["ranks"]
+
 
 class RadixClient:
     """``RadixClient(name)`` connects to the server started as ``--name <name>``
@@ -191,7 +216,8 @@ class RadixClient:
         self._index = None
         self._store = None
         self._attach_mu = threading.Lock()
-        self._t = _Rpc(endpoint or rpc.endpoint_for(name))
+        self._endpoint = endpoint or rpc.endpoint_for(name)
+        self._t = _Rpc(self._endpoint)
         try:
             self.info = (self._t.configure(_geometry.as_spec(geometry)) if geometry is not None
                          else self._t.describe())
@@ -210,6 +236,23 @@ class RadixClient:
         self._work = threading.Event()
         self._completer: Optional[threading.Thread] = None
         self._closed = False
+        self._closing = False
+        self._admit_mu = threading.Lock()
+        self._session = uuid.uuid4().hex
+        self._epoch = self.info.epoch
+        self.rpc_errors = self.epoch_mismatches = 0
+        self._remote_retry_at = 0.0
+        if self.info.pull_protocol >= 2:
+            self._session_call("open")
+
+    def _session_call(self, command):
+        # Lifecycle remains available if a data transport adapter is swapped.
+        control = rpc.Stub(self._endpoint)
+        try:
+            return control.call("Session", {"command": command, "epoch": self._epoch,
+                                             "session": self._session}, timeout=1)["state"]
+        finally:
+            control.close()
 
     # ------------------------------------------------------------- control
 
@@ -277,7 +320,40 @@ class RadixClient:
     def slot_view(self, slot: int, kind: ComponentType = FULL):
         return self.store.slot_view(int(slot), kind)
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = 30.0) -> None:
+        """Stop admission and drain. On timeout keep mappings and RPC alive.
+
+        Retrying close is safe. Killing a process or replacing a server still
+        requires an external data-plane fence; an epoch is not such a fence.
+        """
+        if self._closed:
+            return
+        self._closing = True
+        deadline = time.monotonic() + max(0, timeout_s)
+        if not self._admit_mu.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise TimeoutError("client still admitting; mappings retained")
+        self._admit_mu.release()
+        with self._mu:
+            jobs = list(self._jobs.values())
+        for job in jobs:
+            self.cancel(job)
+        while True:
+            with self._mu:
+                drained = not self._pending
+            if drained:
+                break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("client still draining; pins, slots and mappings retained")
+            self._work.set()
+            time.sleep(0.01)
+        if self.info.pull_protocol >= 2:
+            while True:
+                state = self._session_call("close")
+                if state == "CLOSED":
+                    break
+                if state != "DRAINING" or time.monotonic() >= deadline:
+                    raise TimeoutError(f"session {state}; mappings retained")
+                time.sleep(0.05)
         self._closed = True
         self._work.set()
         if self._completer is not None:
@@ -289,12 +365,25 @@ class RadixClient:
     # ------------------------------------------------------------ pull_async
 
     def pull_async(self, hashes, mask: int = COMPONENT_MASK_FULL, *, lock: bool = True,
-                   timeout_ms: int = 30000, block: bool = True) -> PullJob:
+                   timeout_ms: int = 30000, block: bool = True, source_ranks=()) -> PullJob:
         """query, stage local slots for every remote piece, hand the transfer to
         the server and return; the completer publishes the blocks when the
         server reports them and completes the job with local slots for
         [0, common_hit). With ``block=False`` a client at ``max_outstanding``
-        does not wait: the job completes at once with the local hit."""
+        does not wait: the job completes at once with the local hit.
+
+        ``timeout_ms`` marks an overdue transfer as failed; the job completes
+        only after the backend releases it, so its source pin and staging
+        slots cannot be reused while I/O is still running. Use ``wait(timeout)``
+        to bound the caller's wait, and ``cancel()`` to give up the result while
+        the transfer drains in the background."""
+        with self._admit_mu:
+            return self._pull_async(hashes, mask, lock=lock, timeout_ms=timeout_ms, block=block,
+                                    source_ranks=source_ranks)
+
+    def _pull_async(self, hashes, mask, *, lock, timeout_ms, block, source_ranks=()):
+        if self._closing or self._closed:
+            raise RuntimeError("client is closing")
         if self.local_read_only:
             raise RuntimeError("local_read_only client: pull_async needs the cluster plane; "
                                "use query() for the local hit")
@@ -305,33 +394,140 @@ class RadixClient:
             self._jobs[job.job_id] = job
         job._hashes = np.ascontiguousarray(hashes, dtype=np.uint64)
         job._mask, job._lock = mask, lock
-        job._q = q = self._index.query(job._hashes, mask=mask, local_only=False, lock=True,
-                                       update_meta=True)
-        job._hit = self._stage(job, int(q.common_hit) if int(q.status) == 0 else 0)
-        job.planned_hit = job._hit
-        if not job._items:
-            self._complete(job, [])
-            return job
-        if block:
-            self._slots.acquire()
-        elif not self._slots.acquire(blocking=False):
+        job._timeout_ms = timeout_ms
+        # No remote discovery or pin before both local and node admission.
+        if (self.info.pull_protocol < 2 or time.monotonic() < self._remote_retry_at
+                or not self._slots.acquire(blocking=block)):
             self.saturated += 1
-            self._complete(job, [(False, 0, 0, "client saturated")] * len(job._items))
+            self._local_result(job)
             return job
+        reserved = False
         try:
-            job._ticket = self._t.submit(job._items, timeout_ms)
-        except Exception as e:  # noqa: BLE001 - busy or unreachable server: local hit only
+            key = hashlib.sha256(job._hashes.tobytes() + int(mask).to_bytes(4, "little")).hexdigest()
+            rep = self._op(job, "reserve", nbytes=self._reservation_bytes(job), key=key)
+            reserved = rep["state"] in ("RESERVED", "FOLLOWING")
+            job._following = rep["state"] == "FOLLOWING"
+        except Exception:
+            # A lost reservation response cannot have started DMA: Submit has
+            # not been sent. The server expires the unused reservation.
+            self.rpc_errors += 1
+            self._remote_retry_at = time.monotonic() + 1
+        if not reserved:
             self._slots.release()
-            self._complete(job, [(False, 0, 0, str(e))] * len(job._items))
+            self._local_result(job)
             return job
+        job._state = "RESERVED"
+        try:
+            if job._following:
+                q = self._index.query(job._hashes, mask=mask, local_only=True, lock=False,
+                                      update_meta=False)
+                job.local_hit = int(q.common_hit) if int(q.status) == 0 else 0
+                q.finalize()
+                job.planned_hit = len(job._hashes)
+            else:
+                # Once a client can own pins/staging, its credit must no
+                # longer expire. A lost Hold response is acknowledged below
+                # without ever performing the peer query.
+                held = self._op(job, "hold")
+                if held["state"] != "HELD":
+                    self._local_result(job)
+                    raise DataPlaneUnavailable("reservation unavailable before staging")
+                if not source_ranks and self.info.protection_enabled:
+                    try:
+                        source_ranks = self._t.protected_candidates(job._hashes, mask)
+                    except Exception:
+                        source_ranks = ()
+                candidates = list(dict.fromkeys(int(rank) for rank in source_ranks))[:2]
+                if candidates:
+                    best = None
+                    for rank in candidates:
+                        q = self._index.query(job._hashes, mask=mask, local_only=False,
+                                              lock=True, update_meta=True, source_rank=rank)
+                        if best is None or int(q.common_hit) > int(best.common_hit):
+                            if best is not None:
+                                best.finalize()
+                            best = q
+                            job._q = best
+                        else:
+                            q.finalize()
+                        if int(best.status) == 0 and int(best.common_hit) == len(job._hashes):
+                            break
+                    q = best
+                else:
+                    job._q = q = self._index.query(job._hashes, mask=mask, local_only=False, lock=True,
+                                                  update_meta=True)
+                job._hit = self._stage(job, int(q.common_hit) if int(q.status) == 0 else 0)
+                job.planned_hit = job._hit
+                if not job._items:
+                    self._complete(job, [])
+        except Exception as e:
+            # Nothing has been submitted. Release only known staged resources.
+            try:
+                if job._q is not None:
+                    job._q.finalize()
+                for kind, (_, slots) in job._staged.items():
+                    self._recycle(slots, kind)
+                job._resources_released = True
+            except Exception:
+                job._publication_failed = True
+                job._state = "LOCAL_ERROR"
+            if not job._f.done():
+                if job._publication_failed:
+                    job._f.set_exception(e)
+                else:
+                    self._failing_local_result(job, e)
         with self._mu:
-            self._pending[job._ticket] = job
+            self._pending[job.job_id] = job
             if self._completer is None:
                 self._completer = threading.Thread(target=self._run, name="radixshmem-completer",
                                                    daemon=True)
                 self._completer.start()
         self._work.set()
         return job
+
+    def _failing_local_result(self, job, error):
+        # No Submit has been sent on this path; degrade instead of blocking a
+        # cache consumer. Local-tree errors still surface to the caller.
+        try:
+            self._local_result(job)
+        except Exception:
+            job._f.set_exception(error)
+
+    def _reservation_bytes(self, job):
+        pools = self.info.geometry["pools"]
+        total = 0
+        for kind, name in ((FULL, "full"), (SWA, "swa"), (MAMBA, "mamba")):
+            if name not in pools or not job._mask & (1 << int(kind)):
+                continue
+            pool = pools[name]
+            n = len(job._hashes)
+            if kind == SWA:
+                n = min(n, pool["window_blocks"])
+            elif kind == MAMBA:
+                n = min(n, 1)
+            total += n * pool["slot_bytes"]
+        return total
+
+    def _op(self, job, command, **fields):
+        return self._t.operation(command, self._epoch, self._session, job.job_id, **fields)
+
+    def _local_result(self, job):
+        q = self._index.query(job._hashes, mask=job._mask, local_only=True, lock=False,
+                              update_meta=False)
+        hit = int(q.common_hit) if int(q.status) == 0 else 0
+        q.finalize()
+        job.local_hit = job.planned_hit = hit
+        self._finish(job, hit)
+        job._resources_released = True
+
+    def transfer_stats(self):
+        with self._mu:
+            pending = list(self._pending.values())
+        return {"pending": len(pending), "draining": sum(j.cancelled for j in pending),
+                "quarantined": sum(j._state in ("UNKNOWN", "EPOCH_MISMATCH", "LOCAL_ERROR") for j in pending),
+                "oldest_pending_s": max((time.monotonic() - j._created for j in pending), default=0),
+                "rpc_errors": self.rpc_errors, "epoch_mismatches": self.epoch_mismatches,
+                "saturated": self.saturated, "transfer_failures": self.transfer_failures}
 
     def wait(self, job: Union[PullJob, int], timeout: Optional[float] = None) -> PullResult:
         return (job if isinstance(job, PullJob) else self._jobs[job]).wait(timeout)
@@ -356,28 +552,57 @@ class RadixClient:
     def _run(self) -> None:
         while not self._closed:
             with self._mu:
-                tickets = list(self._pending)
-            if not tickets:
+                pending = list(self._pending.values())
+            if not pending:
                 self._work.wait()
                 self._work.clear()
                 continue
-            try:
-                rep = self._t.wait_any(tickets, 1000)
-                lost = "lost by server"
-            except Exception as e:  # noqa: BLE001 - server gone: pending jobs degrade
-                rep, lost = {"done": {}, "unknown": tickets}, str(e)
-            for ticket in list(rep["done"]) + list(rep["unknown"]):
-                with self._mu:
-                    job = self._pending.pop(ticket, None)
-                if job is None:
+            for job in pending:
+                if job._publication_failed:
                     continue
-                replies = rep["done"].get(ticket) or [(False, 0, 0, lost)] * len(job._items)
                 try:
-                    self._complete(job, replies)
-                except Exception as e:  # noqa: BLE001
-                    job._q.finalize()
-                    job._f.set_exception(e)
-                self._slots.release()
+                    if job.resources_released:
+                        rep = self._op(job, "ack")
+                    elif job._following:
+                        rep = self._op(job, "query")
+                    elif job._ticket < 0:
+                        rep = self._op(job, "submit", items=job._items, timeout_ms=job._timeout_ms)
+                    else:
+                        rep = self._op(job, "query")
+                    job._state = rep["state"]
+                    job._ticket = rep.get("ticket", job._ticket)
+                    if job._state == "EPOCH_MISMATCH":
+                        self.epoch_mismatches += 1
+                        self._remote_retry_at = float("inf")
+                    if not job.resources_released and job._state in ("DONE", "RETIRED"):
+                        replies = rep.get("replies") or [(False, 0, 0, "not accepted")] * len(job._items)
+                        try:
+                            if job._following:
+                                self._local_result(job)
+                            else:
+                                self._complete(job, replies)
+                        except Exception as e:
+                            # A local insertion may already have consumed a
+                            # subset of slots. Never repeat it or guess which
+                            # slots can be recycled after an exception.
+                            job._publication_failed = True
+                            job._state = "LOCAL_ERROR"
+                            if not job._f.done():
+                                job._f.set_exception(e)
+                            continue
+                    if job.resources_released and job._state == "RETIRED":
+                        with self._mu:
+                            self._pending.pop(job.job_id, None)
+                        self._slots.release()
+                except Exception:
+                    # RPC loss, unknown status, or an interrupted local publish
+                    # is not completion. Hold ownership and retry with the same
+                    # operation identity; admission bounds this quarantine.
+                    self.rpc_errors += 1
+                    job._state = "UNKNOWN"
+                    self._remote_retry_at = time.monotonic() + 1
+            self._work.wait(0.05)
+            self._work.clear()
 
     def _stage(self, job: PullJob, hit: int) -> int:
         q, me = job._q, int(self._index.rank())
@@ -440,6 +665,7 @@ class RadixClient:
             else:
                 self._recycle(st, kind)
         self._finish(job, hit, pulled, nbytes)
+        job._resources_released = True
 
     def _finish(self, job: PullJob, hit: int, pulled: int = 0, nbytes: int = 0) -> None:
         lock = job._lock and not job._cancelled
