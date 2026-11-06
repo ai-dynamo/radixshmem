@@ -5,6 +5,7 @@
 the server starts waiting, a client brings the geometry, clients attach on use."""
 
 import os
+import threading
 import time
 import uuid
 
@@ -437,6 +438,7 @@ class _Xfer:
 
     def __init__(self, data):
         self.d, self.polls, self.n, self.hang, self.reject = data, {}, 0, set(), False
+        self.release_busy = threading.Event()
 
     def read(self, seg, remote, local, kind):
         if self.reject:
@@ -452,7 +454,10 @@ class _Xfer:
         return self.d.XferState.COMPLETED, 4096
 
     def release(self, h):
-        return self.d.XFER_EBUSY if h in self.hang else self.d.XFER_OK
+        if h in self.hang:
+            self.release_busy.set()
+            return self.d.XFER_EBUSY
+        return self.d.XFER_OK
 
 
 def test_server_jobs_complete_timeout_busy_and_expire(cfg):
@@ -478,8 +483,12 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
 
         x.hang.add(x.n + 1)
         t3 = srv.submit([item], 100)
+        assert x.release_busy.wait(5)
+        assert srv.wait_any([t3], 20) == {"done": {}, "unknown": []}
+        assert not srv._jobs[t3].done
+        x.hang.clear()
         rep = collect([t3])[t3][0]
-        assert rep[0] is False and "TIMEOUT" in rep[3] and srv._zombies == [x.n]
+        assert rep[0] is False and "TIMEOUT" in rep[3]
 
         x.reject = True
         t4 = srv.submit([item], 1000)
@@ -495,4 +504,123 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
         srv.submit([item], 5000)
     finally:
         srv._xfer = None            # the fake must not be released as a real SlotTransfer
+        srv.close()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("release_error", ["XFER_EBUSY", "XFER_EBACKEND"])
+def test_timed_out_pull_keeps_pins_slots_and_budget_until_release(cfg, cancel, release_error):
+    """Delayed I/O writes into real staging slots after the deadline. Neither
+    timeout nor cancellation may let the client recycle them or the source pin.
+    Unreleased batches must also keep their place in the server's budget."""
+    from radixshmem import _data
+
+    c = cfg(**data(data_bytes=8 * 8192, max_inflight=1, max_pending_jobs=2))
+    srv = up(c, geometry())
+    cl = None
+    allow_release, release_attempted = threading.Event(), threading.Event()
+    read_started = threading.Event()
+    try:
+        cl = client(c)
+        real = cl.index
+        h = hashes(4)
+        local = cl.allocate_slots(2)
+        assert cl.insert(h[:2], local).error == OK
+        q = _Q(local, 2, np.array([100, 101], np.int32), 4)
+        cl._index = scripted_index(real, lambda hs: q)
+
+        class DelayedTransfer:
+            submitted = 0
+            released = 0
+
+            def read(self, seg, remote, destination, kind):
+                self.submitted += 1
+                self.destination = destination
+                read_started.set()
+                return self.submitted, 1
+
+            def poll(self, handle):
+                if allow_release.is_set():
+                    return _data.XferState.COMPLETED, 2 * 8192
+                return _data.XferState.PENDING, 0
+
+            def release(self, handle):
+                release_attempted.set()
+                if not allow_release.is_set():
+                    return getattr(_data, release_error)
+                # Model a late DMA write just before the backend lets go.
+                assert bool(q.pin.finalize)
+                assert real.mempool_used() == 4
+                for slot in self.destination:
+                    cl.slot_view(slot)[:4] = b"late"
+                self.released += 1
+                return _data.XFER_OK
+
+        x = DelayedTransfer()
+        srv._xfer = x
+        srv._peer = lambda rank: "peer"
+
+        class Transport:
+            submit = staticmethod(srv.submit)
+            wait_any = staticmethod(srv.wait_any)
+
+            def close(self):
+                pass
+
+        cl._t.close()
+        cl._t = Transport()
+        job = cl.pull_async(h, timeout_ms=5000)
+        assert read_started.wait(5)
+        with srv._jobs_mu:
+            srv._jobs[job._ticket].deadline = time.monotonic() - 1
+        assert release_attempted.wait(5)
+        with pytest.raises(TimeoutError, match="still running"):
+            job.wait(0.05)
+        assert bool(q.pin.finalize) and real.mempool_used() == 4
+        assert not srv._jobs[job._ticket].done
+        assert srv.wait_any([job._ticket], 10) == {"done": {}, "unknown": []}
+
+        # Allocation pressure cannot reclaim the pinned prefix or staging.
+        free = real.mempool_free()
+        pressure = real.allocate_slots(free + len(local))
+        try:
+            assert len(pressure) == free
+            assert real.query(h, local_only=True, update_meta=False).common_hit == 2
+        finally:
+            real.recycle_slots(pressure)
+
+        queued = srv.submit([(7, 0, [102], [7])], 5000)
+        with srv._jobs_mu:
+            srv._jobs[queued].deadline = time.monotonic() - 1
+        with pytest.raises(radixshmem.ServerBusy):
+            srv.submit([(7, 0, [103], [6])], 5000)
+        if cancel:
+            job.cancel()
+        assert x.submitted == 1 and bool(q.pin.finalize)
+
+        allow_release.set()
+        result = job._f.result(5) if cancel else job.wait(5)
+        assert result.common_hit == 2 and result.remote_blocks == 0
+        assert list(result.full_slots) == list(local)
+        result.finalize()
+        assert not bool(q.pin.finalize)
+        assert cl.transfer_failures == 1 and real.mempool_used() == 2
+        assert real.query(h, local_only=True, update_meta=False).common_hit == 2
+        assert real.check_health() == 0
+
+        # The timed-out batch occupied max_inflight until release. The queued
+        # deadline expired meanwhile, so it must not start another transfer.
+        reply = srv.wait_any([queued], 5000)["done"][queued][0]
+        assert not reply[0] and "TIMEOUT" in reply[3] and reply[2] == 0
+        assert x.submitted == 1 and x.released == 1
+        assert srv.stats()["pending_jobs"] == 0
+    finally:
+        allow_release.set()
+        if cl is not None:
+            cl.close()
+        srv._running = False
+        srv._wake.set()
+        if srv._thread is not None:
+            srv._thread.join(5)
+        srv._xfer = None
         srv.close()
