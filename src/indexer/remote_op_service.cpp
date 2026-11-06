@@ -40,6 +40,7 @@ bool valid_range(int start, int length, int n) {
 
 constexpr int64_t DEDUP_WRITE_TIMEOUT_MS = 3000;
 constexpr int64_t DEDUP_WRITE_MARGIN_MS = 1500;
+constexpr int64_t DEDUP_REPLY_MARGIN_MS = 200;
 
 bool expired(RemoteOpService::Deadline deadline) {
     return std::chrono::system_clock::now() + std::chrono::milliseconds(10) >= deadline;
@@ -242,10 +243,15 @@ DedupReply RemoteOpService::dedup_prefix(const uint64_t* hashes, int n,
         r = ms > 0 ? writer_->write(req.rank, local, remote, (int)ms) : DedupWriter::FAILED;
     }
     std::lock_guard<std::mutex> g(insert_mu_);
-    out.freed = tree_.tree().finish_dedup(plan, r == DedupWriter::OK);
-    if (r == DedupWriter::OK)
+    // A caller that gives up adopts nothing: past its deadline the copy stays here.
+    const bool in_time = deadline == Deadline::max() ||
+                         std::chrono::system_clock::now() +
+                                 std::chrono::milliseconds(DEDUP_REPLY_MARGIN_MS) < deadline;
+    const int freed = tree_.tree().finish_dedup(plan, r == DedupWriter::OK && in_time);
+    out.freed = std::max(freed, 0);
+    if (r == DedupWriter::OK && freed >= 0)
         out.moved = std::move(plan.moved);
-    else if (r == DedupWriter::FAILED)
+    else if (r != DedupWriter::LATE)
         for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
             out.unused[k].insert(out.unused[k].end(), remote[k].begin(), remote[k].end());
     return out;

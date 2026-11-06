@@ -226,17 +226,19 @@ bool RadixShmemTree::plan_dedup(const uint64_t* hashes, int n, int tail_cap, int
 int RadixShmemTree::finish_dedup(DedupPlan& plan, bool commit) {
     set_write_op("dedup");
     write_lock();
-    if (header()->reset_generation.load(std::memory_order_relaxed) != plan.generation) {
+    // Pinned nodes leave only through reset(), which may hand their slots out again.
+    const uint32_t t = header()->reset_generation.load(std::memory_order_relaxed) == plan.generation
+                           ? child_table_.lookup(INVALID_NODE_ID, plan.top_hash)
+                           : INVALID_NODE_ID;
+    if (t == INVALID_NODE_ID) {
         write_unlock();
-        return 0;
+        return -1;
     }
     // Nodes split since the plan carry its pins and its first hashes; nodes added
     // since do not, so they are neither unpinned nor dropped.
-    const uint32_t t = child_table_.lookup(INVALID_NODE_ID, plan.top_hash);
-    bool same = t != INVALID_NODE_ID;
+    bool same = true;
     std::vector<uint32_t> order, kids;
-    std::vector<uint32_t> stack;
-    if (same) stack.push_back(t);
+    std::vector<uint32_t> stack{t};
     while (!stack.empty()) {
         const uint32_t x = stack.back();
         stack.pop_back();

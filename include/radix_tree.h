@@ -126,7 +126,8 @@ public:
     // dropped path, within budget[component] slots. False when nothing can be dropped.
     bool plan_dedup(const uint64_t* hashes, int n, int tail_cap, int branch_cap,
                     const uint32_t budget[NUM_COMPONENT_TYPES], DedupPlan& plan);
-    // Unpins the plan; with `commit`, drops its subtree unless it changed. Returns blocks freed.
+    // Unpins the plan; with `commit`, drops its subtree unless it changed. Returns blocks
+    // freed, or -1 after a reset(): the plan's slots may hold other data by now.
     int finish_dedup(DedupPlan& plan, bool commit);
     // Publishes a moved path [0, n) and leaves what is already there untouched; new
     // entries take now - age as their access time. Slots not taken go to `unused`.

@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+#include "dedup_writer.h"
 #include "radix_tree.h"
 #include "test_utils.h"
 
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <future>
 #include <sys/mman.h>
 #include <thread>
 #include <vector>
@@ -342,11 +344,232 @@ static void test_landing_alloc() {
     TEST_PASS();
 }
 
+static void test_plan_edges() {
+    TEST_BEGIN("plan: no match, reader pin on the path, pinned tail or bottom, nested forks");
+    auto b = fresh("/tdm_b6"), a = fresh("/tdm_a6");
+    DedupPlan plan;
+    auto P = seq(0x1000, 16);
+    assert(!b.plan_dedup(P.data(), 0, 256, 16, BIG, plan));
+    assert(!b.plan_dedup(nullptr, 4, 256, 16, BIG, plan));
+    assert(!b.plan_dedup(P.data(), 16, 256, 16, BIG, plan));
+
+    put(b, P);
+    put(b, cat(P, 8, seq(0x2000, 4)));
+    TreeComponentQueryResult q = b.query_components(P.data(), 6, COMPONENT_MASK_FULL, true, false);
+    assert(b.plan_dedup(P.data(), 16, 256, 16, BIG, plan) && plan.moved.empty());
+    assert(b.finish_dedup(plan, true) == 8 && match(b, P) == 8);
+    assert(b.dec_ref(P.data(), 6, std::move(q.pin)));
+    expect_healthy(b);
+
+    auto Q = seq(0x3000, 8);
+    auto tail = cat(Q, 8, seq(0x4000, 4));
+    put(b, tail);
+    TreeNode* tn = node_of(b, node_at(b, tail));
+    tn->local_ref_count.fetch_add(1);
+    assert(!b.plan_dedup(Q.data(), 8, 256, 16, BIG, plan));
+    assert(!b.plan_dedup(tail.data(), 12, 256, 16, BIG, plan));
+    tn->local_ref_count.fetch_sub(1);
+    expect_healthy(b);
+
+    auto R = seq(0x5000, 8);
+    auto x = cat(R, 4, seq(0x6000, 4));
+    auto y = cat(x, 6, seq(0x7000, 2));
+    auto z = cat(y, 7, seq(0x8000, 2));
+    for (auto* h : {&R, &x, &y, &z}) put(b, *h);
+    put(a, R);
+    assert(b.plan_dedup(R.data(), 8, 256, 16, BIG, plan));
+    int full = 0;
+    for (const MovedPath& p : plan.moved) full += (int)p.full.size();
+    assert(plan.moved.size() == 3 && full == 8);
+    assert(b.finish_dedup(plan, true) == 8 + 8);
+    std::vector<int32_t> unused[3];
+    land(a, plan.moved);
+    adopt_all(a, R, plan.moved, unused);
+    assert(match(a, x) == 8 && match(a, y) == 8 && match(a, z) == 9 && unused[0].empty());
+    expect_healthy(a);
+    expect_healthy(b);
+    b.destroy();
+    a.destroy();
+    TEST_PASS();
+}
+
+static void test_cells_edges() {
+    TEST_BEGIN("cells: a checkpoint at the match END, cells that do not fit stop the bottom");
+    auto b = fresh("/tdm_b7", true);
+    auto P = seq(0x1000, 8);
+    put(b, P);
+    put_aux(b, P, 8, ComponentType::SWA, 4);
+    put_aux(b, P, 8, ComponentType::MAMBA, 1);
+    DedupPlan plan;
+    const uint32_t three[3] = {1024, 3, 64};
+    assert(!b.plan_dedup(P.data(), 8, 256, 16, three, plan));
+    assert(b.plan_dedup(P.data(), 8, 256, 16, BIG, plan));
+    assert(plan.moved.size() == 1 && plan.moved[0].base == 8 && plan.moved[0].cells.size() == 5);
+    const MovedCell& ck = plan.moved[0].cells.back();
+    assert(ck.component == ComponentType::MAMBA && ck.pos == 7);
+    assert(b.finish_dedup(plan, true) == 8);
+    expect_healthy(b);
+    b.destroy();
+    TEST_PASS();
+}
+
+static void test_finish_sees_changes() {
+    TEST_BEGIN("finish keeps the subtree on a new cell, checkpoint or reader pin, and after reset()");
+    auto b = fresh("/tdm_b8", true);
+    auto P = seq(0x1000, 8);
+    DedupPlan plan;
+    put(b, P);
+    put_aux(b, P, 4, ComponentType::SWA, 4);
+    assert(b.plan_dedup(P.data(), 8, 256, 16, BIG, plan));
+    put_aux(b, P, 8, ComponentType::SWA, 4);
+    assert(b.finish_dedup(plan, true) == 0);
+    expect_healthy(b);
+
+    assert(b.plan_dedup(P.data(), 8, 256, 16, BIG, plan));
+    put_aux(b, P, 8, ComponentType::MAMBA, 1);
+    assert(b.finish_dedup(plan, true) == 0);
+    expect_healthy(b);
+
+    assert(b.plan_dedup(P.data(), 8, 256, 16, BIG, plan));
+    TreeComponentQueryResult q = b.query_components(P.data(), 8, COMPONENT_MASK_FULL, true, false);
+    assert(b.finish_dedup(plan, true) == 0);
+    assert(b.dec_ref(P.data(), 8, std::move(q.pin)));
+    expect_healthy(b);
+
+    assert(b.plan_dedup(P.data(), 8, 256, 16, BIG, plan));
+    b.reset();
+    assert(b.finish_dedup(plan, true) == -1 && b.total_blocks() == 0);
+    expect_healthy(b);
+    put(b, P);
+    assert(b.plan_dedup(P.data(), 8, 256, 16, BIG, plan) && b.finish_dedup(plan, true) == 8);
+    expect_healthy(b);
+    b.destroy();
+    TEST_PASS();
+}
+
+static void test_adopt_edges() {
+    TEST_BEGIN("adopt keeps what is there, untouched, and returns slots it cannot place");
+    auto b = fresh("/tdm_b9", true), a = fresh("/tdm_a9", true);
+    auto P = seq(0x1000, 8);
+    auto tail = cat(P, 8, seq(0x5000, 4));
+    put(b, tail);
+    put_aux(b, tail, 12, ComponentType::MAMBA, 1);
+    put(a, tail, 10);
+    put_aux(a, tail, 12 - 2, ComponentType::MAMBA, 1);
+    const uint64_t before = leaf_ts(a, cat(P, 8, seq(0x5000, 2)));
+    sleep_ms(2);
+    DedupPlan plan;
+    assert(b.plan_dedup(P.data(), 8, 256, 16, BIG, plan));
+    assert(b.finish_dedup(plan, true) == 12);
+    std::vector<int32_t> unused[3];
+    land(a, plan.moved);
+    adopt_all(a, P, plan.moved, unused);
+    assert(match(a, tail) == 12 && unused[0].size() == 2 && unused[2].empty());
+    assert(leaf_ts(a, cat(P, 8, seq(0x5000, 2))) == before);
+    expect_healthy(a);
+
+    auto c = fresh("/tdm_c9", true);
+    for (auto& u : unused) u.clear();
+    land(c, plan.moved);
+    adopt_all(c, P, plan.moved, unused);
+    assert(c.total_blocks() == 0 && unused[0].size() == 4 && unused[2].size() == 1);
+    MovedPath far;
+    far.base = 8;
+    far.full_from = 8;
+    std::vector<int32_t> s;
+    assert(a.allocate_slots(1, s, ComponentType::MAMBA) == 1);
+    far.cells.push_back({ComponentType::MAMBA, 11, s[0], 0});
+    assert(a.allocate_slots(1, s, ComponentType::SWA) == 1);
+    far.cells.push_back({ComponentType::SWA, 20, s[0], 0});
+    for (auto& u : unused) u.clear();
+    adopt_all(a, tail, {far}, unused);
+    assert(unused[1].size() == 1 && unused[2].size() == 1);
+    expect_healthy(a);
+    expect_healthy(c);
+    a.destroy();
+    b.destroy();
+    c.destroy();
+    TEST_PASS();
+}
+
+static void test_slot_lru_by_ts() {
+    TEST_BEGIN("SlotLru::insert_by_ts: by time, into an empty list, past the step limit at the head");
+    std::vector<SlotLruEntry> e(16);
+    AuxListAnchors anchors{INVALID_SLOT_LINK, INVALID_SLOT_LINK};
+    SlotLru::init_region(e.data(), 16);
+    SlotLru lru(e.data(), 16, &anchors);
+    lru.insert_by_ts(0, 1, 0, 50, 8);
+    assert(anchors.head == 0 && anchors.tail == 0);
+    for (int i = 1; i <= 9; i++) lru.push_tail(i, 1, 0, 50 + 10 * i);
+    lru.insert_by_ts(12, 1, 0, 75, 100);
+    assert(e[12].prev == 2 && e[12].next == 3 && e[2].next == 12 && e[3].prev == 12);
+    lru.insert_by_ts(13, 1, 0, 10, 3);
+    assert(anchors.head == 13 && e[13].prev == INVALID_SLOT_LINK && e[13].next == 0);
+    lru.insert_by_ts(14, 1, 0, 200, 0);
+    assert(anchors.tail == 14 && e[9].next == 14);
+    std::vector<int32_t> order;
+    for (uint32_t cur = anchors.head; cur != INVALID_SLOT_LINK; cur = e[cur].next) order.push_back((int32_t)cur);
+    assert(order == (std::vector<int32_t>{13, 0, 1, 2, 12, 3, 4, 5, 6, 7, 8, 9, 14}));
+    TEST_PASS();
+}
+
+static void test_landing_pools() {
+    TEST_BEGIN("landing slots: a missing pool gives none, more than the pool gives the free ones");
+    auto t = fresh("/tdm_pools");
+    std::vector<int32_t> s;
+    assert(t.allocate_slots(8, s, ComponentType::SWA, false) == 0 && s.empty());
+    assert(t.allocate_slots(1000, s, ComponentType::FULL, false) == 256 && s.size() == 256);
+    t.recycle_slots(s.data(), (int)s.size());
+    t.destroy();
+    TEST_PASS();
+}
+
+static void test_write_queue() {
+    TEST_BEGIN("DedupWriteQueue: inactive, unclaimed, claimed but unfinished, finished, switched off");
+    DedupWriteQueue q;
+    std::vector<int32_t> local[3] = {{1, 2}, {}, {}}, remote[3] = {{7, 8}, {}, {}};
+    assert(!q.active() && q.write(3, local, remote, 50) == DedupWriter::FAILED);
+    q.set_active(true);
+    assert(q.write(3, local, remote, 10) == DedupWriter::FAILED);
+    assert(q.pop(4, 0).empty());
+
+    auto w = std::async(std::launch::async, [&] { return q.write(3, local, remote, 10); });
+    std::vector<DedupWrite> got = q.pop(4, 1000);
+    assert(got.size() == 1 && got[0].rank == 3 && got[0].local[0] == local[0] &&
+           got[0].remote[0] == remote[0] && got[0].timeout_ms == 10);
+    assert(w.get() == DedupWriter::LATE);
+    q.complete(got[0].id, DedupWriter::OK);
+
+    for (int r : {0, 1, 2, 7}) {
+        auto f = std::async(std::launch::async, [&] { return q.write(1, local, remote, 2000); });
+        got = q.pop(4, 1000);
+        assert(got.size() == 1);
+        q.complete(got[0].id, r);
+        assert(f.get() == (r == 0 ? DedupWriter::OK : r == 1 ? DedupWriter::FAILED : DedupWriter::LATE));
+    }
+
+    auto f1 = std::async(std::launch::async, [&] { return q.write(1, local, remote, 5000); });
+    got = q.pop(4, 1000);
+    auto f2 = std::async(std::launch::async, [&] { return q.write(2, local, remote, 5000); });
+    sleep_ms(50);
+    q.set_active(false);
+    assert(f1.get() == DedupWriter::LATE && f2.get() == DedupWriter::FAILED);
+    assert(q.pop(4, 0).empty());
+    TEST_PASS();
+}
+
 int main() {
     test_tail_and_forks();
     test_shapes_and_caps();
     test_pins_and_changes();
     test_cells();
     test_landing_alloc();
+    test_plan_edges();
+    test_cells_edges();
+    test_finish_sees_changes();
+    test_adopt_edges();
+    test_slot_lru_by_ts();
+    test_landing_pools();
+    test_write_queue();
     return 0;
 }

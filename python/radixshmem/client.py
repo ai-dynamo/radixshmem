@@ -782,10 +782,13 @@ class RadixClient:
                 if self._closed:
                     return
                 rank, hashes = self._dedups.popleft()
-            if self._dedup_move:
-                self._index.dedup_move(rank, hashes, *self._dedup_caps, DEDUP_LANDING)
-            else:
-                self._index.remote_dedup_prefix(rank, hashes)
+            try:
+                if self._dedup_move:
+                    self._index.dedup_move(rank, hashes, *self._dedup_caps, DEDUP_LANDING)
+                else:
+                    self._index.remote_dedup_prefix(rank, hashes)
+            except Exception as e:  # noqa: BLE001 - the next request still goes out
+                print(f"radixshmem: dedup on rank {rank} failed: {type(e).__name__}: {e}", file=sys.stderr)
 
     def _recycle(self, slots, kind: ComponentType) -> None:
         if len(slots):
