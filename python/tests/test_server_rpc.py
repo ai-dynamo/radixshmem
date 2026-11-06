@@ -286,6 +286,8 @@ class _Transport:
         key = (session, sequence)
         if command == "reserve":
             return {"state": "RETIRED" if self.busy else "RESERVED"}
+        if command == "hold":
+            return {"state": "HELD"}
         if command == "ack":
             return {"state": "RETIRED"}
         if command == "submit" and key not in self.operations:

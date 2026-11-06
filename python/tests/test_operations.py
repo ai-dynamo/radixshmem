@@ -75,3 +75,18 @@ def test_retry_cannot_change_its_byte_reservation():
     ledger.reserve("epoch", "a", 1, 50)
     with pytest.raises(ValueError, match="changed"):
         ledger.reserve("epoch", "a", 1, 100)
+
+
+def test_node_wide_singleflight_waits_for_publish_ack_and_cancels_independently():
+    ledger = Operations("epoch", 4, 100)
+    _, owner = ledger.reserve("epoch", "a", 1, 100, key="exact-prefix-and-mask")
+    owner.state = "HELD"
+    owner.expires = time.monotonic() - 1
+    state, follower = ledger.reserve("epoch", "b", 1, 100, key="exact-prefix-and-mask")
+    assert state == "FOLLOWING" and ledger.reserved_bytes == 100
+    ledger.retire("b", 1)
+    assert ledger.lookup("epoch", "a", 1)[1] is owner
+    ledger.reserve("epoch", "c", 1, 100, key="exact-prefix-and-mask")
+    ledger.retire("a", 1)
+    assert ledger.lookup("epoch", "c", 1) == ("RETIRED", None)
+    assert not ledger.active and ledger.reserved_bytes == 0

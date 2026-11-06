@@ -216,7 +216,8 @@ class RadixClient:
         self._index = None
         self._store = None
         self._attach_mu = threading.Lock()
-        self._t = _Rpc(endpoint or rpc.endpoint_for(name))
+        self._endpoint = endpoint or rpc.endpoint_for(name)
+        self._t = _Rpc(self._endpoint)
         try:
             self.info = (self._t.configure(_geometry.as_spec(geometry)) if geometry is not None
                          else self._t.describe())
@@ -241,6 +242,17 @@ class RadixClient:
         self._epoch = self.info.epoch
         self.rpc_errors = self.epoch_mismatches = 0
         self._remote_retry_at = 0.0
+        if self.info.pull_protocol >= 2:
+            self._session_call("open")
+
+    def _session_call(self, command):
+        # Lifecycle remains available if a data transport adapter is swapped.
+        control = rpc.Stub(self._endpoint)
+        try:
+            return control.call("Session", {"command": command, "epoch": self._epoch,
+                                             "session": self._session}, timeout=1)["state"]
+        finally:
+            control.close()
 
     # ------------------------------------------------------------- control
 
@@ -314,6 +326,8 @@ class RadixClient:
         Retrying close is safe. Killing a process or replacing a server still
         requires an external data-plane fence; an epoch is not such a fence.
         """
+        if self._closed:
+            return
         self._closing = True
         deadline = time.monotonic() + max(0, timeout_s)
         if not self._admit_mu.acquire(timeout=max(0, deadline - time.monotonic())):
@@ -332,6 +346,14 @@ class RadixClient:
                 raise TimeoutError("client still draining; pins, slots and mappings retained")
             self._work.set()
             time.sleep(0.01)
+        if self.info.pull_protocol >= 2:
+            while True:
+                state = self._session_call("close")
+                if state == "CLOSED":
+                    break
+                if state != "DRAINING" or time.monotonic() >= deadline:
+                    raise TimeoutError(f"session {state}; mappings retained")
+                time.sleep(0.05)
         self._closed = True
         self._work.set()
         if self._completer is not None:
@@ -403,6 +425,13 @@ class RadixClient:
                 q.finalize()
                 job.planned_hit = len(job._hashes)
             else:
+                # Once a client can own pins/staging, its credit must no
+                # longer expire. A lost Hold response is acknowledged below
+                # without ever performing the peer query.
+                held = self._op(job, "hold")
+                if held["state"] != "HELD":
+                    self._local_result(job)
+                    raise DataPlaneUnavailable("reservation unavailable before staging")
                 if not source_ranks and self.info.protection_enabled:
                     try:
                         source_ranks = self._t.protected_candidates(job._hashes, mask)
@@ -438,7 +467,8 @@ class RadixClient:
             for kind, (_, slots) in job._staged.items():
                 self._recycle(slots, kind)
             job._resources_released = True
-            job._f.set_exception(e)
+            if not job._f.done():
+                self._failing_local_result(job, e)
         with self._mu:
             self._pending[job.job_id] = job
             if self._completer is None:
@@ -447,6 +477,14 @@ class RadixClient:
                 self._completer.start()
         self._work.set()
         return job
+
+    def _failing_local_result(self, job, error):
+        # No Submit has been sent on this path; degrade instead of blocking a
+        # cache consumer. Local-tree errors still surface to the caller.
+        try:
+            self._local_result(job)
+        except Exception:
+            job._f.set_exception(error)
 
     def _reservation_bytes(self, job):
         pools = self.info.geometry["pools"]

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import os
 import socket
 import struct
 import threading
@@ -131,6 +132,8 @@ class ServerConfig:
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     rpc_workers: int = 32            # one blocks per client with jobs in flight
+    metrics_port: int = 0            # 0 disables HTTP exporter
+    metrics_host: str = "127.0.0.1"
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
 
     def __post_init__(self) -> None:
@@ -282,6 +285,10 @@ class RadixServer:
         self._protection_stop = threading.Event()
         self._protection_error = ""
         self._protected_snapshot = ({}, {}, {})
+        self._guard = None
+        self._clients = set()
+        self._closed_sessions = set()
+        self._metrics_http = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -290,12 +297,30 @@ class RadixServer:
         transfer engine); ``waiting`` on return. A cluster node with a data
         plane then follows the geometry its peers publish; every server takes
         a client's ``configure``."""
+        # Refuse an overlapping server before unlinking its RPC socket. A
+        # dirty epoch survives process death and requires operator fencing;
+        # automatically recreating a pool is not crash recovery.
+        path = "/dev/shm/" + self.cfg.name.lstrip("/").replace("/", "_") + ".owner"
+        self._guard = open(path, "a+")
+        try:
+            fcntl.flock(self._guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._guard.seek(0)
+            if self._guard.read():
+                raise RuntimeError(f"unclean pool epoch in {path}; fence old clients and DMA before clearing it")
+            self._guard.write(self.epoch)
+            self._guard.flush()
+            os.fsync(self._guard.fileno())
+        except BaseException:
+            self._guard.close()
+            self._guard = None
+            raise
         self._rpc = rpc.serve({
             "Describe": lambda _: vars(self.describe()),
             "WaitReady": lambda r: vars(self.wait_ready(r["timeout_ms"] / 1000)),
             "Configure": lambda r: vars(self.configure(r["geometry"])),
             "Submit": self._legacy_submit,
             "Operation": self.operation,
+            "Session": self.session,
             "ProtectedCandidates": self.protected_candidates,
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
@@ -316,6 +341,9 @@ class RadixServer:
             self._poller = threading.Thread(target=self._follow_cluster, name="radixshmem-geometry",
                                             daemon=True)
             self._poller.start()
+        if self.cfg.metrics_port:
+            from radixshmem.monitoring import start
+            self._metrics_http = start(self, self.cfg.metrics_host, self.cfg.metrics_port)
         return self
 
     def _preflight(self) -> None:
@@ -367,7 +395,8 @@ class RadixServer:
         while True:
             with self._jobs_mu:
                 self._ops.expire()
-                drained = not self._ops.active and all(j.done for j in self._jobs.values())
+                drained = (not self._clients and not self._ops.active
+                           and all(j.done for j in self._jobs.values()))
             if drained:
                 break
             if time.monotonic() >= deadline:
@@ -375,6 +404,10 @@ class RadixServer:
             self._wake.set()
             time.sleep(0.01)
         self._stop.set()
+        if self._metrics_http is not None:
+            self._metrics_http.shutdown()
+            self._metrics_http.server_close()
+            self._metrics_http = None
         if self._poller is not None:
             self._poller.join(2)
             self._poller = None
@@ -399,6 +432,13 @@ class RadixServer:
         with self._cv:
             self._mode = MODE_CLOSED
             self._cv.notify_all()
+        if self._guard is not None:
+            self._guard.seek(0)
+            self._guard.truncate()
+            self._guard.flush()
+            os.fsync(self._guard.fileno())
+            self._guard.close()
+            self._guard = None
 
     def _teardown_regions(self) -> None:
         """Drop the index, the SlotStore and the data-plane entry; the transfer
@@ -572,6 +612,7 @@ class RadixServer:
                    "transfer_failures": self.transfer_failures, "transfer_bytes": self.transfer_bytes,
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
             out.update(self._ops.stats(), epoch=self.epoch, draining=self._draining,
+                       attached_clients=len(self._clients),
                        inflight_batches=self._inflight_count,
                        release_pending_batches=self._release_pending_count)
             _, members, objects = self._protected_snapshot
@@ -646,6 +687,31 @@ class RadixServer:
 
     # ---------------------------------------------------------------- jobs
 
+    def session(self, request):
+        with self._jobs_mu:
+            if request["epoch"] != self.epoch:
+                return {"state": "EPOCH_MISMATCH"}
+            session = request["session"]
+            if not isinstance(session, str) or not 1 <= len(session) <= 128:
+                raise ValueError("invalid session")
+            if request["command"] == "open":
+                if session in self._closed_sessions:
+                    return {"state": "CLOSED"}
+                if self._draining or (session not in self._ops.sessions and len(self._ops.sessions) >= self.cfg.max_sessions):
+                    raise ServerBusy("session admission stopped")
+                self._clients.add(session)
+                self._ops.sessions.setdefault(session, 0)
+                return {"state": "OPEN"}
+            if request["command"] != "close":
+                raise ValueError("invalid session command")
+            self._ops.expire()
+            if any(s == session for s, _ in self._ops.active):
+                return {"state": "DRAINING"}
+            self._clients.discard(session)
+            if session in self._ops.sessions:
+                self._closed_sessions.add(session)
+            return {"state": "CLOSED"}
+
     def _run_protection(self):
         from radixshmem.client import RadixClient
         from radixshmem.protection import PrefixSpec, ProtectedAgent, ProtectedCatalog
@@ -702,6 +768,8 @@ class RadixServer:
         epoch, session, seq = request["epoch"], request["session"], int(request["sequence"])
         command = request["command"]
         with self._jobs_mu:
+            if epoch == self.epoch and session in self._closed_sessions:
+                return {"state": "RETIRED", "epoch": self.epoch}
             if command == "reserve":
                 state, op = self._ops.reserve(epoch, session, seq, request["nbytes"], request.get("key", ""))
             else:
@@ -713,11 +781,13 @@ class RadixServer:
                     self._ops.retire(session, seq)
                     return {"state": "RETIRED", "epoch": self.epoch}
                 return {"state": "FOLLOWING", "epoch": self.epoch}
+            if command == "hold" and op.state == "RESERVED":
+                op.state = "HELD"
             if command == "submit":
                 fingerprint = json.dumps([request["items"], request["timeout_ms"]], separators=(",", ":"))
                 if op.fingerprint and op.fingerprint != fingerprint:
                     raise ValueError("operation payload changed on retry")
-                if op.state == "RESERVED":
+                if op.state == "HELD":
                     # Validate all descriptors before any transfer can start.
                     try:
                         nbytes = 0
@@ -738,7 +808,7 @@ class RadixServer:
                     self._jobs[ticket].managed = True
             job = self._jobs.get(op.ticket)
             if command == "ack":
-                if op.state == "RESERVED" or (job is not None and job.done):
+                if op.state in ("RESERVED", "HELD") or (job is not None and job.done):
                     self._ops.retire(session, seq)
                     self._jobs.pop(op.ticket, None)
                     return {"state": "RETIRED", "epoch": self.epoch}
@@ -778,7 +848,15 @@ class RadixServer:
                 self._running = True
                 self._thread = threading.Thread(target=self._transfer_loop, name="radixshmem-transfer",
                                                 daemon=True)
-                self._thread.start()
+                try:
+                    self._thread.start()
+                except BaseException:
+                    self._thread = None
+                    self._running = False
+                    self._jobs.pop(job.ticket, None)
+                    if job in self._queue:
+                        self._queue.remove(job)
+                    raise
         self._wake.set()
         return job.ticket
 

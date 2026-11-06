@@ -143,6 +143,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--repair-bytes-per-s", type=parse_size, default=None, help="repair pacing budget")
 
     g = p.add_argument_group("server")
+    g.add_argument("--metrics-port", type=int, default=0, help="HTTP /metrics and /ready; 0 disables")
+    g.add_argument("--metrics-host", default="127.0.0.1")
     g.add_argument("--endpoint", default="",
                    help="gRPC endpoint clients connect to (default: unix:///dev/shm/<name>.sock)")
     g.add_argument("--rpc-workers", type=int, default=32,
@@ -206,7 +208,7 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
         evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
-        cluster=cluster, **kw)
+        metrics_port=a.metrics_port, metrics_host=a.metrics_host, cluster=cluster, **kw)
 
 
 def _stats_line(srv: RadixServer) -> str:
