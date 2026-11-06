@@ -180,6 +180,11 @@ a scrape network. `/metrics` has fixed names and no prompt/tenant/op-id labels:
 | `radixshmem_protected_healthy` / `protected_objects` | protected objects currently meeting the replica floor |
 | `radixshmem_attached_clients` | sessions that block clean server teardown |
 
+Import [`monitoring/shared-cache.json`](monitoring/shared-cache.json) into
+Grafana and select the Prometheus datasource. Its nine panels use actual
+ownership, transfer and verified-hit counters. No inferred GPU consumption or
+acceptance-normalized throughput is plotted.
+
 `/ready` returns separate `local`, `remote`, `protected` booleans. HTTP 200 means
 local service readiness; it does not mean protected redundancy is healthy.
 Client `transfer_stats()` also reports RPC errors, quarantine count and oldest
