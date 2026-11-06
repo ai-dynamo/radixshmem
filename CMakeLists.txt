@@ -535,6 +535,29 @@ foreach(_t IN LISTS _skippable_tests)
     endif()
 endforeach()
 
+# The cluster tests run on the RDMA RHT; with RADIXSHMEM_TEST_REDIS the main ones
+# also run on the Redis RHT (<test>_redis).
+foreach(_t IN LISTS _skippable_tests)
+    if(TEST ${_t} AND NOT _t STREQUAL "test_data_registry")
+        set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "RADIXSHMEM_RHT_BACKEND=rdma")
+    endif()
+endforeach()
+set(_redis_rht_env "RADIXSHMEM_RHT_BACKEND=redis;RADIXSHMEM_RHT_REDIS=${RADIXSHMEM_TEST_REDIS}")
+if(RADIXSHMEM_TEST_REDIS)
+    foreach(_pair test_cluster:test_cluster test_cluster_node_join:test_cluster_node_join
+                  test_client_no_server:test_client_no_server
+                  test_remote_api_grpc:test_remote_api)
+        string(REPLACE ":" ";" _p ${_pair})
+        list(GET _p 0 _name)
+        list(GET _p 1 _exe)
+        if(TEST ${_name})
+            add_test(NAME ${_name}_redis COMMAND ${_exe})
+            set_tests_properties(${_name}_redis PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "${_redis_rht_env}")
+        endif()
+    endforeach()
+endif()
+
 # ==================== Benchmarks (NOT in ctest) ====================
 set(_benches
     bench_insert
@@ -726,10 +749,29 @@ if(BUILD_PYTHON_MODULES)
                    py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)
             set_tests_properties(${_t} PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
-                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
+                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;RADIXSHMEM_RHT_BACKEND=rdma"
                 SKIP_RETURN_CODE 77 TIMEOUT 600)
         endforeach()
         set_tests_properties(py_agentic_stress_3node_threads PROPERTIES TIMEOUT 180)
+        if(RADIXSHMEM_TEST_REDIS)
+            add_test(NAME py_test_cluster_redis COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
+            add_test(NAME py_test_p2p_pull_redis COMMAND ${Python3_EXECUTABLE} tests/test_p2p_pull.py)
+            add_test(NAME py_agentic_stress_2node_redis
+                     COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 2
+                             --base-port 19500 ${_stress_args})
+            add_test(NAME py_agentic_stress_3node_threads_redis
+                     COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 3
+                             --base-port 19600 ${_stress_args} --concurrency 32
+                             --executors-per-worker 8 --register-chunk-size 1
+                             --flush-after-insert)
+            foreach(_t py_test_cluster_redis py_test_p2p_pull_redis py_agentic_stress_2node_redis
+                       py_agentic_stress_3node_threads_redis)
+                set_tests_properties(${_t} PROPERTIES
+                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
+                    ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env}"
+                    SKIP_RETURN_CODE 77 TIMEOUT 600)
+            endforeach()
+        endif()
         message(STATUS "radixshmem._core + radixshmem._data: building "
                        "(pybind11 ${pybind11_VERSION}, ${Python3_EXECUTABLE})")
     else()

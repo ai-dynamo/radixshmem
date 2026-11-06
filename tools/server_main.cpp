@@ -7,8 +7,9 @@
 //     radix_server --name /my_kv_cache --max-blocks 100000
 //
 // Distributed (run on each node; rank is assigned by the registry):
-//     radix_server --num-rht-shards M --registry etcd://10.0.0.1:2379 \
+//     radix_server --expected-min-nodes N --registry etcd://10.0.0.1:2379 \
 //                  --max-blocks 100000
+// The RHT is configured with RADIXSHMEM_RHT_* (docs/api.md).
 
 #include <csignal>
 #include <cstdio>
@@ -37,7 +38,9 @@ static void print_usage(const char* prog) {
     printf("  --data-pool-ratio <float>  DataPool size = max_blocks * ratio * block_bytes (default: 4.0)\n");
     printf("  --evict-policy <str>     Eviction policy: lru (default: lru)\n");
     printf("  --interval <int>         Stats print interval in seconds (default: 5)\n");
-    printf("\nDistributed options (num-rht-shards > 1 enables distributed mode):\n");
+    printf("\nDistributed options (expected-min-nodes > 1 enables distributed mode;\n");
+    printf("the RHT is configured with RADIXSHMEM_RHT_*, see docs/api.md):\n");
+    printf("  --expected-min-nodes <int> Nodes to wait for before the cluster forms\n");
     printf("  --rpc-address <ip>       Bootstrap IP peers connect to (required; 0.0.0.0 for single node)\n");
     printf("  --rpc-interface <nic>    NIC name to resolve the bootstrap IP from; wins over --rpc-address\n");
     printf("  --rpc-port <int>         Bootstrap TCP port (default: 0 = OS-assigned)\n");
@@ -49,12 +52,7 @@ static void print_usage(const char* prog) {
     printf("  --gid-idx <int>          RDMA GID index (default: 3)\n");
     printf("  --bootstrap-timeout <int> Bootstrap timeout in seconds (default: 60)\n");
     printf("  --lease-ttl <int>         etcd lease TTL in seconds (default: 30)\n");
-    printf("  --rht-transport <str>    Client -> RHT holder transport: xrc (default) | dc\n");
     printf("  --peer-index-transport <str>  Remote-walk transport into peer trees: xrc (default) | dc\n");
-    printf("  --num-rht-shards <int>   RHT shard count M (default: 0 = M==world-size)\n");
-    printf("  --rht-shard-holders <list> Comma-separated holder ranks, e.g. 0,2,4,6\n");
-    printf("                           (authoritative only on rank 0; default: ranks [0,M))\n");
-    printf("  --rht-slots <int>        RHT slots per bucket W (1|2|4|8, default 4)\n");
     printf("\n  --help                   Show this help\n");
 }
 
@@ -90,24 +88,8 @@ int main(int argc, char** argv) {
         else if (arg("--gid-idx"))           cfg.gid_idx = next_int();
         else if (arg("--bootstrap-timeout")) cfg.bootstrap_timeout_sec = next_int();
         else if (arg("--lease-ttl"))         cfg.lease_ttl_sec = next_int();
-        else if (arg("--rht-transport"))     cfg.rht_transport = next_str();
         else if (arg("--peer-index-transport")) cfg.peer_index_transport = next_str();
-        else if (arg("--rht-slots"))         cfg.rht_slots_per_bucket = next_int();
-        else if (arg("--num-rht-shards"))        cfg.num_rht_shards = next_int();
-        else if (arg("--rht-shard-holders")) {
-            const char* s = next_str();
-            cfg.rht_shard_holders.clear();
-            // Parse comma-separated rank list, e.g. "0,2,4,6".
-            const char* p = s;
-            while (*p) {
-                char* end = nullptr;
-                long v = strtol(p, &end, 10);
-                if (end == p) break;
-                cfg.rht_shard_holders.push_back((int)v);
-                p = end;
-                while (*p == ',' || *p == ' ') p++;
-            }
-        }
+        else if (arg("--expected-min-nodes")) cfg.expected_min_nodes = next_int();
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             print_usage(argv[0]);
@@ -134,12 +116,12 @@ int main(int argc, char** argv) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    bool distributed = cfg.num_rht_shards > 1;
+    bool distributed = cfg.expected_min_nodes > 1;
     if (distributed) {
         printf("Starting radix_server (distributed, node %s)...\n",
                cfg.node_name.empty() ? "(auto node<ip>)" : cfg.node_name.c_str());
         printf("  Registry:       %s\n", cfg.registry.c_str());
-        printf("  Num shards:     %d\n", cfg.num_rht_shards);
+        printf("  Min nodes:      %d\n", cfg.expected_min_nodes);
         printf("  Cluster ID:     %s\n", cfg.cluster_id.c_str());
         printf("  Max nodes:      %u\n", resolved_max_nodes);
         printf("  Max blocks:     %u%s\n", cfg.shm.max_blocks,

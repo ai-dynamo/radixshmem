@@ -9,6 +9,7 @@
 #include "cluster_protocol.h"
 #include "cluster_manifest.h"
 #include "rht_endpoint.h"        // RdmaRht (+ rht_backend.h)
+#include "rht_redis.h"
 #include "rht_chain.h"
 #include "rdma_remote_walker.h"
 #include "rdma_transport.hpp"
@@ -235,8 +236,14 @@ void RadixClient::bootstrap_cluster() {
                 my_rank);
     }
 
-    rht_ = std::make_unique<RdmaRht>(sm, *tx_, *peer_reg_, peer_faults(),
-                                     cfg_.bootstrap_timeout_sec);
+    if (sm.rht_backend == CLUSTER_RHT_REDIS)
+        rht_ = make_redis_rht({std::string(sm.rht_redis_seeds,
+                                           strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds))),
+                               "rsh:" + cfg_.cluster_id + ":", (int)sm.rht_redis_timeout_ms},
+                              peer_reg_->my_rank(), peer_faults());
+    else
+        rht_ = std::make_unique<RdmaRht>(sm, *tx_, *peer_reg_, peer_faults(),
+                                         cfg_.bootstrap_timeout_sec);
     preconnect_peers();
 
     // Watch /peers for members that join, restart or leave. Anchor at the

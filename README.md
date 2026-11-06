@@ -45,10 +45,13 @@ Single node:
 radix-server --name /my_kv_cache --data-bytes 1024G
 ```
 
-4 nodes, coordinated through etcd:
+4 nodes, coordinated through etcd. The RHT lives in a Redis Cluster by default (`RADIXSHMEM_RHT_REDIS`);
+`RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. The `RADIXSHMEM_RHT_*` variables are
+listed in [`docs/api.md`](docs/api.md).
 
 ```bash
 # Same command on every node except --rpc-address
+export RADIXSHMEM_RHT_REDIS=10.0.0.1:7001,10.0.0.2:7001
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
     --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
