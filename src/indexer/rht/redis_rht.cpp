@@ -398,11 +398,11 @@ public:
     RedisRht(const RedisRhtConfig& cfg, int my_rank, PeerFaultCounters* faults)
         : cfg_(cfg), my_rank_(my_rank),
           breaker_("[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT", faults),
-          conn_(cfg, breaker_) {}
+          writer_(cfg, breaker_) {}
 
     void insert_batch(const RhtInsertEntry* e, int count) override {
-        std::lock_guard<std::mutex> g(mu_);
-        Conn& w = conn_;
+        std::lock_guard<std::mutex> g(write_mu_);
+        Conn& w = writer_;
         for (int i = 0; i < count; i++) {
             int m = w.route(e[i].key, Op::RHT_WRITE);
             if (m < 0) continue;
@@ -418,8 +418,8 @@ public:
     }
 
     void remove_batch(const RhtRemoveEntry* e, int count) override {
-        std::lock_guard<std::mutex> g(mu_);
-        Conn& w = conn_;
+        std::lock_guard<std::mutex> g(write_mu_);
+        Conn& w = writer_;
         for (int i = 0; i < count; i++) {
             int m = w.route(e[i].key, Op::RHT_REMOVE);
             if (m < 0) continue;
@@ -436,8 +436,7 @@ public:
 
     void lookup_batch(const uint64_t* keys, int count,
                       std::vector<RHTValue>* results) override {
-        std::lock_guard<std::mutex> g(mu_);
-        Conn* c = &conn_;
+        std::unique_ptr<Conn> c = acquire();
         for (int i = 0; i < count; i++) {
             results[i].clear();
             int m = c->route(keys[i], Op::RHT_LOOKUP);
@@ -456,17 +455,18 @@ public:
                 results[i].push_back({std::atoi(f->str), get_u32(v->str), get_u32(v->str + 4)});
             }
         });
+        release(std::move(c));
     }
 
     void flush() override {
-        std::lock_guard<std::mutex> g(mu_);
-        conn_.cluster.drain();
+        std::lock_guard<std::mutex> g(write_mu_);
+        writer_.cluster.drain();
     }
 
     // Drops this rank's field from every key under the prefix.
     void reset() override {
-        std::lock_guard<std::mutex> g(mu_);
-        RedisCluster& w = conn_.cluster;
+        std::lock_guard<std::mutex> g(write_mu_);
+        RedisCluster& w = writer_.cluster;
         w.drain();
         const std::string field = std::to_string(my_rank_);
         const std::string match = cfg_.key_prefix + "*";
@@ -502,8 +502,7 @@ public:
 
     void dump(uint64_t key, std::vector<std::string>& lines) override {
         lines.clear();
-        std::lock_guard<std::mutex> g(mu_);
-        Conn* c = &conn_;
+        std::unique_ptr<Conn> c = acquire();
         int m = c->route(key, Op::RHT_LOOKUP);
         if (m >= 0) {
             const char* argv[] = {"HGETALL", c->key.data()};
@@ -524,14 +523,34 @@ public:
                 }
             });
         }
+        release(std::move(c));
     }
 
 private:
+    std::unique_ptr<Conn> acquire() {
+        {
+            std::lock_guard<std::mutex> g(pool_mu_);
+            if (!idle_.empty()) {
+                std::unique_ptr<Conn> c = std::move(idle_.back());
+                idle_.pop_back();
+                return c;
+            }
+        }
+        return std::make_unique<Conn>(cfg_, breaker_);
+    }
+
+    void release(std::unique_ptr<Conn> c) {
+        std::lock_guard<std::mutex> g(pool_mu_);
+        idle_.push_back(std::move(c));
+    }
+
     const RedisRhtConfig cfg_;
     const int my_rank_;
     PeerBreaker breaker_;
-    std::mutex mu_;
-    Conn conn_;
+    std::mutex write_mu_;
+    Conn writer_;
+    std::mutex pool_mu_;
+    std::vector<std::unique_ptr<Conn>> idle_;
 };
 
 // The settings the RHT relies on; CONFIG may be disabled, then none is checked.
