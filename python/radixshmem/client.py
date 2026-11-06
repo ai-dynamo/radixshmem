@@ -294,7 +294,13 @@ class RadixClient:
         the server and return; the completer publishes the blocks when the
         server reports them and completes the job with local slots for
         [0, common_hit). With ``block=False`` a client at ``max_outstanding``
-        does not wait: the job completes at once with the local hit."""
+        does not wait: the job completes at once with the local hit.
+
+        ``timeout_ms`` marks an overdue transfer as failed; the job completes
+        only after the backend releases it, so its source pin and staging
+        slots cannot be reused while I/O is still running. Use ``wait(timeout)``
+        to bound the caller's wait, and ``cancel()`` to give up the result while
+        the transfer drains in the background."""
         if self.local_read_only:
             raise RuntimeError("local_read_only client: pull_async needs the cluster plane; "
                                "use query() for the local hit")
