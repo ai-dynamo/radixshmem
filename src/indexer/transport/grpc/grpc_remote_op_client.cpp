@@ -316,11 +316,15 @@ DedupReply GrpcRemoteOpClientTransport::dedup_prefix(const uint64_t* hashes, int
     impl_->prepare(ctx);
     const RemoteStatus st = to_remote_status(impl_->stub->DedupPrefix(&ctx, req, &rep));
     if (st == RemoteStatus::BAD_REQUEST || st == RemoteStatus::UNKNOWN_OP ||
-        st == RemoteStatus::RESOURCE_EXHAUSTED)
+        st == RemoteStatus::RESOURCE_EXHAUSTED || st == RemoteStatus::STALE_TARGET)
         return unsent(st);
     out.status = st;
     if (st != RemoteStatus::OK) return out;
     out.freed = rep.freed();
+    if (rep.unused_size() == 0) {   // a target without moves wrote nothing
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++) out.unused[k] = in.landing[k];
+        return out;
+    }
     for (int k = 0; k < NUM_COMPONENT_TYPES && k < rep.unused_size(); k++)
         out.unused[k].assign(rep.unused(k).slots().begin(), rep.unused(k).slots().end());
     out.moved.resize(rep.moved_size());

@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <numeric>
@@ -396,6 +397,11 @@ void test_dedup_prefix() {
     insert_auto(*node.client, h.data(), 8);
     DedupReply r = cli.dedup_prefix(h.data(), 8);
     assert(r.status == RemoteStatus::OK && r.freed == 0 && node.used() == 8);
+    DedupRequest req;
+    req.rank = 1;
+    req.landing[0] = {5};
+    r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.status == RemoteStatus::OK && r.freed == 0 && r.unused[0] == (std::vector<int32_t>{5}));
     server.stop();
     expect_healthy(*node.client);
     TEST_PASS();
@@ -404,13 +410,16 @@ void test_dedup_prefix() {
 // Stands in for the server's transfer loop.
 struct FakeWriter : DedupWriter {
     Result next = OK;
+    bool on = true;
     int calls = 0, rank = -1;
+    std::function<void()> during;
     std::vector<int32_t> local[NUM_COMPONENT_TYPES], remote[NUM_COMPONENT_TYPES];
-    bool active() override { return true; }
+    bool active() override { return on; }
     Result write(int r, const std::vector<int32_t> (&l)[NUM_COMPONENT_TYPES],
                  const std::vector<int32_t> (&rm)[NUM_COMPONENT_TYPES], int) override {
         calls++;
         rank = r;
+        if (during) during();
         for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
             local[k] = l[k];
             remote[k] = rm[k];
@@ -469,6 +478,129 @@ void test_dedup_move() {
     r = cli.dedup_prefix(h.data(), 8, drop_only);
     assert(r.freed == 4 && w.calls == 3 && node.used() == 6);
     server.stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
+void test_dedup_move_fallbacks() {
+    TEST_BEGIN("DedupPrefix with landing slots: every drop-only or failed case hands them all back");
+    Node node("dmfb");
+    FakeWriter w;
+    node.svc->set_dedup_writer(&w);
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    auto h = make_hashes(700, 8);
+    auto longer = make_hashes(700, 12);
+    DedupRequest req;
+    req.rank = 3;
+    req.tail_cap = 16;
+    req.branch_cap = 16;
+    req.landing[0] = {40, 41, 42, 43};
+    const std::vector<int32_t> all = req.landing[0];
+
+    w.on = false;
+    insert_auto(*node.client, h.data(), 8);
+    DedupReply r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.status == RemoteStatus::OK && r.freed == 8 && r.unused[0] == all && node.used() == 0);
+    w.on = true;
+    DedupRequest anon = req;
+    anon.rank = -1;
+    insert_auto(*node.client, h.data(), 8);
+    r = cli.dedup_prefix(h.data(), 8, anon);
+    assert(r.freed == 8 && r.unused[0] == all && node.used() == 0);
+    insert_auto(*node.client, h.data(), 8);
+    r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.freed == 8 && r.moved.empty() && r.unused[0] == all && node.used() == 0);
+    assert(w.calls == 0);
+
+    insert_auto(*node.client, longer.data(), 12);
+    DedupRequest small = req;
+    small.tail_cap = 2;
+    r = cli.dedup_prefix(h.data(), 8, small);
+    assert(r.freed == 0 && r.unused[0] == all && node.used() == 12);
+    GrpcRemoteOpClientTransport hurried(target_of(server.port()), 200, kInstance);
+    r = hurried.dedup_prefix(h.data(), 8, req);
+    assert(r.status == RemoteStatus::OK && r.freed == 0 && r.moved.empty() && r.unused[0] == all &&
+           node.used() == 12 && w.calls == 0);
+    r = cli.dedup_prefix(nullptr, 3, req);
+    assert(r.status == RemoteStatus::BAD_REQUEST && r.unused[0] == all);
+    r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.freed == 12 && w.calls == 1 && r.moved.size() == 1 && node.used() == 0);
+    server.stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
+void test_dedup_move_cells() {
+    TEST_BEGIN("DedupPrefix with landing slots carries SWA cells and Mamba checkpoints per pool");
+    Node node("dmcell", kMaxBlocks, true);
+    FakeWriter w;
+    node.svc->set_dedup_writer(&w);
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    auto h = make_hashes(800, 8);
+    insert_auto(*node.client, h.data(), 8);
+    std::vector<int32_t> s;
+    assert(node.client->allocate_slots(4, s, ComponentType::SWA) == 4);
+    assert(node.client->insert(h.data(), 8, s.data(), 4, 0, true, ComponentType::SWA).error ==
+           InsertError::OK);
+    assert(node.client->allocate_slots(1, s, ComponentType::MAMBA) == 1);
+    assert(node.client->insert(h.data(), 8, s.data(), 1, 0, true, ComponentType::MAMBA).error ==
+           InsertError::OK);
+    DedupRequest req;
+    req.rank = 2;
+    req.tail_cap = 16;
+    req.branch_cap = 16;
+    req.landing[1] = {60, 61, 62, 63, 64};
+    req.landing[2] = {70, 71};
+    DedupReply r = cli.dedup_prefix(h.data(), 8, req);
+    assert(r.status == RemoteStatus::OK && r.freed == 8 && r.moved.size() == 1);
+    const MovedPath& p = r.moved[0];
+    assert(p.base == 8 && p.hashes.empty() && p.full.empty() && p.full_from == 8 && p.cells.size() == 5);
+    for (int i = 0; i < 4; i++)
+        assert(p.cells[i].component == ComponentType::SWA && p.cells[i].pos == 4 + i &&
+               p.cells[i].slot == 60 + i && p.cells[i].age_ns < 10000000000ull);
+    assert(p.cells[4].component == ComponentType::MAMBA && p.cells[4].pos == 7 && p.cells[4].slot == 70);
+    assert(r.unused[0].empty() && r.unused[1] == (std::vector<int32_t>{64}) &&
+           r.unused[2] == (std::vector<int32_t>{71}));
+    assert(w.local[1].size() == 4 && w.remote[1] == (std::vector<int32_t>{60, 61, 62, 63}) &&
+           w.local[2].size() == 1 && w.remote[2] == (std::vector<int32_t>{70}) && w.local[0].empty());
+    server.stop();
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
+void test_dedup_move_races() {
+    TEST_BEGIN("DedupPrefix: a reset during the copy sends no manifest; no drop close to the deadline");
+    Node node("dmrace");
+    FakeWriter w;
+    node.svc->set_dedup_writer(&w);
+    auto h = make_hashes(950, 8);
+    auto tail = make_hashes(950, 12);
+    DedupRequest req;
+    req.rank = 3;
+    req.tail_cap = 16;
+    req.branch_cap = 16;
+    req.landing[0] = {40, 41, 42, 43};
+    const std::vector<int32_t> all = req.landing[0];
+
+    insert_auto(*node.client, tail.data(), 12);
+    w.during = [&] { node.tree->tree().reset(); };
+    DedupReply r = node.svc->dedup_prefix(h.data(), 8, req);
+    assert(r.status == RemoteStatus::OK && r.freed == 0 && r.moved.empty() && r.unused[0] == all);
+    assert(w.calls == 1 && node.used() == 0);
+
+    insert_auto(*node.client, tail.data(), 12);
+    w.during = [] { std::this_thread::sleep_for(std::chrono::milliseconds(1600)); };
+    r = node.svc->dedup_prefix(h.data(), 8, req,
+                               std::chrono::system_clock::now() + std::chrono::milliseconds(1700));
+    assert(r.status == RemoteStatus::OK && r.freed == 0 && r.moved.size() == 1 && node.used() == 12);
+    assert(r.unused[0].empty() && w.calls == 2);
+    w.during = nullptr;
+    r = node.svc->dedup_prefix(h.data(), 8, req);
+    assert(r.freed == 12 && r.moved.size() == 1 && node.used() == 0);
     expect_healthy(*node.client);
     TEST_PASS();
 }
@@ -605,6 +737,11 @@ void test_stale_instance() {
            ins.remote_status == RemoteStatus::STALE_TARGET);
     assert(cli.recycle(s.data(), n) == RemoteStatus::STALE_TARGET);
     assert(cli.unlock(h.data(), n, 0, n, n, {}) == RemoteStatus::STALE_TARGET);
+    DedupRequest req;
+    req.rank = 1;
+    req.landing[0] = {7};
+    DedupReply d = cli.dedup_prefix(h.data(), n, req);
+    assert(d.status == RemoteStatus::STALE_TARGET && d.unused[0] == (std::vector<int32_t>{7}));
     assert(node.used() == 0);
     server.stop();
     expect_healthy(*node.client);
@@ -717,6 +854,10 @@ void test_breaker_gates_remote_ops() {
     assert(peer.recycle(s.data(), 4) == RemoteStatus::UNAVAILABLE);
     assert(peer.unlock(h.data(), 4, 0, 4, 4, {}) == RemoteStatus::UNAVAILABLE);
     assert(peer.dedup_prefix(h.data(), 4).status == RemoteStatus::UNAVAILABLE);
+    DedupRequest landing;
+    landing.landing[1] = {9};
+    DedupReply skipped = peer.dedup_prefix(h.data(), 4, landing);
+    assert(skipped.status == RemoteStatus::UNAVAILABLE && skipped.unused[1] == (std::vector<int32_t>{9}));
     assert(t.calls == calls);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -810,10 +951,15 @@ struct BadService final : pb::RemoteOps::Service {
             for (int i = 0; i <= req->runs(0).slots_size(); i++) rep->mutable_runs(0)->add_unused_slots(i);
         return grpc::Status::OK;
     }
+    grpc::Status DedupPrefix(grpc::ServerContext*, const pb::DedupPrefixRequest*,
+                             pb::DedupPrefixResponse* rep) override {
+        rep->set_freed(3);   // a server without moves
+        return grpc::Status::OK;
+    }
 };
 
 void test_bad_reply() {
-    TEST_BEGIN("malformed replies → BAD_REPLY, unknown RPC → UNKNOWN_OP");
+    TEST_BEGIN("malformed replies → BAD_REPLY, unknown RPC → UNKNOWN_OP, no unused list → all landing back");
     BadService svc;
     int port = 0;
     grpc::ServerBuilder b;
@@ -838,6 +984,12 @@ void test_bad_reply() {
                r.runs.size() == runs.size() && r.runs[1].error == InsertError::REMOTE_FAILED &&
                r.full.unused_slots.empty());
     }
+    DedupRequest req;
+    req.rank = 1;
+    req.landing[0] = {5, 6};
+    DedupReply d = cli.dedup_prefix(h.data(), 4, req);
+    assert(d.status == RemoteStatus::OK && d.freed == 3 && d.moved.empty() &&
+           d.unused[0] == (std::vector<int32_t>{5, 6}));
     server->Shutdown();
     TEST_PASS();
 }
@@ -854,6 +1006,9 @@ int main() {
     test_allocate_components();
     test_dedup_prefix();
     test_dedup_move();
+    test_dedup_move_fallbacks();
+    test_dedup_move_cells();
+    test_dedup_move_races();
     test_deadline_no_replay();
     test_no_admission_cap();
     test_deadline_skips_allocate_and_query();

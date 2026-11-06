@@ -355,6 +355,23 @@ def test_a_full_pull_asks_every_source_to_drop_its_copy(monkeypatch, move):
         c.close()
 
 
+def test_a_failed_dedup_does_not_stop_the_next():
+    class Flaky(DedupIndex):
+        def dedup_move(self, rank, hashes, tail_cap, branch_cap, landing):
+            if rank == 1:
+                raise RuntimeError("peer went away")
+            super().dedup_move(rank, hashes, tail_cap, branch_cap, landing)
+
+    index = Flaky(common=8)
+    c = client(index)
+    try:
+        assert full_pull(c) == 8
+        wait_for(lambda: len(index.dedups) == 1)
+        assert index.dedups == [(2, list(range(8)))] and c._deduper.is_alive()
+    finally:
+        c.close()
+
+
 @pytest.mark.parametrize("common, env, role", [(6, "0", "prefill"), (8, "1", "prefill"), (8, "0", "decode")])
 def test_no_dedup_after_a_short_pull_when_disabled_or_on_a_decode_node(monkeypatch, common, env, role):
     monkeypatch.setenv("RADIXSHMEM_DISABLE_AUTO_DEDUP", env)
@@ -602,3 +619,76 @@ def test_close_waits_for_the_pushes_being_completed():
     inserted = sum(entry[0] == "insert" for entry in index.log)
     assert inserted >= 1 and sum(job.wait(0).complete for job in jobs) == inserted
     assert sum(entry == ("unlock", 2) for entry in index.log) == 4
+
+
+class WriteQueue:
+    """The index side of RadixServer._dedup_write_loop: hands out `batches` once, then stops it."""
+
+    def __init__(self, batches, stop, fail_pop=False):
+        self.batches, self.stop, self.fail_pop = list(batches), stop, fail_pop
+        self.done, self.active = {}, True
+
+    def pop_dedup_writes(self, max_writes, timeout_ms):
+        if self.fail_pop:
+            raise RuntimeError("index closed")
+        if self.batches:
+            return self.batches.pop(0)
+        self.stop.set()
+        return []
+
+    def complete_dedup_write(self, wid, result):
+        self.done[wid] = result
+
+    def set_dedup_writer_active(self, on):
+        self.active = on
+
+
+def write(wid, full, swa=()):
+    return wid, 3, 100, [[1000 + s for s in full], [2000 + s for s in swa], []], [list(full), list(swa), []]
+
+
+def test_dedup_writes_report_each_outcome():
+    stop = threading.Event()
+    index = WriteQueue([[write(1, [5]), write(2, [6], [7]), write(3, [8]), write(4, [9]), write(5, [10])]], stop)
+    wid_of = {5: 1, 6: 2, 8: 3, 9: 4, 10: 5}
+    issued = {}
+
+    def submit(items, timeout_ms):
+        wid = wid_of[items[0][2][0]]
+        if wid == 3:
+            raise RuntimeError("server busy")
+        issued[wid] = (items, timeout_ms)
+        return wid
+
+    replies = {1: [(True, 8, 1, "")], 2: [(True, 8, 1, ""), (False, 0, 0, "XferState.FAILED")],
+               5: [(False, 0, 0, XFER_IN_FLIGHT)]}
+    waits = []
+
+    def wait_any(tickets, timeout_ms):
+        waits.append(sorted(tickets))
+        if len(waits) == 1:
+            return {"done": {}, "unknown": []}
+        return {"done": {t: replies[t] for t in tickets if t in replies}, "unknown": [t for t in tickets if t == 4]}
+
+    RadixServer._dedup_write_loop(SimpleNamespace(submit=submit, wait_any=wait_any), index, stop)
+    assert index.done == {1: 0, 2: 1, 3: 1, 4: 2, 5: 2}
+    assert waits == [[1, 2, 4, 5], [1, 2, 4, 5]]
+    items, timeout_ms = issued[2]
+    assert timeout_ms == 100 and items == [(3, int(FULL), [6], [1006], XFER_WRITE),
+                                           (3, int(SWA), [7], [2007], XFER_WRITE)]
+
+
+def test_dedup_writes_stop_late_and_off_on_pop_error():
+    stop = threading.Event()
+    index = WriteQueue([[write(1, [5])]], stop)
+
+    def wait_any(tickets, timeout_ms):
+        stop.set()
+        return {"done": {}, "unknown": []}
+
+    RadixServer._dedup_write_loop(SimpleNamespace(submit=lambda items, ms: 1, wait_any=wait_any), index, stop)
+    assert index.done == {1: 2}
+
+    broken = WriteQueue([], threading.Event(), fail_pop=True)
+    RadixServer._dedup_write_loop(SimpleNamespace(), broken, threading.Event())
+    assert not broken.active and broken.done == {}
