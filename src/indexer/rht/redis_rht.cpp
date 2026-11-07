@@ -611,7 +611,9 @@ public:
         writer_.drain();
     }
 
-    // Drops this rank's field from every key under the prefix.
+    // Drops this rank's field from every key under the prefix. Every round
+    // sends one SCAN to each master still scanning, then the HDELs for what it
+    // found, so the masters work at the same time.
     void reset() override {
         std::lock_guard<std::mutex> g(write_mu_);
         Conn& w = writer_;
@@ -619,32 +621,42 @@ public:
         w.drain();
         const std::string field = std::to_string(my_rank_);
         const std::string match = cfg_.key_prefix + "*";
-        for (int m : w.masters()) {
-            std::string cursor = "0";
-            do {
-                if (!w.usable(m, Op::RHT_REMOVE)) break;
-                const char* argv[] = {"SCAN", cursor.c_str(), "MATCH", match.c_str(),
+        const std::vector<int> masters = w.masters();
+        const size_t n = masters.size();
+        std::vector<std::string> cursor(n, "0");
+        std::vector<char> done(n, 0);
+        while (true) {
+            int scanning = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (!done[i] && !w.usable(masters[i], Op::RHT_REMOVE)) done[i] = 1;
+                if (done[i]) continue;
+                const char* argv[] = {"SCAN", cursor[i].c_str(), "MATCH", match.c_str(),
                                       "COUNT", "1000"};
-                const size_t lens[] = {4, cursor.size(), 5, match.size(), 5, 4};
-                w.append(m, 6, argv, lens, 0);
-                std::vector<std::string> found;
-                bool scanned = false;
-                w.send(Op::RHT_REMOVE, true, [&](int, redisReply* r) {
-                    if (r->type != REDIS_REPLY_ARRAY || r->elements != 2) return;
-                    cursor.assign(r->element[0]->str, r->element[0]->len);
-                    for (size_t j = 0; j < r->element[1]->elements; j++)
-                        found.emplace_back(r->element[1]->element[j]->str,
-                                           r->element[1]->element[j]->len);
-                    scanned = true;
-                });
-                if (!scanned) break;
-                for (const std::string& k : found) {
+                const size_t lens[] = {4, cursor[i].size(), 5, match.size(), 5, 4};
+                w.append(masters[i], 6, argv, lens, (int)i);
+                scanning++;
+            }
+            if (!scanning) break;
+            std::vector<std::vector<std::string>> found(n);
+            std::vector<char> scanned(n, 0);
+            w.send(Op::RHT_REMOVE, true, [&](int i, redisReply* r) {
+                if (r->type != REDIS_REPLY_ARRAY || r->elements != 2) return;
+                cursor[i].assign(r->element[0]->str, r->element[0]->len);
+                for (size_t j = 0; j < r->element[1]->elements; j++)
+                    found[i].emplace_back(r->element[1]->element[j]->str,
+                                          r->element[1]->element[j]->len);
+                scanned[i] = 1;
+            });
+            for (size_t i = 0; i < n; i++) {
+                if (done[i]) continue;
+                if (!scanned[i] || cursor[i] == "0") done[i] = 1;   // a failed master keeps its fields
+                for (const std::string& k : found[i]) {
                     const char* a[] = {"HDEL", k.c_str(), field.c_str()};
                     const size_t l[] = {4, k.size(), field.size()};
-                    w.append(m, 3, a, l, 0);
+                    w.append(masters[i], 3, a, l, 0);
                 }
-                w.send(Op::RHT_REMOVE, false, nullptr);
-            } while (cursor != "0");
+            }
+            w.send(Op::RHT_REMOVE, false, nullptr);
         }
         w.drain();
     }
