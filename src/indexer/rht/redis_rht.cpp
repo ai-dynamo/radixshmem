@@ -324,13 +324,15 @@ struct Node {
 };
 
 // One caller's connections: one pipeline per master per batch, every master's
-// replies read under one deadline. Not thread-safe.
+// replies read under one deadline. A patient Conn (the writer) waits as long
+// as replies keep coming, so a busy master is not taken for a dead one.
+// Not thread-safe.
 class Conn {
 public:
     using OnReply = std::function<void(int tag, redisReply* r)>;
 
-    Conn(ClusterView& view, const RedisRhtConfig& cfg, PeerBreaker& breaker)
-        : view_(view), breaker_(breaker), timeout_ms_(cfg.timeout_ms),
+    Conn(ClusterView& view, const RedisRhtConfig& cfg, PeerBreaker& breaker, bool patient)
+        : view_(view), breaker_(breaker), timeout_ms_(cfg.timeout_ms), patient_(patient),
           key_(cfg.key_prefix + std::string(16, '0')), slots_(view.slots()) {}
 
     ~Conn() {
@@ -481,6 +483,7 @@ private:
             if (!raw) return 0;
             redisReply* r = (redisReply*)raw;
             bool err = r->type == REDIS_REPLY_ERROR;
+            replies_++;
             if (err && (!std::strncmp(r->str, "MOVED", 5) || !std::strncmp(r->str, "ASK", 3)))
                 view_.mark_stale();
             if (!n.owed.empty()) {
@@ -500,14 +503,19 @@ private:
 
     void read(std::vector<int> live, Op op, const OnReply& on_reply) {
         auto deadline = t0_ + std::chrono::milliseconds(timeout_ms_);
+        uint64_t seen = replies_;
         std::vector<pollfd> fds;
         while (true) {
             live.erase(std::remove_if(live.begin(), live.end(),
                                       [&](int m) { return consume(m, op, on_reply) != 0; }),
                        live.end());
             if (live.empty()) return;
-            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
-                deadline - Clock::now()).count();
+            auto now = Clock::now();
+            if (patient_ && replies_ != seen) {
+                seen = replies_;
+                deadline = now + std::chrono::milliseconds(timeout_ms_);
+            }
+            auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
             if (left <= 0) {
                 for (int m : live) fail(m, "timeout", op);
                 return;
@@ -528,10 +536,12 @@ private:
     ClusterView& view_;
     PeerBreaker& breaker_;
     const int timeout_ms_;
+    const bool patient_;
     std::string key_;
     std::shared_ptr<const ClusterView::SlotMap> slots_;
     std::deque<Node> nodes_;   // by master id; references stay valid
     std::vector<int> touched_;
+    uint64_t replies_ = 0;
     Clock::time_point t0_{};
 };
 
@@ -543,7 +553,7 @@ public:
         : cfg_(cfg), my_rank_(my_rank),
           breaker_("[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT", faults,
                    200, 2000),
-          view_(cfg, breaker_), writer_(view_, cfg, breaker_) {}
+          view_(cfg, breaker_), writer_(view_, cfg, breaker_, true) {}
 
     void insert_batch(const RhtInsertEntry* e, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
@@ -698,7 +708,7 @@ private:
                 return c;
             }
         }
-        return std::make_unique<Conn>(view_, cfg_, breaker_);
+        return std::make_unique<Conn>(view_, cfg_, breaker_, false);
     }
 
     void release(std::unique_ptr<Conn> c) {
