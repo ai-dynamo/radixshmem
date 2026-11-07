@@ -30,7 +30,7 @@ using namespace radixshmem;
 using Clock = std::chrono::steady_clock;
 
 static const int kPort = 7351, kMasters = 3, kReplicas = 1, kKeys = 3000;
-static std::string g_bin, g_script;
+static std::string g_bin, g_script, g_cli;
 
 static void cluster(const char* verb) {
     std::string cmd = "REDIS_BIN=" + g_bin + " bash " + g_script + " " + verb + " " +
@@ -54,7 +54,7 @@ static void signal_masters(int sig, int first, int count) {
 }
 
 static std::string node_id(int port) {
-    std::string cmd = g_bin + "/redis-cli -p " + std::to_string(port) + " cluster myid";
+    std::string cmd = g_cli + " -p " + std::to_string(port) + " cluster myid";
     std::string id;
     if (FILE* f = popen(cmd.c_str(), "r")) {
         char buf[128] = {};
@@ -67,7 +67,7 @@ static std::string node_id(int port) {
 
 // Moves `slots` slots from one master to another with redis-cli.
 static void move_slots(int from, int to, int slots) {
-    std::string cmd = g_bin + "/redis-cli --cluster reshard 127.0.0.1:" + std::to_string(from) +
+    std::string cmd = g_cli + " --cluster reshard 127.0.0.1:" + std::to_string(from) +
                       " --cluster-from " + node_id(from) + " --cluster-to " + node_id(to) +
                       " --cluster-slots " + std::to_string(slots) + " --cluster-yes >/dev/null 2>&1";
     if (std::system(cmd.c_str()) != 0) fprintf(stderr, "  %s failed\n", cmd.c_str());
@@ -76,7 +76,7 @@ static void move_slots(int from, int to, int slots) {
 // Waits until every master's replica is online and has applied all it was sent.
 static bool replicas_synced() {
     for (int i = 0; i < kMasters; i++) {
-        std::string cmd = g_bin + "/redis-cli -p " + std::to_string(kPort + i) + " info replication";
+        std::string cmd = g_cli + " -p " + std::to_string(kPort + i) + " info replication";
         std::string out;
         if (FILE* f = popen(cmd.c_str(), "r")) {
             char buf[512];
@@ -309,6 +309,7 @@ int main() {
     }
     g_bin = bin;
     g_script = script;
+    g_cli = g_bin + (::access((g_bin + "/redis-cli").c_str(), X_OK) == 0 ? "/redis-cli" : "/valkey-cli");
     std::string seeds = "127.0.0.1:" + std::to_string(kPort);
     std::string why = redis_rht_check({seeds, "", 1000});
     if (why.find("without hiredis") != std::string::npos) {

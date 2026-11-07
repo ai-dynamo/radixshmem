@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Local Redis Cluster for the Redis RHT tests: N masters on 127.0.0.1, each with R replicas (default 0).
-#   REDIS_BIN=<dir of redis-server, redis-cli> scripts/redis_test_cluster.sh start [port] [masters] [replicas]
+#   REDIS_BIN=<dir of redis-server, redis-cli or their valkey-* names> scripts/redis_test_cluster.sh start [port] [masters] [replicas]
 #   scripts/redis_test_cluster.sh stop [port] [masters] [replicas]
 # Then configure with -DRADIXSHMEM_TEST_REDIS=127.0.0.1:<port>.
 set -eu
@@ -12,7 +12,10 @@ port=${2:-7301}
 n=${3:-3}
 r=${4:-0}
 nodes_total=$((n * (1 + r)))
-bin=${REDIS_BIN:-$(dirname "$(command -v redis-server)")}
+bin=${REDIS_BIN:-$(dirname "$(command -v redis-server || command -v valkey-server)")}
+server=$bin/redis-server
+cli=$bin/redis-cli
+if [ ! -x "$server" ] && [ -x "$bin/valkey-server" ]; then server=$bin/valkey-server; cli=$bin/valkey-cli; fi
 run=/tmp/radixshmem-redis-test
 
 case "$cmd" in
@@ -23,7 +26,7 @@ start)
     d=$run/$p
     mkdir -p "$d"
     rm -f "$d/nodes.conf"
-    "$bin/redis-server" --port "$p" --bind 127.0.0.1 --cluster-enabled yes \
+    "$server" --port "$p" --bind 127.0.0.1 --cluster-enabled yes \
       --cluster-config-file "$d/nodes.conf" --cluster-node-timeout 5000 \
       --cluster-require-full-coverage no --save "" --appendonly no \
       --maxmemory 2gb --maxmemory-policy allkeys-lru \
@@ -31,7 +34,7 @@ start)
     nodes="$nodes 127.0.0.1:$p"
   done
   sleep 1
-  "$bin/redis-cli" --cluster create $nodes --cluster-replicas "$r" --cluster-yes
+  "$cli" --cluster create $nodes --cluster-replicas "$r" --cluster-yes
   ;;
 stop)
   for ((i = 0; i < nodes_total; i++)); do
