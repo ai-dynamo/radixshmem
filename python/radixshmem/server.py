@@ -62,7 +62,7 @@ ROLES = ("prefill", "decode")
 class ClusterConfig:
     """etcd rendezvous and the control-plane RDMA of the index (see
     _core.RadixServerConfig). Distributed when expected_min_nodes > 1; the RHT
-    is configured with RADIXSHMEM_RHT_* (docs/api.md)."""
+    is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* (docs/api.md)."""
 
     expected_min_nodes: int = 0
     settle_ms: int = 500

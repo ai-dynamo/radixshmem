@@ -117,7 +117,7 @@ redisContext* open_conn(const Endpoint& ep, int timeout_ms, std::string& err) {
     redisSetTimeout(c, tv_ms(timeout_ms));
     int one = 1;
     setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    const char* pw = std::getenv("RADIXSHMEM_RHT_REDIS_PASSWORD");
+    const char* pw = std::getenv("RADIXSHMEM_REDIS_PASSWORD");
     if (pw && *pw) {
         redisReply* r = (redisReply*)redisCommand(c, "AUTH %s", pw);
         bool ok = r && r->type == REDIS_REPLY_STATUS;

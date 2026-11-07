@@ -284,10 +284,10 @@ void RadixServer::read_rht_env() {
     if (v == "rdma") e.backend = CLUSTER_RHT_RDMA;
     else if (!v.empty() && v != "redis") throw bad("RADIXSHMEM_RHT_BACKEND", v);
     if (e.backend == CLUSTER_RHT_REDIS) {
-        e.redis = env("RADIXSHMEM_RHT_REDIS");
-        v = env("RADIXSHMEM_RHT_REDIS_TIMEOUT_MS");
+        e.redis = env("RADIXSHMEM_REDIS_ADDRS");
+        v = env("RADIXSHMEM_REDIS_TIMEOUT_MS");
         if (!v.empty() && (e.redis_timeout_ms = std::atoi(v.c_str())) <= 0)
-            throw bad("RADIXSHMEM_RHT_REDIS_TIMEOUT_MS", v);
+            throw bad("RADIXSHMEM_REDIS_TIMEOUT_MS", v);
     } else {
         v = env("RADIXSHMEM_RHT_SHARDS");
         if (!v.empty() && (e.rdma.shards = std::atoi(v.c_str())) < 0) throw bad("RADIXSHMEM_RHT_SHARDS", v);
@@ -330,7 +330,7 @@ void RadixServer::resolve_shard_map(int n_obs) {
         rht_redis_timeout_ms_ = (uint32_t)rht_env_.redis_timeout_ms;
         if (rht_redis_.empty() || rht_redis_.size() >= CLUSTER_RHT_SEEDS_LEN)
             throw std::runtime_error(
-                "RadixServer: the redis RHT needs RADIXSHMEM_RHT_REDIS=host:port,... "
+                "RadixServer: the redis RHT needs RADIXSHMEM_REDIS_ADDRS=host:port,... "
                 "(under 256 chars); RADIXSHMEM_RHT_BACKEND=rdma selects the RDMA RHT");
         std::string why = redis_rht_check({rht_redis_, "", rht_env_.redis_timeout_ms});
         if (!why.empty())

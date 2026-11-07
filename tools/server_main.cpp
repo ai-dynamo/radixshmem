@@ -9,7 +9,7 @@
 // Distributed (run on each node; rank is assigned by the registry):
 //     radix_server --expected-min-nodes N --registry etcd://10.0.0.1:2379 \
 //                  --max-blocks 100000
-// The RHT is configured with RADIXSHMEM_RHT_* (docs/api.md).
+// The RHT is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* (docs/api.md).
 
 #include <csignal>
 #include <cstdio>
@@ -39,7 +39,7 @@ static void print_usage(const char* prog) {
     printf("  --evict-policy <str>     Eviction policy: lru (default: lru)\n");
     printf("  --interval <int>         Stats print interval in seconds (default: 5)\n");
     printf("\nDistributed options (expected-min-nodes > 1 enables distributed mode;\n");
-    printf("the RHT is configured with RADIXSHMEM_RHT_*, see docs/api.md):\n");
+    printf("the RHT is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, see docs/api.md):\n");
     printf("  --expected-min-nodes <int> Nodes to wait for before the cluster forms\n");
     printf("  --rpc-address <ip>       Bootstrap IP peers connect to (required; 0.0.0.0 for single node)\n");
     printf("  --rpc-interface <nic>    NIC name to resolve the bootstrap IP from; wins over --rpc-address\n");

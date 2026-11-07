@@ -110,16 +110,16 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 
 > **Note**: `RadixServer::bootstrap()` **writes** `cfg.register_chunk_tokens` into `cfg.shm.register_chunk_tokens`, so you do not need to mirror it manually. `world_size` / `rank` flow in the opposite direction: after etcd determines them during rendezvous they are **written back into `cfg`**, and together with the identity fields they are stamped into the shm header (`my_rank` / `is_distributed` / `node_name` / `registry` / `cluster_id`).
 
-> **rank0 is authoritative**: for `peer_index_transport` and the `RADIXSHMEM_RHT_*` settings (and RDMA QoS `RADIXSHMEM_RDMA_SL` / `RADIXSHMEM_RDMA_TC`), only the values on **rank 0** take effect. They are computed at bootstrap and **written into etcd `/config`** (shard map blob), and all other nodes and clients read them from there. Other ranks that pass different values have them ignored (a warning is printed) and run with rank0's authoritative values. This way the operator configures them once on rank0, all nodes + clients align automatically, and the client side needs no configuration.
+> **rank0 is authoritative**: for `peer_index_transport`, the `RADIXSHMEM_RHT_*` settings, `RADIXSHMEM_REDIS_ADDRS` and `RADIXSHMEM_REDIS_TIMEOUT_MS` (and RDMA QoS `RADIXSHMEM_RDMA_SL` / `RADIXSHMEM_RDMA_TC`), only the values on **rank 0** take effect. They are computed at bootstrap and **written into etcd `/config`** (shard map blob), and all other nodes and clients read them from there. Other ranks that pass different values have them ignored (a warning is printed) and run with rank0's authoritative values. This way the operator configures them once on rank0, all nodes + clients align automatically, and the client side needs no configuration.
 
 > **RHT backend**: set only through environment variables, read by `radix-server` at bootstrap; the variables of one backend are ignored under the other.
 >
 > | Variable | Default | Meaning |
 > |---|---|---|
 > | `RADIXSHMEM_RHT_BACKEND` | `redis` | `redis`: the RHT lives in a Redis Cluster. `rdma`: in shards on holder ranks, read and written with one-sided RDMA. |
-> | `RADIXSHMEM_RHT_REDIS` | | redis, required: `host:port,...` of any nodes of the cluster. |
-> | `RADIXSHMEM_RHT_REDIS_TIMEOUT_MS` | `50` | redis: deadline of one batch of lookups; writes wait as long as replies keep coming and give up after this long without one. A master that misses it is skipped, its ops counted as dropped, until a background probe reaches it again (after 0.2 s, backing off to 2 s). Writes it misses meanwhile are held (up to 200 k per process, the latest per key) and sent once the key's master answers, if the tree still holds them. |
-> | `RADIXSHMEM_RHT_REDIS_PASSWORD` | | redis: `AUTH` password. Every server **and client** process needs it; it is not put in etcd. |
+> | `RADIXSHMEM_REDIS_ADDRS` | | redis, required: `host:port,...` of any nodes of the cluster. |
+> | `RADIXSHMEM_REDIS_TIMEOUT_MS` | `50` | redis: deadline of one batch of lookups; writes wait as long as replies keep coming and give up after this long without one. A master that misses it is skipped, its ops counted as dropped, until a background probe reaches it again (after 0.2 s, backing off to 2 s). Writes it misses meanwhile are held (up to 200 k per process, the latest per key) and sent once the key's master answers, if the tree still holds them. |
+> | `RADIXSHMEM_REDIS_PASSWORD` | | redis: `AUTH` password. Every server **and client** process needs it; it is not put in etcd. |
 > | `RADIXSHMEM_RHT_SHARDS` | `0` | rdma: shard count M, `0` = one per node. The leader also waits for M nodes. |
 > | `RADIXSHMEM_RHT_SHARD_HOLDERS` | | rdma: candidate holder ranks, e.g. `0,2,4,6`; default ranks `[0, M)`. |
 > | `RADIXSHMEM_RHT_SLOTS` | `4` | rdma: slots per bucket W, one of 1, 2, 4, 8. |

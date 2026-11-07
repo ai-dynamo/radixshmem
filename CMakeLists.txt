@@ -553,7 +553,7 @@ foreach(_t IN LISTS _skippable_tests)
         set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "RADIXSHMEM_RHT_BACKEND=rdma")
     endif()
 endforeach()
-set(_redis_rht_env "RADIXSHMEM_RHT_BACKEND=redis;RADIXSHMEM_RHT_REDIS=${RADIXSHMEM_TEST_REDIS}")
+set(_redis_rht_env "RADIXSHMEM_RHT_BACKEND=redis;RADIXSHMEM_REDIS_ADDRS=${RADIXSHMEM_TEST_REDIS}")
 if(RADIXSHMEM_TEST_REDIS)
     foreach(_pair test_cluster:test_cluster test_cluster_node_join:test_cluster_node_join
                   test_client_no_server:test_client_no_server

@@ -22,7 +22,7 @@ struct RedisRhtConfig {
     std::function<bool(uint64_t first_hash, uint32_t tree_node_id)> live;
 };
 
-// One HASH per key, field = rank. AUTH uses RADIXSHMEM_RHT_REDIS_PASSWORD when
+// One HASH per key, field = rank. AUTH uses RADIXSHMEM_REDIS_PASSWORD when
 // set. Throws on a bad config or a build without hiredis; an unreachable
 // cluster only drops ops until it answers.
 std::unique_ptr<RhtBackend> make_redis_rht(const RedisRhtConfig& cfg, int my_rank,

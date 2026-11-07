@@ -180,7 +180,7 @@ private:
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
 
-    // RADIXSHMEM_RHT_* of this node.
+    // RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* of this node.
     struct RhtEnv {
         uint32_t    backend = CLUSTER_RHT_REDIS;
         std::string redis;                      // "host:port,..."

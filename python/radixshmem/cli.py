@@ -152,7 +152,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "share of a pool (default: 0.05)")
 
     g = p.add_argument_group("distributed (--expected-min-nodes > 1; the RHT is configured with "
-                             "RADIXSHMEM_RHT_*, see docs/api.md)")
+                             "RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, see docs/api.md)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
     g.add_argument("--registry", default="etcd://127.0.0.1:2379")
