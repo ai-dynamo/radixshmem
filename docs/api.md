@@ -125,7 +125,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 > | `RADIXSHMEM_RHT_SLOTS` | `4` | rdma: slots per bucket W, one of 1, 2, 4, 8. |
 > | `RADIXSHMEM_RHT_TRANSPORT` | `xrc` | rdma: `xrc` (one QP per holder) or `dc` (shared DCI). |
 >
-> The redis backend keeps one HASH per route key, `rsh:<cluster_id>:<first_hash in hex>`, with one field per rank. The leader refuses to start unless a seed answers with `cluster_state:ok`. Run the Redis Cluster with `cluster-require-full-coverage no`, `maxmemory` and `maxmemory-policy allkeys-lru` (stale routes are evicted), and without persistence.
+> The redis backend keeps one HASH per route key, `rsh:<cluster_id>:<first_hash in hex>`, with one field per rank. The leader refuses to start unless a seed answers with `cluster_state:ok`. A radix-server starts with an empty tree, so routes published before the start are dropped before the node is ready: the leader of a new cluster deletes every key under the prefix, a node that rejoins or joins a formed cluster deletes its rank's field. Run the Redis Cluster with `cluster-require-full-coverage no`, `maxmemory` and `maxmemory-policy allkeys-lru` (stale routes are evicted), and without persistence.
 
 
 

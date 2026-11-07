@@ -24,6 +24,15 @@ struct RedisRhtConfig {
 std::unique_ptr<RhtBackend> make_redis_rht(const RedisRhtConfig& cfg, int my_rank,
                                            PeerFaultCounters* faults);
 
+// Key prefix of a cluster's routes.
+inline std::string redis_rht_prefix(const std::string& cluster_id) {
+    return "rsh:" + cluster_id + ":";
+}
+
+// Deletes every route under cfg.key_prefix; false if some master could not be
+// cleared.
+bool redis_rht_clear(const RedisRhtConfig& cfg);
+
 // Empty if a seed answers with cluster_state:ok, else why not.
 std::string redis_rht_check(const RedisRhtConfig& cfg);
 

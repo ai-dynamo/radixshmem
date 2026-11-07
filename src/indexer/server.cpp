@@ -457,6 +457,23 @@ std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
     return "";
 }
 
+void RadixServer::drop_stale_routes(bool whole_cluster) {
+    if (rht_backend_ != CLUSTER_RHT_REDIS) return;
+    const RedisRhtConfig rc{rht_redis_, redis_rht_prefix(cfg_.cluster_id),
+                            (int)rht_redis_timeout_ms_};
+    auto t0 = std::chrono::steady_clock::now();
+    if (whole_cluster) {
+        if (!redis_rht_clear(rc))
+            fprintf(stderr, "[RadixServer] could not clear every stale route of cluster %s\n",
+                    cfg_.cluster_id.c_str());
+    } else {
+        make_redis_rht(rc, cfg_.rank, nullptr)->reset(nullptr, -1);
+    }
+    fprintf(stderr, "[RadixServer] stale routes of %s dropped in %.1f s\n",
+            whole_cluster ? "the cluster" : ("rank " + std::to_string(cfg_.rank)).c_str(),
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
 void RadixServer::stamp_shm_ready(int assigned_rank, int n_obs) {
     auto* hdr = static_cast<ShmHeader*>(tree_->shm_base());
     hdr->my_rank        = (uint32_t)assigned_rank;

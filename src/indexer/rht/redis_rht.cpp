@@ -658,6 +658,17 @@ public:
                     "this rank remain on masters it could not reach\n", my_rank_, kRetrySecs);
     }
 
+    // Deletes every key under the prefix, i.e. the routes of all ranks.
+    bool clear() {
+        std::lock_guard<std::mutex> g(write_mu_);
+        writer_.begin();
+        writer_.drain();
+        writer_.set_quiet(true);
+        bool clean = scan_remove("");
+        writer_.set_quiet(false);
+        return clean;
+    }
+
     void dump(uint64_t key, std::vector<std::string>& lines) override {
         lines.clear();
         std::unique_ptr<Conn> c = acquire();
@@ -732,9 +743,9 @@ private:
         return todo.empty();
     }
 
-    // Drops `field` from every key under the prefix. A pass that a down master,
-    // an error reply or a slot move may have left incomplete is repeated once
-    // the masters are up again.
+    // Drops `field` from every key under the prefix, or the keys when it is
+    // empty. A pass that a down master, an error reply or a slot move may have
+    // left incomplete is repeated once the masters are up again.
     bool scan_remove(const std::string& field) {
         const auto give_up = Clock::now() + std::chrono::seconds(kRetrySecs);
         while (true) {
@@ -788,9 +799,9 @@ private:
                 if (!scanned[i]) complete = false;
                 if (!scanned[i] || cursor[i] == "0") done[i] = 1;
                 for (const std::string& k : found[i]) {
-                    const char* a[] = {"HDEL", k.c_str(), field.c_str()};
-                    const size_t l[] = {4, k.size(), field.size()};
-                    w.append(masters[i], 3, a, l, 0);
+                    const char* a[] = {field.empty() ? "UNLINK" : "HDEL", k.c_str(), field.c_str()};
+                    const size_t l[] = {field.empty() ? 6u : 4u, k.size(), field.size()};
+                    w.append(masters[i], field.empty() ? 2 : 3, a, l, 0);
                 }
             }
             w.send(Op::RHT_REMOVE, false, nullptr);
@@ -857,6 +868,11 @@ std::unique_ptr<RhtBackend> make_redis_rht(const RedisRhtConfig& cfg, int my_ran
     return std::make_unique<RedisRht>(cfg, my_rank, faults);
 }
 
+bool redis_rht_clear(const RedisRhtConfig& cfg) {
+    if (parse_seeds(cfg.seeds).empty() || cfg.timeout_ms <= 0) return false;
+    return RedisRht(cfg, -1, nullptr).clear();
+}
+
 std::string redis_rht_check(const RedisRhtConfig& cfg) {
     std::vector<Endpoint> seeds = parse_seeds(cfg.seeds);
     if (seeds.empty()) return "no host:port in '" + cfg.seeds + "'";
@@ -888,6 +904,8 @@ namespace radixshmem {
 std::unique_ptr<RhtBackend> make_redis_rht(const RedisRhtConfig&, int, PeerFaultCounters*) {
     throw std::runtime_error("Redis RHT: radixshmem was built without hiredis");
 }
+
+bool redis_rht_clear(const RedisRhtConfig&) { return false; }
 
 std::string redis_rht_check(const RedisRhtConfig&) {
     return "radixshmem was built without hiredis";

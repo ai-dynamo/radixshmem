@@ -196,6 +196,7 @@ bool EtcdRegistry::run_rendezvous(std::vector<PeerEntry>& out) {
             ok = is_leader ? leader_flow(out) : follower_flow(out, false);
         }
         if (!ok) return false;
+        if (config_preexisting_) rs_.drop_stale_routes(false);
 
         // etcd barrier: mark ready, wait for every registered node.
         int world = world_size();
@@ -288,6 +289,7 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     sm.register_chunk_size = (uint32_t)rs_.register_chunk_size();
     for (int s = 0; s < rs_.num_shards_; s++)
         sm.holder_rank[s] = (uint32_t)rs_.holder_of_shard_[s];
+    rs_.drop_stale_routes(true);
     impl_->cli.put(K.config(), etcd::encode_shardmap(sm), cluster_lease_);
     config_published_ = true;
 
@@ -425,6 +427,7 @@ bool EtcdRegistry::join_existing(std::vector<PeerEntry>& out) {
     impl_->cli.put(K.shm(node_name_), shm_name_, lease_id_);
     impl_->cli.put(K.ready(node_name_), "1", lease_id_);
     rs_.cfg_.world_size = world;
+    rs_.drop_stale_routes(false);
     rs_.stamp_shm_ready(my_rank, world);
 
     fprintf(stderr, "[EtcdRegistry %s] joined as rank %d (data peer, %d nodes)\n",
