@@ -172,6 +172,7 @@ public:
     }
 
     const Endpoint& endpoint(int id) const { return masters_[id].ep; }
+    uint64_t version() const { return version_.load(std::memory_order_acquire); }
     bool down(int id) const { return masters_[id].down.load(std::memory_order_acquire); }
     uint32_t generation(int id) const { return masters_[id].gen.load(std::memory_order_acquire); }
 
@@ -188,6 +189,9 @@ public:
     void mark_stale() {
         if (!stale_.exchange(true)) cv_.notify_one();
     }
+
+    // No master that owns slots is down.
+    bool settled() const { return down_serving().empty(); }
 
 private:
     void run() {
@@ -246,6 +250,7 @@ private:
                     for (long long s = lo; s <= hi; s++) (*map)[s] = (int16_t)id;
                 }
                 std::lock_guard<std::mutex> g(mu_);
+                if (*map != *slots_) version_.fetch_add(1, std::memory_order_acq_rel);
                 slots_ = std::move(map);
             }
             if (r) freeReplyObject(r);
@@ -308,6 +313,7 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::shared_ptr<const SlotMap> slots_;
+    std::atomic<uint64_t> version_{0};   // bumped when slot owners change
     std::atomic<bool> stale_{false};
     bool stop_ = false;
     std::thread thread_;
@@ -351,10 +357,7 @@ public:
     // The master serving k, whose Redis key is left in key(), or -1 with the
     // op counted as dropped.
     int route(uint64_t k, Op op) {
-        static const char hex[] = "0123456789abcdef";
-        char* p = &key_[key_.size() - 16];
-        for (int i = 15; i >= 0; i--, k >>= 4) p[i] = hex[k & 15];
-        int m = (*slots_)[key_slot(key_.data(), key_.size())];
+        int m = owner(k);
         if (m < 0) {
             view_.mark_stale();
             breaker_.skipped(-1, op);
@@ -362,6 +365,22 @@ public:
         }
         return usable(m, op) ? m : -1;
     }
+
+    // The master serving k in this batch's map, or -1; counts nothing.
+    int owner(uint64_t k) {
+        static const char hex[] = "0123456789abcdef";
+        char* p = &key_[key_.size() - 16];
+        for (int i = 15; i >= 0; i--, k >>= 4) p[i] = hex[k & 15];
+        return (*slots_)[key_slot(key_.data(), key_.size())];
+    }
+
+    bool down(int m) const { return view_.down(m); }
+
+    // Error replies read so far.
+    uint64_t errors() const { return errors_; }
+
+    // While quiet, failed ops are not counted as dropped: a reset retries them.
+    void set_quiet(bool q) { quiet_ = q; }
 
     // Master m is up and connected; else the op is counted as dropped.
     bool usable(int m, Op op) {
@@ -446,8 +465,10 @@ private:
     // Drops m's connection; the replies it still owes count as dropped ops.
     void close(int m, Op op) {
         Node& n = nodes_[m];
-        for (Op o : n.owed) breaker_.skipped(m, o);
-        if (n.next < n.tags.size()) breaker_.skipped(m, op, n.tags.size() - n.next);
+        if (!quiet_) {
+            for (Op o : n.owed) breaker_.skipped(m, o);
+            if (n.next < n.tags.size()) breaker_.skipped(m, op, n.tags.size() - n.next);
+        }
         n.owed.clear();
         n.tags.clear();
         n.next = 0;
@@ -484,14 +505,15 @@ private:
             redisReply* r = (redisReply*)raw;
             bool err = r->type == REDIS_REPLY_ERROR;
             replies_++;
+            errors_ += err;
             if (err && (!std::strncmp(r->str, "MOVED", 5) || !std::strncmp(r->str, "ASK", 3)))
                 view_.mark_stale();
             if (!n.owed.empty()) {
-                if (err) breaker_.skipped(m, n.owed.front());
+                if (err && !quiet_) breaker_.skipped(m, n.owed.front());
                 n.owed.pop_front();
             } else {
-                if (err) breaker_.skipped(m, op);
-                else if (on_reply) on_reply(n.tags[n.next], r);
+                if (!err && on_reply) on_reply(n.tags[n.next], r);
+                if (err && !quiet_) breaker_.skipped(m, op);
                 n.next++;
             }
             freeReplyObject(r);
@@ -537,11 +559,12 @@ private:
     PeerBreaker& breaker_;
     const int timeout_ms_;
     const bool patient_;
+    bool quiet_ = false;
     std::string key_;
     std::shared_ptr<const ClusterView::SlotMap> slots_;
     std::deque<Node> nodes_;   // by master id; references stay valid
     std::vector<int> touched_;
-    uint64_t replies_ = 0;
+    uint64_t replies_ = 0, errors_ = 0;
     Clock::time_point t0_{};
 };
 
@@ -621,54 +644,18 @@ public:
         writer_.drain();
     }
 
-    // Drops this rank's field from every key under the prefix. Every round
-    // sends one SCAN to each master still scanning, then the HDELs for what it
-    // found, so the masters work at the same time.
-    void reset() override {
+    // Drops this rank's routes: the listed ones, or with count < 0 this rank's
+    // field in every key under the prefix.
+    void reset(const RhtRemoveEntry* own, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
-        Conn& w = writer_;
-        w.begin();
-        w.drain();
-        const std::string field = std::to_string(my_rank_);
-        const std::string match = cfg_.key_prefix + "*";
-        const std::vector<int> masters = w.masters();
-        const size_t n = masters.size();
-        std::vector<std::string> cursor(n, "0");
-        std::vector<char> done(n, 0);
-        while (true) {
-            int scanning = 0;
-            for (size_t i = 0; i < n; i++) {
-                if (!done[i] && !w.usable(masters[i], Op::RHT_REMOVE)) done[i] = 1;
-                if (done[i]) continue;
-                const char* argv[] = {"SCAN", cursor[i].c_str(), "MATCH", match.c_str(),
-                                      "COUNT", "1000"};
-                const size_t lens[] = {4, cursor[i].size(), 5, match.size(), 5, 4};
-                w.append(masters[i], 6, argv, lens, (int)i);
-                scanning++;
-            }
-            if (!scanning) break;
-            std::vector<std::vector<std::string>> found(n);
-            std::vector<char> scanned(n, 0);
-            w.send(Op::RHT_REMOVE, true, [&](int i, redisReply* r) {
-                if (r->type != REDIS_REPLY_ARRAY || r->elements != 2) return;
-                cursor[i].assign(r->element[0]->str, r->element[0]->len);
-                for (size_t j = 0; j < r->element[1]->elements; j++)
-                    found[i].emplace_back(r->element[1]->element[j]->str,
-                                          r->element[1]->element[j]->len);
-                scanned[i] = 1;
-            });
-            for (size_t i = 0; i < n; i++) {
-                if (done[i]) continue;
-                if (!scanned[i] || cursor[i] == "0") done[i] = 1;   // a failed master keeps its fields
-                for (const std::string& k : found[i]) {
-                    const char* a[] = {"HDEL", k.c_str(), field.c_str()};
-                    const size_t l[] = {4, k.size(), field.size()};
-                    w.append(masters[i], 3, a, l, 0);
-                }
-            }
-            w.send(Op::RHT_REMOVE, false, nullptr);
-        }
-        w.drain();
+        writer_.begin();
+        writer_.drain();
+        writer_.set_quiet(true);
+        bool clean = count >= 0 ? remove_listed(own, count) : scan_remove(std::to_string(my_rank_));
+        writer_.set_quiet(false);
+        if (!clean)
+            fprintf(stderr, "[RadixClient rank %d] Redis RHT: reset gave up after %d s; routes of "
+                    "this rank remain on masters it could not reach\n", my_rank_, kRetrySecs);
     }
 
     void dump(uint64_t key, std::vector<std::string>& lines) override {
@@ -699,6 +686,117 @@ public:
     }
 
 private:
+    static constexpr int kRetrySecs = 30;
+    static constexpr size_t kChunk = 16384;
+
+    // Waits until no master that owns slots is down, or the retries run out.
+    bool wait_settled(Clock::time_point give_up) {
+        do {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            if (view_.settled()) return true;
+        } while (Clock::now() < give_up);
+        return false;
+    }
+
+    // Drops this rank's field from the listed keys, whatever node it names (the
+    // rank's routes are all stale once its tree is reset), and retries those a
+    // down master, a slot move or an error reply kept from landing.
+    bool remove_listed(const RhtRemoveEntry* own, int count) {
+        Conn& w = writer_;
+        const auto give_up = Clock::now() + std::chrono::seconds(kRetrySecs);
+        std::vector<RhtRemoveEntry> todo(own, own + count);
+        while (true) {
+            w.begin();
+            std::vector<RhtRemoveEntry> left;
+            for (size_t b = 0; b < todo.size(); b += kChunk) {
+                const size_t n = std::min(kChunk, todo.size() - b);
+                std::vector<char> landed(n, 0);
+                for (size_t i = 0; i < n; i++) {
+                    const RhtRemoveEntry& e = todo[b + i];
+                    int m = w.owner(e.key);
+                    if (m < 0) view_.mark_stale();
+                    if (m < 0 || w.down(m) || !w.usable(m, Op::RHT_REMOVE)) continue;
+                    std::string field = std::to_string(e.node_id);
+                    const char* argv[] = {"HDEL", w.key().data(), field.c_str()};
+                    const size_t lens[] = {4, w.key().size(), field.size()};
+                    w.append(m, 3, argv, lens, (int)i);
+                }
+                w.send(Op::RHT_REMOVE, true, [&](int i, redisReply*) { landed[i] = 1; });
+                for (size_t i = 0; i < n; i++)
+                    if (!landed[i]) left.push_back(todo[b + i]);
+            }
+            todo.swap(left);
+            if (todo.empty() || !wait_settled(give_up)) break;
+        }
+        if (!todo.empty()) breaker_.skipped(-1, Op::RHT_REMOVE, todo.size());
+        return todo.empty();
+    }
+
+    // Drops `field` from every key under the prefix. A pass that a down master,
+    // an error reply or a slot move may have left incomplete is repeated once
+    // the masters are up again.
+    bool scan_remove(const std::string& field) {
+        const auto give_up = Clock::now() + std::chrono::seconds(kRetrySecs);
+        while (true) {
+            const uint64_t version = view_.version(), errors = writer_.errors();
+            writer_.begin();
+            bool complete = scan_pass(field);
+            writer_.drain();
+            if (complete && writer_.errors() == errors && view_.version() == version) return true;
+            if (!wait_settled(give_up)) return false;
+        }
+    }
+
+    // One pass: each round sends a SCAN to every master still scanning, then the
+    // removals for the keys that came back, so the masters work at the same time.
+    bool scan_pass(const std::string& field) {
+        Conn& w = writer_;
+        const std::string match = cfg_.key_prefix + "*";
+        const std::vector<int> masters = w.masters();
+        const size_t n = masters.size();
+        std::vector<std::string> cursor(n, "0");
+        std::vector<char> done(n, 0);
+        bool complete = true;
+        while (true) {
+            int scanning = 0;
+            for (size_t i = 0; i < n; i++) {
+                if (done[i]) continue;
+                if (w.down(masters[i]) || !w.usable(masters[i], Op::RHT_REMOVE)) {
+                    done[i] = 1;
+                    complete = false;
+                    continue;
+                }
+                const char* argv[] = {"SCAN", cursor[i].c_str(), "MATCH", match.c_str(),
+                                      "COUNT", "1000"};
+                const size_t lens[] = {4, cursor[i].size(), 5, match.size(), 5, 4};
+                w.append(masters[i], 6, argv, lens, (int)i);
+                scanning++;
+            }
+            if (!scanning) return complete;
+            std::vector<std::vector<std::string>> found(n);
+            std::vector<char> scanned(n, 0);
+            w.send(Op::RHT_REMOVE, true, [&](int i, redisReply* r) {
+                if (r->type != REDIS_REPLY_ARRAY || r->elements != 2) return;
+                cursor[i].assign(r->element[0]->str, r->element[0]->len);
+                for (size_t j = 0; j < r->element[1]->elements; j++)
+                    found[i].emplace_back(r->element[1]->element[j]->str,
+                                          r->element[1]->element[j]->len);
+                scanned[i] = 1;
+            });
+            for (size_t i = 0; i < n; i++) {
+                if (done[i]) continue;
+                if (!scanned[i]) complete = false;
+                if (!scanned[i] || cursor[i] == "0") done[i] = 1;
+                for (const std::string& k : found[i]) {
+                    const char* a[] = {"HDEL", k.c_str(), field.c_str()};
+                    const size_t l[] = {4, k.size(), field.size()};
+                    w.append(masters[i], 3, a, l, 0);
+                }
+            }
+            w.send(Op::RHT_REMOVE, false, nullptr);
+        }
+    }
+
     std::unique_ptr<Conn> acquire() {
         {
             std::lock_guard<std::mutex> g(pool_mu_);

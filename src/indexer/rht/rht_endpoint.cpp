@@ -367,7 +367,7 @@ void RdmaRht::flush() {
     impl_->rht->flush();
 }
 
-void RdmaRht::reset() {
+void RdmaRht::reset(const RhtRemoveEntry*, int) {
     // local_shards only ever holds this rank's own shard (see ctor).
     for (auto& kv : impl_->local_shards)
         if (kv.second.valid()) kv.second.reset();

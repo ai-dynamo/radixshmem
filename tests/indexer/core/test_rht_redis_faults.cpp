@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// test_rht_redis_faults — the Redis RHT while masters hang, fail over and
-// while async replies pile up. Starts its own cluster of 3 masters with one
+// test_rht_redis_faults — the Redis RHT while masters hang, fail over or
+// give up slots, and while async replies pile up. Starts its own cluster of 3 masters with one
 // replica each on 127.0.0.1:7351 with RADIXSHMEM_REDIS_SCRIPT and the
 // binaries in RADIXSHMEM_TEST_REDIS_BIN; skips (77) when unset.
 
@@ -51,6 +51,26 @@ static void signal_masters(int sig, int first, int count) {
         int pid = 0;
         if (f >> pid && pid > 0) ::kill(pid, sig);
     }
+}
+
+static std::string node_id(int port) {
+    std::string cmd = g_bin + "/redis-cli -p " + std::to_string(port) + " cluster myid";
+    std::string id;
+    if (FILE* f = popen(cmd.c_str(), "r")) {
+        char buf[128] = {};
+        if (fgets(buf, sizeof(buf), f)) id = buf;
+        pclose(f);
+    }
+    while (!id.empty() && (id.back() == '\n' || id.back() == '\r')) id.pop_back();
+    return id;
+}
+
+// Moves `slots` slots from one master to another with redis-cli.
+static void move_slots(int from, int to, int slots) {
+    std::string cmd = g_bin + "/redis-cli --cluster reshard 127.0.0.1:" + std::to_string(from) +
+                      " --cluster-from " + node_id(from) + " --cluster-to " + node_id(to) +
+                      " --cluster-slots " + std::to_string(slots) + " --cluster-yes >/dev/null 2>&1";
+    if (std::system(cmd.c_str()) != 0) fprintf(stderr, "  %s failed\n", cmd.c_str());
 }
 
 // Waits until every master's replica is online and has applied all it was sent.
@@ -193,6 +213,33 @@ static void test_unread_replies() {
     TEST_PASS();
 }
 
+static void test_reset_after_move() {
+    TEST_BEGIN("a reset that meets moved slots retries them, by list and by scan");
+    const std::string seeds = "127.0.0.1:" + std::to_string(kPort);
+    for (int by_list = 1; by_list >= 0; by_list--) {
+        const std::string prefix = "rsh:test_rht_redis_faults_" + std::to_string(::getpid()) +
+                                   "_moved" + std::to_string(by_list) + ":";
+        auto r0 = make_redis_rht({seeds, prefix, 50}, 0, nullptr);
+        auto r1 = make_redis_rht({seeds, prefix, 50}, 1, nullptr);
+        std::vector<RhtInsertEntry> e(kKeys);
+        std::vector<RhtRemoveEntry> own(kKeys);
+        std::vector<uint64_t> keys(kKeys);
+        for (int k = 0; k < 2; k++) {
+            for (int i = 0; i < kKeys; i++) e[i] = {key_of(i), k, (uint32_t)i, 4};
+            (k ? r1 : r0)->insert_batch(e.data(), kKeys);
+            (k ? r1 : r0)->flush();
+        }
+        for (int i = 0; i < kKeys; i++) own[i] = {key_of(i), 0, (uint32_t)i}, keys[i] = key_of(i);
+        move_slots(by_list ? kPort : kPort + 2, by_list ? kPort + 2 : kPort, 1000);   // r0's map is stale now
+        r0->reset(own.data(), by_list ? kKeys : -1);
+        auto check = make_redis_rht({seeds, prefix, 1000}, 2, nullptr);
+        std::vector<std::vector<RHTValue>> res(kKeys);
+        check->lookup_batch(keys.data(), kKeys, res.data());
+        for (auto& r : res) assert(r.size() == 1 && r[0].node_id == 1);
+    }
+    TEST_PASS();
+}
+
 static void test_failover() {
     TEST_BEGIN("a killed master's replica takes over with every route");
     PeerFaultCounters c{};
@@ -241,6 +288,7 @@ int main() {
     test_hung_master();
     test_hung_cluster();
     test_unread_replies();
+    test_reset_after_move();
     test_failover();
     cluster("stop");
     return tests_report();

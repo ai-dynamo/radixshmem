@@ -25,7 +25,9 @@ public:
                               std::vector<RHTValue>* results) = 0;
     virtual void flush() = 0;
 
-    virtual void reset() = 0;
+    // Drops this rank's routes. `own` lists them when the caller still has its
+    // tree; count < 0 leaves finding them to the backend.
+    virtual void reset(const RhtRemoveEntry* own, int count) = 0;
     virtual void peer_changed(const PeerEntry&) {}
     virtual void peer_left(int) {}
 

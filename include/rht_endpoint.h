@@ -68,8 +68,8 @@ public:
                       std::vector<RHTValue>* results) override;
     void remove_batch(const RhtRemoveEntry* entries, int count) override;
     void flush() override;
-    // Zeroes the shard this rank holds.
-    void reset() override;
+    // Zeroes the shard this rank holds; `own` is not needed.
+    void reset(const RhtRemoveEntry* own, int count) override;
     void peer_changed(const PeerEntry& e) override;
     void peer_left(int rank) override;
     void dump(uint64_t key, std::vector<std::string>& lines) override;

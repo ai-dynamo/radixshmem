@@ -830,7 +830,7 @@ void reset();
 
 Lock: **write lock (**`write_lock`**)** — first drains in-flight remote RDMA readers and makes the background eviction thread yield.
 
-Clears all caches of this client in place: resets this node's radix tree to empty (only a root remains, all slots are returned to the mempool, the `insert_*` diagnostic counters are zeroed), and clears this rank's RHT state: the RDMA RHT memsets to zero the **RHT shards held by this rank (**`**holder_rank == my_rank`)**, the redis RHT deletes this rank's routes. It does **not** remap and does **not** reconnect RDMA — the shm layout / magic / locks / cluster identity markers / established QPs are all kept as is; only the data inside is erased.
+Clears all caches of this client in place: resets this node's radix tree to empty (only a root remains, all slots are returned to the mempool, the `insert_*` diagnostic counters are zeroed), and clears this rank's RHT state: the RDMA RHT memsets to zero the **RHT shards held by this rank (**`**holder_rank == my_rank`)**, the redis RHT deletes this rank's routes, listed from the tree before it is cleared, and retries for up to 30 s those a down master or a slot move kept from landing. It does **not** remap and does **not** reconnect RDMA — the shm layout / magic / locks / cluster identity markers / established QPs are all kept as is; only the data inside is erased.
 
 **Key semantics**
 

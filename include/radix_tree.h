@@ -29,6 +29,11 @@ struct EvictedNode {
     uint32_t tree_node_id;
 };
 
+struct NodeHead {
+    uint64_t first_hash;
+    uint32_t tree_node_id;
+};
+
 // A background-evicted leaf with its root path [0, end): [evicted_from, end)
 // left the tree with its slots held, [0, evicted_from) stays pinned.
 struct HeldEviction {
@@ -190,6 +195,8 @@ public:
     // True iff node_id is live again with this first hash: the evicted id was
     // recycled (LIFO pool) for the same prefix before its RHT removal ran.
     bool node_head_matches(uint32_t node_id, uint64_t first_hash);
+    // Every node holding blocks, i.e. what this tree has routes for in the RHT.
+    std::vector<NodeHead> node_heads();
 
     // Stats
     uint32_t total_radix_nodes() const;

@@ -843,10 +843,18 @@ void RadixClient::recycle_slots(const int32_t* slots, int num,
 
 void RadixClient::reset() {
     require_writable("reset");
-    if (local_) local_->reset();
 #ifndef RADIXSHMEM_NO_RDMA
-    if (distributed_ && rht_ && peer_reg_->my_rank() >= 0) rht_->reset();
+    // The routes go first, while the tree still lists them.
+    if (distributed_ && rht_ && peer_reg_->my_rank() >= 0) {
+        const int32_t my_rank = peer_reg_->my_rank();
+        std::vector<RhtRemoveEntry> own;
+        if (local_)
+            for (const NodeHead& h : local_->tree().node_heads())
+                own.push_back({h.first_hash, my_rank, h.tree_node_id});
+        rht_->reset(own.data(), local_ ? (int)own.size() : -1);
+    }
 #endif
+    if (local_) local_->reset();
 }
 
 

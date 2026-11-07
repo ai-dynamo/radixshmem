@@ -49,8 +49,8 @@ static void test_ranks_and_replace() {
     assert(v[0].node_id == 0 && v[0].tree_node_id == 6 && v[0].num_blocks == 32);
     assert(v[1].node_id == 1 && v[1].tree_node_id == 9 && v[1].num_blocks == 128);
     assert(lookup(*obs, 43).empty());
-    r0->reset();
-    r1->reset();
+    r0->reset(nullptr, -1);
+    r1->reset(nullptr, -1);
     TEST_PASS();
 }
 
@@ -71,12 +71,12 @@ static void test_conditional_remove() {
     r0->flush();
     auto v = lookup(*r0, 7);
     assert(v.size() == 1 && v[0].node_id == 1 && v[0].tree_node_id == 71);
-    r1->reset();
+    r1->reset(nullptr, -1);
     TEST_PASS();
 }
 
 static void test_batches_and_reset() {
-    TEST_BEGIN("large batches over every master; reset drops one rank");
+    TEST_BEGIN("large batches over every master; reset by list or by scan drops one rank");
     const int n = 5000;
     auto r0 = make_redis_rht(config("batch"), 0, nullptr);
     auto r1 = make_redis_rht(config("batch"), 1, nullptr);
@@ -100,10 +100,15 @@ static void test_batches_and_reset() {
                                   : v.node_id == 1 && v.tree_node_id == (uint32_t)(i + 1));
     }
     for (int i = n; i < n + 1000; i++) assert(res[i].empty());
-    r0->reset();
+    std::vector<RhtRemoveEntry> own(n / 2);
+    for (int i = 0; i < n / 2; i++) own[i] = {keys[i], 0, (uint32_t)i};
+    r0->reset(own.data(), n / 2);
+    r1->lookup_batch(keys.data(), n, res.data());
+    for (int i = 0; i < n; i++) assert(res[i].size() == (i < n / 2 ? 1u : 2u));
+    r0->reset(nullptr, -1);
     r1->lookup_batch(keys.data(), n, res.data());
     for (int i = 0; i < n; i++) assert(res[i].size() == 1 && res[i][0].node_id == 1);
-    r1->reset();
+    r1->reset(nullptr, -1);
     r1->lookup_batch(keys.data(), n, res.data());
     for (int i = 0; i < n; i++) assert(res[i].empty());
     TEST_PASS();
@@ -118,7 +123,7 @@ static void test_dump() {
     std::vector<std::string> lines;
     r0->dump(11, lines);
     assert(lines.size() == 1 && lines[0] == "r3:t12/13");
-    r0->reset();
+    r0->reset(nullptr, -1);
     TEST_PASS();
 }
 
