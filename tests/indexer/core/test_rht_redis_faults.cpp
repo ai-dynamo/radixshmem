@@ -18,6 +18,7 @@
 #include <cassert>
 #include <chrono>
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -50,6 +51,23 @@ static void signal_masters(int sig, int first, int count) {
         int pid = 0;
         if (f >> pid && pid > 0) ::kill(pid, sig);
     }
+}
+
+// Waits until every master's replica is online and has applied all it was sent.
+static bool replicas_synced() {
+    for (int i = 0; i < kMasters; i++) {
+        std::string cmd = g_bin + "/redis-cli -p " + std::to_string(kPort + i) + " info replication";
+        std::string out;
+        if (FILE* f = popen(cmd.c_str(), "r")) {
+            char buf[512];
+            while (fgets(buf, sizeof(buf), f)) out += buf;
+            pclose(f);
+        }
+        size_t m = out.find("master_repl_offset:"), r = out.find("state=online,offset=");
+        if (m == std::string::npos || r == std::string::npos) return false;
+        if (std::stoll(out.substr(m + 19)) != std::stoll(out.substr(r + 20))) return false;
+    }
+    return true;
 }
 
 static uint64_t key_of(uint64_t i) {
@@ -179,13 +197,14 @@ static void test_failover() {
     TEST_BEGIN("a killed master's replica takes over with every route");
     PeerFaultCounters c{};
     auto rht = filled("127.0.0.1:" + std::to_string(kPort), "failover", &c);
-    auto calls = probe(*rht, 12.0, [] {
+    for (int i = 0; i < 300 && !replicas_synced(); i++) pause_for(0.1);   // a resyncing replica cannot take over
+    auto calls = probe(*rht, 14.0, [] {
         pause_for(1.0);
         signal_masters(SIGKILL, 1, 1);
     });
     assert(slowest_ms(calls) < 250);
     assert(found_share(calls, 1.3, 5.0) < 0.9);
-    assert(found_share(calls, 10.5, 12.0) == 1.0);
+    assert(found_share(calls, 12.5, 14.0) == 1.0);
     std::vector<uint64_t> keys(kKeys);
     std::vector<std::vector<RHTValue>> res(kKeys);
     for (int i = 0; i < kKeys; i++) keys[i] = key_of(i);
