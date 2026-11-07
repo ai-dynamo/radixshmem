@@ -196,6 +196,7 @@ bool EtcdRegistry::run_rendezvous(std::vector<PeerEntry>& out) {
             ok = is_leader ? leader_flow(out) : follower_flow(out, false);
         }
         if (!ok) return false;
+        if (config_preexisting_) rs_.drop_stale_routes(false);
 
         // etcd barrier: mark ready, wait for every registered node.
         int world = world_size();
@@ -232,8 +233,8 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);
     impl_->cli.put(K.shm(node_name_), shm_name_, lease_id_);
 
-    // Membership gate: at least max(num_rht_shards, expected_min_nodes) nodes, stable.
-    int gate = std::max(rs_.cfg_.num_rht_shards, rs_.cfg_.expected_min_nodes);
+    // Membership gate: at least max(RDMA RHT shards, expected_min_nodes) nodes, stable.
+    int gate = std::max(rs_.rht_min_nodes(), rs_.cfg_.expected_min_nodes);
     if (gate < 1) gate = 1;
     int n_obs = await_membership(gate);
     if (n_obs < 0) {
@@ -263,9 +264,9 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     rs_.cfg_.rank = my_rank;
 
     // RHT min-node barrier: never build a partial shard set.
-    if (rs_.cfg_.num_rht_shards > 0 && n_obs < rs_.cfg_.num_rht_shards) {
-        fprintf(stderr, "[EtcdRegistry leader] node count %d < num_rht_shards %d — "
-                "refusing RHT bring-up\n", n_obs, rs_.cfg_.num_rht_shards);
+    if (rs_.rht_min_nodes() > 0 && n_obs < rs_.rht_min_nodes()) {
+        fprintf(stderr, "[EtcdRegistry leader] node count %d < RADIXSHMEM_RHT_SHARDS %d — "
+                "refusing RHT bring-up\n", n_obs, rs_.rht_min_nodes());
         return false;
     }
 
@@ -281,10 +282,14 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     sm.rht_transport        = rs_.rht_transport_;
     sm.peer_index_transport = rs_.peer_index_transport_;
     sm.rht_slots     = rs_.rht_slots_;
+    sm.rht_backend   = rs_.rht_backend_;
+    sm.rht_redis_timeout_ms = rs_.rht_redis_timeout_ms_;
+    std::strncpy(sm.rht_redis_seeds, rs_.rht_redis_.c_str(), sizeof(sm.rht_redis_seeds) - 1);
     sm.dc_access_key = rs_.dc_access_key_;
     sm.register_chunk_size = (uint32_t)rs_.register_chunk_size();
     for (int s = 0; s < rs_.num_shards_; s++)
         sm.holder_rank[s] = (uint32_t)rs_.holder_of_shard_[s];
+    rs_.drop_stale_routes(true);
     impl_->cli.put(K.config(), etcd::encode_shardmap(sm), cluster_lease_);
     config_published_ = true;
 
@@ -422,6 +427,7 @@ bool EtcdRegistry::join_existing(std::vector<PeerEntry>& out) {
     impl_->cli.put(K.shm(node_name_), shm_name_, lease_id_);
     impl_->cli.put(K.ready(node_name_), "1", lease_id_);
     rs_.cfg_.world_size = world;
+    rs_.drop_stale_routes(false);
     rs_.stamp_shm_ready(my_rank, world);
 
     fprintf(stderr, "[EtcdRegistry %s] joined as rank %d (data peer, %d nodes)\n",

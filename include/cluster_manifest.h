@@ -13,13 +13,15 @@
 
 namespace radixshmem {
 
-static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 13; // 13: remote-op component pool
+static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 14; // 14: RHT backend in the shard map
 static constexpr uint32_t CLUSTER_MANIFEST_HOST_LEN = 64;
 static constexpr uint32_t CLUSTER_MANIFEST_ENTRY_SIZE = 352;
 static constexpr uint32_t CLUSTER_RHT_NAME_LEN = 64;
 
 // Max RHT shards (M) the inline holder map can describe; M <= this cap.
 static constexpr uint32_t CLUSTER_MAX_SHARDS = 64;
+// Redis RHT seed list ("host:port,...") in the shard map.
+static constexpr uint32_t CLUSTER_RHT_SEEDS_LEN = 256;
 
 struct ClusterManifestHeader {
     uint64_t magic;           // CLUSTER_MANIFEST_MAGIC
@@ -53,6 +55,11 @@ static_assert(sizeof(ClusterManifestHeader) == 320,
 enum ClusterTransport : uint32_t {
     CLUSTER_TRANSPORT_XRC = 0,
     CLUSTER_TRANSPORT_DC  = 1,
+};
+
+enum ClusterRhtBackend : uint32_t {
+    CLUSTER_RHT_RDMA  = 0,
+    CLUSTER_RHT_REDIS = 1,
 };
 
 // One entry per rank (each server fills its own; master broadcasts the union).

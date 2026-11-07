@@ -151,7 +151,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="background eviction pauses while unfinished write-backs cover this "
                         "share of a pool (default: 0.05)")
 
-    g = p.add_argument_group("distributed (--expected-min-nodes or --num-rht-shards > 1)")
+    g = p.add_argument_group("distributed (--expected-min-nodes > 1; the RHT is configured with "
+                             "RADIXSHMEM_RHT_*, see docs/api.md)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
     g.add_argument("--registry", default="etcd://127.0.0.1:2379")
@@ -167,13 +168,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
-    g.add_argument("--rht-transport", default="xrc", choices=["xrc", "dc"],
-                   help="client -> RHT shard holder QPs")
     g.add_argument("--peer-index-transport", default="xrc", choices=["xrc", "dc"],
                    help="remote walks into peer trees")
-    g.add_argument("--num-rht-shards", type=int, default=0)
-    g.add_argument("--rht-shard-holders", default="", help="comma-separated ranks")
-    g.add_argument("--rht-slots", type=int, default=4, choices=[1, 2, 4, 8])
     g.add_argument("--remote-op-listen-port", type=int, default=0)
     return p.parse_args(argv)
 
@@ -194,10 +190,7 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
         rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, gid_idx=a.gid_idx,
         bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
-        rht_transport=a.rht_transport,
-        peer_index_transport=a.peer_index_transport, num_rht_shards=a.num_rht_shards,
-        rht_shard_holders=[int(x) for x in a.rht_shard_holders.split(",") if x.strip()],
-        rht_slots_per_bucket=a.rht_slots, remote_op_listen_port=a.remote_op_listen_port)
+        peer_index_transport=a.peer_index_transport, remote_op_listen_port=a.remote_op_listen_port)
     return ServerConfig(
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,

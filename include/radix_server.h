@@ -68,17 +68,10 @@ struct RadixServerConfig {
     uint16_t     rpc_port    = 0;          // 0 = OS-assigned bootstrap / XRC listen port
     int          register_chunk_tokens = DEFAULT_REGISTER_CHUNK_TOKENS;   // copied onto shm at bootstrap
 
-    int          expected_min_nodes = 0;   // 0 = gate on num_rht_shards only
+    int          expected_min_nodes = 0;   // > 1 = distributed
     int          settle_ms          = 500;
 
-    int               num_rht_shards = 0;      // M
-    std::vector<int>  rht_shard_holders;       // candidate holder ranks
-
-    std::string       rht_transport = "xrc";
     std::string       peer_index_transport = "xrc";
-
-    // RHT slots per bucket (W): must be in {1,2,4,8}. rank 0 authoritative (broadcast).
-    int               rht_slots_per_bucket = 4;
 
     uint16_t          remote_op_listen_port = 0;
 
@@ -187,7 +180,27 @@ private:
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
 
-    // Authoritative shard map (resolved on rank 0, broadcast to all).
+    // RADIXSHMEM_RHT_* of this node.
+    struct RhtEnv {
+        uint32_t    backend = CLUSTER_RHT_REDIS;
+        std::string redis;                      // "host:port,..."
+        int         redis_timeout_ms = 50;
+        struct {                                // backend rdma only
+            int              shards = 0;        // M, 0 = one per node
+            std::vector<int> holders;           // candidate holder ranks
+            int              slots = 4;         // W
+            uint32_t         transport = CLUSTER_TRANSPORT_XRC;
+        } rdma;
+    };
+    RhtEnv rht_env_;
+    int rht_min_nodes() const {
+        return rht_env_.backend == CLUSTER_RHT_RDMA ? rht_env_.rdma.shards : 0;
+    }
+
+    // Authoritative RHT (resolved on rank 0, broadcast to all).
+    uint32_t             rht_backend_ = CLUSTER_RHT_REDIS;
+    std::string          rht_redis_;
+    uint32_t             rht_redis_timeout_ms_ = 50;
     int                  num_shards_ = 0;       // M
     uint32_t             rht_capacity_ = 0;     // requested per-shard buckets (RHT normalizes)
     uint32_t             rht_slots_ = 4;        // W: slots per bucket
@@ -218,11 +231,16 @@ private:
 
     void fill_local_entry(PeerEntry& e) const;
     int  register_chunk_size() const;
+    void read_rht_env();
     void resolve_shard_map(int n_obs);
     void adopt_shard_map(const ShardMapMsg& sm);
     // First field where `sm` disagrees with this node's own settings, "" if none.
     std::string shard_map_mismatch(const ShardMapMsg& sm) const;
     void stamp_shm_ready(int assigned_rank, int n_obs);
+    // The tree is new, so routes published before this start are stale: the
+    // leader of a new cluster deletes all of them, a node joining a formed
+    // cluster those of its rank. Redis only.
+    void drop_stale_routes(bool whole_cluster);
     void setup_local_rht_shard(PeerEntry& e);
     void setup_dct(PeerEntry& e);
     void setup_remote_op(PeerEntry& e);

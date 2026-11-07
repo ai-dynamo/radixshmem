@@ -1094,12 +1094,11 @@ static void test_nordma_client_boundaries() {
     RadixClientConfig client_config;
     requires_rdma([&] { RadixClient client(client_config); });
     const std::string name = "/test_cq_nordma_" + std::to_string(::getpid());
-    for (int criterion = 0; criterion < 3; ++criterion) {
+    for (int criterion = 0; criterion < 2; ++criterion) {
         RadixServerConfig server_config;
         server_config.name = name;
         if (criterion == 0) server_config.world_size = 2;
-        if (criterion == 1) server_config.num_rht_shards = 2;
-        if (criterion == 2) server_config.expected_min_nodes = 2;
+        if (criterion == 1) server_config.expected_min_nodes = 2;
         requires_rdma([&] {
             RadixServer server(server_config);
             server.bootstrap();

@@ -3,11 +3,12 @@
 RadixShmem is a KV cache index built on a distributed radix tree. The architecture is decentralized: each node
 keeps its own radix tree in POSIX shared memory. Each tree is both a local and a shared index. It tracks the
 KV cache blocks held in the node's DRAM, and any process on the node can attach to it and insert or look up
-blocks by prefix hash. Other nodes can also query it: a sharded distributed hash table records which node
-holds each prefix, and the querying node reads the peer's tree with one-sided RDMA, so the KV cache is indexed
-globally across the cluster. An inference engine integrates with RadixShmem through one client interface,
-which handles both local and cross-node lookups. The recommended setup uses RadixShmem as the index together
-with an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV cache sharing.
+blocks by prefix hash. Other nodes can also query it: a sharded distributed hash table, the Radix Hash Table
+(RHT), records which node holds each prefix, and the querying node reads the peer's tree with one-sided RDMA,
+so the KV cache is indexed globally across the cluster. An inference engine integrates with RadixShmem through
+one client interface, which handles both local and cross-node lookups. The recommended setup uses RadixShmem as
+the index together with an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV cache
+sharing.
 
 ## Framework support
 
@@ -44,10 +45,13 @@ Single node:
 radix-server --name /my_kv_cache --data-bytes 1024G
 ```
 
-4 nodes, coordinated through etcd:
+4 nodes, coordinated through etcd. The RHT lives in a Redis Cluster by default (`RADIXSHMEM_RHT_REDIS`);
+`RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. The `RADIXSHMEM_RHT_*` variables are
+listed in [`docs/api.md`](docs/api.md).
 
 ```bash
 # Same command on every node except --rpc-address
+export RADIXSHMEM_RHT_REDIS=10.0.0.1:7001,10.0.0.2:7001
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
     --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \

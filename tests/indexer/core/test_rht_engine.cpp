@@ -161,6 +161,8 @@ struct Fixture {
             e.push_back({key_of(i), /*node_id=*/1, (uint32_t)i, (uint32_t)(i + 1)});
         eng.insert_batch(e.data(), (int)e.size());
         eng.flush();
+        ep.calls = ep.max_ops = ep.total_ops = ep.single_reads = 0;   // count what follows
+        cq.waits = 0;
     }
 
     // Look up every key; assert each comes back exactly once with its payload.
@@ -270,17 +272,17 @@ static void test_scratch_below_one_bucket_rejected() {
 }
 
 static void test_remove_over_remote_shard() {
-    TEST_BEGIN("remove_batch clears remote entries via single-bucket reads");
+    TEST_BEGIN("remove_batch reads its buckets in chained rounds");
     Fixture f(BUCKET_BYTES);
-    f.publish_all();                         // insert also reads each bucket once
-    const int reads_before = f.ep.single_reads;
+    f.publish_all();
     std::vector<RhtRemoveEntry> rem;
     for (int i = 1; i < N_KEYS; i += 2)      // odd i -> shard 1 (remote)
         rem.push_back({key_of(i), 1, (uint32_t)i});
     f.eng.remove_batch(rem.data(), (int)rem.size());
     f.eng.flush();
-    // One validating read per removed cell, each into the one-bucket scratch.
-    assert(f.ep.single_reads - reads_before == (int)rem.size());
+    // One read per removed cell, in rounds bounded by the one-bucket scratch.
+    assert(f.ep.single_reads == 0 && f.ep.total_ops == (int)rem.size());
+    assert(f.cq.waits == (int)rem.size());
 
     std::vector<uint64_t> keys(N_KEYS);
     for (int i = 0; i < N_KEYS; i++) keys[i] = key_of(i);
@@ -288,6 +290,34 @@ static void test_remove_over_remote_shard() {
     f.eng.lookup_batch(keys.data(), N_KEYS, res.data());
     for (int i = 0; i < N_KEYS; i++)
         assert(res[i].size() == ((i % 2 == 0) ? 1u : 0u));
+    TEST_PASS();
+}
+
+static void test_insert_chained_reads() {
+    TEST_BEGIN("insert_batch reads its buckets in chained rounds");
+    Fixture f(64 * 1024);
+    std::vector<RhtInsertEntry> e;
+    for (int i = 0; i < N_KEYS; i++)
+        e.push_back({key_of(i), 1, (uint32_t)i, (uint32_t)(i + 1)});
+    f.eng.insert_batch(e.data(), (int)e.size());
+    f.eng.flush();
+    const int chains = (N_KEYS / 2 + RDMA_READ_CHAIN_MAX - 1) / RDMA_READ_CHAIN_MAX;
+    assert(f.ep.single_reads == 0 && f.ep.total_ops == N_KEYS / 2);
+    assert(f.ep.calls == chains && f.cq.waits == chains);
+    f.lookup_all_and_check();
+
+    // W ranks publish one remote key in one batch: each sees the cells the
+    // earlier ones took, so all W land and the shorter old route is shed.
+    std::vector<RhtInsertEntry> same;
+    for (int r = 0; r < (int)W; r++) same.push_back({key_of(1), 10 + r, 7, 8});
+    f.eng.insert_batch(same.data(), (int)same.size());
+    f.eng.flush();
+    uint64_t k = key_of(1);
+    std::vector<RHTValue> got;
+    f.eng.lookup_batch(&k, 1, &got);
+    int mine = 0;
+    for (const RHTValue& v : got) mine += v.node_id >= 10;
+    assert(got.size() == W && mine == (int)W);
     TEST_PASS();
 }
 
@@ -564,6 +594,7 @@ int main() {
     test_odd_scratch_rounds_down();
     test_scratch_below_one_bucket_rejected();
     test_remove_over_remote_shard();
+    test_insert_chained_reads();
     test_follow_rht_chain();
     test_dead_holder_never_throws();
     test_probe_reconnects();

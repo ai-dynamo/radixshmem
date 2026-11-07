@@ -8,14 +8,14 @@
 #ifndef RADIXSHMEM_NO_RDMA
 #include "cluster_protocol.h"
 #include "cluster_manifest.h"
-#include "rht_endpoint.h"        // RhtConsumer / RhtTopology (+ rht_types.h)
+#include "rht_endpoint.h"        // RdmaRht (+ rht_backend.h)
+#include "rht_redis.h"
 #include "rht_chain.h"
 #include "rdma_remote_walker.h"
 #include "rdma_transport.hpp"
 #include "rdma_transport_client.hpp"
 #include "peer_registry.hpp"
 #include "peer_connector.hpp"
-#include "xrc_connect.hpp"
 #ifdef RADIXSHMEM_HAS_ETCD
 #include "etcd_client.hpp"
 #include "registry_client.hpp"
@@ -59,8 +59,7 @@ void RadixClient::teardown_cluster() {
     { std::lock_guard<std::mutex> g(peer_cache_mu_); peer_cache_.clear(); }
     // Destroy peer and RHT readers before the transport that owns their DCI/AHs.
     peer_conn_.reset();
-    rht_conn_.reset();
-    rht_holder_qps_.clear();
+    rht_.reset();
     tx_.reset();
 }
 
@@ -86,7 +85,7 @@ bool RadixClient::wait_for_ready() {
 void RadixClient::admit_peer(const PeerEntry& e) {
     if (!peer_reg_->admit(e) || e.rank == peer_reg_->my_rank()) return;
     drop_peer_session(e.rank);
-    if (rht_conn_) rht_conn_->holder_changed(e);
+    if (rht_) rht_->peer_changed(e);
     if (!peer_conn_) return;
     peer_conn_->peer_changed(e.rank);
     if (!lazy_connect_ && !cfg_.rht_only && !peer_conn_->preconnect(e.rank))
@@ -98,7 +97,7 @@ void RadixClient::remove_peer(int rank) {
     if (rank == peer_reg_->my_rank()) return;
     peer_reg_->remove(rank);
     drop_peer_session(rank);
-    if (rht_conn_) rht_conn_->holder_left(rank);
+    if (rht_) rht_->peer_left(rank);
     if (peer_conn_) peer_conn_->peer_left(rank);
 }
 
@@ -117,93 +116,26 @@ void RadixClient::preconnect_peers() {
     }
 }
 
-void RadixClient::read_topology() {
+ShardMapMsg RadixClient::read_topology() {
 #ifdef RADIXSHMEM_HAS_ETCD
     ClusterTopology t = etcd_->reg->read_topology();
 
     const ShardMapMsg& sm = t.sm;
-    rht_transport_        = sm.rht_transport;
     peer_index_transport_ = sm.peer_index_transport;
     dc_access_key_       = sm.dc_access_key;
     rdma_sl_             = sm.rdma_sl;
     rdma_tc_             = sm.rdma_tc;
     cluster_cs_          = (int)sm.register_chunk_size;
 
-    num_shards_   = (int)sm.num_shards;
-    rht_capacity_ = sm.rht_capacity;
-    rht_slots_    = sm.rht_slots ? sm.rht_slots : 4;
-    holder_of_shard_.assign(num_shards_, 0);
-    for (int s = 0; s < num_shards_; s++)
-        holder_of_shard_[s] = (int)sm.holder_rank[s];
-
     if (t.my_rank < 0 && !cfg_.no_local_tree)
         throw std::runtime_error("RadixClient: own node '" + cfg_.node_name +
                                  "' not found in /peers");
     peer_reg_->seed(std::move(t.peers), t.world_size, t.my_rank);
     peers_snapshot_rev_  = t.peers_rev;
+    return t.sm;
 #else
     throw std::runtime_error("RadixClient: built without etcd");
 #endif
-}
-
-IRdmaEndpoint* RadixClient::connect_rht_holder(int holder) {
-    auto it = rht_holder_qps_.find(holder);
-    if (it != rht_holder_qps_.end()) return it->second.get();
-
-    // The watcher may reallocate the peer table; lock around reads and writes.
-    std::unique_lock<std::shared_mutex> lk(peer_reg_->mutex());
-    auto it2 = rht_holder_qps_.find(holder);
-    if (it2 != rht_holder_qps_.end()) return it2->second.get();
-
-    const PeerEntry& h = peer_reg_->peers_locked()[holder];
-    int my_rank = peer_reg_->my_rank();
-    std::unique_ptr<IRdmaEndpoint> ep;
-
-    if (rht_transport_ == CLUSTER_TRANSPORT_DC) {
-        DcInitiator* dci = tx_->shared_dci();
-        ibv_gid dgid;
-        memcpy(&dgid, h.gid_raw, 16);
-        int ws = peer_reg_->world_size();
-        ibv_ah* ah = tx_->ah_for(holder, dgid, h.lid, h.link_layer, ws);
-        if (!ah) {
-            fprintf(stderr,
-                    "[RadixClient rank %d] RHT-plane AH to holder rank %d failed\n",
-                    my_rank, holder);
-            return nullptr;
-        }
-        DcTargetInfo dst{ah, h.dct_num, dc_access_key_};
-        ep = std::make_unique<DcReader>(dci, dst);
-    } else {
-        // One try: a holder that does not answer is skipped and probed later
-        // by the RHT fault handling, at attach as on the query path.
-        ep = xrc_connect(tx_->ctx(), tx_->cq(), h.host, h.xrc_listen_port, my_rank,
-                         rht_conn_ ? 2 : 10);
-        if (!ep) return nullptr;
-    }
-
-    IRdmaEndpoint* raw = ep.get();
-    rht_holder_qps_.emplace(holder, std::move(ep));
-    return raw;
-}
-
-void RadixClient::setup_rht() {
-    RhtTopology topo;
-    topo.num_shards       = num_shards_;
-    topo.capacity         = rht_capacity_;
-    topo.slots_per_bucket = rht_slots_;
-    topo.my_rank          = peer_reg_->my_rank();
-    topo.holder_of_shard  = holder_of_shard_;
-    topo.peers            = &peer_reg_->peers_locked();
-    topo.faults           = peer_faults();
-
-    rht_conn_ = std::make_unique<RhtConsumer>(
-        topo, tx_->ctx().pd(),
-        [this](int holder) { return connect_rht_holder(holder); },
-        [this](int holder) {
-            std::unique_lock<std::shared_mutex> lk(peer_reg_->mutex());
-            rht_holder_qps_.erase(holder);
-        },
-        cfg_.bootstrap_timeout_sec);
 }
 
 // Build the etcd rendezvous + RDMA/RHT plane. Constructs peer_reg_/etcd_ then
@@ -237,7 +169,7 @@ void RadixClient::bootstrap_cluster() {
 #endif
     if (!wait_for_ready())
         throw std::runtime_error("RadixClient: cluster not ready (etcd timeout)");
-    read_topology();
+    const ShardMapMsg sm = read_topology();
 
     int my_rank = peer_reg_->my_rank();
 
@@ -294,8 +226,7 @@ void RadixClient::bootstrap_cluster() {
     peer_conn_->resize(ws);
     peer_reg_->set_grow_hook([this](int n) { peer_conn_->resize(n); });
 
-    if (rht_transport_ == CLUSTER_TRANSPORT_DC ||
-        (!cfg_.rht_only && peer_index_transport_ == CLUSTER_TRANSPORT_DC)) {
+    if (!cfg_.rht_only && peer_index_transport_ == CLUSTER_TRANSPORT_DC) {
         tx_->shared_dci();
         fprintf(stderr, "[RadixClient rank %d] DC initiator up\n", my_rank);
     }
@@ -305,7 +236,18 @@ void RadixClient::bootstrap_cluster() {
                 my_rank);
     }
 
-    setup_rht();
+    if (sm.rht_backend == CLUSTER_RHT_REDIS) {
+        RedisRhtConfig rc{std::string(sm.rht_redis_seeds,
+                                      strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds))),
+                          redis_rht_prefix(cfg_.cluster_id), (int)sm.rht_redis_timeout_ms, {}};
+        if (local_)
+            rc.live = [this](uint64_t first_hash, uint32_t tree_node_id) {
+                return local_->tree().node_head_matches(tree_node_id, first_hash);
+            };
+        rht_ = make_redis_rht(rc, peer_reg_->my_rank(), peer_faults());
+    } else
+        rht_ = std::make_unique<RdmaRht>(sm, *tx_, *peer_reg_, peer_faults(),
+                                         cfg_.bootstrap_timeout_sec);
     preconnect_peers();
 
     // Watch /peers for members that join, restart or leave. Anchor at the
@@ -349,7 +291,7 @@ void RadixClient::update_rht(const uint64_t* hashes, int n, const InsertResult& 
     if (r.split_node_id != INVALID_NODE_ID)   // suffix split off the [0, n) path
         entries.push_back({r.split_first_hash, (int32_t)my_rank, r.split_node_id,
                            r.split_num_blocks});
-    rht_conn_->insert_batch(entries.data(), (int)entries.size());
+    rht_->insert_batch(entries.data(), (int)entries.size());
 }
 
 InsertResult RadixClient::dist_insert(const uint64_t* hashes, int n,
@@ -368,7 +310,7 @@ InsertResult RadixClient::dist_insert(const uint64_t* hashes, int n,
 void RadixClient::publish_chain(const uint64_t* hashes, int n, const InsertResult& r,
                                 int start) {
     int my_rank = peer_reg_->my_rank();
-    if (!rht_conn_ || my_rank < 0) return;
+    if (!rht_ || my_rank < 0) return;
     std::vector<NodeBoundary> chain = local_->tree().get_node_boundaries(hashes, n);
     if (chain.empty()) return;
     std::vector<RhtInsertEntry> entries;
@@ -379,7 +321,7 @@ void RadixClient::publish_chain(const uint64_t* hashes, int n, const InsertResul
     if (r.split_node_id != INVALID_NODE_ID)   // suffix off the path
         entries.push_back({r.split_first_hash, (int32_t)my_rank,
                            r.split_node_id, r.split_num_blocks});
-    rht_conn_->insert_batch(entries.data(), (int)entries.size());
+    rht_->insert_batch(entries.data(), (int)entries.size());
     if (debug_route_) {
         fprintf(stderr, "[pub r%d] n=%d start=%d h0=%08llx chain:",
                 my_rank, n, start, (unsigned long long)(hashes[0] & 0xffffffffu));
@@ -391,14 +333,14 @@ void RadixClient::publish_chain(const uint64_t* hashes, int n, const InsertResul
     }
 }
 
-void RadixClient::dist_flush() { if (rht_conn_) rht_conn_->flush(); }
+void RadixClient::dist_flush() { if (rht_) rht_->flush(); }
 
 PeerFaultCounters* RadixClient::peer_faults() const {
     return local_ ? local_->tree().peer_faults() : nullptr;
 }
 
 void RadixClient::remove_evicted_from_rht(const EvictedKey* entries, int count) {
-    if (!rht_conn_ || count <= 0) return;
+    if (!rht_ || count <= 0) return;
     int my_rank = peer_reg_->my_rank();
     if (my_rank < 0) return;   // write half: observers publish nothing
     std::vector<RhtRemoveEntry> rem;
@@ -418,12 +360,8 @@ void RadixClient::remove_evicted_from_rht(const EvictedKey* entries, int count) 
                        entries[i].tree_node_id});
     }
     if (rem.empty()) return;
-    rht_conn_->remove_batch(rem.data(), (int)rem.size());
-    rht_conn_->flush();
-}
-
-void RadixClient::reset_owned_rht_shard() {
-    if (rht_conn_ && peer_reg_->my_rank() >= 0) rht_conn_->reset_owned_shard();
+    rht_->remove_batch(rem.data(), (int)rem.size());
+    rht_->flush();
 }
 
 // Lazily open (and cache) the per-rank session. Returns nullptr on any illegal
@@ -638,8 +576,8 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
 
         // Each probe may return multiple candidates (W-way bucket chaining).
         std::vector<std::vector<RHTValue>> probe_results(probe_count);
-        rht_conn_->lookup_batch(probe_keys.data(), probe_count,
-                                probe_results.data());
+        rht_->lookup_batch(probe_keys.data(), probe_count,
+                           probe_results.data());
 
         // Collect remote candidates per position; tally positions hit per peer.
         struct FullHit { int pos; uint32_t tnid; int32_t remote; uint32_t len; };
@@ -700,6 +638,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                     remote_hits.push_back({h.pos, h.tnid});
                     known.emplace(hashes[h.pos], h);
                 }
+            std::unordered_set<uint64_t> probed(probe_keys.begin(), probe_keys.end());
             auto lookup = [&](uint64_t key, RhtHop& hop) {
                 auto it = known.find(key);
                 if (it != known.end()) {
@@ -707,8 +646,9 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                     hop.num_blocks = it->second.len;
                     return true;
                 }
+                if (probed.count(key)) return false;   // the batch found no route of this peer
                 std::vector<RHTValue> vals;
-                rht_conn_->lookup_batch(&key, 1, &vals);
+                rht_->lookup_batch(&key, 1, &vals);
                 for (auto& v : vals)
                     if (!v.empty() && v.node_id == best_remote_node &&
                         v.num_blocks > hop.num_blocks) {
@@ -737,12 +677,11 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                             v.num_blocks);
                 fprintf(stderr, "]");
                 if (::getenv("RADIXSHMEM_DEBUG_ROUTE")[0] == '2') {
-                    std::vector<RhtRawCell> raw;
-                    rht_conn_->dump_bucket(probe_keys[i], raw);
+                    std::vector<std::string> raw;
+                    rht_->dump(probe_keys[i], raw);
                     fprintf(stderr, "{");
                     for (auto& c : raw)
-                        fprintf(stderr, "%016llx/%016llx ", (unsigned long long)c.head,
-                                (unsigned long long)c.ext);
+                        fprintf(stderr, "%s ", c.c_str());
                     fprintf(stderr, "}");
                 }
             }
@@ -868,7 +807,7 @@ ComponentQueryResult RadixClient::query_components_remote_from(
     const int f = result.full_fragments.empty()
                       ? 0
                       : (int)result.full_fragments[0].slot_ids.size();
-    if (!rht_conn_ || h >= n) {
+    if (!rht_ || h >= n) {
         return result;
     }
 
@@ -908,10 +847,18 @@ void RadixClient::recycle_slots(const int32_t* slots, int num,
 
 void RadixClient::reset() {
     require_writable("reset");
-    if (local_) local_->reset();
 #ifndef RADIXSHMEM_NO_RDMA
-    if (distributed_) reset_owned_rht_shard();
+    // The routes go first, while the tree still lists them.
+    if (distributed_ && rht_ && peer_reg_->my_rank() >= 0) {
+        const int32_t my_rank = peer_reg_->my_rank();
+        std::vector<RhtRemoveEntry> own;
+        if (local_)
+            for (const NodeHead& h : local_->tree().node_heads())
+                own.push_back({h.first_hash, my_rank, h.tree_node_id});
+        rht_->reset(own.data(), local_ ? (int)own.size() : -1);
+    }
 #endif
+    if (local_) local_->reset();
 }
 
 
