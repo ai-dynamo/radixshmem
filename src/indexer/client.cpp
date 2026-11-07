@@ -236,12 +236,16 @@ void RadixClient::bootstrap_cluster() {
                 my_rank);
     }
 
-    if (sm.rht_backend == CLUSTER_RHT_REDIS)
-        rht_ = make_redis_rht({std::string(sm.rht_redis_seeds,
-                                           strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds))),
-                               redis_rht_prefix(cfg_.cluster_id), (int)sm.rht_redis_timeout_ms},
-                              peer_reg_->my_rank(), peer_faults());
-    else
+    if (sm.rht_backend == CLUSTER_RHT_REDIS) {
+        RedisRhtConfig rc{std::string(sm.rht_redis_seeds,
+                                      strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds))),
+                          redis_rht_prefix(cfg_.cluster_id), (int)sm.rht_redis_timeout_ms, {}};
+        if (local_)
+            rc.live = [this](uint64_t first_hash, uint32_t tree_node_id) {
+                return local_->tree().node_head_matches(tree_node_id, first_hash);
+            };
+        rht_ = make_redis_rht(rc, peer_reg_->my_rank(), peer_faults());
+    } else
         rht_ = std::make_unique<RdmaRht>(sm, *tx_, *peer_reg_, peer_faults(),
                                          cfg_.bootstrap_timeout_sec);
     preconnect_peers();

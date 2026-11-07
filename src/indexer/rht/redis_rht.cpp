@@ -29,6 +29,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace radixshmem {
@@ -173,6 +174,10 @@ public:
 
     const Endpoint& endpoint(int id) const { return masters_[id].ep; }
     uint64_t version() const { return version_.load(std::memory_order_acquire); }
+    // Bumped when the slot map changes or a down master answers again.
+    uint64_t epoch() const {
+        return version_.load(std::memory_order_acquire) + ups_.load(std::memory_order_acquire);
+    }
     bool down(int id) const { return masters_[id].down.load(std::memory_order_acquire); }
     uint32_t generation(int id) const { return masters_[id].gen.load(std::memory_order_acquire); }
 
@@ -291,6 +296,7 @@ private:
         }
         breaker_.succeeded(id);
         masters_[id].down.store(false, std::memory_order_release);
+        ups_.fetch_add(1, std::memory_order_acq_rel);
     }
 
     // Only the maintenance thread (and the constructor before it) adds masters.
@@ -314,6 +320,7 @@ private:
     std::condition_variable cv_;
     std::shared_ptr<const SlotMap> slots_;
     std::atomic<uint64_t> version_{0};   // bumped when slot owners change
+    std::atomic<uint64_t> ups_{0};       // probes that found a master up
     std::atomic<bool> stale_{false};
     bool stop_ = false;
     std::thread thread_;
@@ -582,16 +589,16 @@ public:
         std::lock_guard<std::mutex> g(write_mu_);
         Conn& w = writer_;
         w.begin();
+        replay(w);
         for (int i = 0; i < count; i++) {
-            int m = w.route(e[i].key, Op::RHT_WRITE);
-            if (m < 0) continue;
-            std::string field = std::to_string(e[i].node_id);
-            char val[8];
-            put_u32(val, e[i].tree_node_id);
-            put_u32(val + 4, e[i].num_blocks);
-            const char* argv[] = {"HSET", w.key().data(), field.c_str(), val};
-            const size_t lens[] = {4, w.key().size(), field.size(), sizeof(val)};
-            w.append(m, 4, argv, lens, i);
+            const Held h{true, e[i].node_id, e[i].tree_node_id, e[i].num_blocks};
+            int m = writable(w, e[i].key, Op::RHT_WRITE);
+            if (m < 0) {
+                hold(e[i].key, h, Op::RHT_WRITE);
+                continue;
+            }
+            if (!held_.empty()) held_.erase(e[i].key);
+            append(w, m, h);
         }
         w.send(Op::RHT_WRITE, false, nullptr);
     }
@@ -600,16 +607,16 @@ public:
         std::lock_guard<std::mutex> g(write_mu_);
         Conn& w = writer_;
         w.begin();
+        replay(w);
         for (int i = 0; i < count; i++) {
-            int m = w.route(e[i].key, Op::RHT_REMOVE);
-            if (m < 0) continue;
-            std::string field = std::to_string(e[i].node_id);
-            char tnid[4];
-            put_u32(tnid, e[i].tree_node_id);
-            const char* argv[] = {"EVAL", kRemoveScript, "1", w.key().data(), field.c_str(), tnid};
-            const size_t lens[] = {4, std::strlen(kRemoveScript), 1, w.key().size(),
-                                   field.size(), sizeof(tnid)};
-            w.append(m, 6, argv, lens, i);
+            const Held h{false, e[i].node_id, e[i].tree_node_id, 0};
+            int m = writable(w, e[i].key, Op::RHT_REMOVE);
+            if (m < 0) {
+                hold(e[i].key, h, Op::RHT_REMOVE);
+                continue;
+            }
+            if (!held_.empty()) held_.erase(e[i].key);
+            append(w, m, h);
         }
         w.send(Op::RHT_REMOVE, false, nullptr);
     }
@@ -641,6 +648,8 @@ public:
 
     void flush() override {
         std::lock_guard<std::mutex> g(write_mu_);
+        writer_.begin();
+        replay(writer_);
         writer_.drain();
     }
 
@@ -648,6 +657,7 @@ public:
     // field in every key under the prefix.
     void reset(const RhtRemoveEntry* own, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
+        held_.clear();
         writer_.begin();
         writer_.drain();
         writer_.set_quiet(true);
@@ -697,6 +707,74 @@ public:
     }
 
 private:
+    // A write that a down master could not take, sent once the key's owner is up.
+    struct Held {
+        bool insert;
+        int32_t node_id;
+        uint32_t tree_node_id, num_blocks;
+    };
+    static constexpr size_t kMaxHeld = 200000;
+
+    // The master to write key to, or -1 when it is down or unknown.
+    int writable(Conn& w, uint64_t key, Op op) {
+        int m = w.owner(key);
+        if (m < 0) view_.mark_stale();
+        return m >= 0 && !w.down(m) && w.usable(m, op) ? m : -1;
+    }
+
+    // Appends the write to the key whose name owner() or writable() left in w.
+    void append(Conn& w, int m, const Held& h) {
+        std::string field = std::to_string(h.node_id);
+        if (h.insert) {
+            char val[8];
+            put_u32(val, h.tree_node_id);
+            put_u32(val + 4, h.num_blocks);
+            const char* argv[] = {"HSET", w.key().data(), field.c_str(), val};
+            const size_t lens[] = {4, w.key().size(), field.size(), sizeof(val)};
+            w.append(m, 4, argv, lens, 0);
+        } else {
+            char tnid[4];
+            put_u32(tnid, h.tree_node_id);
+            const char* argv[] = {"EVAL", kRemoveScript, "1", w.key().data(), field.c_str(), tnid};
+            const size_t lens[] = {4, std::strlen(kRemoveScript), 1, w.key().size(),
+                                   field.size(), sizeof(tnid)};
+            w.append(m, 6, argv, lens, 0);
+        }
+    }
+
+    // Keeps the latest write per key; past kMaxHeld the write is dropped.
+    void hold(uint64_t key, const Held& h, Op op) {
+        if (held_.size() >= kMaxHeld && !held_.count(key)) {
+            breaker_.skipped(-1, op);
+            return;
+        }
+        held_[key] = h;
+    }
+
+    // Sends the held writes whose master is up, once a master is back or the
+    // slot map changed. The tree decides whether each still holds: an insert
+    // goes out only while its node is live, a remove only while it is not, so
+    // the rank's processes agree in whatever order they send theirs.
+    void replay(Conn& w) {
+        if (held_.empty() || view_.epoch() == replayed_) return;
+        replayed_ = view_.epoch();
+        bool any = false;
+        for (auto it = held_.begin(); it != held_.end();) {
+            const Held& h = it->second;
+            int m = writable(w, it->first, h.insert ? Op::RHT_WRITE : Op::RHT_REMOVE);
+            if (m < 0) {
+                ++it;
+                continue;
+            }
+            if (!cfg_.live || cfg_.live(it->first, h.tree_node_id) == h.insert) {
+                append(w, m, h);
+                any = true;
+            }
+            it = held_.erase(it);
+        }
+        if (any) w.send(Op::RHT_WRITE, false, nullptr);
+    }
+
     static constexpr int kRetrySecs = 30;
     static constexpr size_t kChunk = 16384;
 
@@ -831,6 +909,8 @@ private:
     ClusterView view_;
     std::mutex write_mu_;
     Conn writer_;
+    std::unordered_map<uint64_t, Held> held_;   // under write_mu_
+    uint64_t replayed_ = 0;
     std::mutex pool_mu_;
     std::vector<std::unique_ptr<Conn>> idle_;
 };

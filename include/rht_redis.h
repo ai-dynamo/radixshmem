@@ -5,6 +5,7 @@
 
 #include "rht_backend.h"
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -16,6 +17,9 @@ struct RedisRhtConfig {
     std::string seeds;        // "host:port,..." of any nodes of the cluster
     std::string key_prefix;   // a route lives in HASH <key_prefix><first_hash in hex>
     int         timeout_ms = 50;
+    // Whether the rank's tree still holds node tree_node_id starting at
+    // first_hash; checked before a write held back by a down master is sent.
+    std::function<bool(uint64_t first_hash, uint32_t tree_node_id)> live;
 };
 
 // One HASH per key, field = rank. AUTH uses RADIXSHMEM_RHT_REDIS_PASSWORD when

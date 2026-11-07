@@ -97,10 +97,28 @@ static uint64_t key_of(uint64_t i) {
     return z ^ (z >> 31);
 }
 
+static std::string prefix_of(const char* tag) {
+    return "rsh:test_rht_redis_faults_" + std::to_string(::getpid()) + "_" + tag + ":";
+}
+
+// Index of the first key from `from` on whose Redis key falls in slots [lo, hi].
+static uint64_t index_in_slots(const std::string& prefix, int lo, int hi, uint64_t from) {
+    for (uint64_t i = from;; i++) {
+        char name[128];
+        snprintf(name, sizeof(name), "%s%016llx", prefix.c_str(), (unsigned long long)key_of(i));
+        uint16_t crc = 0;
+        for (const char* q = name; *q; q++) {
+            crc ^= (uint16_t)((uint8_t)*q << 8);
+            for (int b = 0; b < 8; b++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+        }
+        if ((crc & 16383) >= lo && (crc & 16383) <= hi) return i;
+    }
+}
+
 static std::unique_ptr<RhtBackend> filled(const std::string& seeds, const char* tag,
-                                          PeerFaultCounters* faults) {
-    auto rht = make_redis_rht({seeds, "rsh:test_rht_redis_faults_" + std::to_string(::getpid()) +
-                               "_" + tag + ":", 50}, 1, faults);
+                                          PeerFaultCounters* faults,
+                                          std::function<bool(uint64_t, uint32_t)> live = {}) {
+    auto rht = make_redis_rht({seeds, prefix_of(tag), 50, std::move(live)}, 1, faults);
     std::vector<RhtInsertEntry> e(kKeys);
     for (int i = 0; i < kKeys; i++) e[i] = {key_of(i), 1, (uint32_t)i, 4};
     rht->insert_batch(e.data(), kKeys);
@@ -241,22 +259,43 @@ static void test_reset_after_move() {
 }
 
 static void test_failover() {
-    TEST_BEGIN("a killed master's replica takes over with every route");
+    TEST_BEGIN("a killed master's replica takes over; writes held meanwhile land after");
     PeerFaultCounters c{};
-    auto rht = filled("127.0.0.1:" + std::to_string(kPort), "failover", &c);
+    // Two keys of the master killed below (it starts with slots 5461-10922): one
+    // whose node the tree drops while the master is gone, one whose node comes back.
+    const uint64_t ie = index_in_slots(prefix_of("failover"), 6000, 10000, 1u << 20);
+    const uint64_t evicted = key_of(ie), reborn = key_of(index_in_slots(prefix_of("failover"), 6000, 10000, ie + 1));
+    auto rht = filled("127.0.0.1:" + std::to_string(kPort), "failover", &c,
+                      [evicted](uint64_t k, uint32_t) { return k != evicted; });
+    RhtInsertEntry r{reborn, 1, 7, 4};
+    rht->insert_batch(&r, 1);
+    rht->flush();
     for (int i = 0; i < 300 && !replicas_synced(); i++) pause_for(0.1);   // a resyncing replica cannot take over
-    auto calls = probe(*rht, 14.0, [] {
+    std::vector<RhtInsertEntry> fresh(kKeys);
+    for (int i = 0; i < kKeys; i++) fresh[i] = {key_of(kKeys + i), 1, (uint32_t)i, 4};
+    auto calls = probe(*rht, 14.0, [&] {
         pause_for(1.0);
         signal_masters(SIGKILL, 1, 1);
+        pause_for(0.5);
+        RhtInsertEntry e{evicted, 1, 8, 4};
+        RhtRemoveEntry d{reborn, 1, 7};
+        rht->insert_batch(&e, 1);
+        rht->remove_batch(&d, 1);
+        rht->insert_batch(fresh.data(), kKeys);
     });
+    rht->flush();
     assert(slowest_ms(calls) < 250);
     assert(found_share(calls, 1.3, 5.0) < 0.9);
     assert(found_share(calls, 12.5, 14.0) == 1.0);
-    std::vector<uint64_t> keys(kKeys);
-    std::vector<std::vector<RHTValue>> res(kKeys);
-    for (int i = 0; i < kKeys; i++) keys[i] = key_of(i);
-    rht->lookup_batch(keys.data(), kKeys, res.data());
-    for (auto& r : res) assert(r.size() == 1);
+    std::vector<uint64_t> keys(2 * kKeys + 2);
+    std::vector<std::vector<RHTValue>> res(2 * kKeys + 2);
+    for (int i = 0; i < 2 * kKeys; i++) keys[i] = key_of(i);
+    keys[2 * kKeys] = evicted;
+    keys[2 * kKeys + 1] = reborn;
+    rht->lookup_batch(keys.data(), 2 * kKeys + 2, res.data());
+    for (int i = 0; i < 2 * kKeys; i++) assert(res[i].size() == 1);
+    assert(res[2 * kKeys].empty());
+    assert(res[2 * kKeys + 1].size() == 1 && res[2 * kKeys + 1][0].tree_node_id == 7);
     TEST_PASS();
 }
 

@@ -128,7 +128,7 @@ static void test_dump() {
 }
 
 static void test_unreachable() {
-    TEST_BEGIN("an unreachable cluster drops and counts, never throws");
+    TEST_BEGIN("an unreachable cluster holds writes, drops lookups, never throws");
     PeerFaultCounters c;
     c.clear();
     auto r = make_redis_rht({"127.0.0.1:1", "rsh:none:", 50}, 0, &c);
@@ -138,7 +138,7 @@ static void test_unreachable() {
     r->remove_batch(&d, 1);
     r->flush();
     assert(lookup(*r, 1).empty());
-    assert(c.rht_writes.load() == 1 && c.rht_removes.load() == 1 && c.rht_lookups.load() == 1);
+    assert(c.rht_writes.load() == 0 && c.rht_removes.load() == 0 && c.rht_lookups.load() == 1);
     TEST_PASS();
 }
 
