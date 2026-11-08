@@ -148,8 +148,10 @@ private:
     using BucketFn = std::function<void(int, const RhtSlot*)>;
     // Reads every key's bucket (local directly, remote in chained rounds) into
     // on_bucket; keys whose holder is skipped or fails count as dropped `op`.
+    // With retry, keys dropped only because another holder failed are read
+    // once more.
     void read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op,
-                      const char* what, const BucketFn& on_bucket);
+                      const char* what, const BucketFn& on_bucket, bool retry = false);
     uint64_t bucket_id(uint64_t key) const;
 
     // Pack head: [key_tag(16) | node_id+1(16) | tree_node_id(32)] = 8 bytes

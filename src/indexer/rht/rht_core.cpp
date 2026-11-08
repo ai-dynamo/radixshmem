@@ -483,7 +483,7 @@ void RhtEngine::insert_batch(const RhtInsertEntry* entries, int count) {
                      have[i] = 1;
                      std::vector<RhtSlot>& b = buckets[bucket_id(keys[i])];
                      if (b.empty()) b.assign(slots, slots + W);
-                 });
+                 }, true);
     for (int i = 0; i < count; i++) {
         if (!have[i]) continue;
         const RhtInsertEntry& e = entries[i];
@@ -533,16 +533,18 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
 }
 
 void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op,
-                             const char* what, const BucketFn& on_bucket) {
+                             const char* what, const BucketFn& on_bucket, bool retry) {
     if (count <= 0) return;
     uint32_t W = slots_per_bucket_;
 
     // Local shards: read directly. Remote: group by endpoint (shards on one
-    // holder share a QP).
+    // holder share a QP). Each holder passes the breaker once per call, so a
+    // probe carries all of its keys.
     struct Probe { int shard; uint32_t bucket; int result_idx; };
     std::vector<IRdmaEndpoint*> eps;
     std::vector<std::vector<Probe>> groups;
     std::vector<RhtSlot> localbuf(W);
+    std::unordered_map<int, IRdmaEndpoint*> resolved;
     size_t remaining = 0;
 
     for (int i = 0; i < count; i++) {
@@ -553,7 +555,10 @@ void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op
             on_bucket(i, localbuf.data());
             continue;
         }
-        IRdmaEndpoint* ep = remote_ep(shard);
+        auto it = resolved.find(breaker_ ? holder_[shard] : shard);
+        if (it == resolved.end())
+            it = resolved.emplace(breaker_ ? holder_[shard] : shard, remote_ep(shard)).first;
+        IRdmaEndpoint* ep = it->second;
         if (!ep) {
             dropped(shard, op);
             continue;
@@ -575,12 +580,20 @@ void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op
     struct Posted { size_t g, from, off; int n, owed; };
     std::vector<Posted> posted;
     RdmaReadOp ops[RDMA_READ_CHAIN_MAX];
+    std::vector<int> again;
 
-    // A group whose holder failed: its unread probes miss.
-    auto drop_group = [&](size_t g) {
-        const size_t left = groups[g].size() - next[g];
-        dropped(groups[g][0].shard, op, left);
-        remaining -= left;
+    // A fault may release other holders than its own: an endpoint is looked up
+    // on every use, and a group whose endpoint is gone is not touched again.
+    auto live = [&](size_t g) { return endpoints_[groups[g][0].shard]; };
+
+    // Gives up group g's probes from index `from` on: they miss, or go back to
+    // be read again.
+    auto give_up = [&](size_t g, size_t from, bool read_again) {
+        remaining -= groups[g].size() - next[g];
+        if (read_again)
+            for (size_t j = from; j < groups[g].size(); j++) again.push_back(groups[g][j].result_idx);
+        else
+            dropped(groups[g][0].shard, op, groups[g].size() - from);
         next[g] = groups[g].size();
     };
 
@@ -588,8 +601,9 @@ void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op
     auto wait_posted = [&]() {
         std::exception_ptr first;
         for (const Posted& p : posted) {
-            if (p.owed <= 0) continue;
-            try { eps[p.g]->rdma_read_multi_wait(p.owed); }
+            IRdmaEndpoint* ep = live(p.g);
+            if (p.owed <= 0 || !ep) continue;
+            try { ep->rdma_read_multi_wait(p.owed); }
             catch (...) { if (!first) first = std::current_exception(); }
         }
         if (first) std::rethrow_exception(first);
@@ -604,6 +618,11 @@ void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op
             for (size_t g = 0; g < groups.size(); g++) {
                 const size_t left = groups[g].size() - next[g];
                 if (left == 0) continue;
+                IRdmaEndpoint* ep = live(g);
+                if (!ep) {
+                    give_up(g, next[g], false);
+                    continue;
+                }
                 if (used == scratch_buckets) break;
                 const int n = (int)std::min({left, (size_t)RDMA_READ_CHAIN_MAX,
                                              scratch_buckets - used});
@@ -617,8 +636,7 @@ void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op
                     ops[j].length      = (uint32_t)bucket_bytes;
                 }
                 cur = g;
-                const int owed =
-                    eps[g]->rdma_read_multi_post(ops, n, rdma_lkey_);
+                const int owed = ep->rdma_read_multi_post(ops, n, rdma_lkey_);
                 cur = SIZE_MAX;
                 posted.push_back({g, next[g], used, n, owed});
                 next[g] += n;
@@ -635,7 +653,7 @@ void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op
             bool collected = false;
             if (cur != SIZE_MAX) {   // a post threw; the chains before it are intact
                 fault(groups[cur][0].shard, what, e, t0);
-                drop_group(cur);
+                give_up(cur, next[cur], retry && live(cur));   // not blamed: another holder's error
                 try {
                     wait_posted();
                     collected = true;
@@ -645,31 +663,45 @@ void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op
             if (!collected) {
                 // The wait threw: fault the broken endpoints and drop every
                 // posted chain, releasing the other endpoints as well so their
-                // unpolled completions leave the CQ with them.
+                // unpolled completions leave the CQ with them; their probes are
+                // read again with `retry`.
                 std::vector<bool> broken(posted.size());
                 bool any = false;
-                for (size_t k = 0; k < posted.size(); k++)
-                    any = (broken[k] = eps[posted[k].g]->broken()) || any;
+                for (size_t k = 0; k < posted.size(); k++) {
+                    IRdmaEndpoint* ep = live(posted[k].g);
+                    any = (broken[k] = ep && ep->broken()) || any;
+                }
                 for (size_t k = 0; k < posted.size(); k++) {
                     const Posted& p = posted[k];
                     const int shard = groups[p.g][0].shard;
-                    dropped(shard, op, (uint64_t)p.n);
-                    if (!any || broken[k])
-                        fault(shard, what, e, t0);
-                    else
-                        release_holder(holder_[shard]);
-                    drop_group(p.g);
+                    const bool healthy = any && !broken[k];
+                    if (live(p.g)) {
+                        if (healthy) release_holder(holder_[shard]);
+                        else fault(shard, what, e, t0);
+                    }
+                    give_up(p.g, p.from, retry && healthy);
                 }
                 continue;
             }
         }
         for (const Posted& p : posted) {
+            if (!live(p.g)) {   // released while its chain was out
+                give_up(p.g, p.from, false);
+                continue;
+            }
             ok(groups[p.g][0].shard);
             for (int j = 0; j < p.n; j++)
                 on_bucket(groups[p.g][p.from + j].result_idx,
                           (const RhtSlot*)((char*)rdma_buf_ +
                                            (p.off + j) * bucket_bytes));
         }
+    }
+
+    if (!again.empty()) {
+        std::vector<uint64_t> k(again.size());
+        for (size_t j = 0; j < again.size(); j++) k[j] = keys[again[j]];
+        read_buckets(k.data(), (int)k.size(), op, what,
+                     [&](int j, const RhtSlot* slots) { on_bucket(again[j], slots); });
     }
 }
 
@@ -692,7 +724,7 @@ void RhtEngine::remove_batch(const RhtRemoveEntry* entries, int count) {
                      have[i] = 1;
                      std::vector<RhtSlot>& b = buckets[bucket_id(keys[i])];
                      if (b.empty()) b.assign(slots, slots + W);
-                 });
+                 }, true);
     for (int i = 0; i < count; i++) {
         if (!have[i]) continue;
         const RhtRemoveEntry& e = entries[i];

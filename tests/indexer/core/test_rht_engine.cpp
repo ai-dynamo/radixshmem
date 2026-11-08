@@ -365,10 +365,14 @@ public:
     bool dead = false;
     bool flush_fails = false;
     bool async = false;
+    bool post_fails = false;
+    bool released = false;  // the engine let go of it
     int  ops = 0;           // remote ops attempted
+    int  used_after_release = 0;
 
     void rdma_read(void* local_buf, uint32_t, uint64_t remote_addr,
                    uint32_t, uint32_t length) override {
+        use();
         hit();
         std::memcpy(local_buf, (const void*)remote_addr, length);
     }
@@ -377,11 +381,14 @@ public:
         return 0;
     }
     void rdma_read_multi(const RdmaReadOp* o, int n, uint32_t) override {
+        use();
         hit();
         for (int i = 0; i < n; i++)
             std::memcpy(o[i].local_buf, (const void*)o[i].remote_addr, o[i].length);
     }
     int rdma_read_multi_post(const RdmaReadOp* o, int n, uint32_t lkey) override {
+        use();
+        if (post_fails) throw std::runtime_error("injected post failure");
         if (!async) {
             rdma_read_multi(o, n, lkey);
             return 0;
@@ -392,6 +399,7 @@ public:
         return 1;
     }
     void rdma_read_multi_wait(int) override {
+        use();
         bool failed = false;
         for (size_t i = 0; i < cq_.inflight.size(); i++) {
             const RdmaReadOp& op = cq_.inflight[i];
@@ -404,16 +412,22 @@ public:
     }
     void rdma_write_async_inline(uint64_t remote_addr, uint32_t,
                                  const void* local_buf, uint32_t length) override {
+        use();
         ops++;   // like DC: a dead target only shows at flush
         if (!dead) std::memcpy((void*)remote_addr, local_buf, length);
     }
     void flush() override {
+        use();
         hit();
         if (flush_fails) throw std::runtime_error("injected flush WC error status=12");
     }
-    bool broken() override { return dead; }
+    bool broken() override {
+        use();
+        return dead;
+    }
 
 private:
+    void use() { used_after_release += released; }
     void hit() {
         ops++;
         if (dead) throw std::runtime_error("injected WC error status=12");
@@ -451,8 +465,15 @@ struct FaultFixture {
                         scratch.size());
         if (with_faults)
             eng.set_fault_handling({0, 1, 2}, &breaker,
-                                   [this](int h) { connects[h]++; return h == 1 ? &a : &b; },
-                                   [this](int h) { releases[h]++; });
+                                   [this](int h) {
+                                       connects[h]++;
+                                       (h == 1 ? a : b).released = false;
+                                       return h == 1 ? &a : &b;
+                                   },
+                                   [this](int h) {
+                                       releases[h]++;
+                                       (h == 1 ? a : b).released = true;
+                                   });
     }
 
     void publish() {
@@ -552,6 +573,72 @@ static void test_shared_cq_wait_fault() {
     TEST_PASS();
 }
 
+static void test_post_fault_releases_other_holder() {
+    TEST_BEGIN("a fault that releases another holder's endpoint never touches it again");
+    for (int path = 0; path < 3; path++) {
+        FaultFixture f;
+        f.publish();
+        f.a.async = f.b.async = true;
+        f.a.dead = true;          // holder 1's endpoint reports broken
+        f.b.post_fails = true;    // and the post to holder 2 is what throws
+        std::vector<RhtInsertEntry> ins;
+        std::vector<RhtRemoveEntry> rem;
+        for (int i = 0; i < N_KEYS; i++) {
+            ins.push_back({key_of(i), 2, (uint32_t)i, 1});
+            rem.push_back({key_of(i), 1, (uint32_t)i});
+        }
+        if (path == 0) f.lookup();
+        else if (path == 1) f.eng.insert_batch(ins.data(), N_KEYS);
+        else f.eng.remove_batch(rem.data(), N_KEYS);
+        assert(f.releases[1] >= 1);
+        assert(f.a.used_after_release == 0 && f.b.used_after_release == 0);
+    }
+    TEST_PASS();
+}
+
+static void test_probe_carries_whole_batch() {
+    TEST_BEGIN("after the backoff a holder's whole write batch is the probe");
+    FaultFixture f;
+    f.publish();
+    f.a.dead = true;
+    f.lookup();                     // holder 1 down
+    f.a.dead = false;
+    sleep_for_ms(120);
+    std::vector<RhtInsertEntry> e;
+    for (int i = 0; i < N_KEYS; i++) e.push_back({key_of(i), 2, (uint32_t)i, 1});
+    f.eng.insert_batch(e.data(), N_KEYS);
+    f.eng.flush();
+    assert(!f.breaker.is_down(1));
+    auto found = f.lookup();
+    assert(found[1] == 2 * f.keys_on(1));   // rank 1's and rank 2's routes on every key
+    TEST_PASS();
+}
+
+static void test_shared_cq_wait_fault_spares_writes() {
+    TEST_BEGIN("a failed wait on a shared CQ does not drop the healthy holder's writes");
+    FaultFixture f;
+    f.publish();
+    f.a.async = f.b.async = true;
+    f.a.dead = true;
+    std::vector<RhtInsertEntry> ins;
+    std::vector<RhtRemoveEntry> rem;
+    for (int i = 0; i < N_KEYS; i++) {
+        ins.push_back({key_of(i), 2, (uint32_t)i, 1});
+        rem.push_back({key_of(i), 1, (uint32_t)i});
+    }
+    f.eng.insert_batch(ins.data(), N_KEYS);
+    f.eng.flush();
+    f.eng.remove_batch(rem.data(), N_KEYS);
+    f.eng.flush();
+    std::vector<uint64_t> keys;
+    for (int i = 0; i < N_KEYS; i++)
+        if (key_of(i) % FaultFixture::kM == 2) keys.push_back(key_of(i));
+    std::vector<std::vector<RHTValue>> res(keys.size());
+    f.eng.lookup_batch(keys.data(), (int)keys.size(), res.data());
+    for (auto& r : res) assert(r.size() == 1 && r[0].node_id == 2);
+    TEST_PASS();
+}
+
 static void test_holder_changed() {
     TEST_BEGIN("holder_changed: a restarted holder is reached at its new address");
     FaultFixture f;
@@ -600,6 +687,9 @@ int main() {
     test_probe_reconnects();
     test_flush_fault();
     test_shared_cq_wait_fault();
+    test_post_fault_releases_other_holder();
+    test_probe_carries_whole_batch();
+    test_shared_cq_wait_fault_spares_writes();
     test_holder_changed();
     test_no_fault_handling_throws();
     return tests_report();
