@@ -103,6 +103,17 @@ uint32_t get_u32(const char* p) {
     return v;
 }
 
+// SCAN pattern of exactly the keys under prefix: its glob characters escaped,
+// then the 16 hex digits of a first_hash.
+std::string match_of(const std::string& prefix) {
+    std::string m;
+    for (char ch : prefix) {
+        if (ch == '*' || ch == '?' || ch == '[' || ch == ']' || ch == '\\') m += '\\';
+        m += ch;
+    }
+    return m + std::string(16, '?');
+}
+
 std::string reply_error(redisReply* r, const char* fallback) {
     return r && r->type == REDIS_REPLY_ERROR ? std::string(r->str, r->len) : fallback;
 }
@@ -185,9 +196,9 @@ class ClusterView {
 public:
     using SlotMap = std::vector<int16_t>;
 
-    ClusterView(const RedisRhtConfig& cfg, PeerBreaker& breaker)
+    ClusterView(const RedisRhtConfig& cfg, PeerBreaker& breaker, std::string who)
         : seeds_(parse_seeds(cfg.seeds)), timeout_ms_(std::max(cfg.timeout_ms, 200)),
-          breaker_(breaker), masters_(new Master[kMaxMasters]),
+          breaker_(breaker), who_(std::move(who)), masters_(new Master[kMaxMasters]),
           slots_(std::make_shared<SlotMap>(16384, -1)) {
         stale_ = !refresh();
         thread_ = std::thread([this] { run(); });
@@ -211,6 +222,11 @@ public:
     }
 
     const Endpoint& endpoint(int id) const { return masters_[id].ep; }
+    // Why the last slot-map load failed, or "" after a success.
+    std::string load_error() const {
+        std::lock_guard<std::mutex> g(mu_);
+        return load_error_;
+    }
     uint64_t version() const { return version_.load(std::memory_order_acquire); }
     // Bumped when the slot map changes or a down master answers again.
     uint64_t epoch() const {
@@ -271,12 +287,17 @@ private:
             if (!down(id)) cand.push_back(masters_[id].ep);
         for (const Endpoint& s : seeds_)
             if (std::find(cand.begin(), cand.end(), s) == cand.end()) cand.push_back(s);
+        std::string why = "no seed";
         for (const Endpoint& ep : cand) {
             std::string err;
             redisContext* c = open_conn(ep, timeout_ms_, err);
-            if (!c) continue;
+            if (!c) {
+                why = ep.str() + ": " + err;
+                continue;
+            }
             redisReply* r = (redisReply*)redisCommand(c, "CLUSTER SLOTS");
             bool ok = r && r->type == REDIS_REPLY_ARRAY && r->elements > 0;
+            if (!ok) why = ep.str() + ": " + reply_error(r, c->err ? c->errstr : "no slots served");
             if (ok) {
                 auto map = std::make_shared<SlotMap>(16384, -1);
                 for (size_t i = 0; i < r->elements; i++) {
@@ -299,9 +320,21 @@ private:
             }
             if (r) freeReplyObject(r);
             redisFree(c);
-            if (ok) return true;
+            if (ok) {
+                loaded("");
+                return true;
+            }
         }
+        loaded(why);
         return false;
+    }
+
+    // Reports each new reason the slot map cannot be loaded.
+    void loaded(const std::string& why) {
+        std::lock_guard<std::mutex> g(mu_);
+        if (!why.empty() && why != load_error_)
+            fprintf(stderr, "%s: cannot load the slot map: %s\n", who_.c_str(), why.c_str());
+        load_error_ = why;
     }
 
     // Masters that are down and still own slots.
@@ -355,11 +388,13 @@ private:
     const std::vector<Endpoint> seeds_;
     const int timeout_ms_;   // background connects and commands
     PeerBreaker& breaker_;
+    const std::string who_;
     std::unique_ptr<Master[]> masters_;
     std::atomic<int> count_{0};
     mutable std::mutex mu_;
     std::condition_variable cv_;
     std::shared_ptr<const SlotMap> slots_;
+    std::string load_error_;
     std::atomic<uint64_t> version_{0};   // bumped when slot owners change
     std::atomic<uint64_t> ups_{0};       // probes that found a master up
     std::atomic<bool> stale_{false};
@@ -425,8 +460,9 @@ public:
 
     bool down(int m) const { return view_.down(m); }
 
-    // Error replies read so far.
+    // Error replies read so far, and the last one.
     uint64_t errors() const { return errors_; }
+    const std::string& last_error() const { return last_error_; }
 
     // While quiet, failed ops are not counted as dropped: a reset retries them.
     void set_quiet(bool q) { quiet_ = q; }
@@ -581,6 +617,7 @@ private:
             bool err = r->type == REDIS_REPLY_ERROR;
             replies_++;
             errors_ += err;
+            if (err) last_error_.assign(r->str, r->len);
             if (err && (!std::strncmp(r->str, "MOVED", 5) || !std::strncmp(r->str, "ASK", 3)))
                 view_.mark_stale();
             if (!n.owed.empty()) {
@@ -635,6 +672,7 @@ private:
     const int timeout_ms_;
     const bool patient_;
     bool quiet_ = false;
+    std::string last_error_;
     std::string key_;
     std::shared_ptr<const ClusterView::SlotMap> slots_;
     std::deque<Node> nodes_;   // by master id; references stay valid
@@ -649,9 +687,10 @@ class RedisRht final : public RhtBackend {
 public:
     RedisRht(const RedisRhtConfig& cfg, int my_rank, PeerFaultCounters* faults)
         : cfg_(cfg), my_rank_(my_rank),
-          breaker_("[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT", faults,
-                   200, 2000),
-          view_(cfg, breaker_), writer_(view_, cfg, breaker_, true) {}
+          who_(my_rank >= 0 ? "[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT"
+                            : std::string("[RadixClient] Redis RHT")),
+          breaker_(who_, faults, 200, 2000), view_(cfg, breaker_, who_),
+          writer_(view_, cfg, breaker_, true) {}
 
     void insert_batch(const RhtInsertEntry* e, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
@@ -723,7 +762,10 @@ public:
 
     // Drops this rank's routes: the listed ones and those of writes still
     // held, or with count < 0 this rank's field in every key under the prefix.
-    void reset(const RhtRemoveEntry* own, int count) override {
+    void reset(const RhtRemoveEntry* own, int count) override { reset_rank(own, count); }
+
+    // reset(), true if every route went.
+    bool reset_rank(const RhtRemoveEntry* own, int count) {
         std::lock_guard<std::mutex> g(write_mu_);
         std::vector<RhtRemoveEntry> listed;
         if (count >= 0) {
@@ -737,9 +779,8 @@ public:
         bool clean = count >= 0 ? remove_listed(listed.data(), (int)listed.size())
                                 : scan_remove(std::to_string(my_rank_));
         writer_.set_quiet(false);
-        if (!clean)
-            fprintf(stderr, "[RadixClient rank %d] Redis RHT: reset gave up after %d s; routes of "
-                    "this rank remain on masters it could not reach\n", my_rank_, kRetrySecs);
+        if (!clean) gave_up("reset");
+        return clean;
     }
 
     // Deletes every key under the prefix, i.e. the routes of all ranks.
@@ -750,6 +791,7 @@ public:
         writer_.set_quiet(true);
         bool clean = scan_remove("");
         writer_.set_quiet(false);
+        if (!clean) gave_up("clear");
         return clean;
     }
 
@@ -849,16 +891,30 @@ private:
         if (any) w.send(Op::RHT_WRITE, false, nullptr);
     }
 
-    static constexpr int kRetrySecs = 30;
     static constexpr size_t kChunk = 16384;
 
-    // Waits until no master that owns slots is down, or the retries run out.
+    // Waits until no master that owns slots is down; false once the retries
+    // run out, whatever keeps the ops from landing.
     bool wait_settled(Clock::time_point give_up) {
-        do {
+        while (Clock::now() < give_up) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
             if (view_.settled()) return true;
-        } while (Clock::now() < give_up);
+        }
         return false;
+    }
+
+    void gave_up(const char* what) {
+        std::string why;
+        if (writer_.masters().empty()) {
+            const std::string load = view_.load_error();
+            why = "no slot map" + (load.empty() ? std::string() : ": " + load);
+        } else if (!writer_.last_error().empty()) {
+            why = "last error reply: " + writer_.last_error();
+        } else {
+            why = "masters down or slots moving";
+        }
+        fprintf(stderr, "%s: %s gave up after %d s and left routes in Redis (%s)\n", who_.c_str(),
+                what, cfg_.retry_secs, why.c_str());
     }
 
     // Drops this rank's field from the listed keys, whatever node it names (the
@@ -866,7 +922,7 @@ private:
     // down master, a slot move or an error reply kept from landing.
     bool remove_listed(const RhtRemoveEntry* own, int count) {
         Conn& w = writer_;
-        const auto give_up = Clock::now() + std::chrono::seconds(kRetrySecs);
+        const auto give_up = Clock::now() + std::chrono::seconds(cfg_.retry_secs);
         std::vector<RhtRemoveEntry> todo(own, own + count);
         while (true) {
             w.begin();
@@ -899,7 +955,7 @@ private:
     // empty. A pass that a down master, an error reply or a slot move may have
     // left incomplete is repeated once the masters are up again.
     bool scan_remove(const std::string& field) {
-        const auto give_up = Clock::now() + std::chrono::seconds(kRetrySecs);
+        const auto give_up = Clock::now() + std::chrono::seconds(cfg_.retry_secs);
         while (true) {
             const uint64_t version = view_.version(), errors = writer_.errors();
             writer_.begin();
@@ -914,8 +970,12 @@ private:
     // removals for the keys that came back, so the masters work at the same time.
     bool scan_pass(const std::string& field) {
         Conn& w = writer_;
-        const std::string match = cfg_.key_prefix + "*";
+        const std::string match = match_of(cfg_.key_prefix);
         const std::vector<int> masters = w.masters();
+        if (masters.empty()) {
+            view_.mark_stale();
+            return false;
+        }
         const size_t n = masters.size();
         std::vector<std::string> cursor(n, "0");
         std::vector<char> done(n, 0);
@@ -979,6 +1039,7 @@ private:
 
     const RedisRhtConfig cfg_;
     const int my_rank_;
+    const std::string who_;
     PeerBreaker breaker_;
     ClusterView view_;
     std::mutex write_mu_;
@@ -1027,6 +1088,11 @@ bool redis_rht_clear(const RedisRhtConfig& cfg) {
     return RedisRht(cfg, -1, nullptr).clear();
 }
 
+bool redis_rht_drop_rank(const RedisRhtConfig& cfg, int rank) {
+    if (parse_seeds(cfg.seeds).empty() || cfg.timeout_ms <= 0) return false;
+    return RedisRht(cfg, rank, nullptr).reset_rank(nullptr, -1);
+}
+
 std::string redis_rht_check(const RedisRhtConfig& cfg) {
     std::vector<Endpoint> seeds = parse_seeds(cfg.seeds);
     if (seeds.empty()) return "no host:port in '" + cfg.seeds + "'";
@@ -1061,6 +1127,8 @@ std::unique_ptr<RhtBackend> make_redis_rht(const RedisRhtConfig&, int, PeerFault
 }
 
 bool redis_rht_clear(const RedisRhtConfig&) { return false; }
+
+bool redis_rht_drop_rank(const RedisRhtConfig&, int) { return false; }
 
 std::string redis_rht_check(const RedisRhtConfig&) {
     return "radixshmem was built without hiredis";

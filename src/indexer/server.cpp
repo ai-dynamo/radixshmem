@@ -462,15 +462,10 @@ void RadixServer::drop_stale_routes(bool whole_cluster) {
     const RedisRhtConfig rc{rht_redis_, redis_rht_prefix(cfg_.cluster_id),
                             (int)rht_redis_timeout_ms_};
     auto t0 = std::chrono::steady_clock::now();
-    if (whole_cluster) {
-        if (!redis_rht_clear(rc))
-            fprintf(stderr, "[RadixServer] could not clear every stale route of cluster %s\n",
-                    cfg_.cluster_id.c_str());
-    } else {
-        make_redis_rht(rc, cfg_.rank, nullptr)->reset(nullptr, -1);
-    }
-    fprintf(stderr, "[RadixServer] stale routes of %s dropped in %.1f s\n",
+    const bool clean = whole_cluster ? redis_rht_clear(rc) : redis_rht_drop_rank(rc, cfg_.rank);
+    fprintf(stderr, "[RadixServer] stale routes of %s %s %.1f s\n",
             whole_cluster ? "the cluster" : ("rank " + std::to_string(cfg_.rank)).c_str(),
+            clean ? "dropped in" : "not all dropped after",
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 

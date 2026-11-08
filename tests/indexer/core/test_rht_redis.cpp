@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -142,6 +143,57 @@ static void test_unreachable() {
     TEST_PASS();
 }
 
+static void test_gives_up() {
+    TEST_BEGIN("reset and clear give up on a cluster whose slot map cannot load");
+    auto run = [](const std::string& seeds) {
+        RedisRhtConfig cfg{seeds, "rsh:test_rht_redis_" + std::to_string(::getpid()) + "_giveup:", 50};
+        cfg.retry_secs = 1;
+        auto r = make_redis_rht(cfg, 0, nullptr);
+        std::vector<RhtRemoveEntry> own(10);
+        for (int i = 0; i < 10; i++) own[i] = {0x1234567800000000ULL + i, 0, (uint32_t)i};
+        auto t0 = std::chrono::steady_clock::now();
+        r->reset(own.data(), 10);
+        r->reset(nullptr, -1);
+        RhtInsertEntry e{0x42, 0, 1, 4};
+        r->insert_batch(&e, 1);
+        r->flush();
+        assert(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+        assert(!redis_rht_clear(cfg) && !redis_rht_drop_rank(cfg, 0));
+    };
+    run("127.0.0.1:1");
+    setenv("RADIXSHMEM_REDIS_PASSWORD", "wrong", 1);
+    run(g_seeds);
+    unsetenv("RADIXSHMEM_REDIS_PASSWORD");
+    TEST_PASS();
+}
+
+static void test_prefix_match() {
+    TEST_BEGIN("clear and scan reset keep to their own prefix, glob characters included");
+    const std::string base = "rsh:test_rht_redis_" + std::to_string(::getpid()) + "_";
+    auto cfg = [&](const std::string& id) { return RedisRhtConfig{g_seeds, base + id + ":", 1000}; };
+    const std::vector<std::string> ids = {"a", "a:b", "x[1]", "x1"};
+    std::vector<std::unique_ptr<RhtBackend>> r;
+    for (const std::string& id : ids) {
+        r.push_back(make_redis_rht(cfg(id), 1, nullptr));
+        std::vector<RhtInsertEntry> e(100);
+        for (int i = 0; i < 100; i++) e[i] = {0x5000 + (uint64_t)i, 1, (uint32_t)i, 4};
+        r.back()->insert_batch(e.data(), 100);
+        r.back()->flush();
+    }
+    auto found = [&](size_t k) {
+        int n = 0;
+        for (int i = 0; i < 100; i++) n += !lookup(*r[k], 0x5000 + (uint64_t)i).empty();
+        return n;
+    };
+    assert(redis_rht_clear(cfg("a")));
+    assert(found(0) == 0 && found(1) == 100);
+    r[2]->reset(nullptr, -1);
+    assert(found(2) == 0 && found(3) == 100);
+    redis_rht_clear(cfg("a:b"));
+    redis_rht_clear(cfg("x1"));
+    TEST_PASS();
+}
+
 static void test_bad_config() {
     TEST_BEGIN("bad seeds or a hash-tag prefix are refused");
     auto throws = [](const RedisRhtConfig& cfg) {
@@ -180,6 +232,8 @@ int main() {
     test_batches_and_reset();
     test_dump();
     test_unreachable();
+    test_gives_up();
+    test_prefix_match();
     test_bad_config();
     return tests_report();
 }
