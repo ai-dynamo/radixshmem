@@ -258,6 +258,53 @@ static void test_reset_after_move() {
     TEST_PASS();
 }
 
+static void test_killed_connections() {
+    TEST_BEGIN("connections the servers closed are reopened, not taken for down masters");
+    PeerFaultCounters c{};
+    auto rht = filled("127.0.0.1:" + std::to_string(kPort), "killed", &c);
+    std::vector<uint64_t> keys(2 * kKeys);
+    std::vector<std::vector<RHTValue>> res(2 * kKeys);
+    for (int i = 0; i < kKeys; i++) keys[i] = key_of(i);
+    rht->lookup_batch(keys.data(), kKeys, res.data());   // pooled connections to every master
+    std::vector<RhtInsertEntry> e(kKeys);
+    for (int i = 0; i < kKeys; i++) e[i] = {key_of(kKeys + i), 1, (uint32_t)i, 4};
+    rht->insert_batch(e.data(), kKeys);                   // replies still owed
+    for (int p = kPort; p < kPort + kMasters; p++)
+        if (std::system((g_cli + " -p " + std::to_string(p) +
+                         " client kill type normal skipme yes >/dev/null 2>&1").c_str()) != 0)
+            fprintf(stderr, "  CLIENT KILL on %d failed\n", p);
+    pause_for(0.2);
+    for (int round = 0; round < 2; round++) {
+        for (int i = 0; i < kKeys; i++) e[i] = {key_of((2 + round) * kKeys + i), 1, (uint32_t)i, 4};
+        rht->insert_batch(e.data(), kKeys);
+    }
+    rht->flush();
+    for (int i = 0; i < 2 * kKeys; i++) keys[i] = key_of(2 * kKeys + i);
+    rht->lookup_batch(keys.data(), 2 * kKeys, res.data());
+    for (auto& r : res) assert(r.size() == 1);
+    assert(c.down_events.load() == 0);
+    TEST_PASS();
+}
+
+static void test_slow_master_write() {
+    TEST_BEGIN("a master too slow to take its share of a batch fails alone");
+    PeerFaultCounters c{};
+    const std::string prefix = prefix_of("slow") + std::string(1000, 'p') + ":";
+    auto rht = make_redis_rht({"127.0.0.1:" + std::to_string(kPort), prefix, 50}, 0, &c);
+    const int n = 3 * 16384;
+    std::vector<RhtRemoveEntry> own(n);
+    for (int i = 0; i < n; i++) own[i] = {key_of(i), 0, (uint32_t)i};
+    signal_masters(SIGSTOP, 1, 1);
+    std::thread resume([] {
+        pause_for(1.5);
+        signal_masters(SIGCONT, 1, 1);
+    });
+    rht->reset(own.data(), n);   // ~5 MB per master per chunk: the stopped one cannot take it
+    resume.join();
+    assert(c.down_events.load() == 1);
+    TEST_PASS();
+}
+
 static void test_failover() {
     TEST_BEGIN("a killed master's replica takes over; writes held meanwhile land after");
     PeerFaultCounters c{};
@@ -329,6 +376,8 @@ int main() {
     test_hung_cluster();
     test_unread_replies();
     test_reset_after_move();
+    test_killed_connections();
+    test_slow_master_write();
     test_failover();
     cluster("stop");
     return tests_report();

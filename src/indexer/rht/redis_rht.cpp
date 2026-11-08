@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/socket.h>
 
 #include <algorithm>
@@ -106,8 +107,45 @@ std::string reply_error(redisReply* r, const char* fallback) {
     return r && r->type == REDIS_REPLY_ERROR ? std::string(r->str, r->len) : fallback;
 }
 
+// While alive, a write to a closed connection fails with EPIPE on this thread
+// instead of raising SIGPIPE, which would end the process.
+class SigpipeBlock {
+public:
+    SigpipeBlock() {
+        sigset_t pipe = pipe_set();
+        pthread_sigmask(SIG_BLOCK, &pipe, &old_);
+        had_ = pending();
+    }
+    ~SigpipeBlock() {
+        if (!had_ && pending()) {
+            sigset_t pipe = pipe_set();
+            const timespec now{0, 0};
+            while (sigtimedwait(&pipe, nullptr, &now) < 0 && errno == EINTR) {}
+        }
+        pthread_sigmask(SIG_SETMASK, &old_, nullptr);
+    }
+    SigpipeBlock(const SigpipeBlock&) = delete;
+    SigpipeBlock& operator=(const SigpipeBlock&) = delete;
+
+private:
+    static sigset_t pipe_set() {
+        sigset_t s;
+        sigemptyset(&s);
+        sigaddset(&s, SIGPIPE);
+        return s;
+    }
+    static bool pending() {
+        sigset_t s;
+        sigpending(&s);
+        return sigismember(&s, SIGPIPE) == 1;
+    }
+    sigset_t old_;
+    bool had_ = false;
+};
+
 // Connected and authenticated, or null with the reason in err.
 redisContext* open_conn(const Endpoint& ep, int timeout_ms, std::string& err) {
+    SigpipeBlock pipe;
     redisContext* c = redisConnectWithTimeout(ep.host.c_str(), ep.port, tv_ms(timeout_ms));
     if (!c || c->err) {
         err = c ? c->errstr : "out of memory";
@@ -226,6 +264,7 @@ private:
     // Loads the slot map from the first node that answers: masters that are
     // up, then the seeds.
     bool refresh() {
+        SigpipeBlock pipe;
         std::vector<Endpoint> cand;
         int n = count_.load(std::memory_order_acquire);
         for (int id = 0; id < n; id++)
@@ -280,6 +319,7 @@ private:
     }
 
     void probe(int id) {
+        SigpipeBlock pipe;
         auto t0 = Clock::now();
         std::string err;
         bool ok = false;
@@ -331,6 +371,7 @@ private:
 struct Node {
     redisContext* c = nullptr;
     uint32_t gen = 0;
+    bool in_batch = false;   // in touched_: this batch has commands on c
     std::vector<int> tags;
     size_t next = 0;
     std::deque<Op> owed;
@@ -389,15 +430,17 @@ public:
     // While quiet, failed ops are not counted as dropped: a reset retries them.
     void set_quiet(bool q) { quiet_ = q; }
 
-    // Master m is up and connected; else the op is counted as dropped.
+    // Master m is up and connected; else the op is counted as dropped. A
+    // connection that already carries commands of this batch is kept.
     bool usable(int m, Op op) {
         if (view_.down(m)) {
             breaker_.skipped(m, op);
             return false;
         }
         Node& n = node(m);
+        if (n.c && n.in_batch) return true;
         uint32_t gen = view_.generation(m);
-        if (n.c && n.gen != gen) close(m, op);   // opened before m last went down
+        if (n.c && (n.gen != gen || hung_up(m)) && n.c) close(m, op);   // stale or closed by the server
         if (!n.c) {
             auto t0 = Clock::now();
             std::string err;
@@ -414,7 +457,10 @@ public:
 
     void append(int m, int argc, const char** argv, const size_t* lens, int tag) {
         Node& n = nodes_[m];
-        if (n.tags.empty()) touched_.push_back(m);
+        if (!n.in_batch) {
+            n.in_batch = true;
+            touched_.push_back(m);
+        }
         redisAppendCommandArgv(n.c, argc, argv, lens);
         n.tags.push_back(tag);
     }
@@ -424,22 +470,32 @@ public:
     void send(Op op, bool wait, const OnReply& on_reply) {
         t0_ = Clock::now();
         std::vector<int> live, backlog;
-        for (int m : touched_) {
-            Node& n = nodes_[m];
-            int done = 0;
-            while (!done && redisBufferWrite(n.c, &done) == REDIS_OK) {}
-            if (!done) {
-                fail(m, "write", op);
-            } else if (wait) {
-                live.push_back(m);
-            } else {
-                n.owed.insert(n.owed.end(), n.tags.size(), op);
-                n.tags.clear();
-                absorb(m, op);
-                if (n.c && n.owed.size() > kMaxOwed) backlog.push_back(m);
+        {
+            SigpipeBlock pipe;
+            for (int m : touched_) {
+                Node& n = nodes_[m];
+                n.in_batch = false;
+                if (!n.c) {
+                    if (!quiet_) breaker_.skipped(m, op, n.tags.size());
+                    n.tags.clear();
+                    continue;
+                }
+                int done = 0;
+                while (!done && redisBufferWrite(n.c, &done) == REDIS_OK) {}
+                if (!done) {
+                    fail(m, "write", op);
+                } else if (wait) {
+                    live.push_back(m);
+                } else {
+                    n.owed.insert(n.owed.end(), n.tags.size(), op);
+                    n.tags.clear();
+                    absorb(m, op);
+                    if (n.c && n.owed.size() > kMaxOwed) backlog.push_back(m);
+                }
             }
         }
         touched_.clear();
+        t0_ = Clock::now();   // replies get the whole timeout, however long the writes took
         read(live, op, on_reply);
         if (!backlog.empty()) {
             t0_ = Clock::now();
@@ -488,6 +544,17 @@ private:
         std::string err = n.c && n.c->err ? n.c->errstr : what;
         if (n.c) close(m, op);
         view_.failed(m, what, err, secs_since(t0_));
+    }
+
+    // The server closed m's connection (a restart, its idle timeout, CLIENT
+    // KILL); the replies that arrived before are read first.
+    bool hung_up(int m) {
+        Node& n = nodes_[m];
+        pollfd p{n.c->fd, POLLIN | POLLRDHUP, 0};
+        if (::poll(&p, 1, 0) <= 0 || !(p.revents & (POLLRDHUP | POLLHUP | POLLERR))) return false;
+        while (!n.owed.empty() && redisBufferRead(n.c) == REDIS_OK &&
+               consume(m, n.owed.front(), nullptr) == 0) {}
+        return true;
     }
 
     // Reads the replies that already arrived, without waiting.
@@ -956,6 +1023,7 @@ bool redis_rht_clear(const RedisRhtConfig& cfg) {
 std::string redis_rht_check(const RedisRhtConfig& cfg) {
     std::vector<Endpoint> seeds = parse_seeds(cfg.seeds);
     if (seeds.empty()) return "no host:port in '" + cfg.seeds + "'";
+    SigpipeBlock pipe;
     std::string why;
     for (const Endpoint& ep : seeds) {
         std::string err;
