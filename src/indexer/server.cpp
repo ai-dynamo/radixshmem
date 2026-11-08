@@ -326,6 +326,9 @@ void RadixServer::resolve_shard_map(int n_obs) {
     rht_transport_ = CLUSTER_TRANSPORT_XRC;
 
     if (rht_backend_ == CLUSTER_RHT_REDIS) {
+        if (cfg_.cluster_id.find_first_of("{}") != std::string::npos)
+            throw std::runtime_error("RadixServer: the redis RHT needs a cluster id without { "
+                                     "or }, not '" + cfg_.cluster_id + "'");
         rht_redis_ = rht_env_.redis;
         rht_redis_timeout_ms_ = (uint32_t)rht_env_.redis_timeout_ms;
         if (rht_redis_.empty() || rht_redis_.size() >= CLUSTER_RHT_SEEDS_LEN)
@@ -369,6 +372,11 @@ void RadixServer::resolve_shard_map(int n_obs) {
 void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
     // Follower path: install the leader's authoritative shard map + QoS. Mirrors
     // what resolve_shard_map() computes on the leader, but from the wire message.
+#ifndef RADIXSHMEM_HAS_REDIS
+    if (sm.rht_backend == CLUSTER_RHT_REDIS)
+        throw std::runtime_error("RadixServer: the cluster keeps its RHT in Redis, and this "
+                                 "radixshmem was built without hiredis");
+#endif
     rht_backend_  = sm.rht_backend;
     rht_redis_.assign(sm.rht_redis_seeds, strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds)));
     rht_redis_timeout_ms_ = sm.rht_redis_timeout_ms;

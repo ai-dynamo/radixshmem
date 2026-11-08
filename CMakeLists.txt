@@ -427,6 +427,13 @@ if(ENABLE_RDMA)
     set_tests_properties(test_client_no_server_dc PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
 
+    # A client borrowing a tree (radix-server's RHT client) that fails to
+    # bootstrap leaves the tree to its owner.
+    add_executable(test_client_borrowed_tree tests/indexer/test_client_borrowed_tree.cpp)
+    target_link_libraries(test_client_borrowed_tree PRIVATE radixshmem)
+    radixshmem_enable_asserts(test_client_borrowed_tree)
+    add_test(NAME test_client_borrowed_tree COMMAND test_client_borrowed_tree)
+
     # M < N RHT-shard decoupling test (N=3, M=2, holders={0,1}).
     add_executable(test_cluster_shards tests/indexer/test_cluster_shards.cpp)
     target_link_libraries(test_cluster_shards PRIVATE radixshmem)
@@ -535,7 +542,7 @@ set(_skippable_tests
     test_cluster test_cluster_dc test_cluster_dc_rht_nic test_cluster_w4
     test_cluster_rht_dc_peer_xrc test_cluster_rht_xrc_peer_dc
     test_cluster_node_join
-    test_client_no_server test_client_no_server_dc
+    test_client_no_server test_client_no_server_dc test_client_borrowed_tree
     test_cluster_shards test_cluster_shards_dc
     test_cluster_shards_dc_rht_nic_w4 test_cluster_shards_w4
     test_data_registry

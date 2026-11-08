@@ -476,7 +476,14 @@ RadixClient::RadixClient(const RadixClientConfig& cfg, LocalTreeConnector* borro
     : local_(borrowed), owns_local_(false), cfg_(cfg) {
     // Borrow the caller's already-attached tree; build the RHT plane only.
     cfg_.rht_only = true;
-    bootstrap_cluster();
+    try {
+        bootstrap_cluster();
+    } catch (...) {
+        // The destructor does not run for a constructor that throws.
+        teardown_cluster();
+        (void)local_.release();
+        throw;
+    }
 }
 #else
 {
