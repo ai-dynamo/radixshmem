@@ -721,15 +721,21 @@ public:
         writer_.drain();
     }
 
-    // Drops this rank's routes: the listed ones, or with count < 0 this rank's
-    // field in every key under the prefix.
+    // Drops this rank's routes: the listed ones and those of writes still
+    // held, or with count < 0 this rank's field in every key under the prefix.
     void reset(const RhtRemoveEntry* own, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
+        std::vector<RhtRemoveEntry> listed;
+        if (count >= 0) {
+            listed.assign(own, own + count);
+            for (const auto& [key, h] : held_) listed.push_back({key, h.node_id, h.tree_node_id});
+        }
         held_.clear();
         writer_.begin();
         writer_.drain();
         writer_.set_quiet(true);
-        bool clean = count >= 0 ? remove_listed(own, count) : scan_remove(std::to_string(my_rank_));
+        bool clean = count >= 0 ? remove_listed(listed.data(), (int)listed.size())
+                                : scan_remove(std::to_string(my_rank_));
         writer_.set_quiet(false);
         if (!clean)
             fprintf(stderr, "[RadixClient rank %d] Redis RHT: reset gave up after %d s; routes of "

@@ -305,6 +305,31 @@ static void test_slow_master_write() {
     TEST_PASS();
 }
 
+static void test_reset_held_remove() {
+    TEST_BEGIN("a list reset also removes the routes whose removal was held");
+    const std::string seeds = "127.0.0.1:" + std::to_string(kPort);
+    const uint64_t k = key_of(index_in_slots(prefix_of("heldreset"), 6000, 10000, 0));
+    auto rht = make_redis_rht({seeds, prefix_of("heldreset"), 50}, 1, nullptr);
+    RhtInsertEntry e{k, 1, 7, 4};
+    rht->insert_batch(&e, 1);
+    rht->flush();
+    signal_masters(SIGSTOP, 1, 1);
+    std::vector<RHTValue> res;
+    rht->lookup_batch(&k, 1, &res);   // times out: the master is marked down
+    RhtRemoveEntry d{k, 1, 7};
+    rht->remove_batch(&d, 1);         // held
+    std::thread resume([] {
+        pause_for(1.0);
+        signal_masters(SIGCONT, 1, 1);
+    });
+    rht->reset(nullptr, 0);
+    resume.join();
+    auto check = make_redis_rht({seeds, prefix_of("heldreset"), 1000}, 2, nullptr);
+    check->lookup_batch(&k, 1, &res);
+    assert(res.empty());
+    TEST_PASS();
+}
+
 static void test_failover() {
     TEST_BEGIN("a killed master's replica takes over; writes held meanwhile land after");
     PeerFaultCounters c{};
@@ -378,6 +403,7 @@ int main() {
     test_reset_after_move();
     test_killed_connections();
     test_slow_master_write();
+    test_reset_held_remove();
     test_failover();
     cluster("stop");
     return tests_report();
