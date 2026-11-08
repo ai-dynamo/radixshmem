@@ -311,8 +311,9 @@ private:
         for (int id = 0; id < n; id++)
             if (down(id)) ids.push_back(id);
         if (ids.empty()) return ids;
-        std::vector<char> serving(n, 0);
-        for (int16_t m : *slots()) if (m >= 0) serving[m] = 1;
+        const std::shared_ptr<const SlotMap> map = slots();
+        std::vector<char> serving(kMaxMasters, 0);
+        for (int16_t m : *map) if (m >= 0 && m < kMaxMasters) serving[m] = 1;
         ids.erase(std::remove_if(ids.begin(), ids.end(), [&](int id) { return !serving[id]; }),
                   ids.end());
         return ids;
