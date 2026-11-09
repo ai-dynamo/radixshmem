@@ -22,10 +22,11 @@ namespace radixshmem {
 struct MatchedNodeSpanView;
 class HealthAuditor;   // src/indexer/health_check.cpp (read-only audit)
 
-// A node by its RHT key (block-0 hash) and its id.
+// A node by its RHT key (block-0 hash), its id and its length.
 struct NodeHead {
     uint64_t first_hash;
     uint32_t tree_node_id;
+    uint32_t num_blocks;
 };
 
 // A background-evicted leaf with its root path [0, end): [evicted_from, end)
