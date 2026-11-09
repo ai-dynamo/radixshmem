@@ -431,10 +431,15 @@ static void test_reset_held_remove() {
 static void test_failover() {
     TEST_BEGIN("a killed master's replica takes over; writes held meanwhile land after");
     PeerFaultCounters c{};
-    // Two keys of the master killed below (it starts with slots 5461-10922): one
-    // whose node the tree drops while the master is gone, one whose node comes back.
+    // Keys of the master killed below (it starts with slots 5461-10922): one whose
+    // node the tree drops while the master is gone, one whose node comes back, and
+    // one that a client started after the kill writes before it knows.
     const uint64_t ie = index_in_slots(prefix_of("failover"), 6000, 10000, 1u << 20);
-    const uint64_t evicted = key_of(ie), reborn = key_of(index_in_slots(prefix_of("failover"), 6000, 10000, ie + 1));
+    const uint64_t ir = index_in_slots(prefix_of("failover"), 6000, 10000, ie + 1);
+    const uint64_t evicted = key_of(ie), reborn = key_of(ir);
+    const uint64_t late = key_of(index_in_slots(prefix_of("failover"), 6000, 10000, ir + 1));
+    PeerFaultCounters c2{};
+    std::unique_ptr<RhtBackend> newcomer;
     auto rht = filled(g_seeds, "failover", &c,
                       [evicted](uint64_t k, uint32_t) { return k != evicted; });
     RhtInsertEntry r{reborn, 1, 7, 4};
@@ -452,8 +457,12 @@ static void test_failover() {
         rht->insert_batch(&e, 1);
         rht->remove_batch(&d, 1);
         rht->insert_batch(fresh.data(), kKeys);
+        newcomer = make_redis_rht({g_seeds, prefix_of("failover"), 50}, 1, &c2);
+        RhtInsertEntry x{late, 1, 9, 4};
+        newcomer->insert_batch(&x, 1);
     });
     rht->flush();
+    newcomer->flush();
     assert(slowest_ms(calls) < 250);
     assert(found_share(calls, 1.3, 5.0) < 0.9);
     assert(found_share(calls, 12.5, 14.0) == 1.0);
@@ -466,6 +475,10 @@ static void test_failover() {
     for (int i = 0; i < 2 * kKeys; i++) assert(res[i].size() == 1);
     assert(res[2 * kKeys].empty());
     assert(res[2 * kKeys + 1].size() == 1 && res[2 * kKeys + 1][0].tree_node_id == 7);
+    std::vector<RHTValue> got;
+    newcomer->lookup_batch(&late, 1, &got);
+    assert(got.size() == 1 && got[0].tree_node_id == 9);
+    assert(c2.rht_writes.load() == 0 && c2.down_events.load() == 1);
     TEST_PASS();
 }
 
