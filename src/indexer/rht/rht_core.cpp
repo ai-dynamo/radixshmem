@@ -457,6 +457,22 @@ uint64_t RhtEngine::bucket_id(uint64_t key) const {
     return ((uint64_t)shard_of(key) << 32) | bucket_of(key);
 }
 
+template <typename Entry>
+RhtEngine::Buckets RhtEngine::read_entry_buckets(const Entry* entries, int count,
+                                                 PeerBreaker::Op op, std::vector<char>& have) {
+    std::vector<uint64_t> keys(count);
+    for (int i = 0; i < count; i++) keys[i] = entries[i].key;
+    have.assign(count, 0);
+    Buckets buckets;
+    read_buckets(keys.data(), count, op, "RHT read",
+                 [&](int i, const RhtSlot* slots) {
+                     have[i] = 1;
+                     std::vector<RhtSlot>& b = buckets[bucket_id(keys[i])];
+                     if (b.empty()) b.assign(slots, slots + slots_per_bucket_);
+                 }, true);
+    return buckets;
+}
+
 void RhtEngine::insert_batch(const RhtInsertEntry* entries, int count) {
     if (count <= 0) return;
     uint32_t W = slots_per_bucket_;
@@ -474,16 +490,8 @@ void RhtEngine::insert_batch(const RhtInsertEntry* entries, int count) {
     // W>1 picks a cell from the bucket's contents: every bucket is read in one
     // batch, then cells are chosen in entry order against copies that already
     // hold the earlier choices, as one read per entry would see them.
-    std::vector<uint64_t> keys(count);
-    for (int i = 0; i < count; i++) keys[i] = entries[i].key;
-    std::vector<char> have(count, 0);
-    std::unordered_map<uint64_t, std::vector<RhtSlot>> buckets;
-    read_buckets(keys.data(), count, PeerBreaker::Op::RHT_WRITE, "RHT read",
-                 [&](int i, const RhtSlot* slots) {
-                     have[i] = 1;
-                     std::vector<RhtSlot>& b = buckets[bucket_id(keys[i])];
-                     if (b.empty()) b.assign(slots, slots + W);
-                 }, true);
+    std::vector<char> have;
+    Buckets buckets = read_entry_buckets(entries, count, PeerBreaker::Op::RHT_WRITE, have);
     for (int i = 0; i < count; i++) {
         if (!have[i]) continue;
         const RhtInsertEntry& e = entries[i];
@@ -715,16 +723,8 @@ void RhtEngine::remove_batch(const RhtRemoveEntry* entries, int count) {
     // collision victims and re-registered nodes stay; buckets read in one batch.
     if (count <= 0) return;
     uint32_t W = slots_per_bucket_;
-    std::vector<uint64_t> keys(count);
-    for (int i = 0; i < count; i++) keys[i] = entries[i].key;
-    std::vector<char> have(count, 0);
-    std::unordered_map<uint64_t, std::vector<RhtSlot>> buckets;
-    read_buckets(keys.data(), count, PeerBreaker::Op::RHT_REMOVE, "RHT read",
-                 [&](int i, const RhtSlot* slots) {
-                     have[i] = 1;
-                     std::vector<RhtSlot>& b = buckets[bucket_id(keys[i])];
-                     if (b.empty()) b.assign(slots, slots + W);
-                 }, true);
+    std::vector<char> have;
+    Buckets buckets = read_entry_buckets(entries, count, PeerBreaker::Op::RHT_REMOVE, have);
     for (int i = 0; i < count; i++) {
         if (!have[i]) continue;
         const RhtRemoveEntry& e = entries[i];

@@ -261,7 +261,7 @@ void RadixClient::bootstrap_cluster() {
     // Evict/merge on the connector's own tree must clean RHT, else the recycled node id orphans a stale anchor.
     if (local_) {
         local_->tree().set_evict_callback(
-            [this](const std::vector<EvictedNode>& evicted) {
+            [this](const std::vector<NodeHead>& evicted) {
                 std::vector<EvictedKey> keys;
                 keys.reserve(evicted.size());
                 for (const auto& e : evicted)

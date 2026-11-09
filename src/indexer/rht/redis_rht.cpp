@@ -703,41 +703,15 @@ public:
           writer_(view_, cfg, true) {}
 
     void insert_batch(const RhtInsertEntry* e, int count) override {
-        std::lock_guard<std::mutex> g(write_mu_);
-        Conn& w = writer_;
-        w.begin();
-        replay(w);
-        for (int i = 0; i < count; i++) {
-            const Held h{true, e[i].node_id, e[i].tree_node_id, e[i].num_blocks};
-            int m = writable(w, e[i].key, Op::RHT_WRITE);
-            if (m < 0) {
-                hold(w, e[i].key, h, Op::RHT_WRITE);
-                continue;
-            }
-            if (!held_.empty()) held_.erase(e[i].key);
-            append(w, m, h);
-        }
-        w.send(Op::RHT_WRITE, false, nullptr);
-        count_lost(w);
+        write_batch(e, count, Op::RHT_WRITE, [](const RhtInsertEntry& x) {
+            return Held{true, x.node_id, x.tree_node_id, x.num_blocks};
+        });
     }
 
     void remove_batch(const RhtRemoveEntry* e, int count) override {
-        std::lock_guard<std::mutex> g(write_mu_);
-        Conn& w = writer_;
-        w.begin();
-        replay(w);
-        for (int i = 0; i < count; i++) {
-            const Held h{false, e[i].node_id, e[i].tree_node_id, 0};
-            int m = writable(w, e[i].key, Op::RHT_REMOVE);
-            if (m < 0) {
-                hold(w, e[i].key, h, Op::RHT_REMOVE);
-                continue;
-            }
-            if (!held_.empty()) held_.erase(e[i].key);
-            append(w, m, h);
-        }
-        w.send(Op::RHT_REMOVE, false, nullptr);
-        count_lost(w);
+        write_batch(e, count, Op::RHT_REMOVE, [](const RhtRemoveEntry& x) {
+            return Held{false, x.node_id, x.tree_node_id, 0};
+        });
     }
 
     void lookup_batch(const uint64_t* keys, int count,
@@ -747,10 +721,7 @@ public:
         for (int i = 0; i < count; i++) {
             results[i].clear();
             int m = c->route(keys[i], Op::RHT_LOOKUP);
-            if (m < 0) continue;
-            const char* argv[] = {"HGETALL", c->key().data()};
-            const size_t lens[] = {7, c->key().size()};
-            c->append(m, 2, argv, lens, i);
+            if (m >= 0) append_hgetall(*c, m, i);
         }
         c->send(Op::RHT_LOOKUP, true, [&](int i, redisReply* r) {
             if (r->type != REDIS_REPLY_ARRAY) return;
@@ -815,9 +786,7 @@ public:
         c->begin();
         int m = c->route(key, Op::RHT_LOOKUP);
         if (m >= 0) {
-            const char* argv[] = {"HGETALL", c->key().data()};
-            const size_t lens[] = {7, c->key().size()};
-            c->append(m, 2, argv, lens, 0);
+            append_hgetall(*c, m, 0);
             c->send(Op::RHT_LOOKUP, true, [&](int, redisReply* r) {
                 if (r->type != REDIS_REPLY_ARRAY) return;
                 for (size_t j = 0; j + 1 < r->elements; j += 2) {
@@ -851,6 +820,32 @@ private:
         int m = w.owner(key);
         if (m < 0) view_.mark_stale();
         return m >= 0 && !w.down(m) && w.usable(m, op) ? m : -1;
+    }
+
+    template <typename Entry, typename ToHeld>
+    void write_batch(const Entry* e, int count, Op op, ToHeld to_held) {
+        std::lock_guard<std::mutex> g(write_mu_);
+        Conn& w = writer_;
+        w.begin();
+        replay(w);
+        for (int i = 0; i < count; i++) {
+            const Held h = to_held(e[i]);
+            int m = writable(w, e[i].key, op);
+            if (m < 0) {
+                hold(w, e[i].key, h, op);
+                continue;
+            }
+            if (!held_.empty()) held_.erase(e[i].key);
+            append(w, m, h);
+        }
+        w.send(op, false, nullptr);
+        count_lost(w);
+    }
+
+    static void append_hgetall(Conn& c, int m, int tag) {
+        const char* argv[] = {"HGETALL", c.key().data()};
+        const size_t lens[] = {7, c.key().size()};
+        c.append(m, 2, argv, lens, tag);
     }
 
     // Appends the write to the key whose name owner() or writable() left in w.

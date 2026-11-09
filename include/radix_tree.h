@@ -22,13 +22,7 @@ namespace radixshmem {
 struct MatchedNodeSpanView;
 class HealthAuditor;   // src/indexer/health_check.cpp (read-only audit)
 
-// Evicted node reported to the RHT-cleanup callback. first_hash = RHT key
-// (block-0 hash); tree_node_id = registered slot id.
-struct EvictedNode {
-    uint64_t first_hash;
-    uint32_t tree_node_id;
-};
-
+// A node by its RHT key (block-0 hash) and its id.
 struct NodeHead {
     uint64_t first_hash;
     uint32_t tree_node_id;
@@ -190,7 +184,7 @@ public:
     EvictPolicy evict_policy() const { return evict_policy_; }
 
     // Optional eviction callback (RHT cleanup), fired AFTER the write lock drops.
-    using EvictCallback = std::function<void(const std::vector<EvictedNode>&)>;
+    using EvictCallback = std::function<void(const std::vector<NodeHead>&)>;
     void set_evict_callback(EvictCallback cb) { evict_cb_ = std::move(cb); }
     // True iff node_id is live again with this first hash: the evicted id was
     // recycled (LIFO pool) for the same prefix before its RHT removal ran.
@@ -281,7 +275,7 @@ private:
 
     // Eviction-cleanup plumbing (RHT); pending buffer is thread_local.
     EvictCallback evict_cb_;
-    static std::vector<EvictedNode>& evicted_pending();
+    static std::vector<NodeHead>& evicted_pending();
     void flush_evicted();
 
     // ---- Shared memory accessors ----
