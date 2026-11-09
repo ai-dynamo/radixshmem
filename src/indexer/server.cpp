@@ -35,6 +35,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -295,7 +296,7 @@ void RadixServer::read_rht_env() {
         for (const char* p = v.c_str(); *p;) {
             char* end = nullptr;
             long r = std::strtol(p, &end, 10);
-            if (end == p) throw bad("RADIXSHMEM_RHT_SHARD_HOLDERS", v);
+            if (end == p || r < 0 || r > INT_MAX) throw bad("RADIXSHMEM_RHT_SHARD_HOLDERS", v);
             e.rdma.holders.push_back((int)r);
             for (p = end; *p == ',' || *p == ' '; p++) {}
         }
@@ -349,8 +350,13 @@ void RadixServer::resolve_shard_map(int n_obs) {
                                  ") exceeds node count (" + std::to_string(n_obs) + ")");
     num_shards_ = M;
 
-    holder_of_shard_.assign(M, 0);
     const std::vector<int>& holders = rht_env_.rdma.holders;
+    for (int h : holders)
+        if (h >= n_obs)
+            throw std::runtime_error("RadixServer: RADIXSHMEM_RHT_SHARD_HOLDERS names rank " +
+                                     std::to_string(h) + ", but the ranks are 0.." +
+                                     std::to_string(n_obs - 1));
+    holder_of_shard_.assign(M, 0);
     for (int s = 0; s < M; s++)   // round-robin over the candidates, default ranks [0, M)
         holder_of_shard_[s] = holders.empty() ? s : holders[s % holders.size()];
 

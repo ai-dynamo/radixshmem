@@ -12,6 +12,7 @@
 //   * A reader on a different rank finds the full prefix via RHT lookup +
 //     RDMA remote-walk against rank 2 (the tree owner).
 //   * A reader on rank 2 (no local shard) finds holder 0's prefix: every lookup round spans both holders' QPs.
+//   * Holder lists naming a negative rank or one past the last rank are refused.
 //
 // Loopback-only, same single-host RDMA NIC. Rank is registry-assigned from the
 // sorted /peers order, so node0/node1/node2 map to ranks 0/1/2 deterministically
@@ -31,6 +32,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <fstream>
 #include <numeric>
 #include <string>
 #include <sys/mman.h>
@@ -111,11 +113,8 @@ bool wait_shm_ready(const std::string& shm_name, int timeout_sec) {
 volatile sig_atomic_t g_term = 0;
 void on_term(int) { g_term = 1; }
 
-int run_server_process(const std::string& node, const std::string& registry,
-                       const std::string& cluster_id) {
-    ::signal(SIGTERM, on_term);
-    ::signal(SIGINT,  on_term);
-
+radixshmem::RadixServerConfig server_cfg(const std::string& node, const std::string& registry,
+                                         const std::string& cluster_id, const char* holders) {
     radixshmem::RadixServerConfig cfg;
     cfg.name        = kShmPrefix;
     cfg.shm.hugepage_path = "";
@@ -124,7 +123,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.register_chunk_tokens = kChunkTokens;
     setenv("RADIXSHMEM_RHT_BACKEND", "rdma", 1);  // shards and holders exist only there
     setenv("RADIXSHMEM_RHT_SHARDS", std::to_string(kNumShards).c_str(), 1);   // M = 2
-    setenv("RADIXSHMEM_RHT_SHARD_HOLDERS", "0,1", 1);   // leader-authoritative
+    setenv("RADIXSHMEM_RHT_SHARD_HOLDERS", holders, 1);   // leader-authoritative
     cfg.expected_min_nodes = kWorldSize;
     cfg.registry    = registry;
     cfg.cluster_id  = cluster_id;
@@ -133,8 +132,15 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.index_dev    = kRdmaDev;
     cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
+    return cfg;
+}
 
-    radixshmem::RadixServer srv(cfg);
+int run_server_process(const std::string& node, const std::string& registry,
+                       const std::string& cluster_id) {
+    ::signal(SIGTERM, on_term);
+    ::signal(SIGINT,  on_term);
+
+    radixshmem::RadixServer srv(server_cfg(node, registry, cluster_id, "0,1"));
     if (!srv.bootstrap()) {
         fprintf(stderr, "[server %s] bootstrap failed\n", node.c_str());
         return 10;
@@ -143,6 +149,33 @@ int run_server_process(const std::string& node, const std::string& registry,
             node.c_str(), srv.rank(), srv.world_size(), srv.shm_name().c_str());
     while (!g_term) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     return server_healthy(srv, node.c_str()) ? 0 : kHealthExitCode;
+}
+
+// Holders 1,3 name rank 3 of ranks 0..2; stderr goes to `log` for the parent.
+int run_bad_holders_process(const std::string& node, const std::string& registry,
+                            const std::string& cluster_id, const char* log) {
+    if (!std::freopen(log, "w", stderr)) return 11;
+    radixshmem::RadixServerConfig cfg = server_cfg(node, registry, cluster_id, "1,3");
+    cfg.bootstrap_timeout_sec = 5;
+    radixshmem::RadixServer srv(cfg);
+    return srv.bootstrap() ? 0 : 10;
+}
+
+// A negative holder is refused while the environment is read.
+bool negative_holder_refused() {
+    radixshmem::RadixServerConfig cfg;
+    cfg.expected_min_nodes = kWorldSize;
+    setenv("RADIXSHMEM_RHT_BACKEND", "rdma", 1);
+    setenv("RADIXSHMEM_RHT_SHARD_HOLDERS", "0,-1", 1);
+    bool refused = false;
+    try {
+        (void)radixshmem::RadixServer(cfg).bootstrap();
+    } catch (const std::exception& e) {
+        refused = std::strstr(e.what(), "RADIXSHMEM_RHT_SHARD_HOLDERS") != nullptr;
+    }
+    unsetenv("RADIXSHMEM_RHT_SHARD_HOLDERS");
+    unsetenv("RADIXSHMEM_RHT_BACKEND");
+    return refused;
 }
 
 int run_writer_process(const radixshmem::RadixClientConfig& cc, int64_t base) {
@@ -275,6 +308,34 @@ int run_client_case(const char* self, const std::string& cs, int node_rank,
     return -2;
 }
 
+// The leader refuses a holder past the last rank before it publishes /config,
+// so no node of that cluster comes up.
+bool bad_holders_refused(const char* self, const std::string& registry,
+                         const std::string& cluster_id) {
+    std::vector<pid_t> pids;
+    std::vector<std::string> logs;
+    for (int r = 0; r < kWorldSize; r++) {
+        logs.push_back("/tmp/" + cluster_id + "_bad_" + node_name_for(r) + ".log");
+        pids.push_back(spawn({self, "--bad-holders", node_name_for(r), registry,
+                              cluster_id + "_bad", logs.back()}));
+    }
+    bool failed = true, named = false;
+    for (pid_t p : pids) {
+        int st = 0;
+        bool exited = p > 0 && ::waitpid(p, &st, 0) == p;
+        failed &= exited && WIFEXITED(st) && WEXITSTATUS(st) != 0;
+    }
+    for (const std::string& f : logs) {
+        std::ifstream in(f);
+        std::string line;
+        while (std::getline(in, line))
+            named |= line.find("RADIXSHMEM_RHT_SHARD_HOLDERS names rank 3") != std::string::npos;
+        ::unlink(f.c_str());
+    }
+    for (int r = 0; r < kWorldSize; r++) ::shm_unlink(shm_name_for(r).c_str());
+    return failed && named;
+}
+
 int client_main(const std::string& cs, const std::string& node,
                 const std::string& registry, const std::string& cluster_id) {
     auto cc = client_cfg(node, registry, cluster_id);
@@ -295,6 +356,8 @@ int main(int argc, char** argv) {
     // Re-exec'd client: --client <case> <node> <registry> <cluster_id>.
     if (argc >= 6 && std::strcmp(argv[1], "--client") == 0)
         return client_main(argv[2], argv[3], argv[4], argv[5]);
+    if (argc >= 6 && std::strcmp(argv[1], "--bad-holders") == 0)
+        return run_bad_holders_process(argv[2], argv[3], argv[4], argv[5]);
 
     radixshmem_test::EtcdHarness etcd;
     if (!etcd.usable()) {
@@ -305,7 +368,15 @@ int main(int argc, char** argv) {
     const std::string registry   = etcd.registry();
     const std::string cluster_id = etcd.cluster_id();
 
+    if (!negative_holder_refused()) {
+        fprintf(stderr, "FAIL: RADIXSHMEM_RHT_SHARD_HOLDERS=0,-1 was accepted\n");
+        return 45;
+    }
     for (int r = 0; r < kWorldSize; r++) ::shm_unlink(shm_name_for(r).c_str());
+    if (!bad_holders_refused(argv[0], registry, cluster_id)) {
+        fprintf(stderr, "FAIL: holder rank 3 of a 3-node cluster was not refused\n");
+        return 46;
+    }
 
     std::vector<pid_t> server_pids(kWorldSize);
     for (int r = 0; r < kWorldSize; r++) {
