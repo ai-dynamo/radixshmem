@@ -45,7 +45,8 @@ Single node:
 radix-server --name /my_kv_cache --data-bytes 1024G
 ```
 
-4 nodes, coordinated through etcd. The RHT lives in a Redis Cluster by default (`RADIXSHMEM_REDIS_ADDRS`);
+4 nodes, coordinated through etcd. The RHT lives in a Redis Cluster by default (`RADIXSHMEM_REDIS_ADDRS`;
+[`docs/redis_deployment.md`](docs/redis_deployment.md) shows how to set one up);
 `RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. The `RADIXSHMEM_RHT_*` and
 `RADIXSHMEM_REDIS_*` variables are listed in [`docs/api.md`](docs/api.md).
 
