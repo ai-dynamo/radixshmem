@@ -202,7 +202,7 @@ struct ShmHeader {
     uint32_t leaf_list_head;
     uint32_t leaf_list_tail;
 
-    std::atomic<uint64_t> access_counter;
+    std::atomic<uint64_t> route_publishes;
 
     uint64_t node_pool_offset;
 

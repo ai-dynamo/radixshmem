@@ -257,6 +257,7 @@ private:
     std::unique_ptr<LocalTreeConnector> local_;
     bool owns_local_ = true;
     bool local_read_only_ = false;   // read-only attach, never joins the cluster
+    std::mutex reset_mu_;
     void require_writable(const char* op) const;
 
     // Pin release, reachable only through a query(lock=true) finalize:
