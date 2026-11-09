@@ -1,18 +1,8 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-"""Two radix-server processes on one host, each owning index + SlotStore +
-transfer engine; a client configures node0, node1 takes the geometry from
-etcd, then a client on node1 pulls node0's blocks with concurrent
-pull_async() jobs.
-
-    python3 test_p2p_pull.py [--index-dev mlx5_bond_0] [--transfer-dev mlx5_bond_0] [--gid-idx 3]
-
-Needs etcd, an RDMA device and the Mooncake backend; exits 77 when missing.
-RADIXSHMEM_TEST_LEASE_S=45 sleeps that long before the reader attaches, past the
-etcd lease TTL, to prove the lease keepalive. Clients are re-exec'd, never
-forked (the etcd Go runtime and ibverbs do not survive fork()).
-"""
+"""Two radix-servers on one host: a client configures node0, node1 takes the geometry from etcd, a client on node1 pulls
+node0's blocks with concurrent pull_async(). Needs etcd, RDMA and Mooncake (exit 77 otherwise); clients are re-exec'd, never forked."""
 
 import argparse
 import glob
@@ -44,34 +34,71 @@ def client_main(role: str, endpoint: str) -> int:
     c = radixshmem.RadixClient(NAME, endpoint=endpoint)
     assert c.geometry["pools"]["full"]["slot_bytes"] == SLOT_BYTES
     out = {"role": role, "rank": c.rank(), "world_size": c.world_size(), "mode": c.info.mode}
-    hs = [radixshmem.compute_hashes(np.arange(1000 * (k + 1), 1000 * (k + 1) + PREFIX_LEN, dtype=np.int64), 1)
-          for k in range(PREFIXES)]
+    # RADIXSHMEM_TEST_SOAK_S > 0: the writer publishes PREFIXES new prefixes every ROUND_S seconds for
+    # that long and the reader pulls each round as it appears, so the data plane carries traffic for
+    # the whole period (a 30 s Mooncake rail pause can expire and the bad pairs be retried).
+    soak_s = float(os.environ.get("RADIXSHMEM_TEST_SOAK_S", "0"))
+    round_s = float(os.environ.get("RADIXSHMEM_TEST_ROUND_S", "2"))
+    rounds = max(1, int(soak_s / round_s)) if soak_s > 0 else 1
+
+    def prefixes(rnd):   # (global prefix index, hashes); rounds never share a prefix
+        return [(PREFIXES * rnd + k,
+                 radixshmem.compute_hashes(np.arange(1000 * (PREFIXES * rnd + k + 1),
+                                                     1000 * (PREFIXES * rnd + k + 1) + PREFIX_LEN,
+                                                     dtype=np.int64), 1))
+                for k in range(PREFIXES)]
+
+    t0 = time.time()
     if role == "writer":
         errors = set()
-        for k, h in enumerate(hs):
-            slots = c.allocate_slots(PREFIX_LEN)
-            for i, s in enumerate(slots):
-                c.slot_view(int(s))[:] = _pattern(k, i)
-            errors.add(str(c.insert(h, slots).error))
-        c.flush()
+        for rnd in range(rounds):
+            for k, h in prefixes(rnd):
+                slots = c.allocate_slots(PREFIX_LEN)
+                for i, s in enumerate(slots):
+                    c.slot_view(int(s))[:] = _pattern(k, i)
+                errors.add(str(c.insert(h, slots).error))
+            c.flush()
+            if rounds > 1:
+                time.sleep(max(0.0, t0 + (rnd + 1) * round_s - time.time()))
         out["insert_errors"] = sorted(errors)
+        out["rounds"] = rounds
     elif role == "reader":
-        jobs = [c.pull_async(h) for h in hs]
-        results = [j.wait(120) for j in jobs]
-        out.update(hits=sum(r.common_hit for r in results),
-                   remote_blocks=sum(r.remote_blocks for r in results),
-                   source_ranks=sorted({r.source_rank for r in results}),
-                   bytes_ok=sum(bytes(c.slot_view(int(s))) == _pattern(k, i)
-                                for k, r in enumerate(results) for i, s in enumerate(r.full_slots)))
-        for r in results:
-            r.finalize()
+        hits = remote = ok = 0
+        ranks = set()
+        slow = []        # rounds whose pull attempts took over a second in all: (round, start offset s, pull s)
+        for rnd in range(rounds):
+            ph = prefixes(rnd)
+            deadline = time.time() + 120
+            t_round, pull_s = time.time(), 0.0
+            while True:   # a soak round waits for the writer to publish it
+                t1 = time.time()
+                results = [j.wait(120) for j in [c.pull_async(h) for _, h in ph]]
+                pull_s += time.time() - t1
+                remote += sum(r.remote_blocks for r in results)   # every attempt's transfers count
+                ranks |= {r.source_rank for r in results if r.remote_blocks > 0}
+                if all(r.common_hit == PREFIX_LEN for r in results) or time.time() > deadline:
+                    break
+                for r in results:
+                    r.finalize()
+                time.sleep(0.2)
+            hits += sum(r.common_hit for r in results)
+            ok += sum(bytes(c.slot_view(int(s))) == _pattern(k, i)
+                      for (k, _), r in zip(ph, results) for i, s in enumerate(r.full_slots))
+            if pull_s > 1.0:
+                slow.append((rnd, round(t_round - t0, 1), round(pull_s, 2)))
+            for r in results:
+                r.finalize()
+        out.update(hits=hits, remote_blocks=remote, source_ranks=sorted(ranks), bytes_ok=ok)
         out["local_hit_after"] = sum(int(c.query(h, local_only=True, update_meta=False).common_hit)
-                                     for h in hs)
-        src, left, deadline = results[0].source_rank, -1, time.monotonic() + 10
+                                     for _, h in prefixes(rounds - 1))
+        src, left, deadline = next(iter(ranks)), -1, time.monotonic() + 10
         while left != 0 and time.monotonic() < deadline:
-            left = sum(int(c.remote_query(src, h, False, False).total_hit_length) for h in hs)
+            left = sum(int(c.remote_query(src, h, False, False).total_hit_length)
+                       for _, h in prefixes(rounds - 1))
             time.sleep(0.05)
         out["source_hit_after"] = left
+        if rounds > 1:
+            out.update(rounds=rounds, elapsed_s=round(time.time() - t0, 1), slow_rounds=slow)
     elif role == "health":
         out["health"] = int(c.check_health())
         out["report"] = c.health_report().describe().strip()

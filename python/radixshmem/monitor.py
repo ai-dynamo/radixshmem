@@ -1,35 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Monitoring endpoint of a radix-server (``ServerConfig.monitor_port``).
-
-The server runs it as a child process (``MonitorProcess`` starts
-``python -m radixshmem.monitor``), so none of its work takes the server's GIL.
-The process reads identity, counters and the cluster's node records through the
-server's Describe / Stats / Nodes RPCs and the tree through its own read-only
-attach of the index shm; it exits with the server, even after a SIGKILL.
-
-Every ``monitor_interval_s`` it copies the tree (``dump_tree``: no lock taken,
-nothing written to shm) and serves on one HTTP port:
-
-    /metrics   Prometheus text: tree size, pool use, the server's counters,
-               and the tree itself as ``radixshmem_treeview_blocks`` rows
-    /sd        Prometheus HTTP service discovery: every server of the cluster
-    /summary   this tree's size, JSON
-    /anchors   prefix-hash cut points of this tree, npz
-    /nodes     first block hash, size and depth of the heaviest radix nodes, npz
-
-One ``radixshmem_treeview_blocks`` row is one node of a view, in depth-first
-order; labels carry the structure (``order``, ``parent``, ``level``, ``self``,
-``dup``, ``label``) and the value is the blocks under the node. The Grafana
-dashboard in radix-monitor/ turns the rows into flame graphs.
-``view="node"`` is this server's radix tree. The lowest-ranked ready server of
-the cluster (the leader) also fetches every peer's anchors, merges them into
-the cluster tree (``treeview.MergedTree``, ``dup`` = servers holding the
-prefix) and exports it as ``view="cluster"``, and counts on how many servers a
-radix node starts at the same block hash (the top 20 above one). Servers find each other through
-the ``monitor`` field of their ``nodes/`` records in etcd.
-"""
+"""Monitoring child process of a radix-server (``ServerConfig.monitor_port``): copies the tree every interval and serves
+/metrics (Prometheus; the tree as ``radixshmem_treeview_blocks`` rows, the leader adds the merged cluster view), /sd, /summary, /anchors, /nodes."""
 
 from __future__ import annotations
 

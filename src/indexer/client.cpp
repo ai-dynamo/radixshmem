@@ -189,7 +189,7 @@ void RadixClient::bootstrap_cluster() {
     if (net.index_dev.empty() || net.index_port <= 0 || net.gid_idx < 0) {
         net.registry_host = registry_host_of(cfg_.registry);
         // The condition under which a DCI is created below.
-        net.need_dc = rht_transport_ == CLUSTER_TRANSPORT_DC ||
+        net.need_dc = (sm.rht_backend == CLUSTER_RHT_RDMA && sm.rht_transport == CLUSTER_TRANSPORT_DC) ||
                       (!cfg_.rht_only && peer_index_transport_ == CLUSTER_TRANSPORT_DC);
         const NetSelection sel = resolve_net(net);
         net.index_dev = sel.index.device;

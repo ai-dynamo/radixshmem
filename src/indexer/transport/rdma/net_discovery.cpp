@@ -18,7 +18,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <map>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -49,29 +48,14 @@ std::vector<std::string> list_dir(const std::string& path) {
     return out;
 }
 
-int prefix_of_mask(const sockaddr* mask) {
-    if (!mask) return -1;
-    int bits = 0;
-    if (mask->sa_family == AF_INET) {
-        uint32_t m = ntohl(reinterpret_cast<const sockaddr_in*>(mask)->sin_addr.s_addr);
-        bits = __builtin_popcount(m);
-    } else if (mask->sa_family == AF_INET6) {
-        const auto* m6 = reinterpret_cast<const sockaddr_in6*>(mask);
-        for (int i = 0; i < 16; i++) bits += __builtin_popcount(m6->sin6_addr.s6_addr[i]);
-    } else {
-        return -1;
-    }
-    return bits;
-}
-
 bool is_loopback(const std::string& ip) { return ip.rfind("127.", 0) == 0 || ip == "::1"; }
 
 class SystemNetProbe final : public NetProbe {
 public:
     explicit SystemNetProbe(std::string sys_root) : sys_root_(std::move(sys_root)) {}
 
-    std::vector<NetAddress> interface_addresses(const std::string& netdev) override {
-        std::vector<NetAddress> out;
+    std::vector<std::string> interface_addresses(const std::string& netdev) override {
+        std::vector<std::string> out;
         ifaddrs* addrs = nullptr;
         if (::getifaddrs(&addrs) != 0) return out;
         for (ifaddrs* a = addrs; a; a = a->ifa_next) {
@@ -84,7 +68,7 @@ public:
             } else {
                 continue;
             }
-            out.push_back({buf, prefix_of_mask(a->ifa_netmask)});
+            out.emplace_back(buf);
         }
         ::freeifaddrs(addrs);
         return out;
@@ -132,7 +116,7 @@ public:
         return type;
     }
 
-    bool route_to(const std::string& host, std::string& src_ip, std::string& out_if) override {
+    bool route_to(const std::string& host, std::string& src_ip) override {
         addrinfo hints{};
         hints.ai_family = AF_INET;
         hints.ai_socktype = SOCK_DGRAM;
@@ -152,19 +136,7 @@ public:
         }
         if (fd >= 0) ::close(fd);
         ::freeaddrinfo(res);
-        if (!ok) return false;
-        out_if.clear();
-        ifaddrs* addrs = nullptr;
-        if (::getifaddrs(&addrs) == 0) {
-            for (ifaddrs* a = addrs; a; a = a->ifa_next) {
-                if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
-                char buf[INET_ADDRSTRLEN] = {0};
-                inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in*>(a->ifa_addr)->sin_addr, buf, sizeof(buf));
-                if (src_ip == buf) { out_if = a->ifa_name; break; }
-            }
-            ::freeifaddrs(addrs);
-        }
-        return true;
+        return ok;
     }
 
 private:
@@ -182,22 +154,11 @@ std::string combo_line(const Combo& c) {
                     std::to_string(c.gid->index) + " " + (c.gid->type.empty() ? "?" : c.gid->type);
     if (c.gid->ipv4_mapped()) s += " " + c.gid->ipv4();
     else s += " " + c.gid->gid;
-    if (!c.gid->netdev.empty()) {
-        s += " (" + c.gid->netdev;
-        for (const auto& a : c.gid->addresses) {
-            s += " " + a.address;
-            s += a.prefix_length >= 0 ? "/" + std::to_string(a.prefix_length) : "/unknown";
-        }
-        s += ")";
-    }
-    s += " numa " + std::to_string(c.dev->numa_node);
-    if (c.dev->rate_gbps > 0) s += " " + std::to_string(c.dev->rate_gbps) + "G";
+    if (!c.gid->netdev.empty()) s += " (" + c.gid->netdev + ")";
     return s;
 }
 
-// Rank of a GID for auto selection on its link; -1 = not an auto candidate (zero, unknown type,
-// type/link mismatch, link-local). On Ethernet: RoCE v2 IPv4, RoCE v2 global IPv6, RoCE v1 IPv4,
-// RoCE v1 global IPv6. The control plane stays IPv4 whatever the GID's family.
+// Rank eligible GIDs: RoCE v2 before v1, IPv4 before global IPv6 within each version; -1 excludes a GID.
 int gid_tier(const GidEntry& g, bool ib) {
     if (g.zero() || g.type.empty()) return -1;
     if (ib) return g.ib_or_v1() ? 0 : -1;
@@ -208,8 +169,7 @@ int gid_tier(const GidEntry& g, bool ib) {
     return -1;
 }
 
-// The GIDs of one port that the auto rule accepts: the best tier the port has; duplicates of one
-// GID keep the lowest index.
+// Keep each port's best GID tier and deduplicate equal GIDs by lowest index.
 std::vector<const GidEntry*> auto_gids(const NetDevice& d, std::string& why_none) {
     std::vector<const GidEntry*> out;
     std::set<std::string> seen;
@@ -238,17 +198,12 @@ std::vector<Combo> on_interface(const std::vector<Combo>& all, const std::string
     return out;
 }
 
-// Combinations matching an address: a GID carrying the address itself wins; only when none does,
-// the GIDs whose interface holds the address (or is `oif`) count, as one interface may back several GIDs.
-std::vector<Combo> on_address(const std::vector<Combo>& all, const std::string& ip, const std::string& oif) {
-    std::vector<Combo> exact, loose;
-    for (const auto& c : all) {
-        if (c.gid->ipv4_mapped() && c.gid->ipv4() == ip) { exact.push_back(c); continue; }
-        bool on_if = !oif.empty() && c.gid->netdev == oif;
-        for (const auto& a : c.gid->addresses) on_if |= a.address == ip;
-        if (on_if) loose.push_back(c);
-    }
-    return exact.empty() ? loose : exact;
+// Combinations whose GID carries the IPv4 itself.
+std::vector<Combo> on_address(const std::vector<Combo>& all, const std::string& ip) {
+    std::vector<Combo> out;
+    for (const auto& c : all)
+        if (c.gid->ipv4_mapped() && c.gid->ipv4() == ip) out.push_back(c);
+    return out;
 }
 
 }  // namespace
@@ -304,7 +259,7 @@ std::string NetSelection::summary() const {
     s += " | index " + index.device + " port " + std::to_string(index.port) + " gid " +
          std::to_string(index.gid_index) + " (" + (index.address.empty() ? index.gid : index.address);
     if (!index.netdev.empty()) s += ", " + index.netdev;
-    s += ", numa " + std::to_string(index.numa_node) + ", " + index.reason + ")";
+    s += ", " + index.reason + ")";
     for (const auto& n : notes) s += " | " + n;
     return s;
 }
@@ -318,10 +273,8 @@ std::unique_ptr<NetProbe> system_net_probe(const std::string& sys_root) {
 std::vector<NetDevice> discover_net_devices(NetProbe& probe, const std::string& sys_root) {
     std::vector<NetDevice> out;
     const std::string base = sys_root + "/class/infiniband";
-    std::map<std::string, std::vector<NetAddress>> addr_cache;
     for (const auto& name : list_dir(base)) {
         const std::string dev = base + "/" + name;
-        const std::string numa = read_line(dev + "/device/numa_node");
         const bool accessible = probe.device_accessible(name);
         const bool dc_capable = probe.device_dc_capable(name);
         for (const auto& pnum : list_dir(dev + "/ports")) {
@@ -333,9 +286,6 @@ std::vector<NetDevice> discover_net_devices(NetProbe& probe, const std::string& 
             const std::string state = read_line(port + "/state");   // "4: ACTIVE"
             d.active = state.find("ACTIVE") != std::string::npos;
             d.link_layer = read_line(port + "/link_layer");
-            const std::string rate = read_line(port + "/rate");     // "400 Gb/sec (4X NDR)"
-            if (!rate.empty()) d.rate_gbps = atoi(rate.c_str());
-            d.numa_node = numa.empty() ? -1 : atoi(numa.c_str());
             d.accessible = accessible;
             d.dc_capable = dc_capable;
             for (const auto& idx : list_dir(port + "/gids")) {
@@ -346,12 +296,6 @@ std::vector<NetDevice> discover_net_devices(NetProbe& probe, const std::string& 
                 g.type = read_line(port + "/gid_attrs/types/" + idx);
                 g.netdev = read_line(port + "/gid_attrs/ndevs/" + idx);
                 if (g.type.empty()) g.type = probe.gid_type(name, d.port, g.index, &g.netdev);   // sysfs attr missing
-                if (!g.netdev.empty()) {
-                    auto it = addr_cache.find(g.netdev);
-                    if (it == addr_cache.end())
-                        it = addr_cache.emplace(g.netdev, probe.interface_addresses(g.netdev)).first;
-                    g.addresses = it->second;
-                }
                 d.gids.push_back(std::move(g));
             }
             std::sort(d.gids.begin(), d.gids.end(), [](const GidEntry& a, const GidEntry& b) { return a.index < b.index; });
@@ -385,10 +329,9 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         throw std::runtime_error(msg);
     };
 
-    // An explicit device and port is a constraint whose first failure is the error; with the port
-    // left open, the device's unusable ports are skipped and reported only if none is usable.
+    // Fail immediately for an invalid explicit device/port pair; otherwise skip unusable ports.
     const bool pinned = !in.index_dev.empty();
-    bool found_dev = !pinned, found_port = !pinned || in.index_port <= 0;
+    bool found_dev = !pinned, found_port = in.index_port <= 0;
     auto reject = [&](const NetDevice& device, const std::string& why) {
         const std::string message = device.name + " port " + std::to_string(device.port) + ": " + why;
         if (pinned && in.index_port > 0) throw std::runtime_error("net: " + message);
@@ -434,13 +377,14 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
                                  (names.empty() ? "none" : names));
     }
     if (!found_port)
-        throw std::runtime_error("net: index_dev '" + in.index_dev + "' has no port " + std::to_string(in.index_port));
+        throw std::runtime_error(pinned ? "net: index_dev '" + in.index_dev + "' has no port " + std::to_string(in.index_port)
+                                        : "net: no RDMA device has port " + std::to_string(in.index_port));
 
     if (combos.empty())
         fail(pinned ? "index_dev '" + in.index_dev + "' has no usable port / GID" : "no usable RDMA device for the index plane", {});
 
     std::string reason;
-    if (!in.index_dev.empty() && in.gid_idx >= 0) {
+    if (combos.size() == 1 && !in.index_dev.empty() && in.gid_idx >= 0) {
         reason = "explicit device and gid";
     } else if (combos.size() == 1) {
         reason = in.index_dev.empty() ? "only candidate" : "explicit device, only gid";
@@ -454,15 +398,15 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
             if (cur.size() == 1 && !n.empty()) reason = "control-interface hint";
         }
         if (cur.size() > 1 && !in.rpc_address.empty() && in.rpc_address != "0.0.0.0") {
-            auto n = on_address(cur, in.rpc_address, "");
+            auto n = on_address(cur, in.rpc_address);
             if (n.empty()) sel.notes.push_back("rpc_address " + in.rpc_address + " is on no RDMA GID");
             else cur = n;
             if (cur.size() == 1 && !n.empty()) reason = "control-address hint";
         }
         if (cur.size() > 1 && probe && !in.registry_host.empty()) {
-            std::string src, oif;
-            if (probe->route_to(in.registry_host, src, oif) && !is_loopback(src)) {
-                auto n = on_address(cur, src, oif);
+            std::string src;
+            if (probe->route_to(in.registry_host, src) && !is_loopback(src)) {
+                auto n = on_address(cur, src);
                 if (n.empty()) sel.notes.push_back("route to registry " + in.registry_host + " (" + src + ") is on no RDMA GID");
                 else cur = n;
                 if (cur.size() == 1 && !n.empty()) reason = "registry-route hint";
@@ -483,18 +427,14 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
     sel.index.gid = c.gid->gid;
     sel.index.netdev = c.gid->netdev;
     sel.index.address = c.gid->ipv4();
-    sel.index.numa_node = c.dev->numa_node;
     sel.index.reason = reason;
 
-    // Control address, settled apart from the index pick: interface > address > the index GID's IPv4 >
-    // the source address of the route to the registry. None leaves control_ip empty: the server
-    // refuses that, a client needs no control address.
+    // Control IPv4: interface > address > index GID > registry route; only clients may leave it empty.
     if (!in.rpc_interface.empty()) {
-        std::vector<NetAddress> addrs;
-        if (probe) addrs = probe->interface_addresses(in.rpc_interface);
         std::vector<std::string> v4;
-        for (const auto& a : addrs)
-            if (a.address.find(':') == std::string::npos) v4.push_back(a.address);
+        if (probe)
+            for (const auto& a : probe->interface_addresses(in.rpc_interface))
+                if (a.find(':') == std::string::npos) v4.push_back(a);
         if (v4.empty())
             throw std::runtime_error("net: rpc_interface '" + in.rpc_interface + "' has no IPv4 address" +
                                      (probe ? "" : " (interface lookup unavailable)"));
@@ -503,8 +443,6 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         if (v4.size() > 1) {
             if (on_if(in.rpc_address)) {
                 pick = in.rpc_address;
-            } else if (on_if(sel.index.address)) {
-                pick = sel.index.address;
             } else {
                 std::string all;
                 for (const auto& a : v4) all += (all.empty() ? "" : ", ") + a;
@@ -523,8 +461,8 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         sel.control_ip = sel.index.address;
         sel.control_source = "index gid";
     } else {
-        std::string src, oif;
-        if (probe && !in.registry_host.empty() && probe->route_to(in.registry_host, src, oif) && !is_loopback(src)) {
+        std::string src;
+        if (probe && !in.registry_host.empty() && probe->route_to(in.registry_host, src) && !is_loopback(src)) {
             sel.control_ip = src;
             sel.control_source = "registry route";
         } else {

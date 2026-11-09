@@ -1,10 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Local RDMA device discovery and the index-plane device / GID / control-address choice.
-// Discovery reads sysfs plus a NetProbe for what sysfs lacks (interface addresses, uverbs access,
-// DC capability, the route to a host); selection is a pure function of the discovered data so it
-// runs without hardware in tests. Nothing here creates a PD, QP, MR or transport session.
+// Discover local RDMA devices and select index/control settings through an injectable system probe.
 #pragma once
 
 #include <cstdint>
@@ -14,17 +11,11 @@
 
 namespace radixshmem {
 
-struct NetAddress {
-    std::string address;        // dotted IPv4 or IPv6 text
-    int         prefix_length = -1;   // -1 = unknown
-};
-
 struct GidEntry {
     int         index = -1;
     std::string gid;            // 8 groups of 4 hex digits, as sysfs prints it
     std::string type;           // "RoCE v2", "IB/RoCE v1", "" = unknown
     std::string netdev;         // interface the GID is bound to, "" = none / not visible
-    std::vector<NetAddress> addresses;   // addresses configured on netdev
 
     bool        zero() const;
     bool        roce_v2() const { return type == "RoCE v2"; }
@@ -42,8 +33,6 @@ struct NetDevice {
     bool        accessible = true;    // the uverbs node can be opened read/write
     bool        dc_capable = true;    // mlx5dv_is_supported(): what the DC transport needs, not a full DC check
     std::string link_layer;     // "Ethernet" | "InfiniBand" | ""
-    int         numa_node = -1;
-    int         rate_gbps = 0;
     std::vector<GidEntry> gids;   // non-zero entries only
 
     const GidEntry* gid(int index) const;
@@ -53,17 +42,16 @@ struct NetDevice {
 class NetProbe {
 public:
     virtual ~NetProbe() = default;
-    virtual std::vector<NetAddress> interface_addresses(const std::string& netdev) = 0;
+    virtual std::vector<std::string> interface_addresses(const std::string& netdev) = 0;   // IPv4 / IPv6 text
     virtual bool device_accessible(const std::string& dev) = 0;
     virtual bool device_dc_capable(const std::string& dev) = 0;
-    // Source address and outgoing interface the kernel would use to reach host; false = unknown.
-    virtual bool route_to(const std::string& host, std::string& src_ip, std::string& out_if) = 0;
+    // Source address the kernel would use to reach host; false = unknown.
+    virtual bool route_to(const std::string& host, std::string& src_ip) = 0;
     // GID type ("RoCE v2" | "IB/RoCE v1" | "" unknown) when sysfs lacks it; may fill netdev too.
     virtual std::string gid_type(const std::string&, int, int, std::string*) { return ""; }
 };
 
-// The real probe: getifaddrs, /dev/infiniband/uverbsN access, mlx5dv_is_supported, UDP connect +
-// getsockname, ibv_query_gid_ex.
+// System probe for interface addresses, uverbs access, mlx5 support, routes, and GID metadata.
 std::unique_ptr<NetProbe> system_net_probe(const std::string& sys_root = "/sys");
 
 // Every port of every device under <sys_root>/class/infiniband, sorted by name then port.
@@ -78,13 +66,12 @@ struct NetSelectionInput {
     std::string registry_host;    // host part of the registry uri, route hint only
     bool        need_dc = false;  // DC transport in use: only dc_capable devices qualify
 
-    // Take what this node's server published where nothing explicit is set; the GID index belongs
-    // to the published device and port (port 0 = an older server that did not publish it).
+    // Inherit defaults only for the matching device and port.
     void inherit_index(const std::string& device, int port, int gid_index) {
         if (index_dev.empty()) index_dev = device;
         if (device.empty() || index_dev != device) return;
         if (index_port <= 0) index_port = port;
-        if (gid_idx < 0 && (port <= 0 || index_port == port)) gid_idx = gid_index;
+        if (gid_idx < 0 && port > 0 && index_port == port) gid_idx = gid_index;
     }
 };
 
@@ -95,7 +82,6 @@ struct IndexPick {
     std::string gid;
     std::string netdev;
     std::string address;          // the GID's IPv4 when it has one
-    int         numa_node = -1;
     std::string reason;           // the rule that settled the choice
 };
 
@@ -107,8 +93,7 @@ struct NetSelection {
     std::string summary() const;  // one line for the bootstrap log
 };
 
-// Throws std::runtime_error whose message lists the candidates when the choice is not unique or
-// an explicit value is invalid. `probe` resolves interface addresses and the route hint; may be null.
+// Select using optional probe hints; throw with diagnostics for invalid or ambiguous choices.
 NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectionInput& in,
                         NetProbe* probe);
 

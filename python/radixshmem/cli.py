@@ -1,31 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""radix-server: run a RadixServer until SIGINT / SIGTERM.
-
-The server starts with what the operator knows (identity, cluster, NICs, the
-SlotStore budget and how it is split between the pools) and waits for a client
-to bring the geometry, tokens per block and bytes per slot:
-``radixshmem.RadixClient(name, radixshmem.Geometry(...))``. In a cluster the first
-node configured spreads its geometry to the others through etcd.
-
-Index only (no data plane; slot ids belong to the client's own storage, whose
-geometry brings the slot counts):
-    radix-server --name /kv
-
-Index + data plane (--data-bytes selects it; the server owns a SlotStore and
-sizes the pools from the budget: SWA and Mamba take their ratio, FULL the rest):
-    radix-server --name /kv --data-bytes 64G
-    radix-server --name /kv --data-bytes 64G --swa-ratio 0.15 --mamba-ratio 0.05
-
-Distributed (one per node, discovery via etcd, rank assigned by etcd):
-    radix-server --name /kv --data-bytes 64G --expected-min-nodes 3 \\
-                 --registry etcd://10.0.0.1:2379 --rpc-address 10.0.0.2 \\
-                 --transfer-dev mlx5_0,mlx5_1
-
-Byte sizes are the client's business; budgets and ratios may differ per node,
-the slot shape may not (the servers cross-check it through etcd).
-"""
+"""radix-server: run a RadixServer until SIGINT / SIGTERM with the operator's settings; a client (or a peer via etcd)
+brings the Geometry. Index-only without --data-bytes; a cluster node with --expected-min-nodes and --registry."""
 
 from __future__ import annotations
 

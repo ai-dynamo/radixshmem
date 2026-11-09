@@ -1,28 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""RadixServer: the one process per node that owns the index, the SlotStore,
-the transfer engine and the etcd entries, and serves RadixClients over gRPC
-(see ``radixshmem.rpc``).
-
-``ServerConfig`` is what the operator knows when the node is deployed:
-identity and cluster, the SlotStore budget (``data_bytes``, 0 = index-only)
-and its split between the pools (``swa_ratio`` / ``mamba_ratio``; FULL takes
-the rest), memory, transfer-engine and index tuning. What a slot looks like
-comes from a client: ``configure(Geometry)`` (the Configure RPC) or, in a
-cluster, the geometry another node's server already created in etcd.
-Until then the server is ``waiting``. ``configure`` validates and plans
-synchronously and returns; a thread then creates the regions and joins the
-cluster (``configuring`` -> ``ready``, or back to ``waiting`` with
-``last_error``). Clients never block unless they call ``wait_ready``.
-
-Transfers are jobs: ``submit`` queues one, a single transfer thread feeds the
-engine and polls completions, ``wait_any`` sleeps on an Event until one of the
-caller's jobs is done. Nothing else polls. With ``transfer_log`` set, every
-transfer that moved data is logged as one line (time, size, bandwidth); the
-transfer thread only stamps times and queues a tuple, a log thread formats and
-writes them.
-"""
+"""RadixServer: the one process per node owning the index, the SlotStore, the transfer engine and the etcd entries,
+serving RadixClients over gRPC; ``waiting`` until a client's or a peer's Geometry arrives, then ``configuring`` -> ``ready``."""
 
 from __future__ import annotations
 
@@ -175,8 +155,7 @@ class ServerConfig:
         return self.endpoint or rpc.endpoint_for(self.name)
 
     def resolved_transfer_ip(self) -> str:
-        """Handshake address of the transfer engine: transfer_ip, else the control address
-        settled at preflight. "0.0.0.0" (single-host test) maps to loopback; nothing else does."""
+        """Use transfer_ip or the resolved control address, mapping only 0.0.0.0 to loopback."""
         if self.transfer_ip:
             return self.transfer_ip
         a = self.cluster.rpc_address
@@ -189,17 +168,7 @@ class ServerConfig:
 
 
 class _ServerRegistry:
-    """The server's keys under ``radix/<cluster_id>/``, as JSON.
-
-    ``geometry``: the uniform part of the cluster's geometry, ``{"geometry",
-    "lease", "node"}``. The first node to accept a geometry creates it
-    (put-if-absent, so concurrent configures cannot both win), before its
-    rendezvous (the peers it waits for at the membership gate may be waiting
-    for exactly this key). It lives on a lease every node that accepted it
-    renews, so it goes away TTL after the last of them stops.
-
-    ``nodes/<node>``: the node's record (role, rank, mode, ...), on this
-    server's own lease. Published at start and rewritten on every mode change."""
+    """The server's JSON keys under ``radix/<cluster_id>/``: ``geometry`` (put-if-absent, on a lease every acceptor renews) and ``nodes/<node>`` (this server's lease)."""
 
     _HOLD_ATTEMPTS = 10
     # The Go wrapper keeps one renewal per lease id per process; servers of one
@@ -332,14 +301,7 @@ class _Job:
 
 
 class _TransferLog:
-    """Per-transfer log lines. ``add`` (transfer thread) only appends a tuple
-    of perf_counter_ns stamps and counts; a daemon thread formats and writes
-    the queued records once per ``period_s``, and ``close`` writes the rest.
-
-    Line: ``xfer <UTC end time> peer=<rank> kind=<pool> slots=<n> desc=<n>
-    bytes=<n> us=<issue to completion> MBps=<bytes/us> wait_us=<submit to
-    issue> inflight=<batches already in flight at issue>`` plus ``op=write``
-    for a write and ``state=<..>`` when the transfer did not complete."""
+    """Queue transfer timing and counts for periodic logging, including write operations and failed states."""
 
     def __init__(self, target: str, period_s: float = 1.0):
         self._q: Deque[tuple] = deque()
@@ -424,10 +386,7 @@ class RadixServer:
     # ------------------------------------------------------------ lifecycle
 
     def start(self) -> "RadixServer":
-        """Serve the endpoint and bring up what needs no geometry (etcd, the
-        transfer engine); ``waiting`` on return. A cluster node with a data
-        plane then follows the geometry its peers publish; every server takes
-        a client's ``configure``."""
+        """Serve the endpoint and bring up what needs no geometry (etcd, the transfer engine); ``waiting`` on return."""
         self._rpc = rpc.serve({
             "Describe": lambda _: vars(self.describe()),
             "WaitReady": lambda r: vars(self.wait_ready(r["timeout_ms"] / 1000)),
@@ -719,12 +678,7 @@ class RadixServer:
         return sorted(recs, key=lambda r: (r.get("rank", -1) < 0, r.get("rank", -1), r.get("node_name", "")))
 
     def configure(self, geometry) -> NodeInfo:
-        """Take a client's geometry: validate it, plan the pools, check it
-        against the cluster's, and start the bring-up thread. Returns at once
-        (``configuring``). A server that already has a geometry only compares:
-        the same one is accepted again, a different one raises
-        ``GeometryMismatch``. ValueError on a geometry that does not fit this
-        server (wrong mode, unplannable budget)."""
+        """Validate and plan a client's geometry, check it against the cluster's and start the bring-up thread; a different second geometry raises GeometryMismatch."""
         spec = _geometry.as_spec(geometry)
         with self._cv:
             self._cv.wait_for(lambda: self._mode != MODE_STARTING)
@@ -750,7 +704,7 @@ class RadixServer:
 
     def _node_key(self) -> str:
         """This node's name under nodes/: the configured node_name, else the
-        one the index derives from its bind IP (node<ip>)."""
+        one the index derives from its published IP (node<ip>)."""
         c = self.cfg.cluster
         if c.node_name:
             return c.node_name
@@ -803,10 +757,7 @@ class RadixServer:
                     self._rejected = published
 
     def wait_ready(self, timeout_s: float) -> NodeInfo:
-        """Block until ``ready``. TimeoutError when the server is still
-        waiting for a geometry or configuring after ``timeout_s``;
-        RuntimeError when it is waiting after a failed configuration (the
-        error is ``last_error``; a new configure clears it) or closed."""
+        """Block until ``ready``: TimeoutError while still waiting or configuring, RuntimeError after a failed configuration (``last_error``) or when closed."""
         with self._cv:
             settled = lambda: (self._mode in (MODE_READY, MODE_CLOSED)  # noqa: E731
                                or (self._mode == MODE_WAITING and bool(self.last_error)))

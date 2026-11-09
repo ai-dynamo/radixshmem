@@ -1,17 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// nixl_backend — ITransferBackend over nixlAgent (backend="UCX"), compiled as
-// a C++20 island (see nixl_backend.hpp). Same validation rules as
-// mooncake_backend.cpp; the two are interchangeable behind SlotTransfer.
-//
-// NIXL differences that shape the design:
-//   - Remote metadata does not expose the peer's data-pool base/length, so
-//     open_segment() asks for it over NIXL notifications: "BUFREQ" is answered
-//     with "BUFRESP:<base>:<len>".
-//   - fetchRemoteMD/sendLocalMD are asynchronous with no completion signal, so
-//     open_segment() resends them on a timer, sends BUFREQ once checkRemoteMD
-//     succeeds, and repeats until BUFRESP arrives or it times out.
+// ITransferBackend over nixlAgent (UCX), a C++20 island with the same validation rules as mooncake_backend.cpp.
+// NIXL metadata lacks the peer's pool base/length: open_segment() asks with BUFREQ/BUFRESP notifications and resends MD on a timer.
 
 #include "nixl_backend.hpp"
 
@@ -39,10 +30,7 @@ namespace radixshmem {
 
 namespace {
 
-// How long open_segment() waits for the peer's data-pool geometry before
-// giving up. Generous: agent/connection setup on a loaded host can itself
-// take a while (UCX worker creation), and this runs once per peer, not once
-// per transfer.
+// How long open_segment() waits for the peer's pool geometry; generous because UCX setup on a loaded host is slow and this runs once per peer.
 constexpr auto kBufGeomTimeout = std::chrono::seconds(30);
 constexpr auto kBufReqRetry    = std::chrono::milliseconds(200);
 constexpr auto kMdRetry        = std::chrono::seconds(1);
@@ -196,11 +184,7 @@ bool NixlBackend::init(const TransferConfig& cfg) {
         return false;
     }
     if (self_port == 0) {
-        // Unlike Mooncake's engine, NIXL's P2P listener gives no way to read
-        // back an OS-assigned ephemeral port after binding — whatever we
-        // publish as local_segment() must be the literal port we bound, or
-        // peers connect to the wrong place. rpc_port=0 ("engine picks") is a
-        // Mooncake-only convenience; the nixl backend needs an explicit port.
+        // NIXL cannot report an OS-assigned port and the published segment must be the bound port, so rpc_port=0 is Mooncake-only.
         fprintf(stderr, "[radixshmem] NixlBackend: rpc_port=0 ('engine picks') is "
                         "not supported — pass an explicit --transfer-port for "
                         "the nixl backend\n");
@@ -228,8 +212,7 @@ bool NixlBackend::init(const TransferConfig& cfg) {
         joined += cfg.device_filter[i];
     }
     if (!joined.empty()) params["device_list"] = joined;
-    // UCX reads its own device list from the environment; which one wins cannot be read back
-    // through the agent, so a conflict is reported, not resolved.
+    // Report overlapping device settings; the agent cannot expose which UCX constraint takes precedence.
     const char* ucx_devs = ::getenv("UCX_NET_DEVICES");
     if (ucx_devs && *ucx_devs && !joined.empty())
         fprintf(stderr, "[radixshmem] NixlBackend: device_list='%s' and UCX_NET_DEVICES='%s' are both set; "

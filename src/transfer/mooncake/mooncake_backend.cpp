@@ -1,20 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// mooncake_backend — ITransferBackend over mooncake::TransferEngine.
-//
-// Compiled as a C++20 island (see mooncake_backend.hpp). It enforces the
-// registration, geometry and batch-validation rules the abstraction promises;
-// test_mooncake_loopback is where those rules are pinned down.
-//
-// Two Mooncake specifics drive the design:
-//
-//   - TransferRequest.target_offset is the peer's *absolute* virtual address,
-//     not an offset into its segment. The abstraction keeps that meaning, so
-//     addresses are computed once, by whoever knows the peer's base.
-//   - A registration longer than max_mr_size is published as several adjacent
-//     BufferDescs (rdma_transport.cpp:303). Reading only buffers[0] would
-//     silently address a fraction of a large store, so they are fused.
+// ITransferBackend over mooncake::TransferEngine (C++20 island, see mooncake_backend.hpp); its rules are pinned by test_mooncake_loopback.
+// target_offset is the peer's absolute address; a registration above max_mr_size arrives as several BufferDescs, which are fused.
 
 #include "mooncake_backend.hpp"
 
@@ -148,6 +136,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
     publish_ = cfg.publish;
 
     const bool auto_discover = cfg.protocol.empty() || cfg.protocol == "rdma";
+    std::vector<std::string> wanted = cfg.device_filter;   // what the engine must end up with
     // MC_TE_FILTERS intersects the allowlist: say what it drops, refuse only an empty result.
     if (auto_discover && !cfg.device_filter.empty()) {
         if (const char* env = ::getenv("MC_TE_FILTERS"); env && *env) {
@@ -171,6 +160,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
             if (!dropped.empty())
                 fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices %s dropped by MC_TE_FILTERS='%s'; "
                                 "the allowlist narrows to %s\n", join(dropped, "-").c_str(), env, join(kept, "-").c_str());
+            wanted = kept;
         }
     }
     if (!cfg.device_filter.empty()) {
@@ -179,10 +169,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
         engine_.reset(new mooncake::TransferEngine(auto_discover));
     }
 
-    // Under P2PHANDSHAKE the engine takes the *host* from this name and ignores
-    // its port, binding whatever it can get instead — so an empty name yields a
-    // segment called ":<port>", which no peer can resolve. Always hand it a
-    // host, and read the bound name back from getLocalIpAndPort().
+    // P2PHANDSHAKE takes only the host from this name; an empty name yields ":<port>", so always pass a host and read the bound name back.
     std::string want = cfg.local_segment;
     if (want.empty() && !cfg.ip_or_host.empty()) {
         want = cfg.ip_or_host + ":" + std::to_string(cfg.rpc_port);
@@ -204,10 +191,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
         }
     }
 
-    // Adoption diagnostics. The engine's HCA list is what its discovery kept; a device whose context
-    // failed later may stay listed, so it is reported as the engine's list, not as proven active.
-    // device_filter is an allowlist intersected with the host (a name the host lacks costs nothing),
-    // but RDMA with no HCA at all would silently run over TCP, so that is refused.
+    // Every explicitly named device must be in the engine's HCA list; reject an empty RDMA set to prevent TCP fallback.
     if (auto_discover) {
         std::vector<std::string> hcas;
         if (auto topo = engine_->getLocalTopology()) hcas = topo->getHcaList();
@@ -218,11 +202,17 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
             return false;
         }
         std::vector<std::string> absent;
-        for (const auto& d : cfg.device_filter)
+        for (const auto& d : wanted)
             if (std::find(hcas.begin(), hcas.end(), d) == hcas.end()) absent.push_back(d);
-        fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices allowed=%s engine=%s%s%s active=unverified\n",
-                join(cfg.device_filter, "all").c_str(), join(hcas, "none").c_str(),
-                absent.empty() ? "" : " absent=", absent.empty() ? "" : join(absent, "-").c_str());
+        if (!absent.empty()) {
+            fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices %s are not in the engine's HCA list (%s): "
+                            "misspelled, or the device has no usable port\n",
+                    join(absent, "-").c_str(), join(hcas, "none").c_str());
+            engine_.reset();
+            return false;
+        }
+        fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices allowed=%s engine=%s active=unverified\n",
+                join(cfg.device_filter, "all").c_str(), join(hcas, "none").c_str());
     } else {
         fprintf(stderr, "[radixshmem] MooncakeBackend: protocol %s; RDMA device constraints not applied\n",
                 cfg.protocol.c_str());
@@ -313,10 +303,7 @@ int MooncakeBackend::open_segment(const std::string& seg_name, SegmentInfo& out)
     Segment seg;
 
     if (seg_name == local_segment_) {
-        // Our own segment. Mooncake would try to hand-shake with itself and
-        // fail, and even if it worked a same-process transfer has no business
-        // going near a QP -- this is the single-node multi-DP path, where the
-        // peer's memory is simply ours.
+        // Our own segment: Mooncake cannot hand-shake with itself, and a same-process transfer is a memcpy (single-node multi-DP path).
         std::lock_guard<std::mutex> lk(mu_);
         AddrRange r{};
         if (!own_region(r)) {

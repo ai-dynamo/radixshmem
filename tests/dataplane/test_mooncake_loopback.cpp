@@ -1,26 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// test_mooncake_loopback — MooncakeBackend against a real TransferEngine.
-//
-//   - self segment: same-process transfers short-circuit to memcpy rather than
-//     hand-shaking with themselves (which Mooncake cannot do anyway)
-//   - validation: a malformed descriptor rejects the whole batch, and nothing
-//     in it is issued
-//   - loopback: two processes, one publishing and one initiator-only, moving
-//     bytes both directions over rdma and over tcp
-//   - device filter: the same loopback with both endpoints pinned to one named
-//     HCA, which is how the data plane is kept off the management NIC
-//   - scatter addressing: a multi-descriptor batch lands byte for byte where a
-//     plain memcpy of the same slot pairs would put it
-//
-// Every engine lives inside a forked child. An ibverbs context does not survive
-// fork(), so a parent that had built an engine could not safely fork children
-// that build their own -- the parent here never touches one.
-//
-// Without RDMA hardware (or without Mooncake compiled in) the engine cannot come
-// up; those cases report SKIP instead of failing, so the suite still runs on a
-// plain host.
+// MooncakeBackend against a real TransferEngine: self segment, batch validation, two-process loopback (rdma/tcp), device filter, scatter addressing.
+// Every engine lives in a forked child (an ibverbs context does not survive fork()); without RDMA or Mooncake the cases SKIP.
 
 #include "data_test_utils.h"
 #include "slot_store.h"
@@ -351,10 +333,7 @@ static void test_loopback_tcp() {
 }
 
 // ==================================================================
-// device_filter is what keeps the data plane on the east-west fabric: without
-// it the engine may pick the management NIC on one end and a fabric HCA on the
-// other, and that pair never reaches RTR. Pinning both endpoints to one named
-// HCA is the deterministic case -- they cannot land on different planes.
+// device_filter keeps both endpoints on one named HCA; a management-NIC / fabric pair never reaches RTR.
 static void test_device_filter() {
     TEST_BEGIN("device_filter pins both endpoints to one named HCA");
     if (!mooncake_available()) { TEST_SKIP("no Mooncake engine"); return; }
@@ -363,10 +342,11 @@ static void test_device_filter() {
 
     assert(run_loopback("rdma", "dev1", {devs[0]}));
 
-    // A list, and one entry that does not exist: the filter is an allowlist
-    // intersected with what the host has, not a list of requirements, so the
-    // real device survives and the transfers still land.
-    assert(run_loopback("rdma", "dev2", {devs[0], "mlx5_no_such_device"}));
+    // An entry the host does not have is an error: the list is explicit, and a
+    // misspelled name must not hand the data plane to the other entry.
+    assert(child_succeeds([&] {
+        assert(!create_transfer_backend(mc_cfg(true, "rdma", 0, {devs[0], "mlx5_no_such_device"})));
+    }));
 
     TEST_PASS();
 }
@@ -376,10 +356,7 @@ static void test_scatter_addressing() {
     TEST_BEGIN("a scattered multi-descriptor batch lands exactly where memcpy would");
     if (!mooncake_available()) { TEST_SKIP("no Mooncake engine"); return; }
 
-    // The reference is a memcpy model of the same slot pairs, computed here.
-    // A divergence means the backend mis-addresses a slot — the failure mode a
-    // single-descriptor test cannot see, because one wrong base still round
-    // trips against itself.
+    // A memcpy model of the same slot pairs is the reference; a divergence is a mis-addressed slot, invisible to a single-descriptor test.
     const int32_t src_slots[] = {0, 5, 6, 7, 31};
     const int32_t dst_slots[] = {20, 21, 22, 8, 19};
     const int n = 5;

@@ -1,11 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// RadixServer — public server surface. Owns the shm region + radix tree, runs the
-// background evictor, and (distributed) brings up the RDMA/XRC/RHT cluster plane +
-// remote-op control plane. The embedded eviction service borrows LocalTreeConnector
-// into an rht_only RadixClient. This TU is the sole home of the heavy RDMA headers;
-// radix_server.h stays verbs-free for the python bindings + tests.
+// RadixServer: owns the shm region and radix tree, runs the evictor and (distributed) the RDMA/XRC/RHT and remote-op planes.
+// Sole home of the heavy RDMA headers; radix_server.h stays verbs-free for the bindings and tests.
 
 #include "radix_server.h"
 
@@ -237,7 +234,7 @@ void RadixServer::fill_local_entry(PeerEntry& e) const {
     e.rank = cfg_.rank;
     e.rht_shard_id = -1;   // overwritten by setup_local_rht_shard on holders
 
-    const char* host = bind_ip_.empty() ? "127.0.0.1" : bind_ip_.c_str();
+    const char* host = publish_ip_.empty() ? "127.0.0.1" : publish_ip_.c_str();
     std::strncpy(e.host, host, sizeof(e.host) - 1);
     e.xrc_listen_port = actual_listen_port_;
 
@@ -574,7 +571,7 @@ bool RadixServer::cluster_bootstrap() {
     if (cfg_.registry.empty()) return true;   // standalone — caller bypasses
 
     const char* dev = cfg_.index_dev.empty() ? nullptr : cfg_.index_dev.c_str();
-    ctx_  = std::make_unique<RdmaContext>(dev, cfg_.index_port > 0 ? cfg_.index_port : 1, cfg_.gid_idx);
+    ctx_  = std::make_unique<RdmaContext>(dev, cfg_.index_port, cfg_.gid_idx);
     xrcd_ = std::make_unique<RdmaXrcd>(*ctx_);
     // cq_ dormant under one-sided traffic; exists only because XRC SRQ/RECV QPs need one.
     cq_   = ibv_create_cq(ctx_->ctx(), 256, nullptr, nullptr, 0);
@@ -692,12 +689,8 @@ RadixServer::~RadixServer() {
 
 #ifndef RADIXSHMEM_NO_RDMA
 std::string resolve_cluster_net(RadixServerConfig& cfg) {
-    if (const char* value = ::getenv("RADIXSHMEM_RHT_TRANSPORT"))
-        cfg.rht_transport = value;
     if (const char* value = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
         cfg.peer_index_transport = value;
-    if (const char* value = ::getenv("RADIXSHMEM_RHT_SLOTS"))
-        cfg.rht_slots_per_bucket = atoi(value);
     if (const char* value = ::getenv("RADIXSHMEM_REGISTRY"))
         cfg.registry = value;
     if (const char* value = ::getenv("RADIXSHMEM_CLUSTER_ID"))
@@ -711,11 +704,19 @@ std::string resolve_cluster_net(RadixServerConfig& cfg) {
     in.rpc_interface = cfg.rpc_interface;
     in.rpc_address   = cfg.rpc_address;
     in.registry_host = registry_host_of(cfg.registry);
-    in.need_dc       = cfg.rht_transport == "dc" || cfg.peer_index_transport == "dc";
+    const char* rht_backend = ::getenv("RADIXSHMEM_RHT_BACKEND");
+    const char* rht_transport = ::getenv("RADIXSHMEM_RHT_TRANSPORT");
+    in.need_dc = cfg.peer_index_transport == "dc" ||
+                 (rht_backend && std::strcmp(rht_backend, "rdma") == 0 &&
+                  rht_transport && std::strcmp(rht_transport, "dc") == 0);
     const NetSelection sel = resolve_net(in);
     if (sel.control_ip.empty())
         throw std::runtime_error("net: no IPv4 control address to publish (index " + sel.index.device + " gid " +
                                  std::to_string(sel.index.gid_index) + "); set rpc_address or rpc_interface");
+    // Every unnamed server on the host would become node0.0.0.0 and share its shm name.
+    if (sel.control_ip == "0.0.0.0" && cfg.node_name.empty())
+        throw std::runtime_error("net: publishing 0.0.0.0 needs a node_name (or RADIXSHMEM_NODE_NAME): "
+                                 "the identity derived from the address is the same for every node on the host");
     cfg.index_dev   = sel.index.device;
     cfg.index_port  = sel.index.port;
     cfg.gid_idx     = sel.index.gid_index;
@@ -738,22 +739,22 @@ bool RadixServer::bootstrap() {
     shm.max_nodes = shm.effective_max_nodes();
 
     // Resolve network settings before publishing or dialing any cluster address.
-    std::string bind_ip;
+    std::string publish_ip;
 #ifndef RADIXSHMEM_NO_RDMA
     if (distributed) {
         const std::string net = resolve_cluster_net(cfg_);
         fprintf(stderr, "[RadixServer] net: %s\n", net.c_str());
-        bind_ip = cfg_.rpc_address;
+        publish_ip = cfg_.rpc_address;
     } else
 #endif
     {
-        bind_ip = resolve_bind_ip(cfg_.rpc_address, cfg_.rpc_interface);
+        publish_ip = resolve_publish_ip(cfg_.rpc_address, cfg_.rpc_interface);
     }
 
-    // Node identity: explicit node_name, else derived from the bind IP (node<ip>).
+    // Node identity: explicit node_name, else derived from the published IP (node<ip>).
     std::string node_name = cfg_.node_name;
     if (node_name.empty())
-        node_name = "node" + bind_ip;
+        node_name = "node" + publish_ip;
     cfg_.node_name = node_name;
 
     // Shm name is identity-based; multiple nodes on one host disambiguate by identity.
@@ -770,7 +771,7 @@ bool RadixServer::bootstrap() {
 
 #ifndef RADIXSHMEM_NO_RDMA
     if (distributed) {
-        bind_ip_ = bind_ip;   // published as PeerEntry.host
+        publish_ip_ = publish_ip;   // published as PeerEntry.host
 
         if (!cluster_bootstrap()) {
             rc_stop();   // endpoint lives on ctx_ — destroy BEFORE tree_/ctx_

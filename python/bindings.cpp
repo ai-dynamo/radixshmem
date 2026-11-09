@@ -257,9 +257,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("registry", &RadixServerConfig::registry)
         .def_readwrite("cluster_id", &RadixServerConfig::cluster_id)
         .def_readwrite("node_name", &RadixServerConfig::node_name)
-        // Distributed-mode control address peers connect to ("0.0.0.0" for a single-node
-        // test). rpc_interface resolves the IP from a NIC and wins over rpc_address; both
-        // empty = the index GID's IPv4 (resolve_cluster_net writes the result back).
+        // Control IPv4 resolved from interface/address settings, the index GID, or the registry route.
         .def_readwrite("rpc_address", &RadixServerConfig::rpc_address)
         .def_readwrite("rpc_interface", &RadixServerConfig::rpc_interface)
         // Bootstrap / XRC listen port; 0 = OS-assigned (the real port is published).
@@ -289,8 +287,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
 
 #ifndef RADIXSHMEM_NO_RDMA
-    // Settle index_dev / gid_idx / rpc_address in place from the local devices (explicit values
-    // validated and kept); returns the summary line, raises with the candidates when ambiguous.
+    // Resolve network settings in place; return a summary or raise on invalid or ambiguous choices.
     m.def("resolve_cluster_net", &resolve_cluster_net, py::arg("cfg"));
 #endif
 
@@ -555,10 +552,7 @@ PYBIND11_MODULE(_core, m) {
         });
 
 #ifdef RADIXSHMEM_HAS_ETCD
-    // ==================== EtcdKv ====================
-    // Plain key/value access to the cluster's etcd, sharing the process-global
-    // connection with RadixServer / DataPlaneRegistry. Values are text (JSON,
-    // base64). Used by radixshmem.server for radix/<cluster_id>/geometry and nodes/<node>.
+    // ==================== EtcdKv: text key/value access to the cluster's etcd over the process-global connection ====================
 
     py::class_<etcd::Client>(m, "EtcdKv")
         .def(py::init([](const std::string& registry) {

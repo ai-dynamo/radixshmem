@@ -1,22 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""radixshmem._data binding tests — the data plane from Python.
-
-The C++ suite (test_slot_store, test_slot_transfer_e2e) owns the functional
-coverage. These tests assert that the binding surface carries it faithfully:
-   - geometry and lifetime come through as Python attributes,
-   - slot views are windows onto the mapping, not copies,
-   - slot lists map to the right C++ parameters, and coalescing is observable
-     from Python (read/write's descriptor count) exactly as it is from C++,
-   - a real two-process transfer, driven entirely from Python, moves the same
-     bytes into the same slots as the C++ end-to-end test does.
-
-Everything past the store tests needs a transfer backend, and the only backend
-is Mooncake, so those tests fork: an ibverbs context does not survive fork(), so
-every engine is built inside a child and the parent never touches one. They SKIP
-when no Mooncake engine can come up on this host.
-"""
+"""radixshmem._data binding tests: the C++ suite owns the functional coverage, these check the binding carries it (geometry
+attributes, slot views as windows, slot lists and coalescing, a two-process transfer). Engines live in forked children; SKIP without Mooncake."""
 
 import os
 import struct
@@ -264,10 +250,7 @@ def test_pools_aligned_with_index():
 
 
 # ==================================================================
-# Two processes over a real engine. Mirrors tests/dataplane/
-# test_slot_transfer_e2e.cpp: same pattern, same slot lists, same expected
-# descriptor counts — the point being that the Python path lands on the same
-# bytes in the same slots.
+# Two processes over a real engine, mirroring tests/dataplane/test_slot_transfer_e2e.cpp: same slots, descriptor counts and bytes.
 PUSH_LOCAL = [40, 41, 42, 50]
 PUSH_REMOTE = [60, 61, 62, 55]
 READ_RUN = 16

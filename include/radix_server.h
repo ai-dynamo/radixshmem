@@ -56,8 +56,7 @@ struct RadixServerConfig {
     // rank: etcd-assigned dense rank, filled after bootstrap.
     int          rank        = 0;
     int          world_size  = 1;   // observed count(/peers) overrides at bootstrap
-    // Index-plane RDMA device, port and GID index. Empty / 0 / -1 = chosen from the local devices at
-    // bootstrap (net_discovery); explicit values are constraints. All are written back resolved.
+    // Device / port / GID: empty / 0 / -1 are resolved at bootstrap; explicit values constrain selection.
     std::string  index_dev;
     int          index_port  = 0;
     int          gid_idx     = -1;
@@ -66,8 +65,7 @@ struct RadixServerConfig {
     // killed node's keys, or a fully stopped cluster's /config, outlive it.
     int          lease_ttl_sec = 30;
 
-    // Control-plane address published to peers: rpc_interface's IPv4 wins over rpc_address; both
-    // empty = the index GID's IPv4. Written back resolved into rpc_address.
+    // Resolve the control IPv4 from explicit settings, the index GID, or the registry route into rpc_address.
     std::string  rpc_address;              // explicit IPv4, e.g. "192.168.1.11"
     std::string  rpc_interface;            // NIC name, e.g. "eth0"
     uint16_t     rpc_port    = 0;          // 0 = OS-assigned bootstrap / XRC listen port
@@ -87,8 +85,7 @@ struct RadixServerConfig {
 };
 
 #ifndef RADIXSHMEM_NO_RDMA
-// Settle index_dev / gid_idx / rpc_address in place from the local devices (explicit values are
-// validated and kept) and return the one-line summary; throws with the candidates when ambiguous.
+// Resolve cluster network settings in place and return a summary; throw on invalid or ambiguous choices.
 std::string resolve_cluster_net(RadixServerConfig& cfg);
 #endif
 
@@ -171,7 +168,7 @@ private:
     std::mutex                     svc_client_mu_;
 
     // ---- cluster bring-up ----
-    std::string bind_ip_;   // published as PeerEntry.host
+    std::string publish_ip_;   // PeerEntry.host; listeners bind the wildcard address
 #ifdef RADIXSHMEM_HAS_ETCD
     std::unique_ptr<EtcdRegistry> registry_;   // holds the lease for the server's lifetime
 #endif
