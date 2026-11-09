@@ -427,7 +427,6 @@ bool EtcdRegistry::join_existing(std::vector<PeerEntry>& out) {
     impl_->cli.put(K.shm(node_name_), shm_name_, lease_id_);
     impl_->cli.put(K.ready(node_name_), "1", lease_id_);
     rs_.cfg_.world_size = world;
-    rs_.drop_stale_routes(false);
     rs_.stamp_shm_ready(my_rank, world);
 
     fprintf(stderr, "[EtcdRegistry %s] joined as rank %d (data peer, %d nodes)\n",
