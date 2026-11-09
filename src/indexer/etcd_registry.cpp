@@ -236,8 +236,7 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     // Membership gate: at least max(RDMA RHT shards, expected_min_nodes) nodes, stable.
     int gate = std::max(rs_.rht_min_nodes(), rs_.cfg_.expected_min_nodes);
     if (gate < 1) gate = 1;
-    int n_obs = await_membership(gate);
-    if (n_obs < 0) {
+    if (await_membership(gate) < 0) {
         fprintf(stderr, "[EtcdRegistry leader] membership gate timeout "
                 "(%ld/%d peers)\n",
                 (long)impl_->cli.count(K.peers_prefix()), gate);
@@ -252,8 +251,9 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
 
     // Assign dense ranks by sorted /peers key order (deterministic).
     auto peers = impl_->cli.get_prefix(K.peers_prefix());
-    for (size_t i = 0; i < peers.size(); i++)
-        impl_->cli.put(K.rank_slot((int)i), leaf(peers[i].key), cluster_lease_);
+    const int ranks = (int)peers.size();
+    for (int i = 0; i < ranks; i++)
+        impl_->cli.put(K.rank_slot(i), leaf(peers[i].key), cluster_lease_);
 
     // Learn our own rank, then resolve the authoritative shard map.
     int my_rank = read_my_rank();
@@ -264,13 +264,13 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     rs_.cfg_.rank = my_rank;
 
     // RHT min-node barrier: never build a partial shard set.
-    if (rs_.rht_min_nodes() > 0 && n_obs < rs_.rht_min_nodes()) {
+    if (rs_.rht_min_nodes() > 0 && ranks < rs_.rht_min_nodes()) {
         fprintf(stderr, "[EtcdRegistry leader] node count %d < RADIXSHMEM_RHT_SHARDS %d — "
-                "refusing RHT bring-up\n", n_obs, rs_.rht_min_nodes());
+                "refusing RHT bring-up\n", ranks, rs_.rht_min_nodes());
         return false;
     }
 
-    rs_.resolve_shard_map(n_obs);
+    rs_.resolve_shard_map(ranks);
 
     ShardMapMsg sm{};
     sm.magic         = CLUSTER_SHARDMAP_MAGIC;

@@ -311,7 +311,7 @@ void RadixServer::read_rht_env() {
     rht_env_ = e;
 }
 
-void RadixServer::resolve_shard_map(int n_obs) {
+void RadixServer::resolve_shard_map(int ranks) {
     // Authoritative on the leader; other ranks overwrite from the broadcast map.
     rdma_sl_ = ctx_->sl();
     rdma_tc_ = ctx_->traffic_class();
@@ -343,19 +343,19 @@ void RadixServer::resolve_shard_map(int n_obs) {
     }
 
     int M = rht_env_.rdma.shards;
-    if (M <= 0) M = n_obs;                           // M == N
+    if (M <= 0) M = ranks;                           // M == N
     if (M > (int)CLUSTER_MAX_SHARDS) M = CLUSTER_MAX_SHARDS;
-    if (M > n_obs)                                   // can't have more holders than nodes
+    if (M > ranks)                                   // can't have more holders than nodes
         throw std::runtime_error("RadixServer: RADIXSHMEM_RHT_SHARDS (" + std::to_string(M) +
-                                 ") exceeds node count (" + std::to_string(n_obs) + ")");
+                                 ") exceeds node count (" + std::to_string(ranks) + ")");
     num_shards_ = M;
 
     const std::vector<int>& holders = rht_env_.rdma.holders;
     for (int h : holders)
-        if (h >= n_obs)
+        if (h >= ranks)
             throw std::runtime_error("RadixServer: RADIXSHMEM_RHT_SHARD_HOLDERS names rank " +
                                      std::to_string(h) + ", but the ranks are 0.." +
-                                     std::to_string(n_obs - 1));
+                                     std::to_string(ranks - 1));
     holder_of_shard_.assign(M, 0);
     for (int s = 0; s < M; s++)   // round-robin over the candidates, default ranks [0, M)
         holder_of_shard_[s] = holders.empty() ? s : holders[s % holders.size()];
@@ -365,7 +365,7 @@ void RadixServer::resolve_shard_map(int n_obs) {
     // module's business; it applies the same rule on holder and consumer.
     auto* hdr = static_cast<ShmHeader*>(tree_->shm_base());
     uint64_t R = hdr->node_pool_capacity;
-    uint64_t per_shard = (2 * R * (uint64_t)n_obs) / (uint64_t)M;
+    uint64_t per_shard = (2 * R * (uint64_t)ranks) / (uint64_t)M;
     rht_capacity_ = per_shard > UINT32_MAX ? UINT32_MAX : (uint32_t)per_shard;
 
     for (int s = 0; s < M; s++) {

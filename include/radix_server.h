@@ -232,7 +232,7 @@ private:
     void fill_local_entry(PeerEntry& e) const;
     int  register_chunk_size() const;
     void read_rht_env();
-    void resolve_shard_map(int n_obs);
+    void resolve_shard_map(int ranks);
     void adopt_shard_map(const ShardMapMsg& sm);
     // First field where `sm` disagrees with this node's own settings, "" if none.
     std::string shard_map_mismatch(const ShardMapMsg& sm) const;
