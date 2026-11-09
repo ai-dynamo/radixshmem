@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace radixshmem {
 
@@ -21,6 +22,9 @@ struct RedisRhtConfig {
     // first_hash; checked before a write held back by a down master is sent.
     std::function<bool(uint64_t first_hash, uint32_t tree_node_id)> live;
     int         retry_secs = 30;   // a reset or clear gives up after this long
+    // This rank's routes. When set, a master that restarted (new run_id, so
+    // empty) gets those in its slots again.
+    std::function<std::vector<RhtInsertEntry>()> routes;
 };
 
 // One HASH per key, field = rank. AUTH uses RADIXSHMEM_REDIS_PASSWORD when

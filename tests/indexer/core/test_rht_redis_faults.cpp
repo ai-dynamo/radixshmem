@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -79,7 +80,8 @@ static bool reachable(int port) {
     return ok;
 }
 
-// Node i as a child that the kernel kills when the test dies, however it dies.
+// Node i as a child that the kernel kills when the test dies, however it dies;
+// a restarted node keeps its directory, so its nodes.conf.
 static pid_t start_node(int i) {
     const std::string port = std::to_string(g_port[i]), dir = g_dir + "/" + port;
     const std::string conf = dir + "/nodes.conf", log = dir + "/redis.log";
@@ -91,7 +93,7 @@ static pid_t start_node(int i) {
                           "--save", "", "--appendonly", "no", "--maxmemory", "2gb",
                           "--maxmemory-policy", "allkeys-lru", "--dir", dir.c_str(),
                           "--logfile", log.c_str(), nullptr};
-    if (::mkdir(dir.c_str(), 0700) != 0) return -1;
+    if (::mkdir(dir.c_str(), 0700) != 0 && errno != EEXIST) return -1;
     const pid_t parent = ::getpid();
     const pid_t pid = ::fork();
     if (pid == 0) {
@@ -200,17 +202,22 @@ static std::string prefix_of(const char* tag) {
     return "rsh:test_rht_redis_faults_" + std::to_string(::getpid()) + "_" + tag + ":";
 }
 
+static int slot_of(const std::string& prefix, uint64_t key) {
+    char name[128];
+    snprintf(name, sizeof(name), "%s%016llx", prefix.c_str(), (unsigned long long)key);
+    uint16_t crc = 0;
+    for (const char* q = name; *q; q++) {
+        crc ^= (uint16_t)((uint8_t)*q << 8);
+        for (int b = 0; b < 8; b++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    return crc & 16383;
+}
+
 // Index of the first key from `from` on whose Redis key falls in slots [lo, hi].
 static uint64_t index_in_slots(const std::string& prefix, int lo, int hi, uint64_t from) {
     for (uint64_t i = from;; i++) {
-        char name[128];
-        snprintf(name, sizeof(name), "%s%016llx", prefix.c_str(), (unsigned long long)key_of(i));
-        uint16_t crc = 0;
-        for (const char* q = name; *q; q++) {
-            crc ^= (uint16_t)((uint8_t)*q << 8);
-            for (int b = 0; b < 8; b++) crc = (crc & 0x8000) ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
-        }
-        if ((crc & 16383) >= lo && (crc & 16383) <= hi) return i;
+        const int s = slot_of(prefix, key_of(i));
+        if (s >= lo && s <= hi) return i;
     }
 }
 
@@ -428,6 +435,48 @@ static void test_reset_held_remove() {
     TEST_PASS();
 }
 
+static void test_master_restart() {
+    TEST_BEGIN("a master that restarts empty gets the routes of a rank that lists them again");
+    const std::string prefix = prefix_of("restart");
+    std::vector<RhtInsertEntry> mine(kKeys), theirs(kKeys);
+    std::vector<uint64_t> keys(kKeys);
+    int restarted = 0;   // keys in the slots of master 1, 5461-10922
+    for (int i = 0; i < kKeys; i++) {
+        keys[i] = key_of(i);
+        mine[i] = {keys[i], 1, (uint32_t)i, 4};
+        theirs[i] = {keys[i], 2, (uint32_t)i, 4};
+        const int s = slot_of(prefix, keys[i]);
+        restarted += s >= 5461 && s <= 10922;
+    }
+    RedisRhtConfig cfg{g_seeds, prefix, 50};
+    cfg.routes = [&] { return mine; };
+    auto rht = make_redis_rht(cfg, 1, nullptr);
+    auto plain = make_redis_rht({g_seeds, prefix, 50}, 2, nullptr);
+    rht->insert_batch(mine.data(), kKeys);
+    rht->flush();
+    plain->insert_batch(theirs.data(), kKeys);
+    plain->flush();
+    pause_for(1.5);   // rht has seen every master's run_id
+    ::kill(g_pid[1], SIGKILL);
+    ::waitpid(g_pid[1], nullptr, 0);
+    g_pid[1] = start_node(1);   // back within the node timeout, still the master of its slots
+    std::vector<std::vector<RHTValue>> res(kKeys);
+    auto routes_of = [&](int rank) {
+        int n = 0;
+        for (auto& r : res)
+            for (auto& v : r) n += v.node_id == rank;
+        return n;
+    };
+    for (int t = 0; t < 150; t++) {
+        pause_for(0.1);
+        rht->lookup_batch(keys.data(), kKeys, res.data());
+        if (routes_of(1) == kKeys) break;
+    }
+    assert(routes_of(1) == kKeys);
+    assert(restarted > 0 && routes_of(2) == kKeys - restarted);
+    TEST_PASS();
+}
+
 static void test_failover() {
     TEST_BEGIN("a killed master's replica takes over; writes held meanwhile land after");
     PeerFaultCounters c{};
@@ -511,6 +560,7 @@ int main() {
     test_killed_connections();
     test_slow_master_write();
     test_reset_held_remove();
+    test_master_restart();
     test_failover();
     stop_cluster();
     return tests_report();

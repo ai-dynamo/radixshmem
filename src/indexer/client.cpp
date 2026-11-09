@@ -244,6 +244,14 @@ void RadixClient::bootstrap_cluster() {
             rc.live = [this](uint64_t first_hash, uint32_t tree_node_id) {
                 return local_->tree().node_head_matches(tree_node_id, first_hash);
             };
+        if (local_ && cfg_.rht_only)   // the radix-server's client, one per rank
+            rc.routes = [this] {
+                const int32_t rank = peer_reg_->my_rank();
+                std::vector<RhtInsertEntry> out;
+                for (const NodeHead& h : local_->tree().node_heads())
+                    out.push_back({h.first_hash, rank, h.tree_node_id, h.num_blocks});
+                return out;
+            };
         rht_ = make_redis_rht(rc, peer_reg_->my_rank(), peer_faults());
     } else
         rht_ = std::make_unique<RdmaRht>(sm, *tx_, *peer_reg_, peer_faults(),

@@ -97,6 +97,11 @@ void put_u32(char* p, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (char)(v >> (8 * i));
 }
 
+void put_hex16(char* p, uint64_t k) {
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 15; i >= 0; i--, k >>= 4) p[i] = hex[k & 15];
+}
+
 uint32_t get_u32(const char* p) {
     uint32_t v = 0;
     for (int i = 0; i < 4; i++) v |= (uint32_t)(uint8_t)p[i] << (8 * i);
@@ -187,19 +192,23 @@ struct Master {
     Endpoint ep;
     std::atomic<bool> down{false};
     std::atomic<uint32_t> gen{0};    // bumped each time the master goes down
+    std::string run_id;              // last seen; maintenance thread only
 };
 
 // Masters, slot owners and health, shared by every connection of one RedisRht.
-// A maintenance thread refreshes the slot map and probes the masters that are
-// down; requests only read.
+// A maintenance thread refreshes the slot map, probes the masters that are
+// down and, given `restarted`, watches for masters that restarted; requests
+// only read.
 class ClusterView {
 public:
     using SlotMap = std::vector<int16_t>;
+    using Restarted = std::function<void(const std::vector<int>& slots)>;
 
-    ClusterView(const RedisRhtConfig& cfg, PeerBreaker& breaker, std::string who)
+    ClusterView(const RedisRhtConfig& cfg, PeerBreaker& breaker, std::string who,
+                Restarted restarted = {})
         : seeds_(parse_seeds(cfg.seeds)), timeout_ms_(std::max(cfg.timeout_ms, 200)),
-          breaker_(breaker), who_(std::move(who)), masters_(new Master[kMaxMasters]),
-          slots_(std::make_shared<SlotMap>(16384, -1)) {
+          breaker_(breaker), who_(std::move(who)), restarted_(std::move(restarted)),
+          masters_(new Master[kMaxMasters]), slots_(std::make_shared<SlotMap>(16384, -1)) {
         stale_ = !refresh();
         thread_ = std::thread([this] { run(); });
     }
@@ -211,6 +220,8 @@ public:
         }
         cv_.notify_one();
         thread_.join();
+        for (redisContext* c : watch_)
+            if (c) redisFree(c);
     }
 
     ClusterView(const ClusterView&) = delete;
@@ -254,7 +265,7 @@ public:
 
 private:
     void run() {
-        auto next_refresh = Clock::now();
+        auto next_refresh = Clock::now(), next_watch = Clock::now();
         int backoff_ms = 200;
         std::unique_lock<std::mutex> lk(mu_);
         while (!stop_) {
@@ -273,6 +284,10 @@ private:
             }
             for (int id : down)
                 if (breaker_.gate(id) == PeerBreaker::Gate::PROBE) probe(id);
+            if (restarted_ && Clock::now() >= next_watch) {
+                watch();
+                next_watch = Clock::now() + std::chrono::seconds(1);
+            }
             lk.lock();
         }
     }
@@ -373,6 +388,60 @@ private:
         ups_.fetch_add(1, std::memory_order_acq_rel);
     }
 
+    // A master that answers with a new run_id restarted, without persistence
+    // empty; once it takes writes again its slots go to restarted_.
+    void watch() {
+        const std::shared_ptr<const SlotMap> map = slots();
+        std::vector<std::vector<int>> owned(count_.load(std::memory_order_acquire));
+        for (int s = 0; s < 16384; s++)
+            if ((*map)[s] >= 0 && (*map)[s] < (int)owned.size()) owned[(*map)[s]].push_back(s);
+        if (watch_.size() < owned.size()) watch_.resize(owned.size(), nullptr);
+        for (int id = 0; id < (int)owned.size(); id++) {
+            if (owned[id].empty() || down(id)) continue;
+            std::string run_id;
+            bool master = false, writable = false;
+            if (!run_id_of(id, run_id, master, writable)) continue;
+            std::string& last = masters_[id].run_id;
+            if (run_id == last || (!last.empty() && master && !writable)) continue;
+            if (!last.empty() && master) {
+                fprintf(stderr, "%s: %s restarted; sending the routes in its %zu slots again\n",
+                        who_.c_str(), masters_[id].ep.str().c_str(), owned[id].size());
+                restarted_(owned[id]);
+            }
+            last = run_id;
+        }
+    }
+
+    // Master id's run_id, whether it is a master and whether its cluster state
+    // is ok, over a connection kept for this; false if it did not answer.
+    bool run_id_of(int id, std::string& run_id, bool& master, bool& writable) {
+        SigpipeBlock pipe;
+        redisContext*& c = watch_[id];
+        std::string err;
+        if (!c && !(c = open_conn(masters_[id].ep, timeout_ms_, err))) return false;
+        redisAppendCommand(c, "INFO server");
+        redisAppendCommand(c, "ROLE");
+        redisAppendCommand(c, "CLUSTER INFO");
+        redisReply* r[3] = {};
+        bool read = true;
+        for (redisReply*& x : r) read = read && redisGetReply(c, (void**)&x) == REDIS_OK;
+        if (read && r[0]->type == REDIS_REPLY_STRING)
+            if (const char* p = std::strstr(r[0]->str, "run_id:"))
+                run_id.assign(p + 7, std::strcspn(p + 7, "\r\n"));
+        master = read && r[1]->type == REDIS_REPLY_ARRAY && r[1]->elements > 0 &&
+                 r[1]->element[0]->type == REDIS_REPLY_STRING &&
+                 !std::strcmp(r[1]->element[0]->str, "master");
+        writable = read && r[2]->type == REDIS_REPLY_STRING &&
+                   std::strstr(r[2]->str, "cluster_state:ok");
+        for (redisReply* x : r)
+            if (x) freeReplyObject(x);
+        if (!read) {
+            redisFree(c);
+            c = nullptr;
+        }
+        return !run_id.empty();
+    }
+
     // Only the maintenance thread (and the constructor before it) adds masters.
     int id_of(const Endpoint& ep) {
         int n = count_.load(std::memory_order_relaxed);
@@ -389,6 +458,7 @@ private:
     const int timeout_ms_;   // background connects and commands
     PeerBreaker& breaker_;
     const std::string who_;
+    const Restarted restarted_;
     std::unique_ptr<Master[]> masters_;
     std::atomic<int> count_{0};
     mutable std::mutex mu_;
@@ -399,6 +469,7 @@ private:
     std::atomic<uint64_t> ups_{0};       // probes that found a master up
     std::atomic<bool> stale_{false};
     bool stop_ = false;
+    std::vector<redisContext*> watch_;   // by master id; maintenance thread only
     std::thread thread_;
 };
 
@@ -457,9 +528,7 @@ public:
 
     // The master serving k in this batch's map, or -1; counts nothing.
     int owner(uint64_t k) {
-        static const char hex[] = "0123456789abcdef";
-        char* p = &key_[key_.size() - 16];
-        for (int i = 15; i >= 0; i--, k >>= 4) p[i] = hex[k & 15];
+        put_hex16(&key_[key_.size() - 16], k);
         return (*slots_)[key_slot(key_.data(), key_.size())];
     }
 
@@ -699,8 +768,22 @@ public:
         : cfg_(cfg), my_rank_(my_rank),
           who_(my_rank >= 0 ? "[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT"
                             : std::string("[RadixClient] Redis RHT")),
-          breaker_(who_, faults, 200, 2000), view_(cfg, breaker_, who_),
-          writer_(view_, cfg, true) {}
+          breaker_(who_, faults, 200, 2000),
+          view_(cfg, breaker_, who_,
+                cfg.routes ? ClusterView::Restarted([this](const std::vector<int>& s) { lost(s); })
+                           : ClusterView::Restarted()),
+          writer_(view_, cfg, true) {
+        if (cfg_.routes) republisher_ = std::thread([this] { republish_loop(); });
+    }
+
+    ~RedisRht() override {
+        {
+            std::lock_guard<std::mutex> g(lost_mu_);
+            stop_ = true;
+        }
+        lost_cv_.notify_one();
+        if (republisher_.joinable()) republisher_.join();
+    }
 
     void insert_batch(const RhtInsertEntry* e, int count) override {
         write_batch(e, count, Op::RHT_WRITE, [](const RhtInsertEntry& x) {
@@ -1034,6 +1117,51 @@ private:
         }
     }
 
+    void lost(const std::vector<int>& slots) {
+        std::lock_guard<std::mutex> g(lost_mu_);
+        for (int s : slots) lost_[s] = 1;
+        lost_any_ = true;
+        lost_cv_.notify_one();
+    }
+
+    // Waits a second after a restart so that the restarts close to it go in one pass.
+    void republish_loop() {
+        std::unique_lock<std::mutex> lk(lost_mu_);
+        while (true) {
+            lost_cv_.wait(lk, [&] { return stop_ || lost_any_; });
+            if (lost_cv_.wait_for(lk, std::chrono::seconds(1), [&] { return stop_.load(); }))
+                return;
+            std::vector<char> slots(16384, 0);
+            slots.swap(lost_);
+            lost_any_ = false;
+            lk.unlock();
+            republish(slots);
+            lk.lock();
+        }
+    }
+
+    void republish(const std::vector<char>& slots) {
+        const auto t0 = Clock::now();
+        std::string key = cfg_.key_prefix + std::string(16, '0');
+        std::vector<RhtInsertEntry> todo;
+        for (const RhtInsertEntry& e : cfg_.routes()) {
+            put_hex16(&key[key.size() - 16], e.key);
+            if (slots[key_slot(key.data(), key.size())]) todo.push_back(e);
+        }
+        size_t sent = 0;
+        for (size_t b = 0; b < todo.size() && !stop_; b += kChunk) {
+            std::vector<RhtInsertEntry> chunk;
+            for (size_t i = b; i < std::min(b + kChunk, todo.size()); i++)
+                if (!cfg_.live || cfg_.live(todo[i].key, todo[i].tree_node_id))
+                    chunk.push_back(todo[i]);
+            insert_batch(chunk.data(), (int)chunk.size());
+            flush();
+            sent += chunk.size();
+        }
+        fprintf(stderr, "%s: sent %zu routes again in %.1f s\n", who_.c_str(), sent,
+                secs_since(t0));
+    }
+
     std::unique_ptr<Conn> acquire() {
         {
             std::lock_guard<std::mutex> g(pool_mu_);
@@ -1055,6 +1183,11 @@ private:
     const int my_rank_;
     const std::string who_;
     PeerBreaker breaker_;
+    std::mutex lost_mu_;   // before view_: its thread calls lost() until view_ is gone
+    std::condition_variable lost_cv_;
+    std::vector<char> lost_ = std::vector<char>(16384, 0);   // slots to send again
+    bool lost_any_ = false;
+    std::atomic<bool> stop_{false};
     ClusterView view_;
     std::mutex write_mu_;
     Conn writer_;
@@ -1062,6 +1195,7 @@ private:
     uint64_t replayed_ = 0;
     std::mutex pool_mu_;
     std::vector<std::unique_ptr<Conn>> idle_;
+    std::thread republisher_;
 };
 
 // The settings the RHT relies on; CONFIG may be disabled, then none is checked.
