@@ -238,7 +238,7 @@ private:
     std::string shard_map_mismatch(const ShardMapMsg& sm) const;
     void stamp_shm_ready(int assigned_rank, int n_obs);
     // The tree is new, so routes published before this start are stale: the
-    // leader of a new cluster deletes all of them, a node joining a formed
+    // leader of a new cluster deletes all of them, a node rejoining a formed
     // cluster those of its rank. Redis only.
     void drop_stale_routes(bool whole_cluster);
     void setup_local_rht_shard(PeerEntry& e);
