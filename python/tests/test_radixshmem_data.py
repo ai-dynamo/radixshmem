@@ -499,9 +499,9 @@ def test_e2e_device_filter():
         print("  SKIP: e2e_device_filter (no RDMA device in sysfs)")
         return
     assert _run_e2e("rdma", "dev1", [devs[0]])
-    # An allowlist, intersected with what the host has -- not a list of
-    # requirements, so a name that does not exist costs nothing.
-    assert _run_e2e("rdma", "dev2", [devs[0], "mlx5_no_such_device"])
+    # A name the host does not have is refused: the list is explicit, a misspelling must not hand
+    # the data plane to the other entry (both children exit at backend creation).
+    assert not _run_e2e("rdma", "dev2", [devs[0], "mlx5_no_such_device"])
     print("  PASS: e2e_device_filter")
 
 
