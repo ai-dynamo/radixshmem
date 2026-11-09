@@ -345,6 +345,7 @@ void RdmaRht::remove_batch(const RhtRemoveEntry* entries, int count) {
     std::lock_guard<std::mutex> g(impl_->op_mu);
     sync_changes();
     impl_->rht->remove_batch(entries, count);
+    impl_->rht->flush();
 }
 
 void RdmaRht::dump(uint64_t key, std::vector<std::string>& lines) {
