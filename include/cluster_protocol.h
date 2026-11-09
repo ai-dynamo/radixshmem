@@ -15,7 +15,7 @@
 
 namespace radixshmem {
 
-constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 13;  // lockstep with manifest v13
+constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 14;  // lockstep with manifest v14
 constexpr uint32_t CLUSTER_HELLO_MAGIC = 0x52584348; // "RXCH"
 constexpr uint32_t CLUSTER_REPLY_MAGIC = 0x52584352; // "RXCR"
 constexpr uint32_t CLUSTER_SHARDMAP_MAGIC = 0x52584d50; // "RXMP"
@@ -35,6 +35,9 @@ struct ShardMapMsg {
     uint32_t reserved_remote_op_transport;
     uint32_t register_chunk_size;   // cs; node-boundary / probe stride alignment
     uint32_t holder_rank[CLUSTER_MAX_SHARDS];  // shard s → holder rank
+    uint32_t rht_backend;    // ClusterRhtBackend; REDIS leaves the shard map empty
+    uint32_t rht_redis_timeout_ms;
+    char     rht_redis_seeds[CLUSTER_RHT_SEEDS_LEN];
 };
 
 // Client → Server, sent after TCP connect: client's RESET XRC SEND QP asks for

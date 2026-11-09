@@ -20,6 +20,12 @@ option(ENABLE_RDMA "Build RDMA-dependent sources (requires libibverbs)" ON)
 
 option(ENABLE_ETCD "Build the etcd cluster-bootstrap registry (requires Go toolchain)" ON)
 
+option(ENABLE_REDIS_RHT "Build the Redis Cluster RHT backend (requires hiredis)" ON)
+set(RADIXSHMEM_TEST_REDIS "" CACHE STRING
+    "host:port of a Redis Cluster for the Redis RHT tests; empty skips them")
+set(RADIXSHMEM_TEST_REDIS_BIN "" CACHE PATH
+    "directory with redis-server and redis-cli for the Redis RHT fault tests; empty skips them")
+
 # Mooncake TransferEngine backs the data plane's transfer backend (src/transfer).
 option(ENABLE_MOONCAKE "Build the Mooncake transfer backend (requires Mooncake headers + lib)" ON)
 set(MOONCAKE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mooncake" CACHE PATH
@@ -64,10 +70,11 @@ set(_radixshmem_sources
     src/indexer/tree_dump.cpp)
 if(ENABLE_RDMA)
     list(APPEND _radixshmem_sources
-        # RHT (router hash table): shard shm + routing engine (core), holder +
-        # consumer endpoints.
+        # RHT (Radix Hash Table): shard shm + routing engine (core), holder +
+        # RdmaRht endpoints.
         src/indexer/rht/rht_core.cpp
         src/indexer/rht/rht_endpoint.cpp
+        src/indexer/rht/redis_rht.cpp
         # RDMA transport plane: verbs primitives split by connection model.
         src/indexer/transport/rdma/context.cpp
         src/indexer/transport/rdma/rc_endpoint.cpp
@@ -116,6 +123,20 @@ else()
     set(RADIXSHMEM_NO_RDMA ON)
 endif()
 target_link_libraries(radixshmem PUBLIC ${_radixshmem_link_libs})
+
+# Redis RHT backend: static hiredis when available, so nothing extra is needed at runtime.
+if(ENABLE_RDMA AND ENABLE_REDIS_RHT)
+    find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
+    find_library(HIREDIS_LIBRARY NAMES libhiredis.a hiredis)
+    if(HIREDIS_INCLUDE_DIR AND HIREDIS_LIBRARY)
+        target_include_directories(radixshmem PRIVATE ${HIREDIS_INCLUDE_DIR})
+        target_link_libraries(radixshmem PRIVATE ${HIREDIS_LIBRARY})
+        target_compile_definitions(radixshmem PRIVATE RADIXSHMEM_HAS_REDIS)
+        message(STATUS "Redis RHT backend: ${HIREDIS_LIBRARY}")
+    else()
+        message(STATUS "Redis RHT backend: hiredis not found, disabled")
+    endif()
+endif()
 
 # ==================== gRPC (remote-op control plane) ====================
 # grpc++/protobuf via pkg-config plus protoc/grpc_cpp_plugin; the generated code is a static library only transport/grpc sees.
@@ -406,6 +427,13 @@ if(ENABLE_RDMA)
     set_tests_properties(test_client_no_server_dc PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
 
+    # A client borrowing a tree (radix-server's RHT client) that fails to
+    # bootstrap leaves the tree to its owner.
+    add_executable(test_client_borrowed_tree tests/indexer/test_client_borrowed_tree.cpp)
+    target_link_libraries(test_client_borrowed_tree PRIVATE radixshmem)
+    radixshmem_enable_asserts(test_client_borrowed_tree)
+    add_test(NAME test_client_borrowed_tree COMMAND test_client_borrowed_tree)
+
     # M < N RHT-shard decoupling test (N=3, M=2, holders={0,1}).
     add_executable(test_cluster_shards tests/indexer/test_cluster_shards.cpp)
     target_link_libraries(test_cluster_shards PRIVATE radixshmem)
@@ -445,6 +473,24 @@ if(ENABLE_RDMA)
     add_test(NAME test_cluster_shards_w4 COMMAND test_cluster_shards)
     set_tests_properties(test_cluster_shards_w4 PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_SLOTS=4")
+
+    # Redis RHT against a live cluster at RADIXSHMEM_TEST_REDIS; skips without one.
+    add_executable(test_rht_redis tests/indexer/core/test_rht_redis.cpp)
+    target_link_libraries(test_rht_redis PRIVATE radixshmem)
+    target_include_directories(test_rht_redis PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
+    radixshmem_enable_asserts(test_rht_redis)
+    add_test(NAME test_rht_redis COMMAND test_rht_redis)
+    set_tests_properties(test_rht_redis PROPERTIES SKIP_RETURN_CODE 77
+        ENVIRONMENT "RADIXSHMEM_TEST_REDIS=${RADIXSHMEM_TEST_REDIS}")
+
+    # Starts its own cluster on 127.0.0.1:7351-7353; skips without RADIXSHMEM_TEST_REDIS_BIN.
+    add_executable(test_rht_redis_faults tests/indexer/core/test_rht_redis_faults.cpp)
+    target_link_libraries(test_rht_redis_faults PRIVATE radixshmem)
+    target_include_directories(test_rht_redis_faults PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
+    radixshmem_enable_asserts(test_rht_redis_faults)
+    add_test(NAME test_rht_redis_faults COMMAND test_rht_redis_faults)
+    set_tests_properties(test_rht_redis_faults PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+        ENVIRONMENT "RADIXSHMEM_TEST_REDIS_BIN=${RADIXSHMEM_TEST_REDIS_BIN};RADIXSHMEM_REDIS_SCRIPT=${CMAKE_SOURCE_DIR}/scripts/redis_test_cluster.sh")
 endif()
 
 # ==================== Remote-op e2e gate ====================
@@ -496,7 +542,7 @@ set(_skippable_tests
     test_cluster test_cluster_dc test_cluster_dc_rht_nic test_cluster_w4
     test_cluster_rht_dc_peer_xrc test_cluster_rht_xrc_peer_dc
     test_cluster_node_join
-    test_client_no_server test_client_no_server_dc
+    test_client_no_server test_client_no_server_dc test_client_borrowed_tree
     test_cluster_shards test_cluster_shards_dc
     test_cluster_shards_dc_rht_nic_w4 test_cluster_shards_w4
     test_data_registry
@@ -506,6 +552,29 @@ foreach(_t IN LISTS _skippable_tests)
         set_tests_properties(${_t} PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endforeach()
+
+# The cluster tests run on the RDMA RHT; with RADIXSHMEM_TEST_REDIS the main ones
+# also run on the Redis RHT (<test>_redis).
+foreach(_t IN LISTS _skippable_tests)
+    if(TEST ${_t} AND NOT _t STREQUAL "test_data_registry")
+        set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "RADIXSHMEM_RHT_BACKEND=rdma")
+    endif()
+endforeach()
+set(_redis_rht_env "RADIXSHMEM_RHT_BACKEND=redis;RADIXSHMEM_REDIS_ADDRS=${RADIXSHMEM_TEST_REDIS}")
+if(RADIXSHMEM_TEST_REDIS)
+    foreach(_pair test_cluster:test_cluster test_cluster_node_join:test_cluster_node_join
+                  test_client_no_server:test_client_no_server
+                  test_remote_api_grpc:test_remote_api)
+        string(REPLACE ":" ";" _p ${_pair})
+        list(GET _p 0 _name)
+        list(GET _p 1 _exe)
+        if(TEST ${_name})
+            add_test(NAME ${_name}_redis COMMAND ${_exe})
+            set_tests_properties(${_name}_redis PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "${_redis_rht_env}")
+        endif()
+    endforeach()
+endif()
 
 # ==================== Benchmarks (NOT in ctest) ====================
 set(_benches
@@ -698,10 +767,29 @@ if(BUILD_PYTHON_MODULES)
                    py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)
             set_tests_properties(${_t} PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
-                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python"
+                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;RADIXSHMEM_RHT_BACKEND=rdma"
                 SKIP_RETURN_CODE 77 TIMEOUT 600)
         endforeach()
         set_tests_properties(py_agentic_stress_3node_threads PROPERTIES TIMEOUT 180)
+        if(RADIXSHMEM_TEST_REDIS)
+            add_test(NAME py_test_cluster_redis COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
+            add_test(NAME py_test_p2p_pull_redis COMMAND ${Python3_EXECUTABLE} tests/test_p2p_pull.py)
+            add_test(NAME py_agentic_stress_2node_redis
+                     COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 2
+                             --base-port 19500 ${_stress_args})
+            add_test(NAME py_agentic_stress_3node_threads_redis
+                     COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 3
+                             --base-port 19600 ${_stress_args} --concurrency 32
+                             --executors-per-worker 8 --register-chunk-size 1
+                             --flush-after-insert)
+            foreach(_t py_test_cluster_redis py_test_p2p_pull_redis py_agentic_stress_2node_redis
+                       py_agentic_stress_3node_threads_redis)
+                set_tests_properties(${_t} PROPERTIES
+                    WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
+                    ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env}"
+                    SKIP_RETURN_CODE 77 TIMEOUT 600)
+            endforeach()
+        endif()
         message(STATUS "radixshmem._core + radixshmem._data: building "
                        "(pybind11 ${pybind11_VERSION}, ${Python3_EXECUTABLE})")
     else()

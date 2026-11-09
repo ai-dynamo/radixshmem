@@ -219,12 +219,12 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
     dev = [devs[rank % len(devs)]] if devs else []
     cluster = radixshmem.ClusterConfig()
     if cfg.nodes > 1:
+        os.environ["RADIXSHMEM_RHT_SLOTS"] = str(cfg.rht_slots)   # read by the RDMA RHT only
         cluster = radixshmem.ClusterConfig(
             expected_min_nodes=cfg.nodes, registry=f"etcd://127.0.0.1:{cfg.etcd_port}",
             cluster_id=f"agentic_{cfg.run_id}", node_name=f"node{rank}", rpc_address="0.0.0.0",
-            num_rht_shards=cfg.nodes, rht_shard_holders=list(range(cfg.nodes)),
             index_dev=dev[0] if dev else "", gid_idx=cfg.gid_idx,
-            bootstrap_timeout_sec=cfg.bootstrap_timeout, rht_slots_per_bucket=cfg.rht_slots)
+            bootstrap_timeout_sec=cfg.bootstrap_timeout)
     monitor = ({"monitor_port": cfg.monitor_port, "monitor_interval_s": cfg.monitor_interval}
                if cfg.monitor_port else {})
     return radixshmem.ServerConfig(
