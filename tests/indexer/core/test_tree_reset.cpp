@@ -166,6 +166,21 @@ static void test_reset_then_fill_and_reset_slots_recycled() {
     TEST_PASS();
 }
 
+// ==================================================================
+static void test_reset_keeps_peer_fault_counts() {
+    TEST_BEGIN("reset keeps the peer fault counts, which describe the cluster");
+
+    ServerLauncher launcher("/test_tr_05", default_cfg());
+    RadixClient client("/test_tr_05");
+
+    client.peer_faults()->rht_removes.store(3);
+    populate(client);
+    client.reset();
+    assert(client.peer_faults()->rht_removes.load() == 3);
+
+    TEST_PASS();
+}
+
 #ifndef RADIXSHMEM_NO_RDMA
 // ==================================================================
 // RhtShard::reset() (run by RdmaRht::reset): every slot zeroed, header kept.
@@ -253,6 +268,7 @@ int main() {
     test_reinsert_after_reset();
     test_double_reset_idempotent();
     test_reset_then_fill_and_reset_slots_recycled();
+    test_reset_keeps_peer_fault_counts();
 #ifndef RADIXSHMEM_NO_RDMA
     test_rht_shard_reset();
     test_rht_shard_capacity_normalized();
