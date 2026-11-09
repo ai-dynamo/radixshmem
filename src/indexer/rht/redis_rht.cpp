@@ -413,6 +413,13 @@ struct Node {
     std::deque<Op> owed;
 };
 
+// n commands of op that got no successful reply from master m (-1: none).
+struct Lost {
+    int m;
+    Op op;
+    uint64_t n;
+};
+
 // One caller's connections: one pipeline per master per batch, every master's
 // replies read under one deadline. A patient Conn (the writer) waits as long
 // as replies keep coming, so a busy master is not taken for a dead one.
@@ -421,8 +428,8 @@ class Conn {
 public:
     using OnReply = std::function<void(int tag, redisReply* r)>;
 
-    Conn(ClusterView& view, const RedisRhtConfig& cfg, PeerBreaker& breaker, bool patient)
-        : view_(view), breaker_(breaker), timeout_ms_(cfg.timeout_ms), patient_(patient),
+    Conn(ClusterView& view, const RedisRhtConfig& cfg, bool patient)
+        : view_(view), timeout_ms_(cfg.timeout_ms), patient_(patient),
           key_(cfg.key_prefix + std::string(16, '0')), slots_(view.slots()) {}
 
     ~Conn() {
@@ -439,15 +446,13 @@ public:
     const std::string& key() const { return key_; }
 
     // The master serving k, whose Redis key is left in key(), or -1 with the
-    // op counted as dropped.
+    // op lost.
     int route(uint64_t k, Op op) {
         int m = owner(k);
-        if (m < 0) {
-            view_.mark_stale();
-            breaker_.skipped(-1, op);
-            return -1;
-        }
-        return usable(m, op) ? m : -1;
+        if (m < 0) view_.mark_stale();
+        if (m >= 0 && usable(m, op)) return m;
+        lose(m, op, 1);
+        return -1;
     }
 
     // The master serving k in this batch's map, or -1; counts nothing.
@@ -464,16 +469,25 @@ public:
     uint64_t errors() const { return errors_; }
     const std::string& last_error() const { return last_error_; }
 
-    // While quiet, failed ops are not counted as dropped: a reset retries them.
-    void set_quiet(bool q) { quiet_ = q; }
+    void lose(int m, Op op, uint64_t n) {
+        for (Lost& l : lost_)
+            if (l.m == m && l.op == op) {
+                l.n += n;
+                return;
+            }
+        lost_.push_back({m, op, n});
+    }
 
-    // Master m is up and connected; else the op is counted as dropped. A
-    // connection that already carries commands of this batch is kept.
+    std::vector<Lost> take_lost() {
+        std::vector<Lost> l;
+        l.swap(lost_);
+        return l;
+    }
+
+    // Master m is up and connected. A connection that already carries
+    // commands of this batch is kept.
     bool usable(int m, Op op) {
-        if (view_.down(m)) {
-            breaker_.skipped(m, op);
-            return false;
-        }
+        if (view_.down(m)) return false;
         Node& n = node(m);
         if (n.c && n.in_batch) return true;
         uint32_t gen = view_.generation(m);
@@ -484,7 +498,6 @@ public:
             n.c = open_conn(view_.endpoint(m), timeout_ms_, err);
             if (!n.c) {
                 view_.failed(m, "connect", err, secs_since(t0));
-                breaker_.skipped(m, op);
                 return false;
             }
             n.gen = gen;
@@ -513,7 +526,7 @@ public:
                 Node& n = nodes_[m];
                 n.in_batch = false;
                 if (!n.c) {
-                    if (!quiet_) breaker_.skipped(m, op, n.tags.size());
+                    lose(m, op, n.tags.size());
                     n.tags.clear();
                     continue;
                 }
@@ -562,13 +575,11 @@ private:
         return nodes_[m];
     }
 
-    // Drops m's connection; the replies it still owes count as dropped ops.
+    // Drops m's connection; the commands it still owes replies to are lost.
     void close(int m, Op op) {
         Node& n = nodes_[m];
-        if (!quiet_) {
-            for (Op o : n.owed) breaker_.skipped(m, o);
-            if (n.next < n.tags.size()) breaker_.skipped(m, op, n.tags.size() - n.next);
-        }
+        for (Op o : n.owed) lose(m, o, 1);
+        if (n.next < n.tags.size()) lose(m, op, n.tags.size() - n.next);
         n.owed.clear();
         n.tags.clear();
         n.next = 0;
@@ -621,11 +632,11 @@ private:
             if (err && (!std::strncmp(r->str, "MOVED", 5) || !std::strncmp(r->str, "ASK", 3)))
                 view_.mark_stale();
             if (!n.owed.empty()) {
-                if (err && !quiet_) breaker_.skipped(m, n.owed.front());
+                if (err) lose(m, n.owed.front(), 1);
                 n.owed.pop_front();
             } else {
                 if (!err && on_reply) on_reply(n.tags[n.next], r);
-                if (err && !quiet_) breaker_.skipped(m, op);
+                if (err) lose(m, op, 1);
                 n.next++;
             }
             freeReplyObject(r);
@@ -668,10 +679,9 @@ private:
     }
 
     ClusterView& view_;
-    PeerBreaker& breaker_;
     const int timeout_ms_;
     const bool patient_;
-    bool quiet_ = false;
+    std::vector<Lost> lost_;
     std::string last_error_;
     std::string key_;
     std::shared_ptr<const ClusterView::SlotMap> slots_;
@@ -690,7 +700,7 @@ public:
           who_(my_rank >= 0 ? "[RadixClient rank " + std::to_string(my_rank) + "] Redis RHT"
                             : std::string("[RadixClient] Redis RHT")),
           breaker_(who_, faults, 200, 2000), view_(cfg, breaker_, who_),
-          writer_(view_, cfg, breaker_, true) {}
+          writer_(view_, cfg, true) {}
 
     void insert_batch(const RhtInsertEntry* e, int count) override {
         std::lock_guard<std::mutex> g(write_mu_);
@@ -701,13 +711,14 @@ public:
             const Held h{true, e[i].node_id, e[i].tree_node_id, e[i].num_blocks};
             int m = writable(w, e[i].key, Op::RHT_WRITE);
             if (m < 0) {
-                hold(e[i].key, h, Op::RHT_WRITE);
+                hold(w, e[i].key, h, Op::RHT_WRITE);
                 continue;
             }
             if (!held_.empty()) held_.erase(e[i].key);
             append(w, m, h);
         }
         w.send(Op::RHT_WRITE, false, nullptr);
+        count_lost(w);
     }
 
     void remove_batch(const RhtRemoveEntry* e, int count) override {
@@ -719,13 +730,14 @@ public:
             const Held h{false, e[i].node_id, e[i].tree_node_id, 0};
             int m = writable(w, e[i].key, Op::RHT_REMOVE);
             if (m < 0) {
-                hold(e[i].key, h, Op::RHT_REMOVE);
+                hold(w, e[i].key, h, Op::RHT_REMOVE);
                 continue;
             }
             if (!held_.empty()) held_.erase(e[i].key);
             append(w, m, h);
         }
         w.send(Op::RHT_REMOVE, false, nullptr);
+        count_lost(w);
     }
 
     void lookup_batch(const uint64_t* keys, int count,
@@ -750,6 +762,7 @@ public:
                 results[i].push_back({std::atoi(f->str), get_u32(v->str), get_u32(v->str + 4)});
             }
         });
+        count_lost(*c);
         release(std::move(c));
     }
 
@@ -758,6 +771,7 @@ public:
         writer_.begin();
         replay(writer_);
         writer_.drain();
+        count_lost(writer_);
     }
 
     // Drops this rank's routes: the listed ones and those of writes still
@@ -775,10 +789,10 @@ public:
         held_.clear();
         writer_.begin();
         writer_.drain();
-        writer_.set_quiet(true);
+        count_lost(writer_);
         bool clean = count >= 0 ? remove_listed(listed.data(), (int)listed.size())
                                 : scan_remove(std::to_string(my_rank_));
-        writer_.set_quiet(false);
+        writer_.take_lost();
         if (!clean) gave_up("reset");
         return clean;
     }
@@ -788,9 +802,9 @@ public:
         std::lock_guard<std::mutex> g(write_mu_);
         writer_.begin();
         writer_.drain();
-        writer_.set_quiet(true);
+        count_lost(writer_);
         bool clean = scan_remove("");
-        writer_.set_quiet(false);
+        writer_.take_lost();
         if (!clean) gave_up("clear");
         return clean;
     }
@@ -819,6 +833,7 @@ public:
                 }
             });
         }
+        c->take_lost();
         release(std::move(c));
     }
 
@@ -858,13 +873,17 @@ private:
         }
     }
 
-    // Keeps the latest write per key; past kMaxHeld the write is dropped.
-    void hold(uint64_t key, const Held& h, Op op) {
+    // Keeps the latest write per key; past kMaxHeld the write is lost.
+    void hold(Conn& w, uint64_t key, const Held& h, Op op) {
         if (held_.size() >= kMaxHeld && !held_.count(key)) {
-            breaker_.skipped(-1, op);
+            w.lose(-1, op, 1);
             return;
         }
         held_[key] = h;
+    }
+
+    void count_lost(Conn& c) {
+        for (const Lost& l : c.take_lost()) breaker_.skipped(l.m, l.op, l.n);
     }
 
     // Sends the held writes whose master is up, once a master is back or the
@@ -1029,7 +1048,7 @@ private:
                 return c;
             }
         }
-        return std::make_unique<Conn>(view_, cfg_, breaker_, false);
+        return std::make_unique<Conn>(view_, cfg_, false);
     }
 
     void release(std::unique_ptr<Conn> c) {
