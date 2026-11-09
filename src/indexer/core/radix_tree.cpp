@@ -1877,9 +1877,9 @@ std::vector<NodeHead> RadixShmemTree::node_heads() {
     return out;
 }
 
-std::vector<EvictedNode>& RadixShmemTree::evicted_pending() {
+std::vector<NodeHead>& RadixShmemTree::evicted_pending() {
     // Per-thread buffer: foreground inserter and background evictor never share.
-    static thread_local std::vector<EvictedNode> buf;
+    static thread_local std::vector<NodeHead> buf;
     return buf;
 }
 

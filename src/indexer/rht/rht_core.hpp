@@ -27,6 +27,7 @@
 #include <exception>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace radixshmem {
@@ -153,6 +154,10 @@ private:
     void read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op,
                       const char* what, const BucketFn& on_bucket, bool retry = false);
     uint64_t bucket_id(uint64_t key) const;
+    using Buckets = std::unordered_map<uint64_t, std::vector<RhtSlot>>;
+    template <typename Entry>
+    Buckets read_entry_buckets(const Entry* entries, int count, PeerBreaker::Op op,
+                               std::vector<char>& have);
 
     // Pack head: [key_tag(16) | node_id+1(16) | tree_node_id(32)] = 8 bytes
     // Empty = 0 (node_id+1 == 0 means no entry).

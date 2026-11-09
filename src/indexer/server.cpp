@@ -779,7 +779,7 @@ bool RadixServer::bootstrap() {
             RadixClient*  ec = svc_client_.get();
             std::mutex*    mu = &svc_client_mu_;
             tree_->set_evict_callback(
-                [ec, mu](const std::vector<EvictedNode>& evicted) {
+                [ec, mu](const std::vector<NodeHead>& evicted) {
                     std::vector<RadixClient::EvictedKey> keys;
                     keys.reserve(evicted.size());
                     for (const auto& e : evicted)
@@ -791,7 +791,7 @@ bool RadixServer::bootstrap() {
         // RemoteOpService::allocate holds svc_client_mu_; relocking here would self-deadlock.
         RadixClient* ec = svc_client_.get();
         svc_tree_->tree().set_evict_callback(
-            [ec](const std::vector<EvictedNode>& evicted) {
+            [ec](const std::vector<NodeHead>& evicted) {
                 std::vector<RadixClient::EvictedKey> keys;
                 keys.reserve(evicted.size());
                 for (const auto& e : evicted)
