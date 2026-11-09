@@ -1055,7 +1055,7 @@ int RadixShmemTree::detach_node(uint32_t node_id, std::vector<int32_t>& out, boo
 
     // Record (first_hash, node_id) for distributed RHT cleanup (flushed after unlock).
     if (evict_cb_)
-        evicted_pending().push_back({head_hash, node_id});
+        evicted_pending().push_back({head_hash, node_id, (uint32_t)n});
 
     int32_t* slots = data_.get_slots(node->data_offset, n);
     for (int i = 0; i < n; i++)
@@ -1871,7 +1871,7 @@ std::vector<NodeHead> RadixShmemTree::node_heads() {
         const TreeNode* nd = nodes_.get(id);
         if (nd->parent_id != INVALID_NODE_ID && nd->num_blocks > 0 &&
             nd->data_offset != INVALID_OFFSET)
-            out.push_back({data_.get_hashes(nd->data_offset)[0], id});
+            out.push_back({data_.get_hashes(nd->data_offset)[0], id, nd->num_blocks});
     }
     read_unlock();
     return out;

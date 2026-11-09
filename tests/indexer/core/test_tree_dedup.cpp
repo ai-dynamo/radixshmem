@@ -92,9 +92,15 @@ static void test_covered_chain() {
     insert(t, h, 4);
     insert(t, h, 8);
     insert(t, h, 12);
+    std::vector<NodeHead> heads = t.node_heads();
+    assert(heads.size() == 3);
+    for (const NodeHead& e : heads) assert(e.num_blocks == 4);
     std::vector<uint64_t> got;
     t.set_evict_callback([&](const std::vector<NodeHead>& v) {
-        for (const NodeHead& e : v) got.push_back(e.first_hash);
+        for (const NodeHead& e : v) {
+            assert(e.num_blocks == 4);
+            got.push_back(e.first_hash);
+        }
     });
     auto longer = seq(0x1000, 16);
     assert(t.dedup_prefix(longer.data(), 16) == 12);
