@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -24,7 +25,7 @@ import numpy as np
 
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import COMPONENT_MASK_FULL, ComponentType
-from radixshmem.rpc import DataPlaneUnavailable, ServerNotReady
+from radixshmem.rpc import DataPlaneUnavailable, ServerNotReady, ServerBusy
 
 FULL, SWA, MAMBA = ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA
 
@@ -36,6 +37,11 @@ MODE_READY = "ready"
 MODE_CLOSED = "closed"
 
 _ATTACH_TIMEOUT_MS = 30000          # a ready server's SlotStore is complete; attach never spins long
+_RPC_RECOVERY_TIMEOUT_S = 30.0
+
+# An ambiguous RPC outcome must not release buffers still writable by RDMA.
+# Retain the client (including source pins) until process teardown.
+_QUARANTINED_CLIENTS = set()
 
 # (peer_rank, kind, remote_slots, local_slots) -> (ok, bytes, descriptors, error)
 TransferItem = Tuple[int, int, List[int], List[int]]
@@ -55,9 +61,9 @@ class NodeInfo:
     node_name: str = ""
     segment: str = ""
     data_bytes: int = 0
-    last_error: str = ""            # why the last configuration failed; "" when none did
     swa_ratio: float = 0.0
     mamba_ratio: float = 0.0
+    last_error: str = ""            # why the last configuration failed; "" when none did
 
 
 @dataclass
@@ -78,8 +84,17 @@ class PullResult:
 
 class PullJob:
     """Handle of one pull_async(). ``wait()`` blocks until the job completed and
-    returns its PullResult; a failed or refused transfer completes the job with
-    the local hit, it never raises."""
+    returns its PullResult. A known failed/refused transfer returns the local
+    hit. An uncertain RPC outcome raises and quarantines its buffers instead
+    of recycling memory that may still be writable by the transport.
+
+    Progress fields (block counts relative to the hash array passed to
+    ``pull_async``, which may itself be a sub-range of a longer sequence):
+
+    * ``local_hit`` / ``planned_hit`` — known as soon as ``pull_async`` returns.
+    * ``published_hit`` — ``local_hit`` while the transfer runs; after completion
+      the published common_hit (or ``local_hit`` if the future failed).
+    """
 
     def __init__(self, job_id: int, client: "RadixClient"):
         self.job_id = job_id
@@ -99,6 +114,10 @@ class PullJob:
         # that plus the remote run being pulled (equal when nothing is pulled).
         self.local_hit = 0
         self.planned_hit = 0
+        # Absolute offsets into the caller's original hash array when pull_async
+        # was given start/end (chunked prefetch). Default: whole array.
+        self.hash_start = 0
+        self.hash_end = 0
 
     def done(self) -> bool:
         return self._f.done()
@@ -107,6 +126,22 @@ class PullJob:
     def cancelled(self) -> bool:
         return self._cancelled
 
+    @property
+    def published_hit(self) -> int:
+        """Blocks known to be local for this job's hash span.
+
+        Before completion this is the pre-transfer local hit; afterwards it is
+        the published ``common_hit`` (still relative to this job's hashes).
+        """
+        if not self._f.done():
+            return int(self.local_hit)
+        if self._f.exception() is not None:
+            return int(self.local_hit)
+        try:
+            return int(self._f.result(timeout=0).common_hit)
+        except Exception:  # noqa: BLE001
+            return int(self.local_hit)
+
     def wait(self, timeout: Optional[float] = None) -> PullResult:
         if self._cancelled:
             raise RuntimeError(f"job {self.job_id} was cancelled")
@@ -114,7 +149,10 @@ class PullJob:
             r = self._f.result(timeout)
         except concurrent.futures.TimeoutError:
             raise TimeoutError(f"job {self.job_id} still running") from None
-        self._client._jobs.pop(self.job_id, None)
+        finally:
+            if self._f.done():
+                with self._client._mu:
+                    self._client._jobs.pop(self.job_id, None)
         return r
 
     def cancel(self) -> None:
@@ -205,6 +243,7 @@ class RadixClient:
         self._mu = threading.Lock()
         self._jobs: Dict[int, PullJob] = {}
         self._pending: Dict[int, PullJob] = {}
+        self._quarantined: Dict[int, PullJob] = {}
         self._next_id = 1
         self._slots = threading.Semaphore(max_outstanding)
         self._work = threading.Event()
@@ -278,6 +317,10 @@ class RadixClient:
         return self.store.slot_view(int(slot), kind)
 
     def close(self) -> None:
+        with self._mu:
+            if (self._pending or self._quarantined
+                    or any(not job.done() for job in self._jobs.values())):
+                raise RuntimeError("cannot close client with undrained or quarantined transfers")
         self._closed = True
         self._work.set()
         if self._completer is not None:
@@ -289,25 +332,52 @@ class RadixClient:
     # ------------------------------------------------------------ pull_async
 
     def pull_async(self, hashes, mask: int = COMPONENT_MASK_FULL, *, lock: bool = True,
-                   timeout_ms: int = 30000, block: bool = True) -> PullJob:
+                   timeout_ms: int = 30000, block: bool = True,
+                   start: int = 0, end: Optional[int] = None) -> PullJob:
         """query, stage local slots for every remote piece, hand the transfer to
         the server and return; the completer publishes the blocks when the
         server reports them and completes the job with local slots for
         [0, common_hit). With ``block=False`` a client at ``max_outstanding``
-        does not wait: the job completes at once with the local hit."""
+        does not wait: the job completes at once with the local hit.
+
+        ``start`` / ``end`` select a half-open block range of ``hashes`` so a
+        caller can prefetch in chunks without slicing the array themselves.
+        Job progress fields (``local_hit``, ``planned_hit``, ``published_hit``)
+        are relative to that sub-range; ``hash_start`` / ``hash_end`` record
+        the absolute offsets into the original array.
+        """
         if self.local_read_only:
             raise RuntimeError("local_read_only client: pull_async needs the cluster plane; "
                                "use query() for the local hit")
+        full = np.ascontiguousarray(hashes, dtype=np.uint64)
+        n = int(full.shape[0])
+        lo = int(start)
+        hi = n if end is None else int(end)
+        if not 0 <= lo <= hi <= n:
+            raise ValueError(f"pull_async range [{lo}, {hi}) out of bounds for {n} hashes")
         self.store
         with self._mu:
             job = PullJob(self._next_id, self)
             self._next_id += 1
             self._jobs[job.job_id] = job
-        job._hashes = np.ascontiguousarray(hashes, dtype=np.uint64)
+        job._hashes = full[lo:hi]
+        job.hash_start, job.hash_end = lo, hi
         job._mask, job._lock = mask, lock
-        job._q = q = self._index.query(job._hashes, mask=mask, local_only=False, lock=True,
-                                       update_meta=True)
-        job._hit = self._stage(job, int(q.common_hit) if int(q.status) == 0 else 0)
+        try:
+            discovery = full if lo == 0 and mask == COMPONENT_MASK_FULL else job._hashes
+            job._q = q = self._index.query(discovery, mask=mask, local_only=False, lock=True,
+                                           update_meta=True)
+            hit = min(int(q.common_hit), len(job._hashes)) if int(q.status) == 0 else 0
+            job._hit = self._stage(job, hit)
+        except Exception:
+            # No descriptor has been submitted: all staged slots are ours.
+            for kind, (_, slots) in job._staged.items():
+                self._recycle(slots, kind)
+            if job._q is not None:
+                job._q.finalize()
+            with self._mu:
+                self._jobs.pop(job.job_id, None)
+            raise
         job.planned_hit = job._hit
         if not job._items:
             self._complete(job, [])
@@ -320,9 +390,14 @@ class RadixClient:
             return job
         try:
             job._ticket = self._t.submit(job._items, timeout_ms)
-        except Exception as e:  # noqa: BLE001 - busy or unreachable server: local hit only
+        except (ServerBusy, DataPlaneUnavailable, ValueError) as e:
             self._slots.release()
             self._complete(job, [(False, 0, 0, str(e))] * len(job._items))
+            return job
+        except Exception as e:
+            # Submit may have reached the server before its response was lost.
+            # Keep its semaphore credit, slots and source pin; never recycle.
+            self._quarantine(job, e)
             return job
         with self._mu:
             self._pending[job._ticket] = job
@@ -354,6 +429,7 @@ class RadixClient:
         return [j for j in jobs if j.done()]
 
     def _run(self) -> None:
+        lost_since = None
         while not self._closed:
             with self._mu:
                 tickets = list(self._pending)
@@ -364,12 +440,29 @@ class RadixClient:
             try:
                 rep = self._t.wait_any(tickets, 1000)
                 lost = "lost by server"
-            except Exception as e:  # noqa: BLE001 - server gone: pending jobs degrade
-                rep, lost = {"done": {}, "unknown": tickets}, str(e)
+                lost_since = None
+            except Exception as exc:  # control-plane loss is not RDMA completion
+                now = time.monotonic()
+                if lost_since is None:
+                    lost_since = now
+                if now - lost_since >= _RPC_RECOVERY_TIMEOUT_S:
+                    # Surface a permanent outage without pretending that the
+                    # transport stopped accessing these buffers.
+                    for ticket in tickets:
+                        with self._mu:
+                            job = self._pending.pop(ticket, None)
+                        if job is not None:
+                            self._quarantine(job, exc)
+                self._work.wait(0.1)
+                self._work.clear()
+                continue
             for ticket in list(rep["done"]) + list(rep["unknown"]):
                 with self._mu:
                     job = self._pending.pop(ticket, None)
                 if job is None:
+                    continue
+                if ticket in rep["unknown"]:
+                    self._quarantine(job, RuntimeError(lost))
                     continue
                 replies = rep["done"].get(ticket) or [(False, 0, 0, lost)] * len(job._items)
                 try:
@@ -379,10 +472,18 @@ class RadixClient:
                     job._f.set_exception(e)
                 self._slots.release()
 
+    def _quarantine(self, job: PullJob, error: Exception) -> None:
+        with self._mu:
+            self.transfer_failures += len(job._items)
+            self._quarantined[job.job_id] = job
+            _QUARANTINED_CLIENTS.add(self)
+            job._f.set_exception(RuntimeError(f"transfer outcome uncertain; buffers quarantined: {error}"))
+
     def _stage(self, job: PullJob, hit: int) -> int:
         q, me = job._q, int(self._index.rank())
-        remote = [(int(r), int(o), np.asarray(s, dtype=np.int32))
-                  for r, o, s in q.full_fragments if r >= 0 and r != me]
+        remote = [(int(r), int(o), np.asarray(s, dtype=np.int32)[:hit - int(o)])
+                  for r, o, s in q.full_fragments
+                  if r >= 0 and r != me and int(o) < hit]
         job.local_hit = int(remote[0][1]) if remote else hit
         if remote:
             job._src, off, rs = remote[0]

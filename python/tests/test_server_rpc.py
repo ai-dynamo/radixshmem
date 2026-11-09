@@ -345,9 +345,19 @@ def test_pull_async_promotes_remote_suffixes_out_of_order(cfg):
         r.finalize()
         h, local, _ = prefix(9, 2)
         transport.lose.add(transport.n + 1)
-        r = cl.wait(cl.pull_async(h).job_id, 10)
-        assert r.common_hit == 2 and r.remote_blocks == 0
-        r.finalize()
+        lost_job = cl.pull_async(h)
+        with pytest.raises(RuntimeError, match="quarantined"):
+            cl.wait(lost_job.job_id, 10)
+        assert cl._quarantined[lost_job.job_id] is lost_job
+        # This transport is scripted and never writes: explicitly prove it is
+        # quiescent before releasing the quarantine for the rest of this test.
+        from radixshmem.client import _QUARANTINED_CLIENTS
+        for kind, (_, slots) in lost_job._staged.items():
+            cl._recycle(slots, kind)
+        lost_job._q.finalize()
+        cl._quarantined.clear()
+        _QUARANTINED_CLIENTS.discard(cl)
+        cl._slots.release()
         transport.busy = True
         h, local, _ = prefix(10, 2)
         r = cl.pull_async(h).wait(10)
@@ -455,6 +465,51 @@ class _Xfer:
         return self.d.XFER_EBUSY if h in self.hang else self.d.XFER_OK
 
 
+def test_tiny_pull_discovers_full_path_but_stages_only_requested_chunk(cfg):
+    c = cfg(**data(data_bytes=1 << 20))
+    srv = up(c, geometry())
+    try:
+        cl = client(c)
+        real, discovered = cl.index, []
+        def query(hs):
+            discovered.append(len(hs))
+            return _Q(np.empty(0, np.int32), 0, np.arange(100, 108, dtype=np.int32), 8)
+        cl._index, cl._t = scripted_index(real, query), _Transport()
+        job = cl.pull_async(hashes(8), end=1)
+        result = job.wait(10)
+        assert discovered == [8]
+        assert job.hash_end == result.common_hit == result.remote_blocks == 1
+        assert cl._t.submitted[0][0][2] == [100]
+        result.finalize()
+        assert real.mempool_used() == 1 and real.check_health() == 0
+        cl.close()
+    finally:
+        srv.close()
+
+
+def test_stage_exception_returns_all_unsubmitted_slots(cfg):
+    c = cfg(**data(data_bytes=1 << 20))
+    srv = up(c, geometry())
+    try:
+        cl = client(c)
+        real = cl.index
+        cl._index = scripted_index(real, lambda hs: _Q(
+            np.empty(0, np.int32), 0, np.arange(100, 108, dtype=np.int32), 8))
+        original = cl._stage
+        def fail_after_allocation(job, hit):
+            original(job, hit)
+            raise RuntimeError("staging failed")
+        cl._stage = fail_after_allocation
+        with pytest.raises(RuntimeError, match="staging failed"):
+            cl.pull_async(hashes(8))
+        assert real.mempool_used() == 0
+        assert cl._jobs == cl._pending == {}
+        assert real.check_health() == 0
+        cl.close()
+    finally:
+        srv.close()
+
+
 def test_server_jobs_complete_timeout_busy_and_expire(cfg):
     from radixshmem import _data
 
@@ -478,8 +533,11 @@ def test_server_jobs_complete_timeout_busy_and_expire(cfg):
 
         x.hang.add(x.n + 1)
         t3 = srv.submit([item], 100)
+        assert collect([t3], timeout=0.2) == {}
+        assert not srv._jobs[t3].done
+        x.hang.clear()  # transport finally stops writing; safe to return slots
         rep = collect([t3])[t3][0]
-        assert rep[0] is False and "TIMEOUT" in rep[3] and srv._zombies == [x.n]
+        assert rep[0] is False and "deadline" in rep[3] and srv._zombies == []
 
         x.reject = True
         t4 = srv.submit([item], 1000)
