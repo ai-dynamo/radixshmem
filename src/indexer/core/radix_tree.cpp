@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -170,9 +172,10 @@ void RadixShmemTree::alloc_root() {
     root->parent_id = INVALID_NODE_ID;
 }
 
-void RadixShmemTree::reset() {
+void RadixShmemTree::reset(std::vector<NodeHead>* left, uint64_t since) {
     set_write_op("reset");
     write_lock();
+    if (left && route_publishes() != since) *left = collect_heads();
 
     nodes_.reset();   // also resets every ComponentStateTable entry
     data_.reset();
@@ -190,7 +193,6 @@ void RadixShmemTree::reset() {
     hdr->leaf_list_head = INVALID_NODE_ID;
     hdr->leaf_list_tail = INVALID_NODE_ID;
     hdr->total_blocks.store(0, std::memory_order_relaxed);
-    hdr->access_counter.store(0, std::memory_order_relaxed);
     hdr->insert_success.store(0, std::memory_order_relaxed);
     hdr->insert_error_node_pool.store(0, std::memory_order_relaxed);
     hdr->insert_error_data_pool.store(0, std::memory_order_relaxed);
@@ -400,7 +402,7 @@ RadixShmemTree RadixShmemTree::create(const std::string& name,
     hdr->total_blocks.store(0, std::memory_order_relaxed);
     hdr->leaf_list_head = INVALID_NODE_ID;
     hdr->leaf_list_tail = INVALID_NODE_ID;
-    hdr->access_counter.store(0, std::memory_order_relaxed);
+    hdr->route_publishes.store(0, std::memory_order_relaxed);
     hdr->node_pool_size.store(0, std::memory_order_relaxed);
     hdr->insert_success.store(0, std::memory_order_relaxed);
     hdr->insert_error_node_pool.store(0, std::memory_order_relaxed);
@@ -1864,8 +1866,14 @@ bool RadixShmemTree::node_head_matches(uint32_t node_id, uint64_t first_hash) {
 }
 
 std::vector<NodeHead> RadixShmemTree::node_heads() {
-    std::vector<NodeHead> out;
     read_lock();
+    std::vector<NodeHead> out = collect_heads();
+    read_unlock();
+    return out;
+}
+
+std::vector<NodeHead> RadixShmemTree::collect_heads() {
+    std::vector<NodeHead> out;
     const uint32_t cap = header()->node_pool_capacity;
     for (uint32_t id = 0; id < cap; id++) {
         const TreeNode* nd = nodes_.get(id);
@@ -1873,8 +1881,21 @@ std::vector<NodeHead> RadixShmemTree::node_heads() {
             nd->data_offset != INVALID_OFFSET)
             out.push_back({data_.get_hashes(nd->data_offset)[0], id, nd->num_blocks});
     }
-    read_unlock();
     return out;
+}
+
+void RadixShmemTree::lock_reset() {
+    while (::flock(fd_, LOCK_EX) != 0 && errno == EINTR) {}
+}
+
+void RadixShmemTree::unlock_reset() { ::flock(fd_, LOCK_UN); }
+
+void RadixShmemTree::note_route_publish() {
+    header()->route_publishes.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t RadixShmemTree::route_publishes() const {
+    return header()->route_publishes.load(std::memory_order_relaxed);
 }
 
 std::vector<NodeHead>& RadixShmemTree::evicted_pending() {

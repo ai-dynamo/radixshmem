@@ -289,6 +289,7 @@ void RadixClient::update_rht(const uint64_t* hashes, int n, const InsertResult& 
     int my_rank = peer_reg_->my_rank();
     if (my_rank < 0 || !local_) return;
     auto& tree = local_->tree();
+    tree.note_route_publish();
     auto boundaries = tree.get_node_boundaries(hashes, n);
     if (boundaries.empty()) return;
     std::vector<RhtInsertEntry> entries;
@@ -319,6 +320,7 @@ void RadixClient::publish_chain(const uint64_t* hashes, int n, const InsertResul
                                 int start) {
     int my_rank = peer_reg_->my_rank();
     if (!rht_ || my_rank < 0) return;
+    local_->tree().note_route_publish();
     std::vector<NodeBoundary> chain = local_->tree().get_node_boundaries(hashes, n);
     if (chain.empty()) return;
     std::vector<RhtInsertEntry> entries;
@@ -861,18 +863,40 @@ void RadixClient::recycle_slots(const int32_t* slots, int num,
 
 void RadixClient::reset() {
     require_writable("reset");
+    std::lock_guard<std::mutex> g(reset_mu_);
+    int32_t rank = -1;
+#ifndef RADIXSHMEM_NO_RDMA
+    if (distributed_ && rht_) rank = peer_reg_->my_rank();
+    if (!local_ && rank >= 0) rht_->reset(nullptr, -1);
+#endif
+    if (!local_) return;
+    RadixShmemTree& tree = local_->tree();
+    const uint64_t gen = tree.reset_generation();
+    tree.lock_reset();
+    struct Unlock {
+        RadixShmemTree& t;
+        ~Unlock() { t.unlock_reset(); }
+    } unlock{tree};
+    if (tree.reset_generation() != gen) return;
+    if (rank < 0) {
+        tree.reset();
+        return;
+    }
 #ifndef RADIXSHMEM_NO_RDMA
     // The routes go first, while the tree still lists them.
-    if (distributed_ && rht_ && peer_reg_->my_rank() >= 0) {
-        const int32_t my_rank = peer_reg_->my_rank();
-        std::vector<RhtRemoveEntry> own;
-        if (local_)
-            for (const NodeHead& h : local_->tree().node_heads())
-                own.push_back({h.first_hash, my_rank, h.tree_node_id});
-        rht_->reset(own.data(), local_ ? (int)own.size() : -1);
+    const uint64_t published = tree.route_publishes();
+    std::vector<RhtRemoveEntry> own;
+    for (const NodeHead& h : tree.node_heads()) own.push_back({h.first_hash, rank, h.tree_node_id});
+    rht_->reset(own.data(), (int)own.size());
+    std::vector<NodeHead> left;
+    tree.reset(&left, published);
+    own.clear();
+    for (const NodeHead& h : left) own.push_back({h.first_hash, rank, h.tree_node_id});
+    if (!own.empty()) {
+        rht_->remove_batch(own.data(), (int)own.size());
+        rht_->flush();
     }
 #endif
-    if (local_) local_->reset();
 }
 
 

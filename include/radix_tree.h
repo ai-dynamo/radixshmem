@@ -105,7 +105,14 @@ public:
 
     // Clear all tree data in place under the write lock (empty tree, single root,
     // slots free); layout/magic/locks untouched. Invalidates prior slot/node IDs.
-    void reset();
+    // With `left`, lists there the nodes it drops if a route was published since
+    // route_publishes() returned `since`.
+    void reset(std::vector<NodeHead>* left = nullptr, uint64_t since = 0);
+    // One reset at a time across processes (flock on the shm file).
+    void lock_reset();
+    void unlock_reset();
+    void note_route_publish();
+    uint64_t route_publishes() const;
 
     // Background eviction: non-blocking write_lock, evict up to target_blocks.
     // Returns blocks freed (0 if lock was busy). With `held`, each task is a chain:
@@ -235,6 +242,7 @@ private:
     friend class TreeDumper;
 
     RadixShmemTree() = default;
+    std::vector<NodeHead> collect_heads();
 
     void init_pools();
 

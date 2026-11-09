@@ -836,6 +836,7 @@ Clears all caches of this client in place: resets this node's radix tree to empt
 
 - **Per node**: `reset()` only clears this rank. In a distributed deployment the whole cluster is cleared if and only if **every rank calls** `reset()` **once**; if only one rank calls it, the trees of the other ranks and the shards not held by this rank remain.
 - **Only clears shards it holds** (RDMA RHT): routes other ranks keep in shards this rank does not hold are not affected.
+- **Concurrent calls**: the processes and threads of one node reset one at a time. A call that waited while another one cleared the tree returns without a reset of its own; a call made after that reset finished runs again. Routes the other processes publish during a reset are removed after the tree is cleared, but only if they still name the node the reset dropped.
 - **Invalidation**: after the call, all previously obtained slot IDs / `ComponentQueryResult` / `QueryResult` / `InsertResult` / `FinalizeFn` are invalid and must not be used.
 
 

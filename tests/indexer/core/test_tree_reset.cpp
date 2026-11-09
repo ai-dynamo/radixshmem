@@ -8,11 +8,14 @@
 
 #include "test_utils.h"
 #include "radix_client.h"
+#include "radix_tree.h"
 #ifndef RADIXSHMEM_NO_RDMA
 #include "rht_core.hpp"   // private module header: this test pokes RhtShard directly
 #endif
 
 #include <cassert>
+#include <chrono>
+#include <thread>
 #include <vector>
 
 using namespace radixshmem;
@@ -181,7 +184,59 @@ static void test_reset_keeps_peer_fault_counts() {
 
     TEST_PASS();
 }
+#endif
 
+// ==================================================================
+static void test_overlapping_resets_run_once() {
+    TEST_BEGIN("a reset that waited for another one to finish skips its own");
+
+    ServerLauncher launcher("/test_tr_06", default_cfg());
+    RadixClient client("/test_tr_06");
+    auto other = RadixShmemTree::attach("/test_tr_06");
+
+    populate(client);
+    const uint64_t gen = other.reset_generation();
+    other.lock_reset();
+    std::thread waiter([&] { client.reset(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    other.reset();
+    other.unlock_reset();
+    waiter.join();
+    assert(other.reset_generation() == gen + 1);
+
+    populate(client);
+    client.reset();
+    assert(other.reset_generation() == gen + 2 && client.total_blocks() == 0);
+    other.detach();
+    TEST_PASS();
+}
+
+// ==================================================================
+static void test_reset_lists_nodes_after_a_publish() {
+    TEST_BEGIN("reset lists the nodes it drops only if a route was published meanwhile");
+
+    ServerLauncher launcher("/test_tr_07", default_cfg());
+    RadixClient client("/test_tr_07");
+    auto tree = RadixShmemTree::attach("/test_tr_07");
+
+    std::vector<NodeHead> left;
+    populate(client);
+    tree.reset(&left, tree.route_publishes());
+    assert(left.empty());
+
+    populate(client);
+    const uint64_t nodes = client.total_radix_nodes() - 1, blocks = client.total_blocks();
+    const uint64_t since = tree.route_publishes();
+    tree.note_route_publish();
+    tree.reset(&left, since);
+    uint64_t listed = 0;
+    for (const NodeHead& h : left) listed += h.num_blocks;
+    assert(left.size() == nodes && listed == blocks && client.total_blocks() == 0);
+    tree.detach();
+    TEST_PASS();
+}
+
+#ifndef RADIXSHMEM_NO_RDMA
 // ==================================================================
 // RhtShard::reset() (run by RdmaRht::reset): every slot zeroed, header kept.
 static void test_rht_shard_reset() {
@@ -268,6 +323,8 @@ int main() {
     test_reinsert_after_reset();
     test_double_reset_idempotent();
     test_reset_then_fill_and_reset_slots_recycled();
+    test_overlapping_resets_run_once();
+    test_reset_lists_nodes_after_a_publish();
 #ifndef RADIXSHMEM_NO_RDMA
     test_reset_keeps_peer_fault_counts();
     test_rht_shard_reset();
