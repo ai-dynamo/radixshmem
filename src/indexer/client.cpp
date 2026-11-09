@@ -361,7 +361,6 @@ void RadixClient::remove_evicted_from_rht(const EvictedKey* entries, int count) 
     }
     if (rem.empty()) return;
     rht_->remove_batch(rem.data(), (int)rem.size());
-    rht_->flush();
 }
 
 // Lazily open (and cache) the per-rank session. Returns nullptr on any illegal
