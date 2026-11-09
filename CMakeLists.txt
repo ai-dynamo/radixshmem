@@ -483,14 +483,14 @@ if(ENABLE_RDMA)
     set_tests_properties(test_rht_redis PROPERTIES SKIP_RETURN_CODE 77
         ENVIRONMENT "RADIXSHMEM_TEST_REDIS=${RADIXSHMEM_TEST_REDIS}")
 
-    # Starts its own cluster on 127.0.0.1:7351-7353; skips without RADIXSHMEM_TEST_REDIS_BIN.
+    # Starts its own 6-node cluster on free ports; skips without RADIXSHMEM_TEST_REDIS_BIN.
     add_executable(test_rht_redis_faults tests/indexer/core/test_rht_redis_faults.cpp)
     target_link_libraries(test_rht_redis_faults PRIVATE radixshmem)
     target_include_directories(test_rht_redis_faults PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
     radixshmem_enable_asserts(test_rht_redis_faults)
     add_test(NAME test_rht_redis_faults COMMAND test_rht_redis_faults)
     set_tests_properties(test_rht_redis_faults PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
-        ENVIRONMENT "RADIXSHMEM_TEST_REDIS_BIN=${RADIXSHMEM_TEST_REDIS_BIN};RADIXSHMEM_REDIS_SCRIPT=${CMAKE_SOURCE_DIR}/scripts/redis_test_cluster.sh")
+        ENVIRONMENT "RADIXSHMEM_TEST_REDIS_BIN=${RADIXSHMEM_TEST_REDIS_BIN}")
 endif()
 
 # ==================== Remote-op e2e gate ====================
