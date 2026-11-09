@@ -273,18 +273,13 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("lease_ttl_sec", &RadixServerConfig::lease_ttl_sec)
         .def_readwrite("register_chunk_tokens",
                        &RadixServerConfig::register_chunk_tokens)
-        // Membership gate: bootstrap waits for max(num_rht_shards, expected_min_nodes)
-        // peers, stable for settle_ms. > 1 also enables distributed mode.
+        // Membership gate: bootstrap waits for max(RADIXSHMEM_RHT_SHARDS of an RDMA
+        // RHT, expected_min_nodes) peers, stable for settle_ms. > 1 enables distributed mode.
         .def_readwrite("expected_min_nodes",
                        &RadixServerConfig::expected_min_nodes)
         .def_readwrite("settle_ms", &RadixServerConfig::settle_ms)
-        .def_readwrite("num_rht_shards", &RadixServerConfig::num_rht_shards)
-        .def_readwrite("rht_shard_holders", &RadixServerConfig::rht_shard_holders)
-        .def_readwrite("rht_transport", &RadixServerConfig::rht_transport)
         .def_readwrite("peer_index_transport",
                        &RadixServerConfig::peer_index_transport)
-        .def_readwrite("rht_slots_per_bucket",
-                       &RadixServerConfig::rht_slots_per_bucket)
         .def_property("remote_op_listen_port",
                       [](const RadixServerConfig& c) { return (int)c.remote_op_listen_port; },
                       [](RadixServerConfig& c, int v) { c.remote_op_listen_port = (uint16_t)v; })

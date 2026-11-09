@@ -228,11 +228,13 @@ def test_remote_op_options():
     from radixshmem.server import ClusterConfig
 
     config = cli.build_config(cli.parse_args([
-        "--remote-op-listen-port", "31001", "--rht-transport", "dc", "--peer-index-transport", "dc"]))
+        "--remote-op-listen-port", "31001", "--peer-index-transport", "dc"]))
     assert config.cluster.remote_op_listen_port == 31001
-    assert config.cluster.rht_transport == config.cluster.peer_index_transport == "dc"
+    assert config.cluster.peer_index_transport == "dc"
     for removed in (["--remote-op-transport", "grpc"], ["--enable-remote-insert"],
-                    ["--enable-remote-query"], ["--zmq-listen-port", "31001"]):
+                    ["--enable-remote-query"], ["--zmq-listen-port", "31001"],
+                    ["--rht-transport", "dc"], ["--rht-slots", "4"], ["--num-rht-shards", "2"],
+                    ["--rht-shard-holders", "0,1"]):
         with pytest.raises(SystemExit):
             cli.parse_args(removed)
     for name in ("remote_op_transport", "enable_remote_insert", "enable_remote_query"):

@@ -20,6 +20,7 @@
 #include "cluster_registry.h"
 #include "rdma_transport.hpp"
 #include "rht_endpoint.h"
+#include "rht_redis.h"
 #include "remote_op_service.hpp"
 #include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path; self-guards on RADIXSHMEM_HAS_ETCD)
 
@@ -270,31 +271,88 @@ void RadixServer::fill_local_entry(PeerEntry& e) const {
     std::strncpy(e.index_dev, cfg_.index_dev.c_str(), sizeof(e.index_dev) - 1);
 }
 
+void RadixServer::read_rht_env() {
+    auto env = [](const char* name) {
+        const char* v = ::getenv(name);
+        return std::string(v ? v : "");
+    };
+    auto bad = [](const char* name, const std::string& v) {
+        return std::runtime_error(std::string("RadixServer: invalid ") + name + "=" + v);
+    };
+    RhtEnv e;
+    std::string v = env("RADIXSHMEM_RHT_BACKEND");
+    if (v == "rdma") e.backend = CLUSTER_RHT_RDMA;
+    else if (!v.empty() && v != "redis") throw bad("RADIXSHMEM_RHT_BACKEND", v);
+    if (e.backend == CLUSTER_RHT_REDIS) {
+        e.redis = env("RADIXSHMEM_REDIS_ADDRS");
+        v = env("RADIXSHMEM_REDIS_TIMEOUT_MS");
+        if (!v.empty() && (e.redis_timeout_ms = std::atoi(v.c_str())) <= 0)
+            throw bad("RADIXSHMEM_REDIS_TIMEOUT_MS", v);
+    } else {
+        v = env("RADIXSHMEM_RHT_SHARDS");
+        if (!v.empty() && (e.rdma.shards = std::atoi(v.c_str())) < 0) throw bad("RADIXSHMEM_RHT_SHARDS", v);
+        v = env("RADIXSHMEM_RHT_SHARD_HOLDERS");
+        for (const char* p = v.c_str(); *p;) {
+            char* end = nullptr;
+            long r = std::strtol(p, &end, 10);
+            if (end == p) throw bad("RADIXSHMEM_RHT_SHARD_HOLDERS", v);
+            e.rdma.holders.push_back((int)r);
+            for (p = end; *p == ',' || *p == ' '; p++) {}
+        }
+        v = env("RADIXSHMEM_RHT_SLOTS");
+        if (!v.empty()) e.rdma.slots = std::atoi(v.c_str());
+        if (e.rdma.slots != 1 && e.rdma.slots != 2 && e.rdma.slots != 4 && e.rdma.slots != 8)
+            throw bad("RADIXSHMEM_RHT_SLOTS", v);
+        v = env("RADIXSHMEM_RHT_TRANSPORT");
+        if (v == "dc") e.rdma.transport = CLUSTER_TRANSPORT_DC;
+        else if (!v.empty() && v != "xrc") throw bad("RADIXSHMEM_RHT_TRANSPORT", v);
+    }
+    rht_env_ = e;
+}
+
 void RadixServer::resolve_shard_map(int n_obs) {
     // Authoritative on the leader; other ranks overwrite from the broadcast map.
-    int M = cfg_.num_rht_shards;
+    rdma_sl_ = ctx_->sl();
+    rdma_tc_ = ctx_->traffic_class();
+    peer_index_transport_ = (cfg_.peer_index_transport == "dc")
+                                ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
+    dc_access_key_ = 0xD0C0ACCE5500F00DULL;   // every plane that runs DC shares it
+    rht_backend_ = rht_env_.backend;
+    num_shards_ = 0;
+    holder_of_shard_.clear();
+    my_local_shard_ = -1;
+    rht_capacity_ = 0;
+    rht_slots_ = 0;
+    rht_transport_ = CLUSTER_TRANSPORT_XRC;
+
+    if (rht_backend_ == CLUSTER_RHT_REDIS) {
+        if (cfg_.cluster_id.find_first_of("{}") != std::string::npos)
+            throw std::runtime_error("RadixServer: the redis RHT needs a cluster id without { "
+                                     "or }, not '" + cfg_.cluster_id + "'");
+        rht_redis_ = rht_env_.redis;
+        rht_redis_timeout_ms_ = (uint32_t)rht_env_.redis_timeout_ms;
+        if (rht_redis_.empty() || rht_redis_.size() >= CLUSTER_RHT_SEEDS_LEN)
+            throw std::runtime_error(
+                "RadixServer: the redis RHT needs RADIXSHMEM_REDIS_ADDRS=host:port,... "
+                "(under 256 chars); RADIXSHMEM_RHT_BACKEND=rdma selects the RDMA RHT");
+        std::string why = redis_rht_check({rht_redis_, "", rht_env_.redis_timeout_ms});
+        if (!why.empty())
+            throw std::runtime_error("RadixServer: Redis RHT at " + rht_redis_ + ": " + why);
+        return;
+    }
+
+    int M = rht_env_.rdma.shards;
     if (M <= 0) M = n_obs;                           // M == N
     if (M > (int)CLUSTER_MAX_SHARDS) M = CLUSTER_MAX_SHARDS;
-    if (M > n_obs) {                                 // can't have more holders than nodes
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "RadixServer: num_rht_shards (%d) exceeds node count (%d)",
-                 M, n_obs);
-        throw std::runtime_error(msg);
-    }
+    if (M > n_obs)                                   // can't have more holders than nodes
+        throw std::runtime_error("RadixServer: RADIXSHMEM_RHT_SHARDS (" + std::to_string(M) +
+                                 ") exceeds node count (" + std::to_string(n_obs) + ")");
     num_shards_ = M;
 
     holder_of_shard_.assign(M, 0);
-    if (!cfg_.rht_shard_holders.empty()) {
-        // Round-robin over the candidate holder list.
-        int nh = (int)cfg_.rht_shard_holders.size();
-        for (int s = 0; s < M; s++)
-            holder_of_shard_[s] = cfg_.rht_shard_holders[s % nh];
-    } else {
-        // Default: holders are ranks [0, M).
-        for (int s = 0; s < M; s++)
-            holder_of_shard_[s] = s;
-    }
+    const std::vector<int>& holders = rht_env_.rdma.holders;
+    for (int s = 0; s < M; s++)   // round-robin over the candidates, default ranks [0, M)
+        holder_of_shard_[s] = holders.empty() ? s : holders[s % holders.size()];
 
     // Per-shard capacity REQUEST: global buckets ~= 2*R*N (load ~0.5), so each
     // shard asks for 2*R*N/M. Rounding (power of two, floor) is the RHT
@@ -304,45 +362,31 @@ void RadixServer::resolve_shard_map(int n_obs) {
     uint64_t per_shard = (2 * R * (uint64_t)n_obs) / (uint64_t)M;
     rht_capacity_ = per_shard > UINT32_MAX ? UINT32_MAX : (uint32_t)per_shard;
 
-    // Which shard (if any) does this rank hold? (first match)
-    my_local_shard_ = -1;
     for (int s = 0; s < M; s++) {
         if (holder_of_shard_[s] == cfg_.rank) { my_local_shard_ = s; break; }
     }
-
-    // Authoritative QoS = rank 0's ctx values (seeded from its env).
-    rdma_sl_ = ctx_->sl();
-    rdma_tc_ = ctx_->traffic_class();
-
-    // Authoritative RHT / peer-index transports (rank 0's cfg). DC access key
-    // is unconditional: every plane that runs DC shares it.
-    rht_transport_ = (cfg_.rht_transport == "dc") ? CLUSTER_TRANSPORT_DC
-                                                   : CLUSTER_TRANSPORT_XRC;
-    peer_index_transport_ = (cfg_.peer_index_transport == "dc")
-                                ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
-    dc_access_key_ = 0xD0C0ACCE5500F00DULL;
-
-    // Authoritative RHT slots-per-bucket (W). Validate ∈ {1,2,4,8}; default 4.
-    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 4;
-    if (W != 1 && W != 2 && W != 4 && W != 8) {
-        fprintf(stderr,
-                "[RadixServer rank 0] WARN: rht_slots=%d not in {1,2,4,8}, "
-                "using 4\n", W);
-        W = 4;
-    }
-    rht_slots_ = (uint32_t)W;
+    rht_transport_ = rht_env_.rdma.transport;
+    rht_slots_ = (uint32_t)rht_env_.rdma.slots;
 }
 
 void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
     // Follower path: install the leader's authoritative shard map + QoS. Mirrors
     // what resolve_shard_map() computes on the leader, but from the wire message.
+#ifndef RADIXSHMEM_HAS_REDIS
+    if (sm.rht_backend == CLUSTER_RHT_REDIS)
+        throw std::runtime_error("RadixServer: the cluster keeps its RHT in Redis, and this "
+                                 "radixshmem was built without hiredis");
+#endif
+    rht_backend_  = sm.rht_backend;
+    rht_redis_.assign(sm.rht_redis_seeds, strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds)));
+    rht_redis_timeout_ms_ = sm.rht_redis_timeout_ms;
     num_shards_   = (int)sm.num_shards;
     rht_capacity_ = sm.rht_capacity;
     rdma_sl_      = sm.rdma_sl;
     rdma_tc_      = sm.rdma_tc;
     rht_transport_        = sm.rht_transport;
     peer_index_transport_ = sm.peer_index_transport;
-    rht_slots_     = sm.rht_slots ? sm.rht_slots : 4;
+    rht_slots_     = sm.rht_slots;
     dc_access_key_ = sm.dc_access_key;
     ctx_->set_qos(rdma_sl_, rdma_tc_);   // adopt authoritative QoS before QPs connect
     holder_of_shard_.assign(num_shards_, 0);
@@ -352,13 +396,10 @@ void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
         if (holder_of_shard_[s] == cfg_.rank && my_local_shard_ < 0)
             my_local_shard_ = s;
     }
-    // Warn if local cfg disagreed with the authoritative map (non-fatal).
-    if (cfg_.num_rht_shards > 0 && cfg_.num_rht_shards != num_shards_) {
-        fprintf(stderr,
-                "[RadixServer rank %d] WARN: local --num-rht-shards=%d ignored, "
-                "cluster authoritative M=%d\n",
-                cfg_.rank, cfg_.num_rht_shards, num_shards_);
-    }
+    if (rht_env_.backend != rht_backend_)
+        fprintf(stderr, "[RadixServer rank %d] WARN: local RADIXSHMEM_RHT_BACKEND ignored, "
+                "the cluster uses the %s RHT\n", cfg_.rank,
+                rht_backend_ == CLUSTER_RHT_REDIS ? "redis" : "rdma");
 }
 
 void RadixServer::setup_local_rht_shard(PeerEntry& e) {
@@ -400,29 +441,40 @@ std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
         return std::string(what) + " " + std::to_string(have) + " != local " +
                std::to_string(want);
     };
-    if (cfg_.num_rht_shards > 0 && (int)sm.num_shards != cfg_.num_rht_shards)
-        return diff("num_rht_shards", sm.num_shards, cfg_.num_rht_shards);
-    if (!cfg_.rht_shard_holders.empty()) {
-        int nh = (int)cfg_.rht_shard_holders.size();
-        for (int s = 0; s < (int)sm.num_shards; s++)
-            if ((int)sm.holder_rank[s] != cfg_.rht_shard_holders[s % nh])
+    if (sm.rht_backend != rht_env_.backend)
+        return diff("RHT backend", sm.rht_backend, rht_env_.backend);
+    if (sm.rht_backend == CLUSTER_RHT_RDMA) {
+        const auto& e = rht_env_.rdma;
+        if (e.shards > 0 && (int)sm.num_shards != e.shards)
+            return diff("RADIXSHMEM_RHT_SHARDS", sm.num_shards, e.shards);
+        for (int s = 0; !e.holders.empty() && s < (int)sm.num_shards; s++)
+            if ((int)sm.holder_rank[s] != e.holders[s % e.holders.size()])
                 return diff(("holder of shard " + std::to_string(s)).c_str(),
-                            sm.holder_rank[s], cfg_.rht_shard_holders[s % nh]);
+                            sm.holder_rank[s], e.holders[s % e.holders.size()]);
+        if ((int)sm.rht_slots != e.slots) return diff("RADIXSHMEM_RHT_SLOTS", sm.rht_slots, e.slots);
+        if (sm.rht_transport != e.transport)
+            return diff("RADIXSHMEM_RHT_TRANSPORT", sm.rht_transport, e.transport);
     }
-    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 4;
-    if (W != 1 && W != 2 && W != 4 && W != 8) W = 4;
-    if ((int)sm.rht_slots != W) return diff("rht_slots", sm.rht_slots, W);
-    auto tp = [](const std::string& s) {
-        return s == "dc" ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
-    };
-    if (sm.rht_transport != (uint32_t)tp(cfg_.rht_transport))
-        return "rht_transport differs from local " + cfg_.rht_transport;
-    if (sm.peer_index_transport != (uint32_t)tp(cfg_.peer_index_transport))
+    uint32_t peer_tp = cfg_.peer_index_transport == "dc" ? CLUSTER_TRANSPORT_DC
+                                                         : CLUSTER_TRANSPORT_XRC;
+    if (sm.peer_index_transport != peer_tp)
         return "peer_index_transport differs from local " + cfg_.peer_index_transport;
     int cs = register_chunk_size();
     if (sm.register_chunk_size && cs > 0 && (int)sm.register_chunk_size != cs)
         return diff("register_chunk_size", sm.register_chunk_size, cs);
     return "";
+}
+
+void RadixServer::drop_stale_routes(bool whole_cluster) {
+    if (rht_backend_ != CLUSTER_RHT_REDIS) return;
+    const RedisRhtConfig rc{rht_redis_, redis_rht_prefix(cfg_.cluster_id),
+                            (int)rht_redis_timeout_ms_};
+    auto t0 = std::chrono::steady_clock::now();
+    const bool clean = whole_cluster ? redis_rht_clear(rc) : redis_rht_drop_rank(rc, cfg_.rank);
+    fprintf(stderr, "[RadixServer] stale routes of %s %s %.1f s\n",
+            whole_cluster ? "the cluster" : ("rank " + std::to_string(cfg_.rank)).c_str(),
+            clean ? "dropped in" : "not all dropped after",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 void RadixServer::stamp_shm_ready(int assigned_rank, int n_obs) {
@@ -566,10 +618,10 @@ bool RadixServer::cluster_bootstrap() {
 // =====================================================================
 
 namespace {
-// Distributed when the caller asks for a multi-node cluster: a min-node gate or
-// shard count above 1, or a legacy world_size hint.
+// Distributed when the caller asks for a multi-node cluster: a min-node gate
+// above 1, or a legacy world_size hint.
 bool want_cluster(const RadixServerConfig& c) {
-    return c.expected_min_nodes > 1 || c.num_rht_shards > 1 || c.world_size > 1;
+    return c.expected_min_nodes > 1 || c.world_size > 1;
 }
 } // namespace
 
@@ -635,6 +687,9 @@ bool RadixServer::bootstrap() {
     const float held_ratio = cfg_.writeback_max_held_ratio;
     if (cfg_.writeback_enabled && !(held_ratio > 0.0f && held_ratio <= 1.0f))
         throw std::runtime_error("RadixServer: writeback_max_held_ratio must be in (0, 1]");
+#ifndef RADIXSHMEM_NO_RDMA
+    if (distributed) read_rht_env();
+#endif
 
     ShmConfig shm = cfg_.shm;
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;
@@ -671,12 +726,8 @@ bool RadixServer::bootstrap() {
         bind_ip_ = bind_ip;   // published as PeerEntry.host
 
         // Deployment-level env overrides.
-        if (const char* t = ::getenv("RADIXSHMEM_RHT_TRANSPORT"))
-            cfg_.rht_transport = t;
         if (const char* t = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
             cfg_.peer_index_transport = t;
-        if (const char* w = ::getenv("RADIXSHMEM_RHT_SLOTS"))
-            cfg_.rht_slots_per_bucket = atoi(w);
         if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))
             cfg_.registry = r;
         if (const char* c = ::getenv("RADIXSHMEM_CLUSTER_ID"))

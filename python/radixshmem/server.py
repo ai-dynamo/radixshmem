@@ -49,9 +49,8 @@ from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
-    "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec", "rht_transport",
-    "peer_index_transport", "num_rht_shards", "rht_shard_holders", "rht_slots_per_bucket",
-    "remote_op_listen_port")
+    "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec",
+    "peer_index_transport", "remote_op_listen_port")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
@@ -62,8 +61,8 @@ ROLES = ("prefill", "decode")
 @dataclass
 class ClusterConfig:
     """etcd rendezvous and the control-plane RDMA of the index (see
-    _core.RadixServerConfig). Distributed when expected_min_nodes or
-    num_rht_shards is > 1."""
+    _core.RadixServerConfig). Distributed when expected_min_nodes > 1; the RHT
+    is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* (docs/api.md)."""
 
     expected_min_nodes: int = 0
     settle_ms: int = 500
@@ -78,16 +77,12 @@ class ClusterConfig:
     gid_idx: int = 3
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
-    rht_transport: str = "xrc"        # client -> RHT shard holder QPs: "xrc" | "dc"
     peer_index_transport: str = "xrc" # remote walk into peer trees: "xrc" | "dc"
-    num_rht_shards: int = 0
-    rht_shard_holders: List[int] = field(default_factory=list)
-    rht_slots_per_bucket: int = 4
     remote_op_listen_port: int = 0
 
     @property
     def distributed(self) -> bool:
-        return self.expected_min_nodes > 1 or self.num_rht_shards > 1
+        return self.expected_min_nodes > 1
 
 
 @dataclass

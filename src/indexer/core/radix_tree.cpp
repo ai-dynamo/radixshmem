@@ -1864,6 +1864,20 @@ bool RadixShmemTree::node_head_matches(uint32_t node_id, uint64_t first_hash) {
     return live;
 }
 
+std::vector<NodeHead> RadixShmemTree::node_heads() {
+    std::vector<NodeHead> out;
+    read_lock();
+    const uint32_t cap = header()->node_pool_capacity;
+    for (uint32_t id = 0; id < cap; id++) {
+        const TreeNode* nd = nodes_.get(id);
+        if (nd->parent_id != INVALID_NODE_ID && nd->num_blocks > 0 &&
+            nd->data_offset != INVALID_OFFSET)
+            out.push_back({data_.get_hashes(nd->data_offset)[0], id});
+    }
+    read_unlock();
+    return out;
+}
+
 std::vector<EvictedNode>& RadixShmemTree::evicted_pending() {
     // Per-thread buffer: foreground inserter and background evictor never share.
     static thread_local std::vector<EvictedNode> buf;

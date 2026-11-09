@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <thread>
+#include <unordered_map>
 #include <unistd.h>
 
 namespace radixshmem {
@@ -452,35 +453,48 @@ static int choose_slot(const RhtSlot* slots, uint32_t W,
     return shortest_of(slots, all, na);
 }
 
+uint64_t RhtEngine::bucket_id(uint64_t key) const {
+    return ((uint64_t)shard_of(key) << 32) | bucket_of(key);
+}
+
 void RhtEngine::insert_batch(const RhtInsertEntry* entries, int count) {
     if (count <= 0) return;
-    // W>1 needs read-modify-write (read the bucket, pick a slot). Group reads
-    // by shard, batch them, choose slots locally, then write only the chosen
-    // single slot per entry. W==1 keeps the old blind-chain-write fast path.
     uint32_t W = slots_per_bucket_;
-
-    std::vector<RhtSlot> bucketbuf(W);
+    if (W == 1) {   // blind overwrite, no read
+        for (int i = 0; i < count; i++) {
+            const RhtInsertEntry& e = entries[i];
+            int shard = shard_of(e.key);
+            RhtSlot packed = make_slot(pack(tag_of(e.key), e.node_id, e.tree_node_id),
+                                       e.num_blocks);
+            if (!write_slot(shard, bucket_of(e.key), 0, packed))
+                dropped(shard, PeerBreaker::Op::RHT_WRITE);
+        }
+        return;
+    }
+    // W>1 picks a cell from the bucket's contents: every bucket is read in one
+    // batch, then cells are chosen in entry order against copies that already
+    // hold the earlier choices, as one read per entry would see them.
+    std::vector<uint64_t> keys(count);
+    for (int i = 0; i < count; i++) keys[i] = entries[i].key;
+    std::vector<char> have(count, 0);
+    std::unordered_map<uint64_t, std::vector<RhtSlot>> buckets;
+    read_buckets(keys.data(), count, PeerBreaker::Op::RHT_WRITE, "RHT read",
+                 [&](int i, const RhtSlot* slots) {
+                     have[i] = 1;
+                     std::vector<RhtSlot>& b = buckets[bucket_id(keys[i])];
+                     if (b.empty()) b.assign(slots, slots + W);
+                 }, true);
     for (int i = 0; i < count; i++) {
+        if (!have[i]) continue;
         const RhtInsertEntry& e = entries[i];
         int shard = shard_of(e.key);
-        uint32_t bucket = bucket_of(e.key);
         uint16_t tag = tag_of(e.key);
-        RhtSlot packed = make_slot(pack(tag, e.node_id, e.tree_node_id),
-                                   e.num_blocks);
-
-        if (W == 1) {
-            if (!write_slot(shard, bucket, 0, packed))   // blind overwrite (legacy)
-                dropped(shard, PeerBreaker::Op::RHT_WRITE);
-            continue;
-        }
-        if (!read_bucket(shard, bucket, bucketbuf.data())) {
-            dropped(shard, PeerBreaker::Op::RHT_WRITE);
-            continue;
-        }
-        int j = choose_slot(bucketbuf.data(), W, tag, e.node_id, packed);
+        RhtSlot packed = make_slot(pack(tag, e.node_id, e.tree_node_id), e.num_blocks);
+        std::vector<RhtSlot>& b = buckets[bucket_id(e.key)];
+        int j = choose_slot(b.data(), W, tag, e.node_id, packed);
         if (j < 0) continue;                         // identical entry → no-op
-        if (!write_slot(shard, bucket, (uint32_t)j, packed))
-            dropped(shard, PeerBreaker::Op::RHT_WRITE);
+        if (write_slot(shard, bucket_of(e.key), (uint32_t)j, packed)) b[j] = packed;
+        else dropped(shard, PeerBreaker::Op::RHT_WRITE);
     }
 }
 
@@ -505,25 +519,32 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
                              std::vector<RHTValue>* results) {
     for (int i = 0; i < count; i++)
         results[i].clear();
-    if (count <= 0) return;
-
     uint32_t W = slots_per_bucket_;
-    auto collect = [&](int i, const RhtSlot* slots) {
-        uint16_t tag = tag_of(keys[i]);
-        for (uint32_t j = 0; j < W; j++) {
-            int32_t nid; uint32_t tnid, nb;
-            if (unpack(slots[j].head, tag, nid, tnid) &&
-                unpack_ext(slots[j].head, slots[j].ext, nb))   // torn cell → drop
-                results[i].push_back({nid, tnid, nb});
-        }
-    };
+    read_buckets(keys, count, PeerBreaker::Op::RHT_LOOKUP, "RHT lookup",
+                 [&](int i, const RhtSlot* slots) {
+                     uint16_t tag = tag_of(keys[i]);
+                     for (uint32_t j = 0; j < W; j++) {
+                         int32_t nid; uint32_t tnid, nb;
+                         if (unpack(slots[j].head, tag, nid, tnid) &&
+                             unpack_ext(slots[j].head, slots[j].ext, nb))   // torn cell → drop
+                             results[i].push_back({nid, tnid, nb});
+                     }
+                 });
+}
+
+void RhtEngine::read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op,
+                             const char* what, const BucketFn& on_bucket, bool retry) {
+    if (count <= 0) return;
+    uint32_t W = slots_per_bucket_;
 
     // Local shards: read directly. Remote: group by endpoint (shards on one
-    // holder share a QP).
+    // holder share a QP). Each holder passes the breaker once per call, so a
+    // probe carries all of its keys.
     struct Probe { int shard; uint32_t bucket; int result_idx; };
     std::vector<IRdmaEndpoint*> eps;
     std::vector<std::vector<Probe>> groups;
     std::vector<RhtSlot> localbuf(W);
+    std::unordered_map<int, IRdmaEndpoint*> resolved;
     size_t remaining = 0;
 
     for (int i = 0; i < count; i++) {
@@ -531,12 +552,15 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
         uint32_t bucket = bucket_of(keys[i]);
         if (shards_[shard] != nullptr || endpoints_.empty()) {
             read_bucket(shard, bucket, localbuf.data());
-            collect(i, localbuf.data());
+            on_bucket(i, localbuf.data());
             continue;
         }
-        IRdmaEndpoint* ep = remote_ep(shard);
+        auto it = resolved.find(breaker_ ? holder_[shard] : shard);
+        if (it == resolved.end())
+            it = resolved.emplace(breaker_ ? holder_[shard] : shard, remote_ep(shard)).first;
+        IRdmaEndpoint* ep = it->second;
         if (!ep) {
-            dropped(shard, PeerBreaker::Op::RHT_LOOKUP);
+            dropped(shard, op);
             continue;
         }
         size_t g = 0;
@@ -545,6 +569,7 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
         groups[g].push_back({shard, bucket, i});
         remaining++;
     }
+    if (groups.empty()) return;
 
     // Rounds: one chain (<= RDMA_READ_CHAIN_MAX buckets) per endpoint, laid
     // back-to-back in rdma_buf_, then one wait. Scratch bounds a round.
@@ -555,12 +580,20 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
     struct Posted { size_t g, from, off; int n, owed; };
     std::vector<Posted> posted;
     RdmaReadOp ops[RDMA_READ_CHAIN_MAX];
+    std::vector<int> again;
 
-    // A group whose holder failed: its unread probes miss.
-    auto drop_group = [&](size_t g) {
-        const size_t left = groups[g].size() - next[g];
-        dropped(groups[g][0].shard, PeerBreaker::Op::RHT_LOOKUP, left);
-        remaining -= left;
+    // A fault may release other holders than its own: an endpoint is looked up
+    // on every use, and a group whose endpoint is gone is not touched again.
+    auto live = [&](size_t g) { return endpoints_[groups[g][0].shard]; };
+
+    // Gives up group g's probes from index `from` on: they miss, or go back to
+    // be read again.
+    auto give_up = [&](size_t g, size_t from, bool read_again) {
+        remaining -= groups[g].size() - next[g];
+        if (read_again)
+            for (size_t j = from; j < groups[g].size(); j++) again.push_back(groups[g][j].result_idx);
+        else
+            dropped(groups[g][0].shard, op, groups[g].size() - from);
         next[g] = groups[g].size();
     };
 
@@ -568,8 +601,9 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
     auto wait_posted = [&]() {
         std::exception_ptr first;
         for (const Posted& p : posted) {
-            if (p.owed <= 0) continue;
-            try { eps[p.g]->rdma_read_multi_wait(p.owed); }
+            IRdmaEndpoint* ep = live(p.g);
+            if (p.owed <= 0 || !ep) continue;
+            try { ep->rdma_read_multi_wait(p.owed); }
             catch (...) { if (!first) first = std::current_exception(); }
         }
         if (first) std::rethrow_exception(first);
@@ -584,6 +618,11 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
             for (size_t g = 0; g < groups.size(); g++) {
                 const size_t left = groups[g].size() - next[g];
                 if (left == 0) continue;
+                IRdmaEndpoint* ep = live(g);
+                if (!ep) {
+                    give_up(g, next[g], false);
+                    continue;
+                }
                 if (used == scratch_buckets) break;
                 const int n = (int)std::min({left, (size_t)RDMA_READ_CHAIN_MAX,
                                              scratch_buckets - used});
@@ -597,8 +636,7 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
                     ops[j].length      = (uint32_t)bucket_bytes;
                 }
                 cur = g;
-                const int owed =
-                    eps[g]->rdma_read_multi_post(ops, n, rdma_lkey_);
+                const int owed = ep->rdma_read_multi_post(ops, n, rdma_lkey_);
                 cur = SIZE_MAX;
                 posted.push_back({g, next[g], used, n, owed});
                 next[g] += n;
@@ -614,8 +652,8 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
             }
             bool collected = false;
             if (cur != SIZE_MAX) {   // a post threw; the chains before it are intact
-                fault(groups[cur][0].shard, "RHT lookup", e, t0);
-                drop_group(cur);
+                fault(groups[cur][0].shard, what, e, t0);
+                give_up(cur, next[cur], retry && live(cur));   // not blamed: another holder's error
                 try {
                     wait_posted();
                     collected = true;
@@ -625,31 +663,45 @@ void RhtEngine::lookup_batch(const uint64_t* keys, int count,
             if (!collected) {
                 // The wait threw: fault the broken endpoints and drop every
                 // posted chain, releasing the other endpoints as well so their
-                // unpolled completions leave the CQ with them.
+                // unpolled completions leave the CQ with them; their probes are
+                // read again with `retry`.
                 std::vector<bool> broken(posted.size());
                 bool any = false;
-                for (size_t k = 0; k < posted.size(); k++)
-                    any = (broken[k] = eps[posted[k].g]->broken()) || any;
+                for (size_t k = 0; k < posted.size(); k++) {
+                    IRdmaEndpoint* ep = live(posted[k].g);
+                    any = (broken[k] = ep && ep->broken()) || any;
+                }
                 for (size_t k = 0; k < posted.size(); k++) {
                     const Posted& p = posted[k];
                     const int shard = groups[p.g][0].shard;
-                    dropped(shard, PeerBreaker::Op::RHT_LOOKUP, (uint64_t)p.n);
-                    if (!any || broken[k])
-                        fault(shard, "RHT lookup", e, t0);
-                    else
-                        release_holder(holder_[shard]);
-                    drop_group(p.g);
+                    const bool healthy = any && !broken[k];
+                    if (live(p.g)) {
+                        if (healthy) release_holder(holder_[shard]);
+                        else fault(shard, what, e, t0);
+                    }
+                    give_up(p.g, p.from, retry && healthy);
                 }
                 continue;
             }
         }
         for (const Posted& p : posted) {
+            if (!live(p.g)) {   // released while its chain was out
+                give_up(p.g, p.from, false);
+                continue;
+            }
             ok(groups[p.g][0].shard);
             for (int j = 0; j < p.n; j++)
-                collect(groups[p.g][p.from + j].result_idx,
-                        (const RhtSlot*)((char*)rdma_buf_ +
-                                         (p.off + j) * bucket_bytes));
+                on_bucket(groups[p.g][p.from + j].result_idx,
+                          (const RhtSlot*)((char*)rdma_buf_ +
+                                           (p.off + j) * bucket_bytes));
         }
+    }
+
+    if (!again.empty()) {
+        std::vector<uint64_t> k(again.size());
+        for (size_t j = 0; j < again.size(); j++) k[j] = keys[again[j]];
+        read_buckets(k.data(), (int)k.size(), op, what,
+                     [&](int j, const RhtSlot* slots) { on_bucket(again[j], slots); });
     }
 }
 
@@ -658,40 +710,36 @@ void RhtEngine::dump_bucket(uint64_t key, std::vector<RhtSlot>& out) {
     read_bucket(shard_of(key), bucket_of(key), out.data());
 }
 
-bool RhtEngine::remove(uint64_t key, int32_t expected_node_id,
-                       uint32_t expected_tree_node_id) {
-    int shard = shard_of(key);
-    uint32_t bucket = bucket_of(key);
-    uint16_t tag = tag_of(key);
-    std::vector<RhtSlot> slots(slots_per_bucket_);
-    if (!read_bucket(shard, bucket, slots.data())) {
-        dropped(shard, PeerBreaker::Op::RHT_REMOVE);
-        return false;
-    }
-    // Find MY slot: triple-match (tag + node_id + tree_node_id). Clears only it,
-    // leaving collision victims / re-registered nodes intact.
-    for (uint32_t j = 0; j < slots_per_bucket_; j++) {
-        int32_t nid; uint32_t tnid;
-        if (!unpack(slots[j].head, tag, nid, tnid)) continue;
-        if (nid == expected_node_id && tnid == expected_tree_node_id) {
-            if (!write_slot(shard, bucket, j, RhtSlot{0, 0})) {
-                dropped(shard, PeerBreaker::Op::RHT_REMOVE);
-                return false;
-            }
-            return true;
+void RhtEngine::remove_batch(const RhtRemoveEntry* entries, int count) {
+    // Clears only the cell naming exactly (tag, node_id, tree_node_id), so
+    // collision victims and re-registered nodes stay; buckets read in one batch.
+    if (count <= 0) return;
+    uint32_t W = slots_per_bucket_;
+    std::vector<uint64_t> keys(count);
+    for (int i = 0; i < count; i++) keys[i] = entries[i].key;
+    std::vector<char> have(count, 0);
+    std::unordered_map<uint64_t, std::vector<RhtSlot>> buckets;
+    read_buckets(keys.data(), count, PeerBreaker::Op::RHT_REMOVE, "RHT read",
+                 [&](int i, const RhtSlot* slots) {
+                     have[i] = 1;
+                     std::vector<RhtSlot>& b = buckets[bucket_id(keys[i])];
+                     if (b.empty()) b.assign(slots, slots + W);
+                 }, true);
+    for (int i = 0; i < count; i++) {
+        if (!have[i]) continue;
+        const RhtRemoveEntry& e = entries[i];
+        std::vector<RhtSlot>& b = buckets[bucket_id(e.key)];
+        uint16_t tag = tag_of(e.key);
+        for (uint32_t j = 0; j < W; j++) {
+            int32_t nid; uint32_t tnid;
+            if (!unpack(b[j].head, tag, nid, tnid) || nid != e.node_id ||
+                tnid != e.tree_node_id)
+                continue;
+            if (write_slot(shard_of(e.key), bucket_of(e.key), j, RhtSlot{0, 0})) b[j] = RhtSlot{0, 0};
+            else dropped(shard_of(e.key), PeerBreaker::Op::RHT_REMOVE);
+            break;
         }
     }
-    return false;
-}
-
-void RhtEngine::remove_batch(const RhtRemoveEntry* entries, int count) {
-    // No grouping/chaining optimization: removes are read-modify-(maybe)write
-    // per cell (must read to validate tag+node+tnid before zeroing), and the
-    // evictor's batch is small relative to inserts. Keep it simple + correct.
-    // Entries that fail validation (re-registered node / hash-collision victim)
-    // are correctly left untouched.
-    for (int i = 0; i < count; i++)
-        remove(entries[i].key, entries[i].node_id, entries[i].tree_node_id);
 }
 
 } // namespace radixshmem

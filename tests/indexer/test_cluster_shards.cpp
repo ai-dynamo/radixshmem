@@ -28,6 +28,7 @@
 #include <chrono>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <numeric>
@@ -121,8 +122,9 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.shm.max_blocks = 4096;
     cfg.shm.block_size = kBlockSize;
     cfg.register_chunk_tokens = kChunkTokens;
-    cfg.num_rht_shards  = kNumShards;            // M = 2
-    cfg.rht_shard_holders = {0, 1};              // holders are ranks 0 and 1 (leader-authoritative)
+    setenv("RADIXSHMEM_RHT_BACKEND", "rdma", 1);  // shards and holders exist only there
+    setenv("RADIXSHMEM_RHT_SHARDS", std::to_string(kNumShards).c_str(), 1);   // M = 2
+    setenv("RADIXSHMEM_RHT_SHARD_HOLDERS", "0,1", 1);   // leader-authoritative
     cfg.expected_min_nodes = kWorldSize;
     cfg.registry    = registry;
     cfg.cluster_id  = cluster_id;

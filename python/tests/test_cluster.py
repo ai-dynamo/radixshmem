@@ -237,7 +237,6 @@ def server_cmd(i, n, registry, cluster_id, workdir, index_dev, gid_idx, transpor
         "--cluster-id", cluster_id,
         "--expected-min-nodes", str(n),
         "--rpc-address", "0.0.0.0",
-        "--rht-transport", transports[0],
         "--peer-index-transport", transports[1],
         # several servers on one host: the default socket is per name, not per node
         "--endpoint", endpoint(workdir, i),
@@ -547,8 +546,12 @@ def orchestrate(args) -> int:
         check(servers[0].poll() is None, "node0's server survives evicting entries held by node"
               f"{v}")
         r = run_client("faults", f"{SHM_PREFIX}_node0")
-        check(r["peer_down_events"] >= 1 and r["rht_removes_dropped"] + r["rht_writes_dropped"] > 0,
-              f"node0 counts the lost ops ({r})")
+        if os.environ.get("RADIXSHMEM_RHT_BACKEND", "redis") == "rdma":
+            check(r["peer_down_events"] >= 1 and r["rht_removes_dropped"] + r["rht_writes_dropped"] > 0,
+                  f"node0 counts the RHT ops lost with node{v}'s shard ({r})")
+        else:
+            check(r["walks_skipped"] >= 1 and r["rht_removes_dropped"] + r["rht_writes_dropped"] == 0,
+                  f"node0 loses no RHT op with node{v}, only its walks ({r})")
 
         print(f"\n[8] node{v}'s lease expires; nothing waits for it")
         time.sleep(LEASE_TTL + 3)
@@ -620,7 +623,9 @@ def main() -> int:
     p.add_argument("--gid-idx", type=int, default=3)
     p.add_argument("--timeout", type=int, default=120,
                    help="seconds to wait for the cluster to form")
-    return orchestrate(p.parse_args())
+    args = p.parse_args()
+    os.environ["RADIXSHMEM_RHT_TRANSPORT"] = args.rht_transport   # the RDMA RHT's, servers inherit it
+    return orchestrate(args)
 
 
 if __name__ == "__main__":

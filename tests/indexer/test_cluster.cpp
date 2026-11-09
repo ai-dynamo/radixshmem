@@ -139,7 +139,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.cluster_id  = cluster_id;
     cfg.node_name   = node;
     cfg.rpc_address = "127.0.0.1";   // single-host peers connect over loopback
-    cfg.num_rht_shards  = num_shards;
+    setenv("RADIXSHMEM_RHT_SHARDS", std::to_string(num_shards).c_str(), 1);
     cfg.expected_min_nodes = min_nodes;
     cfg.index_dev    = kRdmaDev;
     cfg.gid_idx     = kGidIdx;
