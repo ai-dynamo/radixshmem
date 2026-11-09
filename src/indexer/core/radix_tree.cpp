@@ -196,7 +196,6 @@ void RadixShmemTree::reset() {
     hdr->insert_error_data_pool.store(0, std::memory_order_relaxed);
     hdr->insert_error_ht_pool.store(0, std::memory_order_relaxed);
     hdr->insert_error_mempool.store(0, std::memory_order_relaxed);
-    hdr->peer_faults.clear();
     for (auto& held : hdr->held_slots)
         held.store(0, std::memory_order_relaxed);
     hdr->reset_generation.fetch_add(1, std::memory_order_relaxed);
