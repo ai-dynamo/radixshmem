@@ -23,6 +23,7 @@ struct RemoteHit;
 
 class LocalTreeConnector;
 class RadixServer;
+class KvEventRingReader;
 class PeerRegistry;
 class PeerIndexBackend;   // include/peer_index.h
 class RhtBackend;         // include/rht_backend.h
@@ -160,6 +161,21 @@ public:
     // without a local tree.
     PeerFaultCounters* peer_faults() const;
 
+    // ==================== KV-event ring ====================
+    // Readers of the region's placement ring (empty when it has none); each
+    // client keeps its own cursor and never blocks writers.
+    bool kvevent_enabled() const;
+    void kvevent_seek_to_head();
+    struct KvEventRecord {
+        uint32_t kind;                  // KvEventKind
+        std::vector<uint64_t> hashes;   // empty for cleared
+    };
+    struct KvEventBatch {
+        std::vector<KvEventRecord> records;
+        bool overflow = false;          // records were lost; the node's state is unknown
+    };
+    KvEventBatch kvevent_drain(size_t max_hashes = 65536);
+
     // Server-side eviction client: remove RHT entries for locally-evicted nodes
     // (only cells still matching this rank). Empty list ok; flushes at end.
     struct EvictedKey { uint64_t first_hash; uint32_t tree_node_id; };
@@ -248,6 +264,9 @@ private:
     bool local_read_only_ = false;   // read-only attach, never joins the cluster
     std::mutex reset_mu_;
     void require_writable(const char* op) const;
+
+    std::unique_ptr<KvEventRingReader> kvevent_reader_;
+    KvEventRingReader* kvevent_reader();
 
     // Pin release, reachable only through a query(lock=true) finalize:
     // one PinRecord on the local tree / on peer pin.source_rank.

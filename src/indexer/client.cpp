@@ -5,6 +5,7 @@
 #include "radix_server.h"       // RadixClient(RadixServer&) ctor
 
 #include "local.h"
+#include "kvevent.h"
 #include "cluster_protocol.h"
 #include "cluster_manifest.h"
 #include "bilateral_transport.h"
@@ -1047,6 +1048,39 @@ TreeDump RadixClient::dump_tree(uint32_t max_nodes, uint64_t max_blocks) const {
 const std::string& RadixClient::name() const {
     static const std::string kNone;
     return local_ ? local_->name() : kNone;
+}
+
+// ==================== KV-event ring ====================
+
+KvEventRingReader* RadixClient::kvevent_reader() {
+    if (kvevent_reader_) return kvevent_reader_.get();
+    if (!local_) return nullptr;
+    auto& tree = local_->tree();
+    const uint64_t off = tree.kvevent_ring_offset();
+    if (off == 0) return nullptr;
+    kvevent_reader_ = std::make_unique<KvEventRingReader>(
+        (char*)tree.shm_base() + off);
+    return kvevent_reader_.get();
+}
+
+bool RadixClient::kvevent_enabled() const {
+    return const_cast<RadixClient*>(this)->kvevent_reader() != nullptr;
+}
+
+void RadixClient::kvevent_seek_to_head() {
+    if (auto* r = kvevent_reader()) r->seek_to_head();
+}
+
+RadixClient::KvEventBatch RadixClient::kvevent_drain(size_t max_hashes) {
+    KvEventBatch out;
+    auto* r = kvevent_reader();
+    if (r == nullptr) return out;
+    auto res = r->drain(max_hashes);
+    out.records.reserve(res.records.size());
+    for (auto& rec : res.records)
+        out.records.push_back({static_cast<uint32_t>(rec.kind), std::move(rec.hashes)});
+    out.overflow = res.overflow;
+    return out;
 }
 
 } // namespace radixshmem

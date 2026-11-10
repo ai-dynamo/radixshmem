@@ -92,6 +92,13 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--data-pool-ratio", type=float, default=4.0,
                    help="index DataPool = full slots x ratio x bytes per block (default: 4.0)")
     g.add_argument("--evict-policy", default="lru", choices=["lru"])
+    g.add_argument("--kvevent-ring-capacity", type=int, default=0,
+                   help="KV-event ring entries (default: 0 = none, 65536 with --kv-events-endpoint)")
+    g.add_argument("--kv-events-endpoint", default="",
+                   help="ZMQ PUB endpoint for this node's placement stream, e.g. tcp://*:5600 "
+                        "(default: off)")
+    g.add_argument("--kv-events-topic", default="",
+                   help="ZMQ topic frame for --kv-events-endpoint (default: empty)")
     g.add_argument("--hugepage-path", default="",
                    help="hugetlbfs mount for the index and the slot store (default: plain /dev/shm)")
 
@@ -192,6 +199,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         monitor_port=a.monitor_port, monitor_interval_s=a.monitor_interval,
         monitor_tree_nodes=a.monitor_tree_nodes, monitor_cluster_nodes=a.monitor_cluster_nodes,
         writeback_max_held_ratio=a.writeback_max_held,
+        kvevent_ring_capacity=a.kvevent_ring_capacity,
+        kv_events_endpoint=a.kv_events_endpoint, kv_events_topic=a.kv_events_topic,
         cluster=cluster, **kw)
 
 
