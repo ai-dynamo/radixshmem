@@ -2,6 +2,8 @@
 
 With `RADIXSHMEM_RHT_BACKEND=redis`, routes are stored in a Redis Cluster. We recommend three masters with one replica each, six redis-server processes in total.
 
+Recommended versions are Redis 8.10.3 (7.0 or later) and Valkey 9.0.7 (7.2 or later); both are tested.
+
 The example below uses eight radixshmem nodes, n1–n8. Nodes n1–n6 each run one redis-server on port 7001: n1–n3 as masters, n4–n6 as replicas. n7 and n8 run no Redis. Since no node runs more than one redis-server, losing any single node takes down at most one master, and the cluster fails over on its own.
 
 ## 1. Redis server configuration
