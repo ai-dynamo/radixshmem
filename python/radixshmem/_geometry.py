@@ -6,6 +6,7 @@ JSON on the wire::
 
     {"version": 1, "index_name": "/x", "data_name": "/x_data", "hugepage_path": "",
      "block_size": 64, "slot_align": 4096, "register_chunk_tokens": 4096, "max_nodes": 0,
+     "hash_scheme": "xxh64-v1",
      "pools": {"full":  {"slot_bytes": B, "num_slots": N},
                "swa":   {"slot_bytes": B, "num_slots": N, "window_blocks": W},
                "mamba": {"slot_bytes": B, "num_slots": N}}}
@@ -30,6 +31,8 @@ from radixshmem import _core
 
 PROTOCOL_VERSION = 1
 POOL_KINDS = ("full", "swa", "mamba")
+# How clients derive block hashes; every client of a cluster must agree.
+DEFAULT_HASH_SCHEME = "xxh64-v1"
 MAX_REGISTER_CHUNK_SIZE = int(getattr(_core, "MAX_REGISTER_CHUNK_SIZE", 4096))
 
 
@@ -38,7 +41,9 @@ class Geometry:
     """A client's side of the geometry. Data-mode servers take the byte sizes
     and plan the counts; index-only servers take the counts (``*_slots``) and
     ignore the bytes. A pool exists when its bytes or its count is > 0.
-    ``slot_align`` / ``register_chunk_tokens`` 0 = the server's default."""
+    ``slot_align`` / ``register_chunk_tokens`` 0 = the server's default.
+    ``hash_scheme`` names how the client derives block hashes ("" = the
+    built-in ``compute_hashes``, ``DEFAULT_HASH_SCHEME``)."""
 
     block_size: int
     full_slot_bytes: int = 0
@@ -50,6 +55,7 @@ class Geometry:
     mamba_slots: int = 0
     slot_align: int = 0
     register_chunk_tokens: int = 0
+    hash_scheme: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         pools: Dict[str, Dict[str, int]] = {}
@@ -61,9 +67,16 @@ class Geometry:
         if "swa" in pools or self.swa_window_blocks:
             pools.setdefault("swa", {"slot_bytes": 0, "num_slots": 0})
             pools["swa"]["window_blocks"] = int(self.swa_window_blocks)
-        return {"version": PROTOCOL_VERSION, "block_size": int(self.block_size),
-                "slot_align": int(self.slot_align),
-                "register_chunk_tokens": int(self.register_chunk_tokens), "pools": pools}
+        out = {"version": PROTOCOL_VERSION, "block_size": int(self.block_size),
+               "slot_align": int(self.slot_align),
+               "register_chunk_tokens": int(self.register_chunk_tokens), "pools": pools}
+        if self.hash_scheme:
+            out["hash_scheme"] = str(self.hash_scheme)
+        return out
+
+
+def hash_scheme(g: Dict[str, Any]) -> str:
+    return str(g.get("hash_scheme") or DEFAULT_HASH_SCHEME)
 
 
 def as_spec(geometry: Any) -> Dict[str, Any]:
@@ -119,7 +132,8 @@ def plan(spec: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
     out: Dict[str, Any] = {
         "version": PROTOCOL_VERSION, "index_name": cfg.name, "data_name": "",
         "hugepage_path": cfg.hugepage_path, "block_size": block_size, "slot_align": 0,
-        "register_chunk_tokens": tokens, "max_nodes": int(cfg.max_nodes), "pools": {}}
+        "register_chunk_tokens": tokens, "max_nodes": int(cfg.max_nodes),
+        "hash_scheme": hash_scheme(spec), "pools": {}}
     data_bytes = int(cfg.data_bytes)
     if data_bytes <= 0:
         for kind, pool in pools.items():
@@ -170,6 +184,7 @@ def uniform_fields(g: Dict[str, Any]) -> Dict[str, Any]:
     return {"version": PROTOCOL_VERSION, "block_size": int(g["block_size"]),
             "slot_align": int(g.get("slot_align", 0)),
             "register_chunk_tokens": int(g.get("register_chunk_tokens", 0)),
+            "hash_scheme": hash_scheme(g),
             "pools": {kind: {k: int(v) for k, v in pool.items() if k != "num_slots"}
                       for kind, pool in g["pools"].items()}}
 
@@ -181,6 +196,8 @@ def diff_geometry(a: Dict[str, Any], b: Dict[str, Any], *, counts: bool) -> List
     for key in ("block_size", "slot_align", "register_chunk_tokens"):
         if int(a.get(key, 0)) != int(b.get(key, 0)):
             diffs.append(f"{key}: {a.get(key, 0)} != {b.get(key, 0)}")
+    if hash_scheme(a) != hash_scheme(b):
+        diffs.append(f"hash_scheme: {hash_scheme(a)} != {hash_scheme(b)}")
     pa, pb = a["pools"], b["pools"]
     fields = ("slot_bytes", "window_blocks") + (("num_slots",) if counts else ())
     for kind in POOL_KINDS:
