@@ -257,16 +257,16 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("registry", &RadixServerConfig::registry)
         .def_readwrite("cluster_id", &RadixServerConfig::cluster_id)
         .def_readwrite("node_name", &RadixServerConfig::node_name)
-        // Distributed-mode bootstrap IP peers connect to (required when world_size>1;
-        // "0.0.0.0" for a single-node test). rpc_interface resolves the IP from a NIC
-        // and wins over rpc_address.
+        // Control IPv4 resolved from interface/address settings, the index GID, or the registry route.
         .def_readwrite("rpc_address", &RadixServerConfig::rpc_address)
         .def_readwrite("rpc_interface", &RadixServerConfig::rpc_interface)
         // Bootstrap / XRC listen port; 0 = OS-assigned (the real port is published).
         .def_property("rpc_port",
                       [](const RadixServerConfig& c) { return (int)c.rpc_port; },
                       [](RadixServerConfig& c, int v) { c.rpc_port = (uint16_t)v; })
+        // Index-plane device / port / GID index; "" / 0 / -1 = chosen from the local devices.
         .def_readwrite("index_dev", &RadixServerConfig::index_dev)
+        .def_readwrite("index_port", &RadixServerConfig::index_port)
         .def_readwrite("gid_idx", &RadixServerConfig::gid_idx)
         .def_readwrite("bootstrap_timeout_sec",
                        &RadixServerConfig::bootstrap_timeout_sec)
@@ -285,6 +285,11 @@ PYBIND11_MODULE(_core, m) {
                       [](RadixServerConfig& c, int v) { c.remote_op_listen_port = (uint16_t)v; })
         .def_readwrite("writeback_enabled", &RadixServerConfig::writeback_enabled)
         .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
+
+#ifndef RADIXSHMEM_NO_RDMA
+    // Resolve network settings in place; return a summary or raise on invalid or ambiguous choices.
+    m.def("resolve_cluster_net", &resolve_cluster_net, py::arg("cfg"));
+#endif
 
     // ==================== Result types ====================
 
@@ -547,10 +552,7 @@ PYBIND11_MODULE(_core, m) {
         });
 
 #ifdef RADIXSHMEM_HAS_ETCD
-    // ==================== EtcdKv ====================
-    // Plain key/value access to the cluster's etcd, sharing the process-global
-    // connection with RadixServer / DataPlaneRegistry. Values are text (JSON,
-    // base64). Used by radixshmem.server for radix/<cluster_id>/geometry and nodes/<node>.
+    // ==================== EtcdKv: text key/value access to the cluster's etcd over the process-global connection ====================
 
     py::class_<etcd::Client>(m, "EtcdKv")
         .def(py::init([](const std::string& registry) {

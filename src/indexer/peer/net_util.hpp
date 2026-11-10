@@ -34,10 +34,10 @@ inline std::string interface_ipv4(const std::string& iface) {
     return ip;
 }
 
-// Resolve the bind IP from an explicit address and/or interface name.
+// Resolve the IP published to peers (never bound) from an explicit address and/or interface name.
 // Interface takes precedence: if both are set, the address is ignored with a
 // warning. Returns empty if neither yields an address (caller decides policy).
-inline std::string resolve_bind_ip(const std::string& address,
+inline std::string resolve_publish_ip(const std::string& address,
                                    const std::string& iface) {
     if (!iface.empty()) {
         std::string ip = interface_ipv4(iface);

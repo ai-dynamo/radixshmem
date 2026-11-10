@@ -1,31 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""radix-server: run a RadixServer until SIGINT / SIGTERM.
-
-The server starts with what the operator knows (identity, cluster, NICs, the
-SlotStore budget and how it is split between the pools) and waits for a client
-to bring the geometry, tokens per block and bytes per slot:
-``radixshmem.RadixClient(name, radixshmem.Geometry(...))``. In a cluster the first
-node configured spreads its geometry to the others through etcd.
-
-Index only (no data plane; slot ids belong to the client's own storage, whose
-geometry brings the slot counts):
-    radix-server --name /kv
-
-Index + data plane (--data-bytes selects it; the server owns a SlotStore and
-sizes the pools from the budget: SWA and Mamba take their ratio, FULL the rest):
-    radix-server --name /kv --data-bytes 64G
-    radix-server --name /kv --data-bytes 64G --swa-ratio 0.15 --mamba-ratio 0.05
-
-Distributed (one per node, discovery via etcd, rank assigned by etcd):
-    radix-server --name /kv --data-bytes 64G --expected-min-nodes 3 \\
-                 --registry etcd://10.0.0.1:2379 --rpc-address 10.0.0.2 \\
-                 --transfer-dev mlx5_0,mlx5_1
-
-Byte sizes are the client's business; budgets and ratios may differ per node,
-the slot shape may not (the servers cross-check it through etcd).
-"""
+"""radix-server: run a RadixServer until SIGINT / SIGTERM with the operator's settings; a client (or a peer via etcd)
+brings the Geometry. Index-only without --data-bytes; a cluster node with --expected-min-nodes and --registry."""
 
 from __future__ import annotations
 
@@ -158,13 +135,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--registry", default="etcd://127.0.0.1:2379")
     g.add_argument("--cluster-id", default="default")
     g.add_argument("--node-name", default="")
-    g.add_argument("--rpc-address", default="", help="bootstrap IP peers dial; 0.0.0.0 on one host")
-    g.add_argument("--rpc-interface", default="", help="NIC to resolve the bootstrap IP from")
+    g.add_argument("--rpc-address", default="",
+                   help="control IP peers dial (default: the index device's IPv4); 0.0.0.0 on one host")
+    g.add_argument("--rpc-interface", default="", help="NIC to resolve the control IP from (wins over --rpc-address)")
     g.add_argument("--rpc-port", type=int, default=0)
     g.add_argument("--index-dev", default="",
-                   help="HCA of the index control plane (default: first available); "
-                        "the data plane's is --transfer-dev")
-    g.add_argument("--gid-idx", type=int, default=3)
+                   help="HCA of the index control plane (default: chosen from the local devices; "
+                        "several fitting ones is an error listing them); the data plane's is --transfer-dev")
+    g.add_argument("--index-port", type=int, default=0,
+                   help="HCA port of --index-dev (default: 0 = an ACTIVE port with a usable GID)")
+    g.add_argument("--gid-idx", type=int, default=-1,
+                   help="GID index on --index-dev (default: -1 = RoCE v2 IPv4, else RoCE v2 global IPv6, "
+                        "else RoCE v1 with a global address; the IB GID on an IB link)")
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
@@ -188,7 +170,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
     cluster = ClusterConfig(
         expected_min_nodes=a.expected_min_nodes, settle_ms=a.settle_ms, registry=a.registry,
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
-        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, gid_idx=a.gid_idx,
+        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, index_port=a.index_port,
+        gid_idx=a.gid_idx,
         bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
         peer_index_transport=a.peer_index_transport, remote_op_listen_port=a.remote_op_listen_port)
     return ServerConfig(

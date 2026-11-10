@@ -97,8 +97,10 @@ struct RadixClientConfig {
     std::string registry   = "etcd://127.0.0.1:2379";
     std::string cluster_id = "default";
     std::string node_name  = "";     // identity whose shm to attach (/shm/<node_name>)
-    std::string index_dev;            // empty = first available
-    int         gid_idx    = 3;
+    // Device / port / GID: explicit values override server defaults or local discovery for observers.
+    std::string index_dev;
+    int         index_port = 0;
+    int         gid_idx    = -1;
     int         bootstrap_timeout_sec = 60;
     bool        rht_only   = false;  // build only RHT-plane QPs (eviction client)
     bool        no_local_tree = false;  // observer: no local server, rank -1, remote-only
@@ -111,13 +113,7 @@ struct RadixClientConfig {
 
 class RadixClient {
 public:
-    // Attach to an existing shm region by name. local_read_only=true attaches
-    // the tree and nothing else: no etcd, RDMA or RHT plane even when the
-    // region belongs to a cluster, so it is cheap to hold in every worker
-    // process. Such a client reads only: query() is always local,
-    // is_distributed() is false, and insert / allocate_slots / recycle_slots /
-    // reset throw, since topology changes made without the RHT plane would
-    // leave peers routing to nodes this process never unpublished.
+    // Attach to an existing shm region by name; local_read_only attaches the tree only (no etcd/RDMA/RHT): query() is local, writes throw.
     explicit RadixClient(const std::string& name, bool local_read_only = false);
 
     // etcd-native form: discover shm via /shm/<node_name>, join cluster from etcd.
@@ -250,10 +246,7 @@ public:
     TreeDump dump_tree(uint32_t max_nodes = 0, uint64_t max_blocks = 0) const;
 
 private:
-    // `local_` attaches the node-local shm (null for an observer). The cluster
-    // machinery below is built (bootstrap_cluster) only when distributed.
-    // owns_local_ is false when a same-process RadixServer lends its connector
-    // (embedded eviction service): the dtor releases without freeing it.
+    // local_ is the node-local shm (null for an observer); the cluster plane exists only when distributed; owns_local_ false = lent by a RadixServer.
     std::unique_ptr<LocalTreeConnector> local_;
     bool owns_local_ = true;
     bool local_read_only_ = false;   // read-only attach, never joins the cluster

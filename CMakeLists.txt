@@ -77,6 +77,7 @@ if(ENABLE_RDMA)
         src/indexer/rht/redis_rht.cpp
         # RDMA transport plane: verbs primitives split by connection model.
         src/indexer/transport/rdma/context.cpp
+        src/indexer/transport/rdma/net_discovery.cpp
         src/indexer/transport/rdma/rc_endpoint.cpp
         src/indexer/transport/rdma/xrc.cpp
         src/indexer/transport/rdma/dc_oneside.cpp
@@ -397,6 +398,12 @@ foreach(_t ${_core_unit_tests})
 endforeach()
 
 if(ENABLE_RDMA)
+    # Device discovery parser + index-plane selection rules over fake sysfs / probe doubles (no hardware).
+    add_executable(test_net_select tests/indexer/test_net_select.cpp)
+    target_link_libraries(test_net_select PRIVATE radixshmem)
+    radixshmem_enable_asserts(test_net_select)
+    add_test(NAME test_net_select COMMAND test_net_select)
+
     # XRC shared-state cross-process primitive test (no radixshmem needed).
     add_executable(test_xrc_state tests/indexer/test_xrc_state.cpp)
     target_link_libraries(test_xrc_state PRIVATE radixshmem)

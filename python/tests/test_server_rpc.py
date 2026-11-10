@@ -244,6 +244,121 @@ def test_remote_op_options():
     assert not hasattr(radixshmem._core.RadixServerConfig(), "zmq_listen_port")
 
 
+def test_control_address_resolution():
+    """Check handshake address fallback, explicit device/GID selection, and invalid GID rejection."""
+    c = ServerConfig(transfer_ip="10.9.9.9")
+    assert c.resolved_transfer_ip() == "10.9.9.9"
+    c = ServerConfig()
+    c.cluster.rpc_address = "0.0.0.0"
+    assert c.resolved_transfer_ip() == "127.0.0.1"
+    c.cluster.rpc_address = "10.6.131.12"
+    assert c.resolved_transfer_ip() == "10.6.131.12"
+    c.cluster.rpc_address = ""
+    with pytest.raises(ValueError):
+        c.resolved_transfer_ip()
+
+    dev, cc0, summary = _one_usable_device()
+    gid, addr = cc0.gid_idx, cc0.rpc_address
+    assert gid >= 0 and addr and addr != "0.0.0.0"
+    assert f"index {dev} port {cc0.index_port} gid {gid}" in summary and "explicit device" in summary
+    cc = radixshmem._core.RadixServerConfig()
+    cc.index_dev, cc.gid_idx, cc.rpc_address = dev, gid, "10.9.9.9"
+    radixshmem._core.resolve_cluster_net(cc)
+    assert (cc.index_dev, cc.gid_idx, cc.rpc_address) == (dev, gid, "10.9.9.9")
+    cc.gid_idx = 250
+    with pytest.raises(RuntimeError, match="gid 250 is not set"):
+        radixshmem._core.resolve_cluster_net(cc)
+
+
+def test_net_preflight_copies_normalized_cluster_settings(monkeypatch):
+    normalized = dict(registry="etcd://192.0.2.1:2379", cluster_id="normalized", node_name="node-test",
+                      peer_index_transport="dc", index_port=2,
+                      index_dev="mlx5_test", gid_idx=7, rpc_address="192.0.2.2")
+
+    def resolve(config):
+        for name, value in normalized.items():
+            setattr(config, name, value)
+        return "normalized test settings"
+
+    monkeypatch.setattr(radixshmem._core, "resolve_cluster_net", resolve, raising=False)
+    config = ServerConfig()
+    RadixServer(config)._resolve_net()
+    for name, value in normalized.items():
+        assert getattr(config.cluster, name) == value
+
+
+def test_core_net_resolver_applies_environment_before_discovery(monkeypatch):
+    if not hasattr(radixshmem._core, "resolve_cluster_net"):
+        pytest.skip("built without RDMA")
+    overrides = dict(PEER_INDEX_TRANSPORT=("peer_index_transport", "dc"),
+                     REGISTRY=("registry", "etcd://192.0.2.1:2379"),
+                     CLUSTER_ID=("cluster_id", "normalized"), NODE_NAME=("node_name", "node-test"))
+    for name, (_, value) in overrides.items():
+        monkeypatch.setenv(f"RADIXSHMEM_{name}", str(value))
+    config = radixshmem._core.RadixServerConfig()
+    config.index_dev = "radixshmem_missing_test_device"
+    with pytest.raises(RuntimeError, match="not found"):
+        radixshmem._core.resolve_cluster_net(config)
+    for name, value in overrides.values():
+        assert getattr(config, name) == value
+
+
+def _one_usable_device():
+    """(index_dev, resolved config, summary) of a local device the resolver settles on its own; else skip."""
+    sysfs = "/sys/class/infiniband"
+    devs = sorted(os.listdir(sysfs)) if os.path.isdir(sysfs) else []
+    if not devs or not hasattr(radixshmem._core, "resolve_cluster_net"):
+        pytest.skip("no RDMA device or built without RDMA")
+    for dev in devs:
+        cc = radixshmem._core.RadixServerConfig()
+        cc.index_dev = dev
+        try:
+            summary = radixshmem._core.resolve_cluster_net(cc)
+        except RuntimeError:
+            continue   # not ACTIVE, no usable GID or several of them on this device
+        return dev, cc, summary
+    pytest.skip("no device with one usable GID")
+
+
+def test_wildcard_control_address_needs_a_node_name(cfg, monkeypatch):
+    """0.0.0.0 would name every server on the host node0.0.0.0: the resolver refuses it unless a
+    node_name (explicit or RADIXSHMEM_NODE_NAME) is given, judges the resolved address rather than
+    the raw setting, and the Python preflight runs it before any shm region exists."""
+    dev, cc0, _ = _one_usable_device()
+    gid, port = cc0.gid_idx, cc0.index_port
+    monkeypatch.delenv("RADIXSHMEM_NODE_NAME", raising=False)
+
+    def config(**kw):
+        cc = radixshmem._core.RadixServerConfig()
+        cc.index_dev, cc.gid_idx, cc.rpc_address = dev, gid, "0.0.0.0"
+        for k, v in kw.items():
+            setattr(cc, k, v)
+        return cc
+
+    with pytest.raises(RuntimeError, match="node_name"):
+        radixshmem._core.resolve_cluster_net(config())
+    cc = config(node_name="a")
+    radixshmem._core.resolve_cluster_net(cc)
+    assert cc.rpc_address == "0.0.0.0"
+    monkeypatch.setenv("RADIXSHMEM_NODE_NAME", "b")
+    cc = config()
+    radixshmem._core.resolve_cluster_net(cc)
+    assert (cc.node_name, cc.rpc_address) == ("b", "0.0.0.0")
+    monkeypatch.delenv("RADIXSHMEM_NODE_NAME")
+    ndev_path = f"{'/sys/class/infiniband'}/{dev}/ports/{port}/gid_attrs/ndevs/{gid}"
+    if os.path.exists(ndev_path):
+        cc = config(rpc_interface=open(ndev_path).read().strip())
+        radixshmem._core.resolve_cluster_net(cc)   # the interface's IP is published, not 0.0.0.0
+        assert cc.rpc_address not in ("", "0.0.0.0")
+
+    c = cfg()
+    c.cluster.expected_min_nodes, c.cluster.rpc_address = 2, "0.0.0.0"
+    c.cluster.index_dev, c.cluster.gid_idx = dev, gid
+    with pytest.raises(RuntimeError, match="node_name"):
+        RadixServer(c).start()
+    assert not os.path.exists(f"/dev/shm{c.name}_node0.0.0.0")
+
+
 def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):
     c = cfg(**data())
     srv = up(c, geometry())

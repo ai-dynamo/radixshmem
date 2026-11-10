@@ -1,24 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Node-join integration test over etcd dynamic membership.
-//
-// Brings up a 2-node cluster (node0, node1; both RHT holders, num_shards=2),
-// then spawns a third node as a data-only peer (join_existing). Verifies:
-//
-//   1. A reader on node0, attached while the cluster was 2 nodes, senses node2
-//      through its /peers watcher (world_size() grows 2→3) with no re-attach.
-//   2. That reader RDMA remote-walks a prefix written by node2, connecting to
-//      node2's endpoint on first use.
-//   3. remote_node_id == 2, common_hit covers the prefix, rdma reads > 0.
-//
-// Re-exec discipline (as test_cluster.cpp): the etcd Go-client wrapper starts
-// its runtime at library-load, so every server AND client is a fresh exec.
-//   --server <node> <registry> <cluster_id> <num_shards> <min_nodes>
-//   --joined-reader <node> <registry> <cluster_id>
-//   --writer2       <node> <registry> <cluster_id>
-//
-// Loopback-only — all processes run on the host that owns the RDMA NIC.
+// Node join over etcd dynamic membership: a 2-node cluster gains a data-only third node; a reader attached on node0 sees
+// world_size 2->3 and remote-walks node2's prefix. Every process is re-exec'd (--server / --joined-reader / --writer2); loopback only.
 
 #include "radix_client.h"
 #include "radix_server.h"
@@ -52,7 +36,7 @@ constexpr int    kBootstrapTO  = 30;
 constexpr int    kJoinTO       = 40;   // reader's budget to sense node2 + hit
 constexpr const char* kShmPrefix = "/test_join";
 constexpr const char* kRdmaDev   = "mlx5_bond_0";
-constexpr int    kGidIdx        = 3;
+constexpr int    kGidIdx        = -1;   // auto: must resolve to the RoCE v2 IPv4 entry on this host
 
 std::string node_name_for(int rank) { return "node" + std::to_string(rank); }
 std::string shm_name_for(int rank) {
