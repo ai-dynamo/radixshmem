@@ -63,16 +63,36 @@ message AllocateComponentsResponse {
   repeated ComponentSlots components = 2;  // one per request entry when error is OK, else none
 }
 
+// A lock pins only a hit longer than `incumbent`, FULL only from min(full_from, hit).
 message QueryRequest {
   repeated fixed64 hashes = 1;
-  bool lock = 2;          // pin the matched prefix until Unlock
+  bool lock = 2;          // pin the hit until Unlock
   bool update_meta = 3;   // bump LRU on the target
+  uint32 mask = 4;        // components to match, COMPONENT_MASK_* bits
+  uint32 incumbent = 5;
+  uint32 full_from = 6;
+}
+// What Query(lock) pinned: block ranges of FULL and SWA, the node END whose Mamba
+// checkpoint it holds, and the last pinned node's blocks past the request's hashes.
+message Pin {
+  uint32 full_start = 1;
+  uint32 full_end = 2;
+  uint32 swa_start = 3;
+  uint32 swa_end = 4;
+  uint32 mamba_end = 5;   // 0 = none
+  repeated fixed64 tail = 6;
+}
+message Checkpoint {
+  int32 slot = 1;
 }
 message QueryResponse {
   int32 hit_length = 1;
-  repeated int32 slots = 2;  // hit_length entries
-  int32 pin_end = 3;
-  repeated fixed64 pin_tail = 4;
+  repeated int32 slots = 2;       // FULL [min(full_from, hit_length), hit_length)
+  reserved 3, 4;                  // pin_end, pin_tail: now in pin
+  uint32 swa_start = 5;
+  repeated int32 swa_slots = 6;   // SWA [swa_start, hit_length)
+  Checkpoint mamba = 7;           // the Mamba checkpoint at hit_length
+  Pin pin = 8;
 }
 
 // Publish slots[i] for hashes[start + i] after the KV transfer completed.
@@ -112,13 +132,11 @@ message RecycleRequest {
 }
 message RecycleResponse {}
 
-// Drop a Query(lock) pin over hashes[start, start + length).
+// Drop what a Query(lock) over the same hashes pinned. Not idempotent: never replayed.
 message UnlockRequest {
   repeated fixed64 hashes = 1;
-  int32 start = 2;
-  int32 length = 3;
-  int32 pin_end = 4;
-  repeated fixed64 pin_tail = 5;
+  reserved 2, 3, 4, 5;   // start, length, pin_end, pin_tail: now in pin
+  Pin pin = 6;
 }
 message UnlockResponse {}
 

@@ -36,8 +36,7 @@ public:
     GrpcRemoteOpClientTransport& operator=(const GrpcRemoteOpClientTransport&) = delete;
 
     AllocateReply allocate(int n, ComponentType component = ComponentType::FULL) override;
-    QueryReply query(const uint64_t* hashes, int n, bool lock,
-                     bool update_meta) override;
+    QueryReply query(const uint64_t* hashes, int n, const RemoteQuery& q) override;
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
                         const int32_t* slots, bool auto_recycle,
                         ComponentType component = ComponentType::FULL) override;
@@ -48,9 +47,7 @@ public:
                                  bool auto_recycle) override;
     RemoteStatus recycle(const int32_t* slots, int num_slots,
                          ComponentType component = ComponentType::FULL) override;
-    RemoteStatus unlock(const uint64_t* hashes, int n, int start,
-                        int length, int pin_end,
-                        const std::vector<uint64_t>& pin_tail) override;
+    RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin) override;
     DedupReply dedup_prefix(const uint64_t* hashes, int n,
                             const DedupRequest& req = {}) override;
     bool connected() override;

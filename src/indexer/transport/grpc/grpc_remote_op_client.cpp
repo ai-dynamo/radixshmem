@@ -8,9 +8,11 @@
 
 #include "cluster_protocol.h"
 #include "remote_ops.grpc.pb.h"
+#include "remote_ops_codec.hpp"
 
 #include <grpcpp/grpcpp.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <vector>
@@ -151,28 +153,43 @@ AllocateComponentsReply GrpcRemoteOpClientTransport::allocate_components(
 }
 
 QueryReply GrpcRemoteOpClientTransport::query(const uint64_t* hashes, int n,
-                                              bool lock, bool update_meta) {
+                                              const RemoteQuery& q) {
     QueryReply out;
     if (!copyable(hashes, n)) { out.status = RemoteStatus::BAD_REQUEST; return out; }
     pb::QueryRequest req;
     req.mutable_hashes()->Add(hashes, hashes + n);
-    req.set_lock(lock);
-    req.set_update_meta(update_meta);
+    req.set_lock(q.lock);
+    req.set_update_meta(q.update_meta);
+    req.set_mask(q.mask);
+    req.set_incumbent(q.window.incumbent);
+    req.set_full_from(q.window.full_from);
     pb::QueryResponse rep;
     grpc::ClientContext ctx;
     impl_->prepare(ctx);
     out.status = to_remote_status(impl_->stub->Query(&ctx, req, &rep));
     if (out.status != RemoteStatus::OK) return out;
-    if (rep.hit_length() < 0 || rep.hit_length() > n ||
-        rep.slots_size() != rep.hit_length() ||
-        (lock && rep.hit_length() > 0 && rep.pin_end() < rep.hit_length())) {
+    const int64_t hit = rep.hit_length();
+    const bool swa = (q.mask & COMPONENT_MASK_SWA) != 0 && hit > 0;
+    const pb::Pin& pin = rep.pin();
+    const int64_t pin_end = std::max({(int64_t)pin.full_end(), (int64_t)pin.swa_end(),
+                                      (int64_t)pin.mamba_end()});
+    if (hit < 0 || hit > n ||
+        rep.slots_size() != ((q.mask & COMPONENT_MASK_FULL) != 0
+                                 ? hit - std::min<int64_t>(q.window.full_from, hit) : 0) ||
+        (swa ? rep.swa_start() > hit || rep.swa_slots_size() != hit - rep.swa_start()
+             : rep.swa_slots_size() != 0) ||
+        (rep.has_mamba() && (q.mask & COMPONENT_MASK_MAMBA) == 0) ||
+        (rep.has_pin() && !q.lock) || pin.full_start() > pin.full_end() ||
+        pin.swa_start() > pin.swa_end() || pin_end > hit + pin.tail_size()) {
         out.status = RemoteStatus::BAD_REPLY;
         return out;
     }
-    out.hit_length = rep.hit_length();
+    out.hit_length = (int)hit;
     out.slots.assign(rep.slots().begin(), rep.slots().end());
-    out.pin_end = rep.pin_end();
-    out.pin_tail.assign(rep.pin_tail().begin(), rep.pin_tail().end());
+    out.swa_start = rep.swa_start();
+    out.swa_slots.assign(rep.swa_slots().begin(), rep.swa_slots().end());
+    if (rep.has_mamba()) out.mamba_slot = rep.mamba().slot();
+    out.pin = pin_from_pb(pin);
     return out;
 }
 
@@ -274,17 +291,13 @@ RemoteStatus GrpcRemoteOpClientTransport::recycle(const int32_t* slots,
     return to_remote_status(impl_->stub->Recycle(&ctx, req, &rep));
 }
 
-RemoteStatus GrpcRemoteOpClientTransport::unlock(
-        const uint64_t* hashes, int n, int start, int length, int pin_end,
-        const std::vector<uint64_t>& pin_tail) {
-    if (!copyable(hashes, n) || !copyable(pin_tail.data(), (int)pin_tail.size()))
+RemoteStatus GrpcRemoteOpClientTransport::unlock(const uint64_t* hashes, int n,
+                                                const PinRecord& pin) {
+    if (!copyable(hashes, n) || !copyable(pin.tail.data(), (int)pin.tail.size()))
         return RemoteStatus::BAD_REQUEST;
     pb::UnlockRequest req;
     req.mutable_hashes()->Add(hashes, hashes + n);
-    req.set_start(start);
-    req.set_length(length);
-    req.set_pin_end(pin_end);
-    req.mutable_pin_tail()->Add(pin_tail.begin(), pin_tail.end());
+    pin_to_pb(pin, req.mutable_pin());
     pb::UnlockResponse rep;
     grpc::ClientContext ctx;
     impl_->prepare(ctx);

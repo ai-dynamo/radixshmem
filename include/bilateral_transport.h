@@ -3,7 +3,8 @@
 
 #pragma once
 
-#include "types.h"   // AllocateReply, QueryReply, InsertResult, RemoteStatus
+#include "component_types.h"   // QueryReply, RemoteQuery, PinRecord
+#include "types.h"             // AllocateReply, InsertResult, RemoteStatus
 
 #include <cstdint>
 #include <vector>
@@ -17,8 +18,7 @@ public:
     virtual AllocateReply allocate(int n, ComponentType component = ComponentType::FULL) = 0;
     virtual AllocateComponentsReply allocate_components(
         const std::vector<ComponentCount>& components) = 0;
-    virtual QueryReply query(const uint64_t* hashes, int n, bool lock,
-                             bool update_meta) = 0;
+    virtual QueryReply query(const uint64_t* hashes, int n, const RemoteQuery& q) = 0;
     virtual InsertResult insert(const uint64_t* hashes, int n, int start,
                                 int length, const int32_t* slots,
                                 bool auto_recycle,
@@ -29,9 +29,8 @@ public:
                                          bool auto_recycle) = 0;
     virtual RemoteStatus recycle(const int32_t* slots, int num_slots,
                                  ComponentType component = ComponentType::FULL) = 0;
-    virtual RemoteStatus unlock(const uint64_t* hashes, int n, int start,
-                                int length, int pin_end,
-                                const std::vector<uint64_t>& pin_tail) = 0;
+    // Drops a query(lock) pin; never replayed, so a lost reply may leave it.
+    virtual RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin) = 0;
     virtual DedupReply dedup_prefix(const uint64_t* hashes, int n,
                                     const DedupRequest& req = {}) = 0;
     virtual bool connected() = 0;

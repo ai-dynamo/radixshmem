@@ -934,11 +934,9 @@ static RemoteStatus retry_unexecuted(Op op) {
 }
 
 static void release_remote_pin(RemotePeer& peer, const std::vector<uint64_t>& hashes,
-                               int hit_length, int pin_end,
-                               const std::vector<uint64_t>& pin_tail) {
+                               const PinRecord& pin) {
     RemoteStatus st = retry_unexecuted([&] {
-        return peer.unlock(hashes.data(), (int)hashes.size(), 0, hit_length,
-                           pin_end, pin_tail);
+        return peer.unlock(hashes.data(), (int)hashes.size(), pin);
     });
     if (st != RemoteStatus::OK && st != RemoteStatus::STALE_TARGET)
         fprintf(stderr, "[RadixClient] remote unlock on rank %d failed: status %d\n",
@@ -1005,7 +1003,10 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
     if (n <= 0) return out;                       // empty input, status OK
     auto p = peer_for(rank);
     if (!p) { out.status = missing_peer_status(rank); return out; }
-    QueryReply rep = p->query(hashes, n, lock, update_meta);
+    RemoteQuery q;
+    q.lock = lock;
+    q.update_meta = update_meta;
+    QueryReply rep = p->query(hashes, n, q);
 
     out.status            = rep.status;
     out.total_hit_length  = rep.hit_length;
@@ -1013,12 +1014,10 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
     out.local_hit_length  = 0;
     out.remote_slots      = std::move(rep.slots);  // len == hit_length
     out.remote_node_id    = p->peer_rank();
-    if (lock && rep.status == RemoteStatus::OK && rep.hit_length > 0) {
+    if (lock && rep.status == RemoteStatus::OK && !rep.pin.empty()) {
         std::vector<uint64_t> hc(hashes, hashes + n);
-        out.finalize = FinalizeFn([p, hc = std::move(hc), len = rep.hit_length,
-                                   pin_end = rep.pin_end,
-                                   tail = std::move(rep.pin_tail)]() {
-            release_remote_pin(*p, hc, len, pin_end, tail);
+        out.finalize = FinalizeFn([p, hc = std::move(hc), pin = std::move(rep.pin)]() {
+            release_remote_pin(*p, hc, pin);
         });
     }
     return out;

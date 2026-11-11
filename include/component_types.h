@@ -50,6 +50,35 @@ struct TreeComponentQueryResult {
     PinRecord pin;
 };
 
+// The part of a hit a caller folds into its own: a lock pins only a hit longer
+// than `incumbent`, and Full only over [min(full_from, hit), hit).
+struct PinWindow {
+    uint32_t incumbent = 0;
+    uint32_t full_from = 0;
+};
+
+// A query sent to another rank's tree (remote ops, peer index).
+struct RemoteQuery {
+    uint32_t  mask = COMPONENT_MASK_FULL;
+    bool      lock = false;
+    bool      update_meta = false;
+    PinWindow window;
+};
+
+// slots hold Full [min(window.full_from, hit_length), hit_length), swa_slots SWA
+// [swa_start, hit_length); mamba_slot is the checkpoint at hit_length.
+struct QueryReply {
+    RemoteStatus status = RemoteStatus::OK;
+    int hit_length = 0;
+    std::vector<int32_t> slots;
+    uint32_t swa_start = 0;
+    std::vector<int32_t> swa_slots;
+    int32_t mamba_slot = INVALID_COMPONENT_SLOT;
+    PinRecord pin;
+    int rdma_read_count = 0;     // one-sided ops of an RDMA walk
+    int rdma_atomic_count = 0;
+};
+
 // ---- Public component query surface (RadixClient::query, mask overload). ----
 
 // Owning slot copy; slot IDs are only valid on source_rank's SlotStore.

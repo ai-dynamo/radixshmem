@@ -62,14 +62,12 @@ public:
                                  const int32_t* full_slots, const std::vector<ComponentRun>& runs,
                                  bool auto_recycle = true);
 
-    QueryReply query(const uint64_t* hashes, int n, bool lock = false,
-                     bool update_meta = true);
+    QueryReply query(const uint64_t* hashes, int n, const RemoteQuery& q);
 
     // Both return the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
     RemoteStatus recycle(const int32_t* slots, int num_slots,
                          ComponentType component = ComponentType::FULL);
-    RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length,
-                        int pin_end, const std::vector<uint64_t>& pin_tail);
+    RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin);
     DedupReply dedup_prefix(const uint64_t* hashes, int n, const DedupRequest& req = {});
 
     const std::string& endpoint() const { return endpoint_; }

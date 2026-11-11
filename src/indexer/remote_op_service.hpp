@@ -28,8 +28,8 @@ public:
                            ComponentType component = ComponentType::FULL);
     AllocateComponentsReply allocate_components(const std::vector<ComponentCount>& components,
                                                 Deadline deadline = Deadline::max());
-    QueryReply    query(const uint64_t* hashes, int n, bool lock,
-                        bool update_meta, Deadline deadline = Deadline::max());
+    QueryReply    query(const uint64_t* hashes, int n, const RemoteQuery& q,
+                        Deadline deadline = Deadline::max());
     // slots[i] holds hashes[start + i]; invalid requests yield REMOTE_FAILED with remote_status = BAD_REQUEST.
     InsertResult  insert(const uint64_t* hashes, int n, int start, int length,
                          const int32_t* slots, bool auto_recycle,
@@ -39,9 +39,8 @@ public:
                                  bool auto_recycle);
     RemoteStatus  recycle(const int32_t* slots, int num_slots,
                           ComponentType component = ComponentType::FULL);
-    // Drop a query(lock=true) pin over hashes[start, start + length).
-    RemoteStatus  unlock(const uint64_t* hashes, int n, int start, int length,
-                         int pin_end, const uint64_t* pin_tail, int pin_tail_n);
+    // Drop a query(lock=true) pin.
+    RemoteStatus  unlock(const uint64_t* hashes, int n, PinRecord&& pin);
     // With landing slots in `req`, also writes what blocks the drop into them through
     // the dedup writer; without an active writer it only drops.
     DedupReply    dedup_prefix(const uint64_t* hashes, int n, const DedupRequest& req = {},
