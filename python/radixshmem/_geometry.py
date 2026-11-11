@@ -24,6 +24,7 @@ cluster must share (counts and names may differ); it is what goes to etcd.
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
@@ -114,13 +115,71 @@ def _stride(slot_bytes: int, align: int) -> int:
     return -(-int(slot_bytes) // align) * align
 
 
+def _plan_budget(pools: Dict[str, Any], budget: int, align: int,
+                 ratios: Dict[str, Any], what: str,
+                 ignore_counts: bool = False) -> Dict[str, Dict[str, int]]:
+    """Slot counts for ``budget`` bytes: each aux pool gets ``ratio x budget``
+    (``ratios``: kind -> (setting name, value)), FULL what is left."""
+    out: Dict[str, Dict[str, int]] = {}
+    for kind, pool in pools.items():
+        if int(pool.get("num_slots", 0)) > 0 and not ignore_counts:
+            raise ValueError(f"{what}: the server plans the {kind} pool from its budget; "
+                             f"num_slots must not be given")
+        if int(pool.get("slot_bytes", 0)) <= 0:
+            raise ValueError(f"{what}: the {kind} pool needs slot_bytes > 0")
+    fixed = 0
+    for kind in ("swa", "mamba"):
+        if kind not in pools:
+            continue
+        setting, ratio = ratios.get(kind, (f"{kind}_ratio", 0.0))
+        ratio = float(ratio)
+        if ratio <= 0:
+            raise ValueError(f"the model needs a {kind} pool but the server's {setting} is 0")
+        stride = _stride(pools[kind]["slot_bytes"], align)
+        n = math.floor(ratio * budget / stride + 1e-6)
+        if n <= 0:
+            raise ValueError(f"{kind} ratio {ratio} of {budget} B holds no {kind} slot of {stride} B")
+        fixed += n * stride
+        out[kind] = {"slot_bytes": int(pools[kind]["slot_bytes"]), "num_slots": n}
+    full_stride = _stride(pools["full"]["slot_bytes"], align)
+    n_full = (budget - fixed) // full_stride
+    if n_full <= 0:
+        raise ValueError(f"the aux pools take {fixed} B of the {budget} B {what} budget, leaving no "
+                         f"FULL slot of {full_stride} B")
+    out["full"] = {"slot_bytes": int(pools["full"]["slot_bytes"]), "num_slots": int(n_full)}
+    return out
+
+
+def _ssd_files(cfg: Any, kind: str, pool: Dict[str, int]) -> Dict[str, Any]:
+    """Lay ``pool``'s slots out over the SSD directories the way FlexKV
+    addresses them: slot s is on directory s % D, in file (s // D) % F at
+    block (s // D) // F. Rounds num_slots down to D x F x blocks_per_file."""
+    dirs, slot_bytes = list(cfg.ssd_dirs), int(pool["slot_bytes"])
+    per_dir = int(pool["num_slots"]) // len(dirs)
+    per_file = per_dir
+    if int(cfg.ssd_file_bytes) > 0:
+        per_file = min(per_dir, int(cfg.ssd_file_bytes) // slot_bytes)
+    if per_file <= 0:
+        raise ValueError(f"SSD {kind} pool: {pool['num_slots']} slots of {slot_bytes} B do not fill "
+                         f"one block per directory ({len(dirs)} directories)")
+    files_per_dir = per_dir // per_file
+    pool["num_slots"] = len(dirs) * files_per_dir * per_file
+    stem = cfg.name.lstrip("/").replace("/", "_")
+    return {"blocks_per_file": per_file,
+            "files": [[os.path.join(d, f"{stem}_{kind}_{i}_{j}.bin") for j in range(files_per_dir)]
+                      for i, d in enumerate(dirs)]}
+
+
 def plan(spec: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
     """Resolve a client's geometry against the server (``ServerConfig``:
     name, data_bytes, swa_ratio, mamba_ratio, slot_align, register_chunk_tokens,
-    max_nodes, hugepage_path, data_name). Data mode plans every count from the
+    max_nodes, hugepage_path, data_name, ssd_*). Data mode plans every count from the
     budget: SWA and Mamba get ``ratio x data_bytes`` worth of slots, FULL what
-    is left. Index-only takes the counts from the spec. ValueError on a
-    malformed spec, one for the other mode, or a budget that fits no slot."""
+    is left. Index-only takes the counts from the spec, unless the server owns
+    SSD files (``ssd_bytes``): then it plans them from that budget the same
+    way (ignoring any counts the spec brings) and publishes the files under
+    ``ssd``. ValueError on a malformed
+    spec, one for the other mode, or a budget that fits no slot."""
     validate_spec(spec)
     pools = spec["pools"]
     block_size = int(spec["block_size"])
@@ -135,7 +194,14 @@ def plan(spec: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
         "register_chunk_tokens": tokens, "max_nodes": int(cfg.max_nodes),
         "hash_scheme": hash_scheme(spec), "pools": {}}
     data_bytes = int(cfg.data_bytes)
-    if data_bytes <= 0:
+    ssd_bytes = int(getattr(cfg, "ssd_bytes", 0))
+    if data_bytes <= 0 and ssd_bytes > 0:
+        if "mamba" in pools:
+            raise ValueError("the SSD files hold no Mamba pool")
+        out["pools"] = _plan_budget(pools, ssd_bytes, 1, {"swa": ("ssd_swa_ratio", cfg.ssd_swa_ratio)}, "SSD",
+                                    ignore_counts=True)
+        out["ssd"] = {kind: _ssd_files(cfg, kind, pool) for kind, pool in out["pools"].items()}
+    elif data_bytes <= 0:
         for kind, pool in pools.items():
             n = int(pool.get("num_slots", 0))
             if n <= 0:
@@ -146,31 +212,9 @@ def plan(spec: Dict[str, Any], cfg: Any) -> Dict[str, Any]:
         align = int(spec.get("slot_align", 0)) or int(cfg.slot_align)
         out["slot_align"] = align
         out["data_name"] = cfg.data_name or f"{cfg.name}_data"
-        for kind, pool in pools.items():
-            if int(pool.get("num_slots", 0)) > 0:
-                raise ValueError(f"data mode: the server plans the {kind} pool from data_bytes and "
-                                 f"its ratio; num_slots must not be given")
-            if int(pool.get("slot_bytes", 0)) <= 0:
-                raise ValueError(f"data mode: the {kind} pool needs slot_bytes > 0")
-        fixed = 0
-        for kind in ("swa", "mamba"):
-            if kind not in pools:
-                continue
-            ratio = float(getattr(cfg, f"{kind}_ratio"))
-            if ratio <= 0:
-                raise ValueError(f"the model needs a {kind} pool but the server's {kind}_ratio is 0")
-            stride = _stride(pools[kind]["slot_bytes"], align)
-            n = math.floor(ratio * data_bytes / stride + 1e-6)
-            if n <= 0:
-                raise ValueError(f"{kind}_ratio {ratio} of {data_bytes} B holds no {kind} slot of {stride} B")
-            fixed += n * stride
-            out["pools"][kind] = {"slot_bytes": int(pools[kind]["slot_bytes"]), "num_slots": n}
-        full_stride = _stride(pools["full"]["slot_bytes"], align)
-        n_full = (data_bytes - fixed) // full_stride
-        if n_full <= 0:
-            raise ValueError(f"the aux pools take {fixed} B of the {data_bytes} B budget, leaving no "
-                             f"FULL slot of {full_stride} B")
-        out["pools"]["full"] = {"slot_bytes": int(pools["full"]["slot_bytes"]), "num_slots": int(n_full)}
+        out["pools"] = _plan_budget(pools, data_bytes, align,
+                                    {"swa": ("swa_ratio", cfg.swa_ratio),
+                                     "mamba": ("mamba_ratio", cfg.mamba_ratio)}, "data mode")
     if "swa" in pools:
         out["pools"]["swa"]["window_blocks"] = int(pools["swa"]["window_blocks"])
     if out["max_nodes"] <= 0:

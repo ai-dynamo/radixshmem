@@ -127,6 +127,17 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--job-ttl", type=float, default=None,
                    help="seconds an uncollected job is kept (default: 300)")
 
+    g = p.add_argument_group("SSD files (index only: the slots are blocks of these files)")
+    g.add_argument("--ssd-dir", action="append", default=[],
+                   help="directory for SSD files, repeatable (one per device)")
+    g.add_argument("--ssd-bytes", type=parse_size, default=0,
+                   help="SSD budget over all --ssd-dir, e.g. 2T; the server creates the files and "
+                        "plans the slot counts from the client's block sizes")
+    g.add_argument("--ssd-swa-ratio", type=float, default=0.0,
+                   help="share of --ssd-bytes for SWA slots when the model has SWA layers (default: 0)")
+    g.add_argument("--ssd-file-bytes", type=parse_size, default=0,
+                   help="largest SSD file (default: one file per directory and pool)")
+
     g = p.add_argument_group("server")
     g.add_argument("--endpoint", default="",
                    help="gRPC endpoint clients connect to (default: unix:///dev/shm/<name>.sock)")
@@ -196,6 +207,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         monitor_tree_nodes=a.monitor_tree_nodes, monitor_cluster_nodes=a.monitor_cluster_nodes,
         writeback_max_held_ratio=a.writeback_max_held,
         kv_events_endpoint=a.kv_events_endpoint,
+        ssd_dirs=a.ssd_dir, ssd_bytes=a.ssd_bytes, ssd_swa_ratio=a.ssd_swa_ratio,
+        ssd_file_bytes=a.ssd_file_bytes,
         cluster=cluster, **kw)
 
 
@@ -228,6 +241,9 @@ def main(argv=None) -> None:
         print(f"  Data name:      {cfg.resolved_data_name}")
         print(f"  Data budget:    {fmt_size(cfg.data_bytes)}  (swa {cfg.swa_ratio:g}, "
               f"mamba {cfg.mamba_ratio:g}, FULL the rest)")
+    if cfg.ssd_bytes:
+        print(f"  SSD budget:     {fmt_size(cfg.ssd_bytes)} over {', '.join(cfg.ssd_dirs)}  "
+              f"(swa {cfg.ssd_swa_ratio:g}, FULL the rest)")
     if cfg.distributed:
         print(f"  Registry:       {cfg.cluster.registry}  cluster {cfg.cluster.cluster_id}")
     sys.stdout.flush()

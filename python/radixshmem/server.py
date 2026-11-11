@@ -27,6 +27,7 @@ writes them.
 from __future__ import annotations
 
 import fcntl
+import os
 import json
 import socket
 import struct
@@ -96,6 +97,12 @@ class ServerConfig:
     hugepage_path: str = ""          # hugetlbfs mount for both regions, "" = /dev/shm
     prefault: bool = True
     slot_align: int = 4096           # slot stride alignment unless the geometry brings its own
+    # Index-only only: SSD files this server creates for its clients' blocks.
+    # Slot s is block (s // D) // F of file (s // D) % F in directory s % D.
+    ssd_dirs: List[str] = field(default_factory=list)
+    ssd_bytes: int = 0               # total over ssd_dirs, 0 = the client owns its storage
+    ssd_swa_ratio: float = 0.0       # share of ssd_bytes for SWA slots
+    ssd_file_bytes: int = 0          # largest file, 0 = one file per directory and pool
     # transfer engine (distributed data mode)
     transfer_backend: str = "mooncake"  # "mooncake" | "nixl"
     transfer_protocol: str = "rdma"
@@ -138,6 +145,14 @@ class ServerConfig:
             raise ValueError("swa_ratio + mamba_ratio must stay below 1 to leave FULL slots")
         if self.index_only and (self.swa_ratio or self.mamba_ratio):
             raise ValueError("pool ratios need data_bytes > 0; without it the server is index only")
+        if self.ssd_bytes < 0 or self.ssd_file_bytes < 0:
+            raise ValueError("ssd_bytes and ssd_file_bytes must be >= 0")
+        if self.ssd_bytes and not self.index_only:
+            raise ValueError("SSD files need an index-only server (no data_bytes)")
+        if bool(self.ssd_bytes) != bool(self.ssd_dirs):
+            raise ValueError("ssd_bytes and ssd_dirs go together")
+        if not 0.0 <= float(self.ssd_swa_ratio) < 1.0:
+            raise ValueError("ssd_swa_ratio must be in [0, 1)")
         if self.slot_align <= 0 or self.slot_align & (self.slot_align - 1):
             raise ValueError("slot_align must be a power of two")
         if self.register_chunk_tokens <= 0:
@@ -180,6 +195,35 @@ class ServerConfig:
         if c.rpc_interface:
             return _nic_ip(c.rpc_interface)
         return c.rpc_address if c.rpc_address not in ("", "0.0.0.0") else "127.0.0.1"
+
+
+def _create_ssd_files(g: Dict[str, Any]) -> None:
+    """Create the SSD files the geometry lays out (sparse). Files of the right
+    size are kept: a fresh index never points into their old contents."""
+    want: Dict[str, int] = {}
+    for kind, layout in g["ssd"].items():
+        size = int(layout["blocks_per_file"]) * int(g["pools"][kind]["slot_bytes"])
+        for path in (p for files in layout["files"] for p in files):
+            want[path] = size
+    need: Dict[str, int] = {}
+    for path, size in want.items():
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        have = os.path.getsize(path) if os.path.exists(path) else 0
+        need[d] = need.get(d, 0) + max(0, size - have)
+    for d, n in need.items():
+        st = os.statvfs(d)
+        if n > st.f_frsize * st.f_bavail:
+            raise RuntimeError(f"SSD directory {d} has {st.f_frsize * st.f_bavail} B free, "
+                               f"the files need {n} B more")
+    for path, size in want.items():
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            if os.fstat(fd).st_size != size:
+                os.ftruncate(fd, size)
+                os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def _nic_ip(ifname: str) -> str:
@@ -693,7 +737,8 @@ class RadixServer:
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
                 mamba_ratio=float(c.mamba_ratio),
-                role=c.role)
+                role=c.role,
+                ssd_bytes=int(c.ssd_bytes))
 
     def _node_record(self) -> Dict[str, Any]:
         info = self.describe()
@@ -880,6 +925,8 @@ class RadixServer:
             _geometry.check_attached(g, iclient, store)
         else:
             _geometry.check_attached(g, iclient, None)
+        if g.get("ssd"):
+            _create_ssd_files(g)
         with self._cv:
             self._index, self._iclient, self._store = index, iclient, store
         if store is not None and index.is_distributed():

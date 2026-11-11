@@ -71,6 +71,7 @@ class NodeInfo:
     swa_ratio: float = 0.0
     mamba_ratio: float = 0.0
     role: str = "prefill"           # PD disaggregation role: "prefill" | "decode"
+    ssd_bytes: int = 0              # > 0: the server owns SSD files its slots name (geometry["ssd"])
 
 
 @dataclass
