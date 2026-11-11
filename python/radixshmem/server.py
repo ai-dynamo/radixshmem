@@ -50,6 +50,7 @@ _CLUSTER_FIELDS = (
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
+_KV_EVENTS_RING = 65536  # KV-event ring entries x 14 hashes, 8 MiB of shm
 
 ROLES = ("prefill", "decode")
 
@@ -111,12 +112,9 @@ class ServerConfig:
     data_pool_ratio: float = 4.0     # DataPool bytes = full_slots x ratio x (12 | 16 with SWA)
     evict_policy: str = "lru"
     writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
-    # KV-event ring entries (14 hashes each); 0 = no ring. Sized automatically when
-    # kv_events_endpoint is set.
-    kvevent_ring_capacity: int = 0
-    # ZMQ PUB endpoint of this node's placement stream (radixshmem.kv_events), e.g. "tcp://*:5600".
+    # ZMQ PUB endpoint of this node's placement stream (radixshmem.kv_events), e.g.
+    # "tcp://*:5600". Setting it also sizes the region's KV-event ring.
     kv_events_endpoint: str = ""
-    kv_events_topic: str = ""
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
@@ -864,7 +862,8 @@ class RadixServer:
         c, g = self.cfg, self._geometry
         shm = _geometry.shm_config(g, background_evict_ratio=c.background_evict_ratio,
                                    data_pool_ratio=c.data_pool_ratio,
-                                   kvevent_ring_capacity=self._ring_capacity())
+                                   kvevent_ring_capacity=(
+                                       _KV_EVENTS_RING if c.kv_events_endpoint else 0))
         shm.evict_policy = {"lru": EvictPolicy.LRU}[c.evict_policy]
         shm.max_nodes = shm.effective_max_nodes()
         index = _core.RadixServer(self._core_config(shm, g))
@@ -886,15 +885,6 @@ class RadixServer:
         if store is not None and index.is_distributed():
             self._data_plane_up(index, store)
 
-    # 64k entries x 14 hashes, 8 MiB of shm.
-    _DEFAULT_KV_EVENTS_RING = 65536
-
-    def _ring_capacity(self) -> int:
-        c = self.cfg
-        if c.kv_events_endpoint and c.kvevent_ring_capacity <= 0:
-            return self._DEFAULT_KV_EVENTS_RING
-        return c.kvevent_ring_capacity
-
     def _start_kv_events(self) -> None:
         c, g, index = self.cfg, self._geometry, self._index
         if not c.kv_events_endpoint:
@@ -904,8 +894,7 @@ class RadixServer:
         publisher = KvEventPublisher(
             self._iclient, c.kv_events_endpoint, cluster_id=c.cluster.cluster_id,
             node=max(index.rank(), 0), node_name=index.node_name() or c.cluster.node_name,
-            hash_scheme=_geometry.hash_scheme(g), block_size=int(g["block_size"]),
-            topic=c.kv_events_topic.encode())
+            hash_scheme=_geometry.hash_scheme(g), block_size=int(g["block_size"]))
         with self._cv:
             self._kv_events = publisher
 

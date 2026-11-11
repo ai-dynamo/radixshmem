@@ -165,7 +165,6 @@ public:
     // Readers of the region's placement ring (empty when it has none); each
     // client keeps its own cursor and never blocks writers.
     bool kvevent_enabled() const;
-    void kvevent_seek_to_head();
     struct KvEventRecord {
         uint32_t kind;                  // KvEventKind
         std::vector<uint64_t> hashes;   // empty for cleared

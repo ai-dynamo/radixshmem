@@ -1068,10 +1068,6 @@ bool RadixClient::kvevent_enabled() const {
     return const_cast<RadixClient*>(this)->kvevent_reader() != nullptr;
 }
 
-void RadixClient::kvevent_seek_to_head() {
-    if (auto* r = kvevent_reader()) r->seek_to_head();
-}
-
 RadixClient::KvEventBatch RadixClient::kvevent_drain(size_t max_hashes) {
     KvEventBatch out;
     auto* r = kvevent_reader();
