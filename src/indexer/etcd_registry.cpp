@@ -100,11 +100,10 @@ bool EtcdRegistry::reclaim_previous_run() {
     int64_t lease = 0;
     if (!impl_->cli.get_with_lease(K.peer(node_name_), val, lease)) return true;
 
-    PeerEntry old{}, mine{};
-    rs_.fill_local_entry(mine);
-    if (etcd::decode_peer(val, old) && old.xrc_listen_port != 0 &&
-        !(old.xrc_listen_port == mine.xrc_listen_port &&
-          std::strcmp(old.host, mine.host) == 0)) {
+    // This run listens on nothing yet: a port of the old entry that answers is
+    // another live server's.
+    PeerEntry old{};
+    if (etcd::decode_peer(val, old) && old.xrc_listen_port != 0) {
         int fd = xrc_tcp_connect(old.host, old.xrc_listen_port, 1);
         if (fd >= 0) {
             ::close(fd);
@@ -293,11 +292,9 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     impl_->cli.put(K.config(), etcd::encode_shardmap(sm), cluster_lease_);
     config_published_ = true;
 
-    // Round 2: leader's own RHT shard + remote-op + DCT; re-publish with rank set.
+    // Round 2: leader's planes; re-publish with rank set.
     mine.rank = my_rank;
-    rs_.setup_local_rht_shard(mine);
-    rs_.setup_remote_op(mine);
-    rs_.setup_dct(mine);
+    rs_.setup_planes(mine);
     impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);
 
     // stamp_shm_ready() happens in run_rendezvous() once world_size is known.
@@ -336,11 +333,10 @@ bool EtcdRegistry::follower_flow(std::vector<PeerEntry>& out, bool published) {
         }
         if (!adopt_config(cfg_val)) return false;
 
-        // Round 2: holders build RHT + remote-op + DCT; re-publish with rank set.
+        // Round 2: this node's planes (holders also their RHT shard); re-publish
+        // with rank set.
         mine.rank = my_rank;
-        rs_.setup_local_rht_shard(mine);
-        rs_.setup_remote_op(mine);
-        rs_.setup_dct(mine);
+        rs_.setup_planes(mine);
         impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);
     }
 
@@ -415,12 +411,11 @@ bool EtcdRegistry::join_existing(std::vector<PeerEntry>& out) {
     }
     rs_.cfg_.rank = my_rank;
 
-    // 4. Set up remote-op + DCT so existing nodes can reach us; no local RHT shard.
+    // 4. Set up the planes so existing nodes can reach us; no local RHT shard.
     PeerEntry mine{};
     rs_.fill_local_entry(mine);
     mine.rank = my_rank;
-    rs_.setup_remote_op(mine);
-    rs_.setup_dct(mine);
+    rs_.setup_planes(mine);
 
     int world = world_size();
     impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);

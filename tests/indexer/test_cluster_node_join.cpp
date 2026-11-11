@@ -186,7 +186,8 @@ int run_writer2_process(const radixshmem::RadixClientConfig& cc) {
 // Long-lived reader on node0: attaches while the cluster is 2 nodes, then must
 // (a) sense node2 via its /peers watcher (world_size 2→3) and (b) remote-walk
 // prefix B on node2 through the lazily-built data-peer endpoint.
-int run_joined_reader_process(const radixshmem::RadixClientConfig& cc) {
+// `attached_fd` tells the parent it may start node2.
+int run_joined_reader_process(const radixshmem::RadixClientConfig& cc, int attached_fd) {
     try {
         radixshmem::RadixClient cli(cc);
         if (!cli.is_distributed()) {
@@ -198,6 +199,9 @@ int run_joined_reader_process(const radixshmem::RadixClientConfig& cc) {
                     cli.world_size());
             return 22;
         }
+        const char attached = 1;
+        if (::write(attached_fd, &attached, 1) != 1) return 28;
+        ::close(attached_fd);
 
         // (a) Wait for the watcher to grow the peer table to include node2.
         auto deadline = std::chrono::steady_clock::now() +
@@ -277,8 +281,9 @@ int main(int argc, char** argv) {
         return run_server_process(argv[2], argv[3], argv[4],
                                   std::atoi(argv[5]), std::atoi(argv[6]));
     }
-    if (argc >= 5 && std::strcmp(argv[1], "--joined-reader") == 0) {
-        return run_joined_reader_process(client_cfg(argv[2], argv[3], argv[4]));
+    if (argc >= 6 && std::strcmp(argv[1], "--joined-reader") == 0) {
+        return run_joined_reader_process(client_cfg(argv[2], argv[3], argv[4]),
+                                         std::atoi(argv[5]));
     }
     if (argc >= 5 && std::strcmp(argv[1], "--writer2") == 0) {
         return run_writer2_process(client_cfg(argv[2], argv[3], argv[4]));
@@ -321,10 +326,21 @@ int main(int argc, char** argv) {
     }
     fprintf(stderr, "[parent] initial 2-node cluster ready\n");
 
-    // ---- long-lived reader on node0 (attaches at world=2) ----
+    // ---- long-lived reader on node0 (attaches at world=2, before node2 starts) ----
+    int attached[2];
+    if (::pipe(attached) != 0) { cleanup(); return 32; }
     pid_t reader = spawn({argv[0], "--joined-reader", node_name_for(0),
-                          registry, cluster_id});
+                          registry, cluster_id, std::to_string(attached[1])});
+    ::close(attached[1]);
     if (reader < 0) { fprintf(stderr, "[parent] spawn reader failed\n"); cleanup(); return 32; }
+    char ok = 0;
+    const bool reader_attached = ::read(attached[0], &ok, 1) == 1;
+    ::close(attached[0]);
+    if (!reader_attached) {
+        fprintf(stderr, "[parent] reader never attached (rc=%d)\n", wait_one(reader, "joined_reader"));
+        cleanup();
+        return 32;
+    }
 
     // ---- node2 joins (min_nodes=3; config already present → join_existing) ----
     pid_t node2 = spawn({argv[0], "--server", node_name_for(2), registry,

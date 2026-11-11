@@ -80,6 +80,8 @@ if(ENABLE_RDMA)
         src/indexer/transport/rdma/rc_endpoint.cpp
         src/indexer/transport/rdma/xrc.cpp
         src/indexer/transport/rdma/dc_oneside.cpp
+        # The RDMA side of a radix-server (device, XRC accept loop, DCT, tree MR).
+        src/indexer/transport/rdma/rdma_host.cpp
         # Peer-facing plane: lazy data-plane endpoints + remote-walk executor +
         # remote-op session factory + client-side remote-op protocol (RemotePeer).
         src/indexer/peer/peer_connector.cpp

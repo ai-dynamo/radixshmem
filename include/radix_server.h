@@ -19,8 +19,7 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "cluster_protocol.h"      // ibv_cq, CLUSTER_TRANSPORT_*
-#include <unordered_map>
+#include "cluster_manifest.h"      // CLUSTER_TRANSPORT_*, CLUSTER_RHT_*
 #endif
 
 namespace radixshmem {
@@ -30,13 +29,8 @@ class RadixShmemTree;
 #ifndef RADIXSHMEM_NO_RDMA
 class LocalTreeConnector;
 class RadixClient;
-class RdmaContext;
-class RdmaXrcd;
-class XrcSrq;
-class RdmaMemoryRegion;
+class RdmaHost;    // src/indexer/transport/rdma/rdma_host.hpp
 class RhtHolder;   // src/indexer/rht/rht_endpoint.h
-class DcTarget;
-class XrcRecvQp;
 class EtcdRegistry;
 struct PeerEntry;
 struct ShardMapMsg;
@@ -165,17 +159,12 @@ private:
     std::unique_ptr<EtcdRegistry> registry_;   // holds the lease for the server's lifetime
 #endif
 
-    std::unique_ptr<RdmaContext>      ctx_;
-    std::unique_ptr<RdmaXrcd>         xrcd_;
-    std::unique_ptr<XrcSrq>           srq_;
-    ibv_cq*                            cq_ = nullptr;
-    std::unique_ptr<RdmaMemoryRegion> shm_mr_;       // tree shm MR: READ|ATOMIC
+    // The RDMA side peers' one-sided QPs reach.
+    std::unique_ptr<RdmaHost>          rdma_;
 
-    // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE).
+    // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE) on rdma_.
     std::unique_ptr<RhtHolder>         rht_holder_;
 
-    // DC read target for the RHT and peer-index planes.
-    std::unique_ptr<DcTarget>          dct_;
     uint32_t                           rht_transport_ = CLUSTER_TRANSPORT_XRC;
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
@@ -209,24 +198,7 @@ private:
     int                  rdma_sl_ = 5;          // authoritative QoS (rank 0)
     int                  rdma_tc_ = 160;
 
-    // TCP XRC listener
-    int       xrc_listen_fd_ = -1;
-    uint16_t  actual_listen_port_ = 0;
-    std::thread listener_thread_;
-    std::atomic<bool> stopping_{false};
-
-    // Per-client XRC RECV QP table, keyed by an internal counter.
-    struct ClientSlot {
-        std::unique_ptr<XrcRecvQp> recv_qp;
-        int32_t  client_rank   = -1;
-        uint32_t client_send_qp_num = 0;
-        uint32_t recv_qp_num       = 0;
-    };
-    mutable std::mutex clients_mu_;
-    std::unordered_map<uint64_t, std::unique_ptr<ClientSlot>> clients_;
-    uint64_t next_client_id_ = 1;
-
-    // etcd rendezvous, install manifest, start XRC accept loop; true when all peers ready.
+    // etcd rendezvous, install manifest, bring up the planes; true when all peers ready.
     bool cluster_bootstrap();
 
     void fill_local_entry(PeerEntry& e) const;
@@ -241,11 +213,12 @@ private:
     // leader of a new cluster deletes all of them, a node rejoining a formed
     // cluster those of its rank. Redis only.
     void drop_stale_routes(bool whole_cluster);
+    // Round 2 of the rendezvous, once the shard map is known: the RDMA side,
+    // the RHT shard (holders), the remote-op endpoint.
+    void setup_planes(PeerEntry& e);
+    void setup_rdma(PeerEntry& e);
     void setup_local_rht_shard(PeerEntry& e);
-    void setup_dct(PeerEntry& e);
     void setup_remote_op(PeerEntry& e);
-    void xrc_listener_loop();
-    void handle_client(int conn_fd);
 
     // ---- remote-op control plane (remote_op_service.cpp) ----
     std::unique_ptr<IRemoteOpServerTransport> rc_server_;
