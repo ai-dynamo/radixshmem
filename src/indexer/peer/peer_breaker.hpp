@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Per-peer circuit breaker for the one-sided index planes (RHT, remote walks).
+// Per-peer circuit breaker for the index planes (RHT, peer index, remote ops).
 // A failed op marks the peer unreachable; ops to it are skipped for a backoff
 // (1 s, doubling to 30 s), then one op probes it. Transitions are logged,
 // skipped ops are counted here and in the node's shm counters.
@@ -21,7 +21,7 @@ namespace radixshmem {
 
 class PeerBreaker {
 public:
-    enum class Op { RHT_WRITE, RHT_REMOVE, RHT_LOOKUP, WALK, REMOTE_OP, COUNT };
+    enum class Op { RHT_WRITE, RHT_REMOVE, RHT_LOOKUP, WALK, REMOTE_OP, RELEASE, COUNT };
     enum class Gate { PASS, SKIP, PROBE };
 
     // who: log prefix, e.g. "[RadixClient rank 0] RHT". shared may be null.

@@ -52,7 +52,8 @@ static void print_usage(const char* prog) {
     printf("  --gid-idx <int>          RDMA GID index (default: 3)\n");
     printf("  --bootstrap-timeout <int> Bootstrap timeout in seconds (default: 60)\n");
     printf("  --lease-ttl <int>         etcd lease TTL in seconds (default: 30)\n");
-    printf("  --peer-index-transport <str>  Remote-walk transport into peer trees: xrc (default) | dc\n");
+    printf("  --peer-index-backend <str>    Queries into peer trees: rdma (default, one-sided walks) | grpc (remote ops)\n");
+    printf("  --peer-index-transport <str>  Transport of the rdma walks: xrc (default) | dc\n");
     printf("\n  --help                   Show this help\n");
 }
 
@@ -88,6 +89,7 @@ int main(int argc, char** argv) {
         else if (arg("--gid-idx"))           cfg.gid_idx = next_int();
         else if (arg("--bootstrap-timeout")) cfg.bootstrap_timeout_sec = next_int();
         else if (arg("--lease-ttl"))         cfg.lease_ttl_sec = next_int();
+        else if (arg("--peer-index-backend")) cfg.peer_index_backend = next_str();
         else if (arg("--peer-index-transport")) cfg.peer_index_transport = next_str();
         else if (arg("--expected-min-nodes")) cfg.expected_min_nodes = next_int();
         else {

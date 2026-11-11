@@ -168,8 +168,10 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
+    g.add_argument("--peer-index-backend", default="rdma", choices=["rdma", "grpc"],
+                   help="queries into peer trees: one-sided RDMA walks or the peer's gRPC remote ops")
     g.add_argument("--peer-index-transport", default="xrc", choices=["xrc", "dc"],
-                   help="remote walks into peer trees")
+                   help="transport of the RDMA walks")
     g.add_argument("--remote-op-listen-port", type=int, default=0)
     return p.parse_args(argv)
 
@@ -190,7 +192,8 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
         rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, gid_idx=a.gid_idx,
         bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
-        peer_index_transport=a.peer_index_transport, remote_op_listen_port=a.remote_op_listen_port)
+        peer_index_backend=a.peer_index_backend, peer_index_transport=a.peer_index_transport,
+        remote_op_listen_port=a.remote_op_listen_port)
     return ServerConfig(
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,

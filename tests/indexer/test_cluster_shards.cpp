@@ -52,7 +52,7 @@ constexpr int64_t kBase2        = 3000;       // rank 2's prefix tokens
 constexpr int64_t kBase0        = 9000;       // rank 0's prefix tokens
 constexpr int    kBootstrapTO   = 30;
 constexpr const char* kShmPrefix = "/test_dcshard";
-constexpr const char* kRdmaDev   = "mlx5_bond_0";
+const char* const kRdmaDev  = test_rdma_dev();
 constexpr int    kGidIdx        = 3;
 
 std::string node_name_for(int rank) { return "node" + std::to_string(rank); }

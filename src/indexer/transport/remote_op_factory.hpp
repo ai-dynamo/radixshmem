@@ -21,8 +21,9 @@ struct PeerEntry;
 std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
     uint16_t listen_port, uint64_t instance_id, RemoteOpAddr& addr);
 
+// timeout_ms bounds each op; 0 = RADIXSHMEM_REMOTE_OP_TIMEOUT_MS, else 5000.
 std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
-    const PeerEntry& peer, std::string& endpoint);
+    const PeerEntry& peer, std::string& endpoint, int timeout_ms = 0);
 
 }  // namespace radixshmem
 

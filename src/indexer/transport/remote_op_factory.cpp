@@ -32,7 +32,7 @@ std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
 }
 
 std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
-        const PeerEntry& peer, std::string& endpoint) {
+        const PeerEntry& peer, std::string& endpoint, int timeout_ms) {
     if (peer.remote_op_listen_port == 0)
         throw std::runtime_error(
             "open_remote: peer rank " + std::to_string(peer.rank) +
@@ -43,9 +43,10 @@ std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
                                 std::to_string(peer.remote_op_listen_port);
     endpoint = "grpc://" + hostport;
     return std::make_unique<GrpcRemoteOpClientTransport>(
-        hostport, grpc_remote_op_timeout_ms(), peer.instance_id);
+        hostport, timeout_ms > 0 ? timeout_ms : grpc_remote_op_timeout_ms(), peer.instance_id);
 #else
     (void)endpoint;
+    (void)timeout_ms;
     throw std::runtime_error(
         "open_remote: gRPC is the only supported transport but is not compiled into this build");
 #endif

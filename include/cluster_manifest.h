@@ -13,7 +13,7 @@
 
 namespace radixshmem {
 
-static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 14; // 14: RHT backend in the shard map
+static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 15; // 15: peer index backend in the shard map
 static constexpr uint32_t CLUSTER_MANIFEST_HOST_LEN = 64;
 static constexpr uint32_t CLUSTER_MANIFEST_ENTRY_SIZE = 352;
 static constexpr uint32_t CLUSTER_RHT_NAME_LEN = 64;
@@ -60,6 +60,12 @@ enum ClusterTransport : uint32_t {
 enum ClusterRhtBackend : uint32_t {
     CLUSTER_RHT_RDMA  = 0,
     CLUSTER_RHT_REDIS = 1,
+};
+
+// How a query reaches the tree of the peer the RHT picked (peer_index.h).
+enum ClusterPeerIndexBackend : uint32_t {
+    CLUSTER_PEER_INDEX_RDMA = 0,
+    CLUSTER_PEER_INDEX_GRPC = 1,
 };
 
 // One entry per rank (each server fills its own; master broadcasts the union).

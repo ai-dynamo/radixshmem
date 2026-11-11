@@ -50,7 +50,7 @@ from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
     "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec",
-    "peer_index_transport", "remote_op_listen_port")
+    "peer_index_backend", "peer_index_transport", "remote_op_listen_port")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
@@ -77,7 +77,8 @@ class ClusterConfig:
     gid_idx: int = 3
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
-    peer_index_transport: str = "xrc" # remote walk into peer trees: "xrc" | "dc"
+    peer_index_backend: str = "rdma"  # queries into peer trees: "rdma" (walks) | "grpc" (remote ops)
+    peer_index_transport: str = "xrc" # transport of the rdma walks: "xrc" | "dc"
     remote_op_listen_port: int = 0
 
     @property

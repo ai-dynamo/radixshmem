@@ -3,9 +3,9 @@
 
 // RadixServer — public server surface. Owns the shm region + radix tree, runs the
 // background evictor, and (distributed) joins the cluster through etcd and brings
-// up its planes: the RDMA side (RdmaHost), the RHT shard, and the remote-op
-// endpoint. The embedded eviction service borrows LocalTreeConnector into an
-// rht_only RadixClient.
+// up its planes: the RDMA side (RdmaHost) when the RHT or the peer index runs on
+// RDMA, the RHT shard, and the remote-op endpoint. The embedded eviction service
+// borrows LocalTreeConnector into an rht_only RadixClient.
 
 #include "radix_server.h"
 
@@ -247,6 +247,11 @@ void RadixServer::resolve_shard_map(int ranks) {
     // Authoritative on the leader; other ranks overwrite from the broadcast map.
     rdma_sl_ = env_int("RADIXSHMEM_RDMA_SL", 5);
     rdma_tc_ = env_int("RADIXSHMEM_RDMA_TC", 160);
+    if (cfg_.peer_index_backend != "rdma" && cfg_.peer_index_backend != "grpc")
+        throw std::runtime_error("RadixServer: peer_index_backend is rdma or grpc, not '" +
+                                 cfg_.peer_index_backend + "'");
+    peer_index_backend_ = cfg_.peer_index_backend == "grpc" ? CLUSTER_PEER_INDEX_GRPC
+                                                             : CLUSTER_PEER_INDEX_RDMA;
     peer_index_transport_ = (cfg_.peer_index_transport == "dc")
                                 ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
     dc_access_key_ = 0xD0C0ACCE5500F00DULL;   // every plane that runs DC shares it
@@ -323,6 +328,7 @@ void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
     rdma_sl_      = sm.rdma_sl;
     rdma_tc_      = sm.rdma_tc;
     rht_transport_        = sm.rht_transport;
+    peer_index_backend_   = sm.peer_index_backend;
     peer_index_transport_ = sm.peer_index_transport;
     rht_slots_     = sm.rht_slots;
     dc_access_key_ = sm.dc_access_key;
@@ -337,6 +343,11 @@ void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
         fprintf(stderr, "[RadixServer rank %d] WARN: local RADIXSHMEM_RHT_BACKEND ignored, "
                 "the cluster uses the %s RHT\n", cfg_.rank,
                 rht_backend_ == CLUSTER_RHT_REDIS ? "redis" : "rdma");
+    const char* peer_backend = peer_index_backend_ == CLUSTER_PEER_INDEX_GRPC ? "grpc" : "rdma";
+    if (cfg_.peer_index_backend != peer_backend)
+        fprintf(stderr, "[RadixServer rank %d] WARN: local peer_index_backend %s ignored, "
+                "the cluster uses %s\n", cfg_.rank, cfg_.peer_index_backend.c_str(),
+                peer_backend);
 }
 
 void RadixServer::setup_planes(PeerEntry& e) {
@@ -346,18 +357,21 @@ void RadixServer::setup_planes(PeerEntry& e) {
 }
 
 void RadixServer::setup_rdma(PeerEntry& e) {
+    const bool rht = rht_backend_ == CLUSTER_RHT_RDMA;
+    const bool walks = peer_index_backend_ == CLUSTER_PEER_INDEX_RDMA;
+    if (!rht && !walks) return;   // Redis RHT + gRPC peer index: no RDMA at all
     RdmaHostConfig hc;
     hc.dev     = cfg_.index_dev;
     hc.gid_idx = cfg_.gid_idx;
     hc.sl      = rdma_sl_;
     hc.tc      = rdma_tc_;
     hc.port    = cfg_.rpc_port;
-    hc.dc      = rht_transport_ == CLUSTER_TRANSPORT_DC ||
-                 peer_index_transport_ == CLUSTER_TRANSPORT_DC;
+    hc.dc      = (rht && rht_transport_ == CLUSTER_TRANSPORT_DC) ||
+                 (walks && peer_index_transport_ == CLUSTER_TRANSPORT_DC);
     hc.dc_access_key = dc_access_key_;
     hc.rank    = cfg_.rank;
     rdma_ = std::make_unique<RdmaHost>(hc);
-    rdma_->expose_tree(tree_->shm_base(), tree_->shm_size());
+    if (walks) rdma_->expose_tree(tree_->shm_base(), tree_->shm_size());
     rdma_->publish_to(e);
 }
 
@@ -404,9 +418,13 @@ std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
         if (sm.rht_transport != e.transport)
             return diff("RADIXSHMEM_RHT_TRANSPORT", sm.rht_transport, e.transport);
     }
+    const char* peer_backend = sm.peer_index_backend == CLUSTER_PEER_INDEX_GRPC ? "grpc" : "rdma";
+    if (cfg_.peer_index_backend != peer_backend)
+        return std::string("peer_index_backend ") + peer_backend + " != local " +
+               cfg_.peer_index_backend;
     uint32_t peer_tp = cfg_.peer_index_transport == "dc" ? CLUSTER_TRANSPORT_DC
                                                          : CLUSTER_TRANSPORT_XRC;
-    if (sm.peer_index_transport != peer_tp)
+    if (sm.peer_index_backend == CLUSTER_PEER_INDEX_RDMA && sm.peer_index_transport != peer_tp)
         return "peer_index_transport differs from local " + cfg_.peer_index_transport;
     int cs = register_chunk_size();
     if (sm.register_chunk_size && cs > 0 && (int)sm.register_chunk_size != cs)
@@ -443,7 +461,7 @@ bool RadixServer::cluster_bootstrap() {
     if (cfg_.registry.empty()) return true;   // standalone — caller bypasses
 
     // etcd rendezvous: discover peers + order bringup via etcd (sole path); the
-    // planes come up in its round 2, once the shard map is known.
+    // planes come up in its round 2, once the shard map says which ones run.
 #ifdef RADIXSHMEM_HAS_ETCD
     // registry uri = "etcd://host:port" → strip scheme to "host:port".
     std::string ep = cfg_.registry;
@@ -565,6 +583,8 @@ bool RadixServer::bootstrap() {
         bind_ip_ = bind_ip;   // published as PeerEntry.host
 
         // Deployment-level env overrides.
+        if (const char* b = ::getenv("RADIXSHMEM_PEER_INDEX_BACKEND"))
+            cfg_.peer_index_backend = b;
         if (const char* t = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
             cfg_.peer_index_transport = t;
         if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))

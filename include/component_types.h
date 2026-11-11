@@ -20,7 +20,8 @@ struct PinBlockRange {
 };
 
 // Release data; swa.start records A. source_rank tags the pinned tree
-// (-1 = local). The release re-walks CALLER-supplied hashes; `tail` holds the
+// (-1 = local) and source_instance the run of the peer that holds it. The
+// release re-walks CALLER-supplied hashes; `tail` holds the
 // tree's own hashes for the deepest pinned node's blocks past the caller's
 // keys (positions [end - size, end), end = the deepest lane END), which the
 // caller lacks. Any lane may pin such a terminal, so the tail is lane-neutral.
@@ -29,6 +30,7 @@ struct PinRecord {
     PinBlockRange swa;
     int32_t mamba_end = INVALID_COMPONENT_SLOT;
     int32_t source_rank = -1;
+    uint64_t source_instance = 0;
     std::vector<uint64_t> tail;
 
     bool empty() const noexcept {

@@ -51,6 +51,7 @@ public:
     DedupReply dedup_prefix(const uint64_t* hashes, int n,
                             const DedupRequest& req = {}) override;
     bool connected() override;
+    void connect() override;
 
 private:
     struct Impl;

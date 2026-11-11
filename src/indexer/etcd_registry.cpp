@@ -101,15 +101,16 @@ bool EtcdRegistry::reclaim_previous_run() {
     if (!impl_->cli.get_with_lease(K.peer(node_name_), val, lease)) return true;
 
     // This run listens on nothing yet: a port of the old entry that answers is
-    // another live server's.
+    // another live server's. A server without RDMA has no XRC port, only a gRPC one.
     PeerEntry old{};
-    if (etcd::decode_peer(val, old) && old.xrc_listen_port != 0) {
-        int fd = xrc_tcp_connect(old.host, old.xrc_listen_port, 1);
+    if (etcd::decode_peer(val, old)) {
+        const uint16_t port = old.xrc_listen_port ? old.xrc_listen_port
+                                                  : old.remote_op_listen_port;
+        int fd = port ? xrc_tcp_connect(old.host, port, 1) : -1;
         if (fd >= 0) {
             ::close(fd);
             fprintf(stderr, "[EtcdRegistry %s] node name is held by a live "
-                    "radix-server at %s:%u\n", node_name_.c_str(), old.host,
-                    old.xrc_listen_port);
+                    "radix-server at %s:%u\n", node_name_.c_str(), old.host, port);
             return false;
         }
     }
@@ -279,6 +280,7 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     sm.rdma_sl       = rs_.rdma_sl_;
     sm.rdma_tc       = rs_.rdma_tc_;
     sm.rht_transport        = rs_.rht_transport_;
+    sm.peer_index_backend   = rs_.peer_index_backend_;
     sm.peer_index_transport = rs_.peer_index_transport_;
     sm.rht_slots     = rs_.rht_slots_;
     sm.rht_backend   = rs_.rht_backend_;

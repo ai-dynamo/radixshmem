@@ -34,6 +34,8 @@ public:
     virtual DedupReply dedup_prefix(const uint64_t* hashes, int n,
                                     const DedupRequest& req = {}) = 0;
     virtual bool connected() = 0;
+    // Starts connecting now instead of on the first op.
+    virtual void connect() {}
 };
 
 // The gRPC server's TCP endpoint.

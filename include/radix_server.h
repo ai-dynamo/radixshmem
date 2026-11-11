@@ -19,7 +19,7 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "cluster_manifest.h"      // CLUSTER_TRANSPORT_*, CLUSTER_RHT_*
+#include "cluster_manifest.h"      // CLUSTER_TRANSPORT_*, CLUSTER_RHT_*, CLUSTER_PEER_INDEX_*
 #endif
 
 namespace radixshmem {
@@ -65,6 +65,9 @@ struct RadixServerConfig {
     int          expected_min_nodes = 0;   // > 1 = distributed
     int          settle_ms          = 500;
 
+    // How a query reaches the tree of the peer the RHT picked: "rdma" (one-sided
+    // walks over peer_index_transport) or "grpc" (the peer's Query/Unlock remote ops).
+    std::string       peer_index_backend   = "rdma";
     std::string       peer_index_transport = "xrc";
 
     uint16_t          remote_op_listen_port = 0;
@@ -159,13 +162,14 @@ private:
     std::unique_ptr<EtcdRegistry> registry_;   // holds the lease for the server's lifetime
 #endif
 
-    // The RDMA side peers' one-sided QPs reach.
+    // The RDMA side peers' one-sided QPs reach; only when a plane runs on RDMA.
     std::unique_ptr<RdmaHost>          rdma_;
 
     // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE) on rdma_.
     std::unique_ptr<RhtHolder>         rht_holder_;
 
     uint32_t                           rht_transport_ = CLUSTER_TRANSPORT_XRC;
+    uint32_t                           peer_index_backend_ = CLUSTER_PEER_INDEX_RDMA;
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
 
@@ -213,8 +217,8 @@ private:
     // leader of a new cluster deletes all of them, a node rejoining a formed
     // cluster those of its rank. Redis only.
     void drop_stale_routes(bool whole_cluster);
-    // Round 2 of the rendezvous, once the shard map is known: the RDMA side,
-    // the RHT shard (holders), the remote-op endpoint.
+    // Round 2 of the rendezvous, once the shard map is known: the RDMA side if a
+    // plane needs it, the RHT shard (holders), the remote-op endpoint.
     void setup_planes(PeerEntry& e);
     void setup_rdma(PeerEntry& e);
     void setup_local_rht_shard(PeerEntry& e);

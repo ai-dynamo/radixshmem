@@ -82,9 +82,11 @@ if(ENABLE_RDMA)
         src/indexer/transport/rdma/dc_oneside.cpp
         # The RDMA side of a radix-server (device, XRC accept loop, DCT, tree MR).
         src/indexer/transport/rdma/rdma_host.cpp
-        # Peer-facing plane: lazy data-plane endpoints + remote-walk executor +
-        # remote-op session factory + client-side remote-op protocol (RemotePeer).
-        src/indexer/peer/peer_connector.cpp
+        # Peer-facing plane: the peer index backends (RDMA walks, gRPC remote ops)
+        # + remote-walk executor + client-side remote-op protocol (RemotePeer).
+        src/indexer/peer/peer_index.cpp
+        src/indexer/peer/rdma_peer_index.cpp
+        src/indexer/peer/grpc_peer_index.cpp
         src/indexer/peer/peer_breaker.cpp
         src/indexer/peer/rdma_remote_walker.cpp
         src/indexer/peer/remote_op.cpp
@@ -104,7 +106,7 @@ target_include_directories(radixshmem PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/core
     # Public cluster headers require the one-sided RDMA transport headers.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/rdma
-    # peer-plane headers (peer_connector.hpp, peer_registry.hpp, xrc_connect.hpp,
+    # peer-plane headers (rdma_peer_index.hpp, peer_registry.hpp, xrc_connect.hpp,
     # net_util.hpp) are private under src/indexer/peer.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/peer
 )
@@ -468,6 +470,13 @@ if(ENABLE_RDMA)
     set_tests_properties(test_cluster_shards_dc_rht_nic_w4 PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_RHT_SLOTS=4")
 
+    # The peer index over the peers' gRPC Query/Unlock instead of RDMA walks.
+    foreach(_t test_cluster test_cluster_node_join test_client_no_server)
+        add_test(NAME ${_t}_grpc_peer COMMAND ${_t})
+        set_tests_properties(${_t}_grpc_peer PROPERTIES
+            ENVIRONMENT "RADIXSHMEM_PEER_INDEX_BACKEND=grpc")
+    endforeach()
+
     # Multi-slot RHT re-run with W=4 to exercise collision chaining.
     add_test(NAME test_cluster_w4 COMMAND test_cluster)
     set_tests_properties(test_cluster_w4 PROPERTIES
@@ -547,6 +556,7 @@ set(_skippable_tests
     test_client_no_server test_client_no_server_dc test_client_borrowed_tree
     test_cluster_shards test_cluster_shards_dc
     test_cluster_shards_dc_rht_nic_w4 test_cluster_shards_w4
+    test_cluster_grpc_peer test_cluster_node_join_grpc_peer test_client_no_server_grpc_peer
     test_data_registry
 )
 foreach(_t IN LISTS _skippable_tests)
@@ -574,6 +584,11 @@ if(RADIXSHMEM_TEST_REDIS)
             add_test(NAME ${_name}_redis COMMAND ${_exe})
             set_tests_properties(${_name}_redis PROPERTIES SKIP_RETURN_CODE 77
                 ENVIRONMENT "${_redis_rht_env}")
+            # Redis RHT + gRPC peer index use no RDMA: a device that does not
+            # exist fails any plane that would open one.
+            add_test(NAME ${_name}_no_rdma COMMAND ${_exe})
+            set_tests_properties(${_name}_no_rdma PROPERTIES SKIP_RETURN_CODE 77
+                ENVIRONMENT "${_redis_rht_env};RADIXSHMEM_PEER_INDEX_BACKEND=grpc;RADIXSHMEM_RDMA_DEV=no_rdma_device")
         endif()
     endforeach()
 endif()
@@ -773,6 +788,17 @@ if(BUILD_PYTHON_MODULES)
                 SKIP_RETURN_CODE 77 TIMEOUT 600)
         endforeach()
         set_tests_properties(py_agentic_stress_3node_threads PROPERTIES TIMEOUT 180)
+        # The peer index over gRPC remote ops instead of RDMA walks.
+        add_test(NAME py_test_cluster_grpc_peer COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
+        add_test(NAME py_agentic_stress_2node_grpc_peer
+                 COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 2
+                         --base-port 19700 ${_stress_args})
+        foreach(_t py_test_cluster_grpc_peer py_agentic_stress_2node_grpc_peer)
+            set_tests_properties(${_t} PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
+                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;RADIXSHMEM_RHT_BACKEND=rdma;RADIXSHMEM_PEER_INDEX_BACKEND=grpc"
+                SKIP_RETURN_CODE 77 TIMEOUT 600)
+        endforeach()
         if(RADIXSHMEM_TEST_REDIS)
             add_test(NAME py_test_cluster_redis COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
             add_test(NAME py_test_p2p_pull_redis COMMAND ${Python3_EXECUTABLE} tests/test_p2p_pull.py)
@@ -791,6 +817,16 @@ if(BUILD_PYTHON_MODULES)
                     ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env}"
                     SKIP_RETURN_CODE 77 TIMEOUT 600)
             endforeach()
+            # Redis RHT + gRPC peer index: the index planes use no RDMA.
+            add_test(NAME py_agentic_stress_3node_threads_no_rdma
+                     COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 3
+                             --base-port 19800 ${_stress_args} --concurrency 32
+                             --executors-per-worker 8 --register-chunk-size 1
+                             --flush-after-insert)
+            set_tests_properties(py_agentic_stress_3node_threads_no_rdma PROPERTIES
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
+                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env};RADIXSHMEM_PEER_INDEX_BACKEND=grpc"
+                SKIP_RETURN_CODE 77 TIMEOUT 600)
         endif()
         message(STATUS "radixshmem._core + radixshmem._data: building "
                        "(pybind11 ${pybind11_VERSION}, ${Python3_EXECUTABLE})")

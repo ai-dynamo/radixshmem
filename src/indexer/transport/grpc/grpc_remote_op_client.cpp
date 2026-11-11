@@ -365,6 +365,10 @@ bool GrpcRemoteOpClientTransport::connected() {
     return impl_->channel->GetState(false) == GRPC_CHANNEL_READY;
 }
 
+void GrpcRemoteOpClientTransport::connect() {
+    (void)impl_->channel->GetState(true);
+}
+
 }  // namespace radixshmem
 
 #endif  // RADIXSHMEM_HAS_GRPC

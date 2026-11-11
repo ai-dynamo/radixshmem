@@ -51,7 +51,7 @@ constexpr int    kPrefixLen    = 16;   // prefix B written by node2
 constexpr int    kBootstrapTO  = 30;
 constexpr int    kJoinTO       = 40;   // reader's budget to sense node2 + hit
 constexpr const char* kShmPrefix = "/test_join";
-constexpr const char* kRdmaDev   = "mlx5_bond_0";
+const char* const kRdmaDev  = test_rdma_dev();
 constexpr int    kGidIdx        = 3;
 
 std::string node_name_for(int rank) { return "node" + std::to_string(rank); }
@@ -236,9 +236,9 @@ int run_joined_reader_process(const radixshmem::RadixClientConfig& cc, int attac
                     qr.common_hit, remote_src(qr), qr.rdma_read_count);
             return 24;
         }
-        if (qr.rdma_read_count <= 0) {
-            fprintf(stderr, "[joined_reader] expected rdma_read_count>0 got %d\n",
-                    qr.rdma_read_count);
+        if (!remote_reads_ok(qr)) {
+            fprintf(stderr, "[joined_reader] rdma_read_count %d does not fit the "
+                            "peer index\n", qr.rdma_read_count);
             return 26;
         }
         fprintf(stderr, "[joined_reader] OK hit node2: total=%d remote_src=%d "

@@ -464,7 +464,8 @@ def orchestrate(args) -> int:
                   f"node{i} local_read_only client hit {r['hit']} blocks locally")
             check(r["refused"] == 3, f"node{i} local_read_only client refused every mutation")
 
-        print("\n[3] reader clients on the other nodes see it over RDMA")
+        grpc_peer = os.environ.get("RADIXSHMEM_PEER_INDEX_BACKEND") == "grpc"
+        print(f"\n[3] reader clients on the other nodes see it over {'gRPC' if grpc_peer else 'RDMA'}")
         for i in range(1, args.nodes):
             r = run_client("reader", f"{SHM_PREFIX}_node{i}")
             print(f"  {r}")
@@ -473,7 +474,8 @@ def orchestrate(args) -> int:
             check(r["local_hit_length"] == 0, f"node{i} had nothing locally")
             check(r["remote_node_id"] == ranks[0],
                   f"node{i} resolved the holder to rank {ranks[0]}")
-            check(r["rdma_read_count"] > 0, f"node{i} walked the peer over RDMA")
+            check((r["rdma_read_count"] == 0) == grpc_peer,
+                  f"node{i} queried the peer ({r['rdma_read_count']} RDMA reads)")
 
         print(f"\n[3b] a session alternating node0/node1 for {TURNS} turns keeps its whole history")
         for k in range(TURNS):

@@ -54,7 +54,7 @@ constexpr int    kBlockSize     = 1;
 constexpr int    kPrefixLen     = 16;          // hashes inserted by writer
 constexpr int    kBootstrapTO   = 30;
 constexpr const char* kShmPrefix = "/test_dc";
-constexpr const char* kRdmaDev   = "mlx5_bond_0";
+const char* const kRdmaDev  = test_rdma_dev();
 constexpr int    kGidIdx        = 3;
 
 std::string node_name_for(int rank) { return "node" + std::to_string(rank); }
@@ -215,8 +215,8 @@ int run_reader_process(const radixshmem::RadixClientConfig& cc) {
                     kPrefixLen, qr.common_hit);
             ok = false;
         }
-        if (qr.rdma_read_count <= 0) {
-            fprintf(stderr, "[reader] expected rdma_read_count > 0, got %d\n",
+        if (!remote_reads_ok(qr)) {
+            fprintf(stderr, "[reader] rdma_read_count %d does not fit the peer index\n",
                     qr.rdma_read_count);
             ok = false;
         }

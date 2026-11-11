@@ -15,7 +15,7 @@
 
 namespace radixshmem {
 
-constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 14;  // lockstep with manifest v14
+constexpr uint32_t CLUSTER_PROTOCOL_VERSION = 15;  // lockstep with manifest v15
 constexpr uint32_t CLUSTER_HELLO_MAGIC = 0x52584348; // "RXCH"
 constexpr uint32_t CLUSTER_REPLY_MAGIC = 0x52584352; // "RXCR"
 constexpr uint32_t CLUSTER_SHARDMAP_MAGIC = 0x52584d50; // "RXMP"
@@ -29,10 +29,10 @@ struct ShardMapMsg {
     int32_t  rdma_sl;        // authoritative QoS (rank 0's env), see manifest
     int32_t  rdma_tc;
     uint32_t rht_transport;         // authoritative RHT-plane transport (ClusterTransport)
-    uint32_t peer_index_transport;  // authoritative peer-index-plane transport
+    uint32_t peer_index_transport;  // authoritative peer-index-plane transport (RDMA backend)
     uint32_t rht_slots;      // authoritative W (RHT slots per bucket)
     uint64_t dc_access_key;  // cluster-wide DCT key (when either plane is DC)
-    uint32_t reserved_remote_op_transport;
+    uint32_t peer_index_backend;    // ClusterPeerIndexBackend
     uint32_t register_chunk_size;   // cs; node-boundary / probe stride alignment
     uint32_t holder_rank[CLUSTER_MAX_SHARDS];  // shard s → holder rank
     uint32_t rht_backend;    // ClusterRhtBackend; REDIS leaves the shard map empty

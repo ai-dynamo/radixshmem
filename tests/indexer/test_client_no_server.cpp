@@ -54,7 +54,7 @@ constexpr int    kBlockSize     = 1;
 constexpr int    kPrefixLen     = 16;
 constexpr int    kBootstrapTO   = 30;
 constexpr const char* kShmPrefix = "/test_nosrv";
-constexpr const char* kRdmaDev   = "mlx5_bond_0";
+const char* const kRdmaDev  = test_rdma_dev();
 constexpr int    kGidIdx        = 3;
 constexpr const char* kObserverNode = "observer";
 
@@ -220,8 +220,8 @@ int run_observer_process(const std::string& registry,
                     remote_src(qr));
             ok = false;
         }
-        if (qr.rdma_read_count <= 0) {
-            fprintf(stderr, "[observer] expected rdma_read_count>0, got %d\n",
+        if (!remote_reads_ok(qr)) {
+            fprintf(stderr, "[observer] rdma_read_count %d does not fit the peer index\n",
                     qr.rdma_read_count);
             ok = false;
         }

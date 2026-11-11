@@ -34,7 +34,8 @@ PeerBreaker::Gate PeerBreaker::gate(int rank) {
 void PeerBreaker::skipped(int rank, Op op, uint64_t n) {
     if (shared_) {
         std::atomic<uint64_t>* c[kOps] = {&shared_->rht_writes, &shared_->rht_removes,
-                                          &shared_->rht_lookups, &shared_->walks, nullptr};
+                                          &shared_->rht_lookups, &shared_->walks, nullptr,
+                                          nullptr};
         if (c[(int)op]) c[(int)op]->fetch_add(n, std::memory_order_relaxed);
     }
     std::lock_guard<std::mutex> g(mu_);
@@ -124,7 +125,7 @@ std::string PeerBreaker::label(const Peer& p) {
 
 std::string PeerBreaker::summary(const uint64_t (&n)[kOps]) {
     static const char* const kNames[kOps] = {"RHT writes", "RHT removes", "lookups", "walks",
-                                             "remote ops"};
+                                             "remote ops", "pin releases"};
     std::string s;
     for (int i = 0; i < kOps; i++) {
         if (!n[i]) continue;

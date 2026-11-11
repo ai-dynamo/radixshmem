@@ -4,6 +4,7 @@
 #pragma once
 
 #include "component_types.h"
+#include "peer_index.h"          // RemoteHit
 #include "rdma_transport.hpp"
 #include "types.h"
 #include <cstdint>
@@ -50,11 +51,6 @@ struct TreeNodeData {
 };
 static_assert(sizeof(TreeNodeData) == sizeof(TreeNode),
               "TreeNodeData must match TreeNode layout");
-
-struct RemoteHit {
-    int position;
-    uint32_t tree_node_id;
-};
 
 struct RemoteComponentWalkResult {
     TreeComponentQueryResult tree;
