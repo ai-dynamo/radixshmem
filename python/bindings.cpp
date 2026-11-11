@@ -720,7 +720,6 @@ PYBIND11_MODULE(_core, m) {
         .def("print_tree", &RadixClient::print_tree)
         .def("name", &RadixClient::name)
         .def("kvevent_enabled", &RadixClient::kvevent_enabled)
-        .def("kvevent_seek_to_head", &RadixClient::kvevent_seek_to_head)
         .def("kvevent_drain", [](RadixClient& c, size_t max_hashes) {
             RadixClient::KvEventBatch b;
             {

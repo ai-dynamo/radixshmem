@@ -6,7 +6,7 @@ from its KV-event ring (one stream per node).
 
 Wire (ZMQ PUB, multipart): ``[topic, seq, payload]``
 
-* ``topic`` -- configured bytes, ``b""`` by default.
+* ``topic`` -- always ``b""``.
 * ``seq`` -- 8-byte big-endian batch number, +1 per batch from 0. A gap means
   batches were lost (PUB drops under backpressure, or a slow joiner).
 * ``payload`` -- msgpack map::
@@ -61,19 +61,18 @@ class KvEventPublisher:
     ``heartbeat_s`` so a new subscriber learns the incarnation and seq."""
 
     def __init__(self, client, endpoint: str, *, cluster_id: str, node: int, node_name: str,
-                 hash_scheme: str, block_size: int, topic: bytes = b"",
+                 hash_scheme: str, block_size: int,
                  interval_s: float = 0.01, heartbeat_s: float = 1.0):
         import msgpack  # noqa: F401 - fail at start-up, not on the first batch
         import zmq
 
         if not client.kvevent_enabled():
             raise ValueError("the region has no KV-event ring; start radix-server with "
-                             "--kvevent-ring-capacity > 0")
+                             "--kv-events-endpoint")
         self._client = client
         self._header = {"v": WIRE_VERSION, "cluster_id": cluster_id, "node": int(node),
                         "node_name": node_name, "incarnation": uuid.uuid4().hex,
                         "hash_scheme": hash_scheme, "block_size": int(block_size)}
-        self._topic = topic
         self._interval_s = interval_s
         self._heartbeat_s = heartbeat_s
         self._ctx = zmq.Context.instance()
@@ -84,7 +83,6 @@ class KvEventPublisher:
         self.endpoint = self._sock.getsockopt_string(zmq.LAST_ENDPOINT)
         self._seq = 0
         self._stop = threading.Event()
-        client.kvevent_seek_to_head()
         self._thread = threading.Thread(target=self._run, name="radixshmem-kv-events", daemon=True)
         self._thread.start()
         log.info("publishing node placement on %s (incarnation %s)", self.endpoint,
@@ -99,7 +97,7 @@ class KvEventPublisher:
 
         payload = dict(self._header)
         payload["events"] = events
-        self._sock.send_multipart([self._topic, struct.pack(">Q", self._seq),
+        self._sock.send_multipart([b"", struct.pack(">Q", self._seq),
                                    msgpack.packb(payload, use_bin_type=True)])
         self._seq += 1
 
