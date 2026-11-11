@@ -26,7 +26,9 @@ cd python && pip install -e .
 Cross-node remote ops use gRPC exclusively and need the grpc++ and protobuf development packages
 (Ubuntu: `apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc`).
 An RDMA build fails configuration if these dependencies are missing. There is no ZMQ/DC remote-op fallback.
-The RHT and peer-index planes still support one-sided XRC/DC RDMA independently.
+The RHT and the peer index each run on one-sided RDMA (XRC or DC) or without it: the RHT on Redis
+(`RADIXSHMEM_RHT_BACKEND=redis`), the peer index on the peers' gRPC remote ops
+(`--peer-index-backend grpc`). With both, the index opens no RDMA device on any node.
 
 C++ local-only builds (`-DENABLE_RDMA=OFF`) retain `RadixClient`, the standalone
 `radix_server`, and local tests; distributed client/server entry points are rejected.
