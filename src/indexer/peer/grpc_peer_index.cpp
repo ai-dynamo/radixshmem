@@ -147,6 +147,7 @@ void GrpcPeerIndex::unlock(const uint64_t* hashes, int n, PinRecord&& pin) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10 << i));
         st = s->ops->unlock(hashes, n, pin);
     }
+    if (st == RemoteStatus::OK) breaker_.succeeded(rank);
     if (st == RemoteStatus::OK || st == RemoteStatus::STALE_TARGET) return;
     if (unreachable(st))
         breaker_.failed(rank, "unlock",
