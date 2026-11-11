@@ -8,8 +8,10 @@
 #include "tree_dump.h"
 #include "types.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <cstdlib>
 #include <mutex>
@@ -296,6 +298,17 @@ private:
     std::shared_ptr<RemotePeer> peer_for(int rank);
     void drop_peer_session(int rank);
     RemoteStatus missing_peer_status(int rank) const;
+
+    // Landing slots of a dedup move that timed out or whose writer ran late:
+    // the source may still write them, so they are recycled only after a delay.
+    struct HeldLanding {
+        std::chrono::steady_clock::time_point until;
+        uint64_t generation = 0;   // a reset in between reinitialised the pools
+        std::vector<int32_t> slots[NUM_COMPONENT_TYPES];
+    };
+    std::mutex held_landing_mu_;
+    std::deque<HeldLanding> held_landing_;
+    void recycle_held_landing();
 
     // Step one, RHT probe from the deepest position not past the incumbent, with
     // the chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
