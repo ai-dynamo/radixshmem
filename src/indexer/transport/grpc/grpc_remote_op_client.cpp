@@ -86,6 +86,11 @@ GrpcRemoteOpClientTransport::GrpcRemoteOpClientTransport(
     args.SetInt(GRPC_ARG_HTTP2_MAX_PINGS_WITHOUT_DATA, 0);
     args.SetInt(GRPC_ARG_HTTP2_MIN_SENT_PING_INTERVAL_WITHOUT_DATA_MS,
                 kGrpcRemoteOpKeepaliveMs);
+    // A new channel dials anew instead of sharing a connection that backs off
+    // (default up to 120 s) since the peer went away; retries stay within 1 s.
+    args.SetInt(GRPC_ARG_USE_LOCAL_SUBCHANNEL_POOL, 1);
+    args.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 100);
+    args.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 1000);
     impl_->channel = grpc::CreateCustomChannel(
         target, grpc::InsecureChannelCredentials(), args);
     impl_->stub = pb::RemoteOps::NewStub(impl_->channel);
