@@ -601,6 +601,7 @@ set(_benches
     bench_query
     bench_query_dist
     bench_cluster
+    bench_peer_query
     stress_test_llm
 )
 foreach(_b ${_benches})
