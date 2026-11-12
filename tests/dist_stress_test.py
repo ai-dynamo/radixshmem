@@ -1187,8 +1187,9 @@ def _create_cluster_node(rank: int, cfg: StressConfig):
     rscfg.registry = f"etcd://{cfg.master_addr}:2379"
     rscfg.cluster_id = "dist_stress"
     rscfg.node_name = f"node{rank}"
-    rscfg.index_dev = cfg.index_dev
-    rscfg.gid_idx = cfg.gid_idx
+    if cfg.index_dev:   # the device of the index planes that run on RDMA
+        os.environ["RADIXSHMEM_INDEX_DEV"] = cfg.index_dev
+    os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(cfg.gid_idx)
     rscfg.bootstrap_timeout_sec = cfg.bootstrap_timeout
     rscfg.register_chunk_tokens = cfg.register_chunk_size * cfg.block_size
 

@@ -11,6 +11,19 @@
 
 namespace radixshmem {
 
+IndexDevice index_device_env() {
+    IndexDevice d;
+    if (const char* v = ::getenv("RADIXSHMEM_INDEX_DEV")) d.dev = v;
+    if (const char* v = ::getenv("RADIXSHMEM_INDEX_GID_IDX")) {
+        char* end = nullptr;
+        const long g = std::strtol(v, &end, 10);
+        if (end == v || *end != '\0' || g < 0 || g > 255)
+            throw std::runtime_error(std::string("invalid RADIXSHMEM_INDEX_GID_IDX=") + v);
+        d.gid_idx = (int)g;
+    }
+    return d;
+}
+
 RdmaContext::RdmaContext(const char* dev_name, int port, int gid_idx)
     : port_(port), gid_idx_(gid_idx) {
     // QoS defaults from env; set_qos() may override before QPs connect.

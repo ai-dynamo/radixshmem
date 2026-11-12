@@ -110,15 +110,14 @@ InsertPathResult RemotePeer::insert_path(const uint64_t* hashes, int n, int star
     return r;
 }
 
-QueryReply RemotePeer::query(const uint64_t* hashes, int n, bool lock,
-                             bool update_meta) {
+QueryReply RemotePeer::query(const uint64_t* hashes, int n, const RemoteQuery& q) {
     QueryReply r;
     if (skipped()) {
         r.status = RemoteStatus::UNAVAILABLE;
         return r;
     }
     const auto t0 = Clock::now();
-    r = transport_->query(hashes, n, lock, update_meta);
+    r = transport_->query(hashes, n, q);
     observe("query", r.status, since(t0));
     return r;
 }
@@ -132,12 +131,10 @@ RemoteStatus RemotePeer::recycle(const int32_t* slots, int num_slots,
     return st;
 }
 
-RemoteStatus RemotePeer::unlock(const uint64_t* hashes, int n, int start,
-                                int length, int pin_end,
-                                const std::vector<uint64_t>& pin_tail) {
+RemoteStatus RemotePeer::unlock(const uint64_t* hashes, int n, const PinRecord& pin) {
     if (skipped()) return RemoteStatus::UNAVAILABLE;
     const auto t0 = Clock::now();
-    const RemoteStatus st = transport_->unlock(hashes, n, start, length, pin_end, pin_tail);
+    const RemoteStatus st = transport_->unlock(hashes, n, pin);
     observe("unlock", st, since(t0));
     return st;
 }

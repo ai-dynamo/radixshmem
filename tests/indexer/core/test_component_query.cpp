@@ -1346,6 +1346,51 @@ static void test_remote_pin_incumbent_release() {
     TEST_PASS();
 }
 
+static bool same_pin(const PinRecord& a, const PinRecord& b) {
+    return a.full.start == b.full.start && a.full.end == b.full.end &&
+           a.swa.start == b.swa.start && a.swa.end == b.swa.end &&
+           a.mamba_end == b.mamba_end && a.tail == b.tail;
+}
+
+// The peer index over gRPC pins on the peer's CPU what an RDMA walk pins by FAA.
+static void test_window_pin_matches_remote_walk() {
+    TEST_BEGIN("remote: a windowed CPU pin equals the RDMA walk's, case by case");
+
+    const char* name = "/test_cq_window_pin";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, cfg(4, 3, 128));
+    auto h = seq(1000, 12);
+    insert_fresh(t, h.data(), 12);
+    for (int e : {3, 6, 9}) publish_at(t, h.data(), e, 4);
+    mamba_ok(t, h.data(), 9);
+
+    Rig r(t);
+    const uint32_t masks[] = {COMPONENT_MASK_FULL, FS, FM, FSM,
+                              COMPONENT_MASK_SWA, COMPONENT_MASK_MAMBA};
+    int pinned = 0;
+    for (uint32_t mask : masks)
+        for (int len : {12, 10, 9, 5, 3})
+            for (int inc : {0, 2, 6, 9})
+                for (int from : {0, 1, 4, 12}) {
+                    PinWindow w{(uint32_t)inc, (uint32_t)from};
+                    auto cpu = t.query_components(h.data(), len, mask, true, false, &w);
+                    auto rdma = r.walker.walk_components(r.info, h.data(), len, mask,
+                                                         true, inc, from);
+                    assert_same(cpu, rdma.tree);
+                    assert(same_pin(cpu.pin, rdma.remote_pin));
+                    pinned += !cpu.pin.empty();
+                    assert(t.dec_ref(h.data(), len, std::move(cpu.pin)));
+                    if (!rdma.remote_pin.empty())
+                        assert(r.walker.dec_ref_components_remote(
+                            r.info, h.data(), len, std::move(rdma.remote_pin)));
+                }
+    assert(pinned > 0);
+
+    expect_healthy(t);
+    t.destroy();
+    TEST_PASS();
+}
+
 static void test_remote_throw_releases_reader_count() {
     TEST_BEGIN("remote: an op throwing mid-walk leaves no reader count");
 
@@ -1750,6 +1795,7 @@ int main() {
 #ifndef RADIXSHMEM_NO_RDMA
     test_remote_parity_and_abi_gate();
     test_remote_pin_incumbent_release();
+    test_window_pin_matches_remote_walk();
     test_remote_throw_releases_reader_count();
     test_remote_pin_swa_terminal_past_query();
     test_remote_pin_swa_only_terminal_past_query();

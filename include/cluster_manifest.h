@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Cluster wire structs (ClusterManifestHeader + PeerEntry) — base64'd into etcd
-// /config and /peers, decoded by RadixServer and RadixClient.
+// PeerEntry, the etcd /peers wire struct (base64'd, not laid out in shm), and the
+// cluster enums and limits the shard map in /config uses.
 
 #pragma once
 
@@ -13,44 +13,15 @@
 
 namespace radixshmem {
 
-static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 14; // 14: RHT backend in the shard map
+static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 16; // 16: one RPC port, no reserved fields
 static constexpr uint32_t CLUSTER_MANIFEST_HOST_LEN = 64;
-static constexpr uint32_t CLUSTER_MANIFEST_ENTRY_SIZE = 352;
+static constexpr uint32_t CLUSTER_MANIFEST_ENTRY_SIZE = 344;
 static constexpr uint32_t CLUSTER_RHT_NAME_LEN = 64;
 
 // Max RHT shards (M) the inline holder map can describe; M <= this cap.
 static constexpr uint32_t CLUSTER_MAX_SHARDS = 64;
 // Redis RHT seed list ("host:port,...") in the shard map.
 static constexpr uint32_t CLUSTER_RHT_SEEDS_LEN = 256;
-
-struct ClusterManifestHeader {
-    uint64_t magic;           // CLUSTER_MANIFEST_MAGIC
-    uint32_t version;         // CLUSTER_MANIFEST_VERSION
-    uint32_t world_size;
-    uint32_t entry_size;      // CLUSTER_MANIFEST_ENTRY_SIZE
-                              // NOTE: this header is not on the wire today —
-                              // peer blobs carry their own version framing.
-    uint32_t entry_count;     // == world_size
-
-    // ---- Authoritative RHT shard map (rank 0, broadcast) ----
-    uint32_t num_shards;      // M (number of RHT shards)
-    uint32_t rht_capacity;    // requested per-shard bucket count, global/uniform (RHT normalizes)
-    uint32_t shard_holder_rank[CLUSTER_MAX_SHARDS];   // shard s → holder rank; [0,num_shards) valid
-
-    // ---- Authoritative RDMA QoS (rank 0, broadcast); applied to index-plane QPs ----
-    int32_t  rdma_sl;
-    int32_t  rdma_tc;
-
-    // ---- RDMA transports (rank 0, broadcast) ----
-    uint32_t peer_index_transport;   // remote walk into peer trees, see ClusterTransport
-    uint32_t rht_slots;          // W: RHT slots per bucket (chaining depth)
-    uint64_t dc_access_key;      // cluster-wide DCT key (either plane DC)
-
-    uint32_t reserved_remote_op_transport;
-    uint32_t rht_transport;         // client -> RHT shard holder, see ClusterTransport
-};
-static_assert(sizeof(ClusterManifestHeader) == 320,
-              "ClusterManifestHeader size changed — update version + readers");
 
 enum ClusterTransport : uint32_t {
     CLUSTER_TRANSPORT_XRC = 0,
@@ -62,17 +33,22 @@ enum ClusterRhtBackend : uint32_t {
     CLUSTER_RHT_REDIS = 1,
 };
 
+// How a query reaches the tree of the peer the RHT picked (peer_index.h).
+enum ClusterPeerIndexBackend : uint32_t {
+    CLUSTER_PEER_INDEX_RDMA = 0,
+    CLUSTER_PEER_INDEX_GRPC = 1,
+};
+
 // One entry per rank (each server fills its own; master broadcasts the union).
 struct PeerEntry {
     // Identity
     int32_t  rank;
     int32_t  _pad0;
 
-    // Reachability — TCP bootstrap endpoint for this rank's XRC listener
+    // Reachability: the gRPC endpoint of remote ops, peer queries and XRC setup
     char     host[CLUSTER_MANIFEST_HOST_LEN];
-    uint16_t xrc_listen_port;
-    // gRPC remote-op TCP port.
-    uint16_t remote_op_listen_port;
+    uint16_t rpc_port;
+    uint16_t _pad1;
     uint32_t _pad2;
 
     // Shared memory layout (this peer's local shm region)
@@ -107,12 +83,10 @@ struct PeerEntry {
     // XRC bootstrap-time hints
     uint32_t srq_num;                          // peer's SRQ number
     uint32_t dct_num;                          // DC target for RHT / peer-index reads (0 when neither plane is DC)
-    uint32_t reserved_remote_op_dct;
 
     // RDMA device name (client's local entry picks the same device)
     char     index_dev[32];
 
-    uint32_t reserved_remote_op_dct_extra;
     uint64_t instance_id;
 
     // Component ABI (from ShmHeader at bootstrap); layout sizes are
@@ -152,8 +126,5 @@ inline bool peer_component_abi_valid(const PeerEntry& e,
     }
     return true;
 }
-
-// ClusterManifestHeader / PeerEntry are the etcd /config and /peers wire structs
-// (base64'd); they are not laid out in shm.
 
 } // namespace radixshmem

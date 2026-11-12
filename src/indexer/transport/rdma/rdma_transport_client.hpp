@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Shared client-side RDMA base: device context, CQ, a registered scratch buffer
-// for one-sided walk replies, and one process-shared DC initiator. Peer, RHT, and
-// remote-op planes borrow these; none of them owns the context.
+// Client-side RDMA base of one plane (peer index, RHT): device context, CQ, an
+// optional registered scratch buffer for one-sided walk replies, and a DC initiator.
 
 #pragma once
 
+#include "cluster_manifest.h"   // PeerEntry
 #include "rdma_transport.hpp"
 
 #include <cstddef>
@@ -22,20 +22,30 @@ class RdmaTransportClient {
   public:
     static constexpr size_t BUF_SIZE = 1 << 20;
 
-    // Open the device, size the CQ for `world_size` peers, and register the
-    // scratch buffer. QoS is adopted before any QP connect.
-    RdmaTransportClient(const char* dev, int gid_idx, int sl, int tc,
-                        int world_size) {
-        ctx_ = std::make_unique<RdmaContext>(dev, 1, gid_idx);
+    // Open the device, size the CQ for `world_size` peers, and register a
+    // scratch buffer of `buf_size` bytes (0 = none). QoS is adopted before any
+    // QP connect. The device and GID index: RADIXSHMEM_INDEX_DEV / _GID_IDX, else
+    // what `self` (this node's /peers entry, null for an observer) published,
+    // else the first device and GID index 3.
+    RdmaTransportClient(const PeerEntry* self, int sl, int tc, int world_size,
+                        size_t buf_size = BUF_SIZE) {
+        IndexDevice d = index_device_env();
+        const bool published = self && self->index_dev[0] != '\0';
+        if (d.dev.empty() && published)
+            d.dev.assign(self->index_dev, strnlen(self->index_dev, sizeof(self->index_dev)));
+        if (d.gid_idx < 0) d.gid_idx = published ? self->gid_index : 3;
+        ctx_ = std::make_unique<RdmaContext>(d.dev.empty() ? nullptr : d.dev.c_str(), 1,
+                                             d.gid_idx);
         ctx_->set_qos(sl, tc);
         int cq_depth = std::max(256, world_size * 128);
         cq_ = ibv_create_cq(ctx_->ctx(), cq_depth, nullptr, nullptr, 0);
         if (!cq_)
             throw std::runtime_error("RdmaTransportClient: ibv_create_cq failed");
-        buf_ = aligned_alloc(4096, BUF_SIZE);
-        memset(buf_, 0, BUF_SIZE);
+        if (buf_size == 0) return;
+        buf_ = aligned_alloc(4096, buf_size);
+        memset(buf_, 0, buf_size);
         buf_mr_ = std::make_unique<RdmaMemoryRegion>(
-            ctx_->pd(), buf_, BUF_SIZE,
+            ctx_->pd(), buf_, buf_size,
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
             IBV_ACCESS_REMOTE_READ);
     }
@@ -71,7 +81,7 @@ class RdmaTransportClient {
     // Drop the shared DCI; only valid once every DcReader borrowing it is gone.
     void reset_dci() { dci_.reset(); }
 
-    // Per-rank DC address handle, cached and shared across data + RHT planes.
+    // Per-rank DC address handle, cached.
     // Built once from the peer's gid/lid; nullptr on failure. `n` sizes the cache.
     ibv_ah* ah_for(int rank, const ibv_gid& dgid, uint16_t dlid,
                    uint8_t link_layer, int n) {
@@ -94,7 +104,7 @@ class RdmaTransportClient {
     void*                              buf_ = nullptr;
     std::unique_ptr<RdmaMemoryRegion>  buf_mr_;
     std::unique_ptr<DcInitiator>       dci_;
-    std::vector<ibv_ah*>               ah_;   // per-rank, shared data + RHT planes
+    std::vector<ibv_ah*>               ah_;   // per-rank
     std::vector<ibv_gid>               ah_gid_;
     std::vector<ibv_ah*>               retired_ah_;
 };

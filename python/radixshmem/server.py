@@ -49,8 +49,7 @@ from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
-    "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec",
-    "peer_index_transport", "remote_op_listen_port")
+    "rpc_interface", "rpc_port", "bootstrap_timeout_sec", "lease_ttl_sec")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
@@ -60,9 +59,10 @@ ROLES = ("prefill", "decode")
 
 @dataclass
 class ClusterConfig:
-    """etcd rendezvous and the control-plane RDMA of the index (see
-    _core.RadixServerConfig). Distributed when expected_min_nodes > 1; the RHT
-    is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* (docs/api.md)."""
+    """etcd rendezvous of the index (see _core.RadixServerConfig). Distributed
+    when expected_min_nodes > 1; the RHT is configured with RADIXSHMEM_RHT_* and
+    RADIXSHMEM_REDIS_*, the peer index with RADIXSHMEM_PEER_INDEX_*, and the RDMA
+    device of either with RADIXSHMEM_INDEX_DEV / _GID_IDX (docs/api.md)."""
 
     expected_min_nodes: int = 0
     settle_ms: int = 500
@@ -71,14 +71,9 @@ class ClusterConfig:
     node_name: str = ""
     rpc_address: str = ""
     rpc_interface: str = ""
-    rpc_port: int = 0
-    index_dev: str = ""              # HCA of the index control plane, "" = first available;
-                                     # the data plane's HCAs are ServerConfig.transfer_devices
-    gid_idx: int = 3
+    rpc_port: int = 0                 # gRPC endpoint peers reach, 0 = OS-assigned
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
-    peer_index_transport: str = "xrc" # remote walk into peer trees: "xrc" | "dc"
-    remote_op_listen_port: int = 0
 
     @property
     def distributed(self) -> bool:
@@ -121,7 +116,6 @@ class ServerConfig:
     writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
-    rpc_workers: int = 32            # one blocks per client with jobs in flight
     role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
     # monitoring endpoint (radixshmem.monitor): Prometheus /metrics with the tree, 0 = off
     monitor_port: int = 0            # first port tried; servers sharing a host take the next free one
@@ -441,7 +435,7 @@ class RadixServer:
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
             "Nodes": lambda _: {"nodes": self.nodes()},
-        }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
+        }, self.cfg.resolved_endpoint)
         if self.cfg.transfer_log and self._xlog is None:
             self._xlog = _TransferLog(self.cfg.transfer_log)
         try:

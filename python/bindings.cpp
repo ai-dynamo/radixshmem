@@ -262,12 +262,11 @@ PYBIND11_MODULE(_core, m) {
         // and wins over rpc_address.
         .def_readwrite("rpc_address", &RadixServerConfig::rpc_address)
         .def_readwrite("rpc_interface", &RadixServerConfig::rpc_interface)
-        // Bootstrap / XRC listen port; 0 = OS-assigned (the real port is published).
+        // gRPC endpoint peers reach (remote ops, peer queries, XRC setup); 0 = OS-assigned,
+        // the real port is published.
         .def_property("rpc_port",
                       [](const RadixServerConfig& c) { return (int)c.rpc_port; },
                       [](RadixServerConfig& c, int v) { c.rpc_port = (uint16_t)v; })
-        .def_readwrite("index_dev", &RadixServerConfig::index_dev)
-        .def_readwrite("gid_idx", &RadixServerConfig::gid_idx)
         .def_readwrite("bootstrap_timeout_sec",
                        &RadixServerConfig::bootstrap_timeout_sec)
         .def_readwrite("lease_ttl_sec", &RadixServerConfig::lease_ttl_sec)
@@ -278,11 +277,6 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("expected_min_nodes",
                        &RadixServerConfig::expected_min_nodes)
         .def_readwrite("settle_ms", &RadixServerConfig::settle_ms)
-        .def_readwrite("peer_index_transport",
-                       &RadixServerConfig::peer_index_transport)
-        .def_property("remote_op_listen_port",
-                      [](const RadixServerConfig& c) { return (int)c.remote_op_listen_port; },
-                      [](RadixServerConfig& c, int v) { c.remote_op_listen_port = (uint16_t)v; })
         .def_readwrite("writeback_enabled", &RadixServerConfig::writeback_enabled)
         .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
 

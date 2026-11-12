@@ -36,8 +36,7 @@ public:
     GrpcRemoteOpClientTransport& operator=(const GrpcRemoteOpClientTransport&) = delete;
 
     AllocateReply allocate(int n, ComponentType component = ComponentType::FULL) override;
-    QueryReply query(const uint64_t* hashes, int n, bool lock,
-                     bool update_meta) override;
+    QueryReply query(const uint64_t* hashes, int n, const RemoteQuery& q) override;
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
                         const int32_t* slots, bool auto_recycle,
                         ComponentType component = ComponentType::FULL) override;
@@ -48,23 +47,24 @@ public:
                                  bool auto_recycle) override;
     RemoteStatus recycle(const int32_t* slots, int num_slots,
                          ComponentType component = ComponentType::FULL) override;
-    RemoteStatus unlock(const uint64_t* hashes, int n, int start,
-                        int length, int pin_end,
-                        const std::vector<uint64_t>& pin_tail) override;
+    RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin) override;
     DedupReply dedup_prefix(const uint64_t* hashes, int n,
                             const DedupRequest& req = {}) override;
+    RemoteStatus xrc_connect(const XrcConnInfo& mine, XrcConnInfo& theirs) override;
     bool connected() override;
+    void connect() override;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-// Binds on construction; UNAVAILABLE until start(svc); stop() drains handlers.
+// Binds on construction and serves XrcConnect through `xrc` (UNIMPLEMENTED without
+// one); the other ops are UNAVAILABLE until start(svc); stop() drains handlers.
 class GrpcRemoteOpServer : public IRemoteOpServerTransport {
 public:
     // listen_port 0 = OS-assigned; bind failure throws.
-    GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id);
+    GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id, XrcAcceptor xrc = {});
     ~GrpcRemoteOpServer() override;
 
     GrpcRemoteOpServer(const GrpcRemoteOpServer&) = delete;

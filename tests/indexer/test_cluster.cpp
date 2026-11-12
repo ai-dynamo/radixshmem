@@ -54,8 +54,6 @@ constexpr int    kBlockSize     = 1;
 constexpr int    kPrefixLen     = 16;          // hashes inserted by writer
 constexpr int    kBootstrapTO   = 30;
 constexpr const char* kShmPrefix = "/test_dc";
-constexpr const char* kRdmaDev   = "mlx5_bond_0";
-constexpr int    kGidIdx        = 3;
 
 std::string node_name_for(int rank) { return "node" + std::to_string(rank); }
 
@@ -86,8 +84,6 @@ radixshmem::RadixClientConfig client_cfg(const std::string& node,
     cc.registry   = registry;
     cc.cluster_id = cluster_id;
     cc.node_name  = node;
-    cc.index_dev   = kRdmaDev;
-    cc.gid_idx    = kGidIdx;
     cc.bootstrap_timeout_sec = kBootstrapTO;
     return cc;
 }
@@ -141,8 +137,6 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.rpc_address = "127.0.0.1";   // single-host peers connect over loopback
     setenv("RADIXSHMEM_RHT_SHARDS", std::to_string(num_shards).c_str(), 1);
     cfg.expected_min_nodes = min_nodes;
-    cfg.index_dev    = kRdmaDev;
-    cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
 
     radixshmem::RadixServer srv(cfg);
@@ -215,8 +209,8 @@ int run_reader_process(const radixshmem::RadixClientConfig& cc) {
                     kPrefixLen, qr.common_hit);
             ok = false;
         }
-        if (qr.rdma_read_count <= 0) {
-            fprintf(stderr, "[reader] expected rdma_read_count > 0, got %d\n",
+        if (!remote_reads_ok(qr)) {
+            fprintf(stderr, "[reader] rdma_read_count %d does not fit the peer index\n",
                     qr.rdma_read_count);
             ok = false;
         }
@@ -541,6 +535,7 @@ int client_main(const std::string& cs, const std::string& node,
 } // namespace
 
 int main(int argc, char** argv) {
+    default_index_dev();
     // Re-exec'd server: --server <node> <registry> <cluster_id> <num_shards> <min_nodes>
     if (argc >= 7 && std::strcmp(argv[1], "--server") == 0) {
         return run_server_process(argv[2], argv[3], argv[4],
