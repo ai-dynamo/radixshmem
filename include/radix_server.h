@@ -63,10 +63,6 @@ struct RadixServerConfig {
     int          expected_min_nodes = 0;   // > 1 = distributed
     int          settle_ms          = 500;
 
-    // Transport of the rdma peer index's walks: "xrc" or "dc". The peer index
-    // backend itself is RADIXSHMEM_PEER_INDEX_BACKEND.
-    std::string       peer_index_transport = "xrc";
-
     uint16_t          remote_op_listen_port = 0;
 
     // Cluster bootstrap registry: "etcd://host:port" (etcd dynamic discovery).
@@ -183,8 +179,12 @@ private:
         } rdma;
     };
     RhtEnv rht_env_;
-    // RADIXSHMEM_PEER_INDEX_BACKEND of this node: grpc (default) or rdma.
-    uint32_t peer_index_env_ = CLUSTER_PEER_INDEX_GRPC;
+    // RADIXSHMEM_PEER_INDEX_* of this node.
+    struct PeerIndexEnv {
+        uint32_t backend = CLUSTER_PEER_INDEX_GRPC;
+        uint32_t rdma_transport = CLUSTER_TRANSPORT_XRC;   // backend rdma only
+    };
+    PeerIndexEnv peer_index_env_;
     int rht_min_nodes() const {
         return rht_env_.backend == CLUSTER_RHT_RDMA ? rht_env_.rdma.shards : 0;
     }

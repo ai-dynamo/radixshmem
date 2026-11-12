@@ -29,7 +29,7 @@ struct ShardMapMsg {
     int32_t  rdma_sl;        // authoritative QoS (rank 0's env), see manifest
     int32_t  rdma_tc;
     uint32_t rht_transport;         // authoritative RHT-plane transport (ClusterTransport)
-    uint32_t peer_index_transport;  // authoritative peer-index-plane transport (RDMA backend)
+    uint32_t peer_index_transport;  // rdma peer index's transport (ClusterTransport)
     uint32_t rht_slots;      // authoritative W (RHT slots per bucket)
     uint64_t dc_access_key;  // cluster-wide DCT key (when either plane is DC)
     uint32_t peer_index_backend;    // ClusterPeerIndexBackend

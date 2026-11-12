@@ -228,7 +228,7 @@ def start_etcd(workdir: str):
     raise RuntimeError("etcd did not come up")
 
 
-def server_cmd(i, n, registry, cluster_id, workdir, transports, decode=None):
+def server_cmd(i, n, registry, cluster_id, workdir, decode=None):
     cmd = [
         sys.executable, "-m", "radixshmem.cli",
         "--name", SHM_PREFIX,
@@ -237,7 +237,6 @@ def server_cmd(i, n, registry, cluster_id, workdir, transports, decode=None):
         "--cluster-id", cluster_id,
         "--expected-min-nodes", str(n),
         "--rpc-address", "0.0.0.0",
-        "--peer-index-transport", transports[1],
         # several servers on one host: the default socket is per name, not per node
         "--endpoint", endpoint(workdir, i),
         "--lease-ttl", str(LEASE_TTL),
@@ -255,11 +254,11 @@ def launch(cmd, path):
     return subprocess.Popen(cmd, stdout=open(path, "ab"), stderr=subprocess.STDOUT, env=env)
 
 
-def start_servers(n, registry, cluster_id, workdir, transports=("xrc", "xrc")):
+def start_servers(n, registry, cluster_id, workdir):
     procs, logs = [], []
     for i in range(n):
         path = os.path.join(workdir, f"server{i}.log")
-        procs.append(launch(server_cmd(i, n, registry, cluster_id, workdir, transports), path))
+        procs.append(launch(server_cmd(i, n, registry, cluster_id, workdir), path))
         logs.append(path)
     return procs, logs
 
@@ -390,8 +389,7 @@ def orchestrate(args) -> int:
         print(f"etcd on {registry}   logs in {workdir}")
 
         print(f"\n[1] starting {args.nodes} radix-server processes, then a client configures each")
-        servers, logs = start_servers(args.nodes, registry, cluster_id, workdir,
-                                      (args.rht_transport, args.peer_index_transport))
+        servers, logs = start_servers(args.nodes, registry, cluster_id, workdir)
         wait_banner(servers, logs, "Waiting for a client's geometry", args.timeout)
         for i in range(args.nodes):
             ns = nodes_of(workdir, i)
@@ -502,7 +500,6 @@ def orchestrate(args) -> int:
         check(kv.get(geo_key) == geo, "the geometry key outlives a killed holder unchanged")
         mark = len(read(logs[v]))
         servers[v] = launch(server_cmd(v, args.nodes, registry, cluster_id, workdir,
-                                       (args.rht_transport, args.peer_index_transport),
                                        decode=False),
                             logs[v])
         wait_banner([servers[v]], [logs[v]], "Waiting for a client's geometry", args.timeout, [mark])
@@ -616,12 +613,14 @@ def main() -> int:
     p.add_argument("--nodes", type=int, default=3)
     p.add_argument("--index-dev", default="mlx5_bond_0")
     p.add_argument("--rht-transport", default="xrc", choices=["xrc", "dc"])
-    p.add_argument("--peer-index-transport", default="xrc", choices=["xrc", "dc"])
+    p.add_argument("--peer-index-rdma-transport", default="xrc", choices=["xrc", "dc"])
     p.add_argument("--gid-idx", type=int, default=3)
     p.add_argument("--timeout", type=int, default=120,
                    help="seconds to wait for the cluster to form")
     args = p.parse_args()
-    os.environ["RADIXSHMEM_RHT_TRANSPORT"] = args.rht_transport   # the RDMA RHT's, servers inherit it
+    # The RDMA RHT's and the rdma peer index's transports; the servers inherit them.
+    os.environ["RADIXSHMEM_RHT_TRANSPORT"] = args.rht_transport
+    os.environ["RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT"] = args.peer_index_rdma_transport
     # The device of the planes that run on RDMA; the servers inherit it.
     os.environ["RADIXSHMEM_INDEX_DEV"] = args.index_dev
     os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(args.gid_idx)

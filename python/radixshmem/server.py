@@ -50,7 +50,7 @@ from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
     "rpc_interface", "rpc_port", "bootstrap_timeout_sec", "lease_ttl_sec",
-    "peer_index_transport", "remote_op_listen_port")
+    "remote_op_listen_port")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
@@ -62,8 +62,8 @@ ROLES = ("prefill", "decode")
 class ClusterConfig:
     """etcd rendezvous of the index (see _core.RadixServerConfig). Distributed
     when expected_min_nodes > 1; the RHT is configured with RADIXSHMEM_RHT_* and
-    RADIXSHMEM_REDIS_*, the peer index with RADIXSHMEM_PEER_INDEX_BACKEND, and the
-    RDMA device of either with RADIXSHMEM_INDEX_DEV / _GID_IDX (docs/api.md)."""
+    RADIXSHMEM_REDIS_*, the peer index with RADIXSHMEM_PEER_INDEX_*, and the RDMA
+    device of either with RADIXSHMEM_INDEX_DEV / _GID_IDX (docs/api.md)."""
 
     expected_min_nodes: int = 0
     settle_ms: int = 500
@@ -75,7 +75,6 @@ class ClusterConfig:
     rpc_port: int = 0
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
-    peer_index_transport: str = "xrc" # transport of the rdma peer index's walks: "xrc" | "dc"
     remote_op_listen_port: int = 0
 
     @property

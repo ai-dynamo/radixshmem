@@ -243,23 +243,32 @@ void RadixServer::read_rht_env() {
 }
 
 void RadixServer::read_peer_index_env() {
+    auto bad = [](const char* name, const char* v, const char* values) {
+        return std::runtime_error(std::string("RadixServer: invalid ") + name + "=" + v + " (" +
+                                  values + ")");
+    };
+    PeerIndexEnv e;
     const char* v = ::getenv("RADIXSHMEM_PEER_INDEX_BACKEND");
-    if (!v || !*v || strcasecmp(v, "grpc") == 0)
-        peer_index_env_ = CLUSTER_PEER_INDEX_GRPC;
-    else if (strcasecmp(v, "rdma") == 0)
-        peer_index_env_ = CLUSTER_PEER_INDEX_RDMA;
-    else
-        throw std::runtime_error(std::string("RadixServer: invalid RADIXSHMEM_PEER_INDEX_BACKEND=") +
-                                 v + " (grpc or rdma)");
+    if (v && *v && strcasecmp(v, "rdma") == 0)
+        e.backend = CLUSTER_PEER_INDEX_RDMA;
+    else if (v && *v && strcasecmp(v, "grpc") != 0)
+        throw bad("RADIXSHMEM_PEER_INDEX_BACKEND", v, "grpc or rdma");
+    v = ::getenv("RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT");
+    if (e.backend == CLUSTER_PEER_INDEX_RDMA && v && *v) {
+        if (strcasecmp(v, "dc") == 0)
+            e.rdma_transport = CLUSTER_TRANSPORT_DC;
+        else if (strcasecmp(v, "xrc") != 0)
+            throw bad("RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT", v, "xrc or dc");
+    }
+    peer_index_env_ = e;
 }
 
 void RadixServer::resolve_shard_map(int ranks) {
     // Authoritative on the leader; other ranks overwrite from the broadcast map.
     rdma_sl_ = env_int("RADIXSHMEM_RDMA_SL", 5);
     rdma_tc_ = env_int("RADIXSHMEM_RDMA_TC", 160);
-    peer_index_backend_ = peer_index_env_;
-    peer_index_transport_ = (cfg_.peer_index_transport == "dc")
-                                ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
+    peer_index_backend_   = peer_index_env_.backend;
+    peer_index_transport_ = peer_index_env_.rdma_transport;
     dc_access_key_ = 0xD0C0ACCE5500F00DULL;   // every plane that runs DC shares it
     rht_backend_ = rht_env_.backend;
     num_shards_ = 0;
@@ -349,7 +358,7 @@ void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
         fprintf(stderr, "[RadixServer rank %d] WARN: local RADIXSHMEM_RHT_BACKEND ignored, "
                 "the cluster uses the %s RHT\n", cfg_.rank,
                 rht_backend_ == CLUSTER_RHT_REDIS ? "redis" : "rdma");
-    if (peer_index_env_ != peer_index_backend_)
+    if (peer_index_env_.backend != peer_index_backend_)
         fprintf(stderr, "[RadixServer rank %d] WARN: local RADIXSHMEM_PEER_INDEX_BACKEND "
                 "ignored, the cluster uses the %s peer index\n", cfg_.rank,
                 peer_index_backend_ == CLUSTER_PEER_INDEX_GRPC ? "grpc" : "rdma");
@@ -422,13 +431,15 @@ std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
             return diff("RADIXSHMEM_RHT_TRANSPORT", sm.rht_transport, e.transport);
     }
     auto peer = [](uint32_t b) { return b == CLUSTER_PEER_INDEX_GRPC ? "grpc" : "rdma"; };
-    if (sm.peer_index_backend != peer_index_env_)
+    auto tp = [](uint32_t t) { return t == CLUSTER_TRANSPORT_DC ? "dc" : "xrc"; };
+    const PeerIndexEnv& pe = peer_index_env_;
+    if (sm.peer_index_backend != pe.backend)
         return std::string("RADIXSHMEM_PEER_INDEX_BACKEND ") + peer(sm.peer_index_backend) +
-               " != local " + peer(peer_index_env_);
-    uint32_t peer_tp = cfg_.peer_index_transport == "dc" ? CLUSTER_TRANSPORT_DC
-                                                         : CLUSTER_TRANSPORT_XRC;
-    if (sm.peer_index_backend == CLUSTER_PEER_INDEX_RDMA && sm.peer_index_transport != peer_tp)
-        return "peer_index_transport differs from local " + cfg_.peer_index_transport;
+               " != local " + peer(pe.backend);
+    if (sm.peer_index_backend == CLUSTER_PEER_INDEX_RDMA &&
+        sm.peer_index_transport != pe.rdma_transport)
+        return std::string("RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT ") +
+               tp(sm.peer_index_transport) + " != local " + tp(pe.rdma_transport);
     int cs = register_chunk_size();
     if (sm.register_chunk_size && cs > 0 && (int)sm.register_chunk_size != cs)
         return diff("register_chunk_size", sm.register_chunk_size, cs);
@@ -589,8 +600,6 @@ bool RadixServer::bootstrap() {
         bind_ip_ = bind_ip;   // published as PeerEntry.host
 
         // Deployment-level env overrides.
-        if (const char* t = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
-            cfg_.peer_index_transport = t;
         if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))
             cfg_.registry = r;
         if (const char* c = ::getenv("RADIXSHMEM_CLUSTER_ID"))

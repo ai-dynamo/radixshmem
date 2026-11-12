@@ -40,8 +40,9 @@ static void print_usage(const char* prog) {
     printf("  --interval <int>         Stats print interval in seconds (default: 5)\n");
     printf("\nDistributed options (expected-min-nodes > 1 enables distributed mode;\n");
     printf("the RHT is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with\n");
-    printf("RADIXSHMEM_PEER_INDEX_BACKEND=grpc|rdma, and the RDMA device of either with\n");
-    printf("RADIXSHMEM_INDEX_DEV / RADIXSHMEM_INDEX_GID_IDX, see docs/api.md):\n");
+    printf("RADIXSHMEM_PEER_INDEX_BACKEND=grpc|rdma and RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=xrc|dc,\n");
+    printf("and the RDMA device of either with RADIXSHMEM_INDEX_DEV / RADIXSHMEM_INDEX_GID_IDX,\n");
+    printf("see docs/api.md):\n");
     printf("  --expected-min-nodes <int> Nodes to wait for before the cluster forms\n");
     printf("  --rpc-address <ip>       Bootstrap IP peers connect to (required; 0.0.0.0 for single node)\n");
     printf("  --rpc-interface <nic>    NIC name to resolve the bootstrap IP from; wins over --rpc-address\n");
@@ -52,7 +53,6 @@ static void print_usage(const char* prog) {
     printf("  --node-name <string>     etcd node identity; empty derives from the resolved IP (default: empty)\n");
     printf("  --bootstrap-timeout <int> Bootstrap timeout in seconds (default: 60)\n");
     printf("  --lease-ttl <int>         etcd lease TTL in seconds (default: 30)\n");
-    printf("  --peer-index-transport <str>  Transport of the rdma walks: xrc (default) | dc\n");
     printf("\n  --help                   Show this help\n");
 }
 
@@ -86,7 +86,6 @@ int main(int argc, char** argv) {
         else if (arg("--rpc-port"))          cfg.rpc_port = (uint16_t)next_int();
         else if (arg("--bootstrap-timeout")) cfg.bootstrap_timeout_sec = next_int();
         else if (arg("--lease-ttl"))         cfg.lease_ttl_sec = next_int();
-        else if (arg("--peer-index-transport")) cfg.peer_index_transport = next_str();
         else if (arg("--expected-min-nodes")) cfg.expected_min_nodes = next_int();
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);

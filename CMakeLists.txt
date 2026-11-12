@@ -429,7 +429,7 @@ if(ENABLE_RDMA)
     add_test(NAME test_client_no_server COMMAND test_client_no_server)
     add_test(NAME test_client_no_server_dc COMMAND test_client_no_server)
     set_tests_properties(test_client_no_server_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
+        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
 
     # A client borrowing a tree (radix-server's RHT client) that fails to
     # bootstrap leaves the tree to its owner.
@@ -447,17 +447,17 @@ if(ENABLE_RDMA)
     # Same binaries re-run over the DC data-plane transport (incl. fetch-add atomics).
     add_test(NAME test_cluster_dc COMMAND test_cluster)
     set_tests_properties(test_cluster_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
+        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
     # The two planes pick their transport independently: one DC, the other XRC.
     add_test(NAME test_cluster_rht_dc_peer_xrc COMMAND test_cluster)
     set_tests_properties(test_cluster_rht_dc_peer_xrc PROPERTIES
         ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc")
     add_test(NAME test_cluster_rht_xrc_peer_dc COMMAND test_cluster)
     set_tests_properties(test_cluster_rht_xrc_peer_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
+        ENVIRONMENT "RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
     add_test(NAME test_cluster_shards_dc COMMAND test_cluster_shards)
     set_tests_properties(test_cluster_shards_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
+        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
 
     # DC + peer-shard RDMA: a rank only attaches its own shard, so every peer
     # shard's RHT access hits the DC one-sided WRITE path (write_async_inline +
@@ -465,10 +465,10 @@ if(ENABLE_RDMA)
     # forces it. W=4 also covers read-modify-write over the collision chain.
     add_test(NAME test_cluster_dc_rht_nic COMMAND test_cluster)
     set_tests_properties(test_cluster_dc_rht_nic PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
+        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
     add_test(NAME test_cluster_shards_dc_rht_nic_w4 COMMAND test_cluster_shards)
     set_tests_properties(test_cluster_shards_dc_rht_nic_w4 PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc;RADIXSHMEM_RHT_SLOTS=4")
+        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc;RADIXSHMEM_RHT_SLOTS=4")
 
     # The peer index over the peers' gRPC Query/Unlock instead of RDMA walks.
     foreach(_t test_cluster test_cluster_node_join test_client_no_server)
@@ -515,7 +515,7 @@ if(ENABLE_RDMA)
         add_test(NAME test_remote_api_grpc COMMAND test_remote_api)
         add_test(NAME test_remote_api_grpc_dcd COMMAND test_remote_api)
         set_tests_properties(test_remote_api_grpc_dcd PROPERTIES
-            ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_TRANSPORT=dc")
+            ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
     endif()
 endif()
 

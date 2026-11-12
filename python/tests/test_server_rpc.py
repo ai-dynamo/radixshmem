@@ -227,17 +227,18 @@ def test_remote_op_options():
     from radixshmem import cli
     from radixshmem.server import ClusterConfig
 
-    config = cli.build_config(cli.parse_args([
-        "--remote-op-listen-port", "31001", "--peer-index-transport", "dc"]))
+    config = cli.build_config(cli.parse_args(["--remote-op-listen-port", "31001"]))
     assert config.cluster.remote_op_listen_port == 31001
-    assert config.cluster.peer_index_transport == "dc"
+    # The peer index and the index's RDMA device are set with RADIXSHMEM_* variables.
     for removed in (["--remote-op-transport", "grpc"], ["--enable-remote-insert"],
                     ["--enable-remote-query"], ["--zmq-listen-port", "31001"],
                     ["--rht-transport", "dc"], ["--rht-slots", "4"], ["--num-rht-shards", "2"],
-                    ["--rht-shard-holders", "0,1"]):
+                    ["--rht-shard-holders", "0,1"], ["--peer-index-backend", "rdma"],
+                    ["--peer-index-transport", "dc"], ["--index-dev", "mlx5_0"], ["--gid-idx", "3"]):
         with pytest.raises(SystemExit):
             cli.parse_args(removed)
-    for name in ("remote_op_transport", "enable_remote_insert", "enable_remote_query"):
+    for name in ("remote_op_transport", "enable_remote_insert", "enable_remote_query",
+                 "peer_index_backend", "peer_index_transport", "index_dev", "gid_idx"):
         with pytest.raises(TypeError):
             ClusterConfig(**{name: True})
         assert not hasattr(radixshmem._core.RadixServerConfig(), name)

@@ -42,7 +42,7 @@ struct ClusterManifestHeader {
     int32_t  rdma_tc;
 
     // ---- RDMA transports (rank 0, broadcast) ----
-    uint32_t peer_index_transport;   // remote walk into peer trees, see ClusterTransport
+    uint32_t peer_index_transport;   // rdma peer index's transport, see ClusterTransport
     uint32_t rht_slots;          // W: RHT slots per bucket (chaining depth)
     uint64_t dc_access_key;      // cluster-wide DCT key (either plane DC)
 

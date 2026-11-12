@@ -276,8 +276,6 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("expected_min_nodes",
                        &RadixServerConfig::expected_min_nodes)
         .def_readwrite("settle_ms", &RadixServerConfig::settle_ms)
-        .def_readwrite("peer_index_transport",
-                       &RadixServerConfig::peer_index_transport)
         .def_property("remote_op_listen_port",
                       [](const RadixServerConfig& c) { return (int)c.remote_op_listen_port; },
                       [](RadixServerConfig& c, int v) { c.remote_op_listen_port = (uint16_t)v; })

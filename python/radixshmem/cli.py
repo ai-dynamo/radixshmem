@@ -153,7 +153,7 @@ def parse_args(argv=None) -> argparse.Namespace:
 
     g = p.add_argument_group("distributed (--expected-min-nodes > 1; the RHT is configured with "
                              "RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with "
-                             "RADIXSHMEM_PEER_INDEX_BACKEND, the RDMA device of either with "
+                             "RADIXSHMEM_PEER_INDEX_*, the RDMA device of either with "
                              "RADIXSHMEM_INDEX_DEV / _GID_IDX, see docs/api.md)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
@@ -166,8 +166,6 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
-    g.add_argument("--peer-index-transport", default="xrc", choices=["xrc", "dc"],
-                   help="transport of the rdma peer index's walks")
     g.add_argument("--remote-op-listen-port", type=int, default=0)
     return p.parse_args(argv)
 
@@ -188,7 +186,7 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
         rpc_interface=a.rpc_interface, rpc_port=a.rpc_port,
         bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
-        peer_index_transport=a.peer_index_transport, remote_op_listen_port=a.remote_op_listen_port)
+        remote_op_listen_port=a.remote_op_listen_port)
     return ServerConfig(
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
