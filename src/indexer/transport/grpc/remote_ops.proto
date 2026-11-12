@@ -16,6 +16,7 @@ service RemoteOps {
   rpc Recycle(RecycleRequest) returns (RecycleResponse);
   rpc Unlock(UnlockRequest) returns (UnlockResponse);
   rpc DedupPrefix(DedupPrefixRequest) returns (DedupPrefixResponse);
+  rpc XrcConnect(XrcConnectRequest) returns (XrcConnectResponse);
 }
 
 // Mirrors radixshmem::InsertError (types.h); values are the same.
@@ -171,4 +172,22 @@ message DedupPrefixResponse {
   int32 freed = 1;
   repeated MovedPath moved = 2;
   repeated ComponentSlots unused = 3;   // landing slots nothing was written to
+}
+
+// RDMA connection setup: the target pairs an XRC RECV QP on its SRQ with the
+// caller's SEND QP. Served before the other ops; UNIMPLEMENTED without an RDMA side.
+message XrcEnd {
+  int32 rank = 1;
+  uint32 qp_num = 2;
+  uint32 srq_num = 3;   // the target's SRQ
+  uint32 link_layer = 4;
+  uint32 lid = 5;
+  int32 gid_index = 6;
+  bytes gid = 7;        // 16 bytes
+}
+message XrcConnectRequest {
+  XrcEnd caller = 1;
+}
+message XrcConnectResponse {
+  XrcEnd target = 1;
 }

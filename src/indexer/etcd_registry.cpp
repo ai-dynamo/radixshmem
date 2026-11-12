@@ -10,7 +10,7 @@
 #include "cluster_protocol.h"
 
 #include "etcd_client.hpp"
-#include "xrc_connect.hpp"
+#include "net_util.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,8 +21,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <unistd.h>
 
 namespace radixshmem {
 
@@ -100,19 +98,14 @@ bool EtcdRegistry::reclaim_previous_run() {
     int64_t lease = 0;
     if (!impl_->cli.get_with_lease(K.peer(node_name_), val, lease)) return true;
 
-    // This run listens on nothing yet: a port of the old entry that answers is
-    // another live server's. A server without RDMA has no XRC port, only a gRPC one.
+    // This run listens on nothing yet: if the old entry's RPC port answers, a live
+    // server holds the name.
     PeerEntry old{};
-    if (etcd::decode_peer(val, old)) {
-        const uint16_t port = old.xrc_listen_port ? old.xrc_listen_port
-                                                  : old.remote_op_listen_port;
-        int fd = port ? xrc_tcp_connect(old.host, port, 1) : -1;
-        if (fd >= 0) {
-            ::close(fd);
-            fprintf(stderr, "[EtcdRegistry %s] node name is held by a live "
-                    "radix-server at %s:%u\n", node_name_.c_str(), old.host, port);
-            return false;
-        }
+    if (etcd::decode_peer(val, old) && old.rpc_port &&
+        tcp_port_open(old.host, old.rpc_port, 1)) {
+        fprintf(stderr, "[EtcdRegistry %s] node name is held by a live "
+                "radix-server at %s:%u\n", node_name_.c_str(), old.host, old.rpc_port);
+        return false;
     }
     if (lease > 0) {
         try { impl_->cli.revoke(lease); } catch (const std::exception&) {}   // expired meanwhile

@@ -13,7 +13,7 @@
 
 namespace radixshmem {
 
-static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 15; // 15: peer index backend in the shard map
+static constexpr uint32_t CLUSTER_MANIFEST_VERSION  = 16; // 16: XRC connects through the RPC port
 static constexpr uint32_t CLUSTER_MANIFEST_HOST_LEN = 64;
 static constexpr uint32_t CLUSTER_MANIFEST_ENTRY_SIZE = 352;
 static constexpr uint32_t CLUSTER_RHT_NAME_LEN = 64;
@@ -74,11 +74,10 @@ struct PeerEntry {
     int32_t  rank;
     int32_t  _pad0;
 
-    // Reachability — TCP bootstrap endpoint for this rank's XRC listener
+    // Reachability: the gRPC endpoint of remote ops, peer queries and XRC setup
     char     host[CLUSTER_MANIFEST_HOST_LEN];
-    uint16_t xrc_listen_port;
-    // gRPC remote-op TCP port.
-    uint16_t remote_op_listen_port;
+    uint16_t rpc_port;
+    uint16_t _pad1;
     uint32_t _pad2;
 
     // Shared memory layout (this peer's local shm region)

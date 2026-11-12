@@ -49,8 +49,7 @@ from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
-    "rpc_interface", "rpc_port", "bootstrap_timeout_sec", "lease_ttl_sec",
-    "remote_op_listen_port")
+    "rpc_interface", "rpc_port", "bootstrap_timeout_sec", "lease_ttl_sec")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
@@ -72,10 +71,9 @@ class ClusterConfig:
     node_name: str = ""
     rpc_address: str = ""
     rpc_interface: str = ""
-    rpc_port: int = 0
+    rpc_port: int = 0                 # gRPC endpoint peers reach, 0 = OS-assigned
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
-    remote_op_listen_port: int = 0
 
     @property
     def distributed(self) -> bool:

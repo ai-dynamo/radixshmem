@@ -7,9 +7,22 @@
 #include "types.h"             // AllocateReply, InsertResult, RemoteStatus
 
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace radixshmem {
+
+// One end of an XRC connection: the caller's SEND QP, or the RECV QP and SRQ the
+// target paired with it, and the address of that end's HCA port.
+struct XrcConnInfo {
+    int32_t  rank = -1;
+    uint32_t qp_num = 0;
+    uint32_t srq_num = 0;   // target end only
+    uint32_t link_layer = 0;
+    uint32_t lid = 0;
+    int32_t  gid_index = 0;
+    uint8_t  gid[16] = {};
+};
 
 // Typed remote operations, independent of gRPC encoding.
 class IRemoteOpClientTransport {
@@ -33,6 +46,9 @@ public:
     virtual RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin) = 0;
     virtual DedupReply dedup_prefix(const uint64_t* hashes, int n,
                                     const DedupRequest& req = {}) = 0;
+    // RDMA connection setup: the target pairs a RECV QP with the caller's XRC SEND
+    // QP `mine` and returns its end. UNKNOWN_OP if the target has no RDMA side.
+    virtual RemoteStatus xrc_connect(const XrcConnInfo& mine, XrcConnInfo& theirs) = 0;
     virtual bool connected() = 0;
     // Starts connecting now instead of on the first op.
     virtual void connect() {}
@@ -45,7 +61,11 @@ struct RemoteOpAddr {
 
 class RemoteOpService;
 
-// Backend lifecycle: rc_build_endpoint publishes the endpoint; call stop() before destruction.
+// The server's side of XrcConnect; throws on failure.
+using XrcAcceptor = std::function<XrcConnInfo(const XrcConnInfo& caller)>;
+
+// Built in round 2 of the rendezvous, when it starts serving XrcConnect; the other
+// ops wait for start(). Call stop() before destruction.
 class IRemoteOpServerTransport {
 public:
     virtual ~IRemoteOpServerTransport() = default;

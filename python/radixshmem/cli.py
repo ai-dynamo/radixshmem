@@ -162,11 +162,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--node-name", default="")
     g.add_argument("--rpc-address", default="", help="bootstrap IP peers dial; 0.0.0.0 on one host")
     g.add_argument("--rpc-interface", default="", help="NIC to resolve the bootstrap IP from")
-    g.add_argument("--rpc-port", type=int, default=0)
+    g.add_argument("--rpc-port", type=int, default=0,
+                   help="port of the gRPC endpoint peers reach: remote ops, peer queries, "
+                        "RDMA connection setup (default: 0 = OS-assigned)")
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
-    g.add_argument("--remote-op-listen-port", type=int, default=0)
     return p.parse_args(argv)
 
 
@@ -185,8 +186,7 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         expected_min_nodes=a.expected_min_nodes, settle_ms=a.settle_ms, registry=a.registry,
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
         rpc_interface=a.rpc_interface, rpc_port=a.rpc_port,
-        bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
-        remote_op_listen_port=a.remote_op_listen_port)
+        bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl)
     return ServerConfig(
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,

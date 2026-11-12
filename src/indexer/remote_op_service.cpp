@@ -11,7 +11,6 @@
 #include "radix_client.h"          // RadixClient (svc_client_)
 #include "cluster_protocol.h"      // MAX_REMOTE_OP_BLOCKS
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "remote_op_factory.hpp"   // make_remote_op_server
 
 #include <algorithm>
 #include <chrono>
@@ -256,13 +255,6 @@ DedupReply RemoteOpService::dedup_prefix(const uint64_t* hashes, int n,
 }
 
 // ==================== RadixServer remote-op endpoint ====================
-
-RemoteOpAddr RadixServer::rc_build_endpoint() {
-    // Body of the build_remote_op callback.
-    RemoteOpAddr addr{};
-    rc_server_ = make_remote_op_server(cfg_.remote_op_listen_port, instance_id_, addr);
-    return addr;
-}
 
 void RadixServer::rc_spawn() {
     if (!rc_server_) return;

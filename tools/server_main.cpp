@@ -46,7 +46,8 @@ static void print_usage(const char* prog) {
     printf("  --expected-min-nodes <int> Nodes to wait for before the cluster forms\n");
     printf("  --rpc-address <ip>       Bootstrap IP peers connect to (required; 0.0.0.0 for single node)\n");
     printf("  --rpc-interface <nic>    NIC name to resolve the bootstrap IP from; wins over --rpc-address\n");
-    printf("  --rpc-port <int>         Bootstrap TCP port (default: 0 = OS-assigned)\n");
+    printf("  --rpc-port <int>         gRPC port peers reach: remote ops, peer queries,\n"
+           "                           RDMA connection setup (default: 0 = OS-assigned)\n");
     printf("  --settle-ms <int>        Membership stability window in ms (default: 500)\n");
     printf("  --registry <string>      Cluster bootstrap registry etcd://host:port (default: etcd://127.0.0.1:2379)\n");
     printf("  --cluster-id <string>    etcd key namespace radix/<cluster-id>/... (default: default)\n");

@@ -57,13 +57,12 @@ struct RadixServerConfig {
 
     std::string  rpc_address;              // explicit IPv4, e.g. "192.168.1.11"
     std::string  rpc_interface;            // NIC name, e.g. "eth0"
-    uint16_t     rpc_port    = 0;          // 0 = OS-assigned bootstrap / XRC listen port
+    // gRPC endpoint peers reach: remote ops, peer queries, XRC setup; 0 = OS-assigned.
+    uint16_t     rpc_port    = 0;
     int          register_chunk_tokens = DEFAULT_REGISTER_CHUNK_TOKENS;   // copied onto shm at bootstrap
 
     int          expected_min_nodes = 0;   // > 1 = distributed
     int          settle_ms          = 500;
-
-    uint16_t          remote_op_listen_port = 0;
 
     // Cluster bootstrap registry: "etcd://host:port" (etcd dynamic discovery).
     std::string       registry   = "etcd://127.0.0.1:2379";
@@ -218,7 +217,7 @@ private:
     // cluster those of its rank. Redis only.
     void drop_stale_routes(bool whole_cluster);
     // Round 2 of the rendezvous, once the shard map is known: the RDMA side if a
-    // plane needs it, the RHT shard (holders), the remote-op endpoint.
+    // plane needs it, the RHT shard (holders), the RPC endpoint.
     void setup_planes(PeerEntry& e);
     void setup_rdma(PeerEntry& e);
     void setup_local_rht_shard(PeerEntry& e);
@@ -229,7 +228,6 @@ private:
     uint64_t instance_id_ = 0;
     std::unique_ptr<RemoteOpService> rc_service_;   // built by rc_spawn on svc_*
 
-    RemoteOpAddr rc_build_endpoint();
     // Start serving once svc_* exist; rc_stop stops serving, then drops the service.
     void     rc_spawn();
     void     rc_stop();

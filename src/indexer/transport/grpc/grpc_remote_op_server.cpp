@@ -21,6 +21,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace radixshmem {
 
@@ -57,22 +58,47 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     int port = 0;
     std::string instance;
 
+    XrcAcceptor       xrc;
     RemoteOpService*  svc = nullptr;
     std::atomic<bool> ready{false};
     std::once_flag    stopped;
+
+    bool for_us(grpc::ServerContext* ctx) const {
+        const auto& md = ctx->client_metadata();
+        auto it = md.find(kGrpcRemoteOpInstanceKey);
+        return it != md.end() && it->second == grpc::string_ref(instance);
+    }
 
     template <typename Op>
     grpc::Status run(grpc::ServerContext* ctx, Op&& op) {
         if (!ready.load())
             return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                                 "remote-op: server not serving");
-        const auto& md = ctx->client_metadata();
-        auto it = md.find(kGrpcRemoteOpInstanceKey);
-        if (it == md.end() || it->second != grpc::string_ref(instance))
+        if (!for_us(ctx))
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                                 "remote-op: request for another server instance");
         try {
             return op();
+        } catch (const std::exception& e) {
+            return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+        }
+    }
+
+    // Not gated on start(): peers connect while this server's own bootstrap goes on.
+    grpc::Status XrcConnect(grpc::ServerContext* ctx, const pb::XrcConnectRequest* req,
+                            pb::XrcConnectResponse* rep) override {
+        if (!xrc)
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "remote-op: no RDMA side on this server");
+        if (!for_us(ctx))
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "remote-op: request for another server instance");
+        XrcConnInfo caller;
+        if (!xrc_from_pb(req->caller(), caller))
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "remote-op: bad GID");
+        try {
+            xrc_to_pb(xrc(caller), rep->mutable_target());
+            return grpc::Status::OK;
         } catch (const std::exception& e) {
             return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
         }
@@ -235,9 +261,11 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     }
 };
 
-GrpcRemoteOpServer::GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id)
+GrpcRemoteOpServer::GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id,
+                                       XrcAcceptor xrc)
     : impl_(std::make_unique<Impl>()) {
     impl_->instance = std::to_string(instance_id);
+    impl_->xrc = std::move(xrc);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort("0.0.0.0:" + std::to_string(listen_port),

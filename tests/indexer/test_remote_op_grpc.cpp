@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Loopback gRPC tests on a real tree: five ops, errors, deadlines, lifecycle and replies,
-// and the peer index over them; no RDMA/etcd.
+// the peer index over them, and the XRC setup RPC; no RDMA/etcd.
 
 #include "test_utils.h"
 #include "grpc_remote_op.hpp"
@@ -115,13 +115,13 @@ void test_transport_factory() {
     TEST_BEGIN("transport factory serves gRPC and rejects an entry without a port");
     Node node("factory");
     RemoteOpAddr address;
-    auto server = make_remote_op_server(0, kInstance, address);
+    auto server = make_remote_op_server(0, kInstance, {}, address);
     assert(address.port != 0);
     server->start(*node.svc);
     PeerEntry peer{};
     peer.rank = 1;
     std::strcpy(peer.host, "127.0.0.1");
-    peer.remote_op_listen_port = address.port;
+    peer.rpc_port = address.port;
     peer.instance_id = kInstance;
     std::string endpoint;
     auto client = make_remote_op_client(peer, endpoint);
@@ -130,12 +130,12 @@ void test_transport_factory() {
     assert(allocated.status == RemoteStatus::OK && allocated.slots.size() == 2);
     assert(client->recycle(allocated.slots.data(), 2) == RemoteStatus::OK);
     assert(node.used() == 0);
-    peer.remote_op_listen_port = 0;
+    peer.rpc_port = 0;
     bool rejected = false;
     try {
         make_remote_op_client(peer, endpoint);
     } catch (const std::runtime_error& error) {
-        rejected = std::string(error.what()).find("no remote-op port") != std::string::npos;
+        rejected = std::string(error.what()).find("no RPC port") != std::string::npos;
     }
     assert(rejected);
     server->stop();
@@ -836,6 +836,10 @@ struct FakeTransport final : IRemoteOpClientTransport {
         r.status = next;
         return r;
     }
+    RemoteStatus xrc_connect(const XrcConnInfo&, XrcConnInfo&) override {
+        calls++;
+        return next;
+    }
     bool connected() override { return up; }
 };
 
@@ -911,7 +915,7 @@ PeerEntry entry_of(Node& node, uint16_t port, uint64_t instance) {
     PeerEntry e{};
     e.rank = 1;
     std::strcpy(e.host, "127.0.0.1");
-    e.remote_op_listen_port = port;
+    e.rpc_port = port;
     e.instance_id = instance;
     e.shm_size = node.tree->tree().shm_size();
     e.node_pool_capacity = hdr->node_pool_capacity;
@@ -1094,6 +1098,49 @@ void test_peer_index_restarted_peer() {
     TEST_PASS();
 }
 
+// ---- XRC setup: served before start(), for this instance, absent without RDMA ----
+void test_xrc_connect() {
+    TEST_BEGIN("XrcConnect before start(), instance-checked, UNKNOWN_OP without an RDMA side");
+    std::atomic<bool> fail{false};
+    // Answers with the caller's end shifted, so the reply shows both directions decoded.
+    GrpcRemoteOpServer server(0, kInstance, [&](const XrcConnInfo& c) {
+        if (fail.load()) throw std::runtime_error("no RECV QP");
+        XrcConnInfo t = c;
+        t.rank = c.rank + 1;
+        t.qp_num = c.qp_num + 1;
+        t.srq_num = 77;
+        t.lid = c.lid + 1;
+        t.gid[15] = (uint8_t)(c.gid[15] + 1);
+        return t;
+    });
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    XrcConnInfo mine;
+    mine.rank = 2;
+    mine.qp_num = 0x4242;
+    mine.link_layer = 2;
+    mine.lid = 9;
+    mine.gid_index = 3;
+    for (int i = 0; i < 16; i++) mine.gid[i] = (uint8_t)(0xa0 + i);
+    XrcConnInfo theirs;
+    assert(cli.xrc_connect(mine, theirs) == RemoteStatus::OK);
+    assert(theirs.rank == 3 && theirs.qp_num == 0x4243 && theirs.srq_num == 77 &&
+           theirs.link_layer == 2 && theirs.lid == 10 && theirs.gid_index == 3);
+    assert(std::memcmp(theirs.gid, mine.gid, 15) == 0 && theirs.gid[15] == 0xb0);
+    assert(cli.allocate(1).status == RemoteStatus::UNAVAILABLE);   // the rest waits for start()
+
+    GrpcRemoteOpClientTransport other(target_of(server.port()), 5000, kInstance + 1);
+    assert(other.xrc_connect(mine, theirs) == RemoteStatus::STALE_TARGET);
+    fail = true;
+    assert(cli.xrc_connect(mine, theirs) == RemoteStatus::INTERNAL);
+    server.stop();
+
+    GrpcRemoteOpServer plain(0, kInstance);
+    GrpcRemoteOpClientTransport no_rdma(target_of(plain.port()), 5000, kInstance);
+    assert(no_rdma.xrc_connect(mine, theirs) == RemoteStatus::UNKNOWN_OP);
+    plain.stop();
+    TEST_PASS();
+}
+
 // ---- lifecycle: not ready → serving → stop with an op in flight → gone ----
 void test_lifecycle() {
     TEST_BEGIN("ready gate, stop with an op in flight, repeat stop");
@@ -1166,6 +1213,11 @@ struct BadService final : pb::RemoteOps::Service {
         rep->set_freed(3);   // a server without moves
         return grpc::Status::OK;
     }
+    grpc::Status XrcConnect(grpc::ServerContext*, const pb::XrcConnectRequest*,
+                            pb::XrcConnectResponse* rep) override {
+        rep->mutable_target()->set_gid("short");
+        return grpc::Status::OK;
+    }
 };
 
 void test_bad_reply() {
@@ -1200,6 +1252,8 @@ void test_bad_reply() {
     DedupReply d = cli.dedup_prefix(h.data(), 4, req);
     assert(d.status == RemoteStatus::OK && d.freed == 3 && d.moved.empty() &&
            d.unused[0] == (std::vector<int32_t>{5, 6}));
+    XrcConnInfo theirs;
+    assert(cli.xrc_connect(XrcConnInfo{}, theirs) == RemoteStatus::BAD_REPLY);
     server->Shutdown();
     TEST_PASS();
 }
@@ -1230,6 +1284,7 @@ int main() {
     test_peer_index_dead_peer();
     test_peer_index_hung_peer();
     test_peer_index_restarted_peer();
+    test_xrc_connect();
     test_lifecycle();
     test_bad_reply();
     return tests_report();

@@ -80,7 +80,9 @@ if(ENABLE_RDMA)
         src/indexer/transport/rdma/rc_endpoint.cpp
         src/indexer/transport/rdma/xrc.cpp
         src/indexer/transport/rdma/dc_oneside.cpp
-        # The RDMA side of a radix-server (device, XRC accept loop, DCT, tree MR).
+        # XRC SEND-QP setup through the peer's XrcConnect RPC.
+        src/indexer/transport/rdma/xrc_connect.cpp
+        # The RDMA side of a radix-server (device, XRC SRQ, DCT, tree MR).
         src/indexer/transport/rdma/rdma_host.cpp
         # Peer-facing plane: the peer index backends (RDMA walks, gRPC remote ops)
         # + remote-walk executor + client-side remote-op protocol (RemotePeer).
@@ -106,8 +108,8 @@ target_include_directories(radixshmem PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/core
     # Public cluster headers require the one-sided RDMA transport headers.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/rdma
-    # peer-plane headers (rdma_peer_index.hpp, peer_registry.hpp, xrc_connect.hpp,
-    # net_util.hpp) are private under src/indexer/peer.
+    # peer-plane headers (rdma_peer_index.hpp, peer_registry.hpp, net_util.hpp)
+    # are private under src/indexer/peer.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/peer
 )
 

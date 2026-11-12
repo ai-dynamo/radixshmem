@@ -67,9 +67,9 @@ bool RdmaPeerIndex::connect_peer(const PeerEntry& peer, int peer_idx) {
         DcTargetInfo dst{ah, peer.dct_num, dc_access_key_};
         slot.ep = std::make_unique<DcReader>(tx_->shared_dci(), dst);
     } else {
-        slot.ep = xrc_connect(tx_->ctx(), tx_->cq(), peer.host, peer.xrc_listen_port,
-                              my_rank, slot.failed ? std::min(cfg_.bootstrap_timeout_sec, 2)
-                                                   : cfg_.bootstrap_timeout_sec);
+        slot.ep = xrc_connect(tx_->ctx(), tx_->cq(), peer, my_rank,
+                              slot.failed ? std::min(cfg_.bootstrap_timeout_sec, 2)
+                                          : cfg_.bootstrap_timeout_sec);
         if (!slot.ep) return false;   // reported by the breaker
     }
 

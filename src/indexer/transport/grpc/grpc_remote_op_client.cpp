@@ -361,6 +361,18 @@ DedupReply GrpcRemoteOpClientTransport::dedup_prefix(const uint64_t* hashes, int
     return out;
 }
 
+RemoteStatus GrpcRemoteOpClientTransport::xrc_connect(const XrcConnInfo& mine,
+                                                      XrcConnInfo& theirs) {
+    pb::XrcConnectRequest req;
+    xrc_to_pb(mine, req.mutable_caller());
+    pb::XrcConnectResponse rep;
+    grpc::ClientContext ctx;
+    impl_->prepare(ctx);
+    const RemoteStatus st = to_remote_status(impl_->stub->XrcConnect(&ctx, req, &rep));
+    if (st != RemoteStatus::OK) return st;
+    return xrc_from_pb(rep.target(), theirs) ? RemoteStatus::OK : RemoteStatus::BAD_REPLY;
+}
+
 bool GrpcRemoteOpClientTransport::connected() {
     return impl_->channel->GetState(false) == GRPC_CHANNEL_READY;
 }

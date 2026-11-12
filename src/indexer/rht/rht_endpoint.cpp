@@ -278,8 +278,7 @@ IRdmaEndpoint* RdmaRht::Impl::connect(int holder) {
         ep = std::make_unique<DcReader>(dci, DcTargetInfo{ah, h.dct_num, dc_access_key});
     } else {
         // One try; a holder that does not answer is probed again by the breaker.
-        ep = xrc_connect(tx->ctx(), tx->cq(), h.host, h.xrc_listen_port, my_rank,
-                         attached ? 2 : 10);
+        ep = xrc_connect(tx->ctx(), tx->cq(), h, my_rank, attached ? 2 : 10);
         if (!ep) return nullptr;
     }
     IRdmaEndpoint* raw = ep.get();

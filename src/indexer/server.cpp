@@ -22,6 +22,7 @@
 #include "rht_endpoint.h"
 #include "rht_redis.h"
 #include "remote_op_service.hpp"
+#include "remote_op_factory.hpp"
 #include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path; self-guards on RADIXSHMEM_HAS_ETCD)
 #endif
 
@@ -377,7 +378,6 @@ void RadixServer::setup_rdma(PeerEntry& e) {
     RdmaHostConfig hc;
     hc.sl      = rdma_sl_;
     hc.tc      = rdma_tc_;
-    hc.port    = cfg_.rpc_port;
     hc.dc      = (rht && rht_transport_ == CLUSTER_TRANSPORT_DC) ||
                  (walks && peer_index_transport_ == CLUSTER_TRANSPORT_DC);
     hc.dc_access_key = dc_access_key_;
@@ -406,9 +406,14 @@ void RadixServer::setup_remote_op(PeerEntry& e) {
     std::random_device rd;
     instance_id_ = (((uint64_t)rd() << 32) | rd()) | 1;
     e.instance_id = instance_id_;
-    e.remote_op_listen_port = rc_build_endpoint().port;
-    fprintf(stderr, "[RadixServer rank %d] remote-op endpoint up: grpc (port=%u)\n",
-            cfg_.rank, e.remote_op_listen_port);
+    // Peers set up their XRC QPs to rdma_ through it from now on, the rest after rc_spawn().
+    XrcAcceptor xrc;
+    if (rdma_) xrc = [h = rdma_.get()](const XrcConnInfo& c) { return h->accept_xrc(c); };
+    RemoteOpAddr addr;
+    rc_server_ = make_remote_op_server(cfg_.rpc_port, instance_id_, std::move(xrc), addr);
+    e.rpc_port = addr.port;
+    fprintf(stderr, "[RadixServer rank %d] RPC endpoint up: grpc (port=%u)\n",
+            cfg_.rank, e.rpc_port);
 }
 
 std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {

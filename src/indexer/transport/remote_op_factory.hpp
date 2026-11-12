@@ -17,9 +17,10 @@ namespace radixshmem {
 
 struct PeerEntry;
 
-// Creates the gRPC transport behind the typed service interface.
+// Creates the gRPC transport behind the typed service interface; `xrc` serves
+// XrcConnect on a server with an RDMA side.
 std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
-    uint16_t listen_port, uint64_t instance_id, RemoteOpAddr& addr);
+    uint16_t listen_port, uint64_t instance_id, XrcAcceptor xrc, RemoteOpAddr& addr);
 
 // timeout_ms bounds each op; 0 = RADIXSHMEM_REMOTE_OP_TIMEOUT_MS, else 5000.
 std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(

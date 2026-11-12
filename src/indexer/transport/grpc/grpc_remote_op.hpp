@@ -50,6 +50,7 @@ public:
     RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin) override;
     DedupReply dedup_prefix(const uint64_t* hashes, int n,
                             const DedupRequest& req = {}) override;
+    RemoteStatus xrc_connect(const XrcConnInfo& mine, XrcConnInfo& theirs) override;
     bool connected() override;
     void connect() override;
 
@@ -58,11 +59,12 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
-// Binds on construction; UNAVAILABLE until start(svc); stop() drains handlers.
+// Binds on construction and serves XrcConnect through `xrc` (UNIMPLEMENTED without
+// one); the other ops are UNAVAILABLE until start(svc); stop() drains handlers.
 class GrpcRemoteOpServer : public IRemoteOpServerTransport {
 public:
     // listen_port 0 = OS-assigned; bind failure throws.
-    GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id);
+    GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id, XrcAcceptor xrc = {});
     ~GrpcRemoteOpServer() override;
 
     GrpcRemoteOpServer(const GrpcRemoteOpServer&) = delete;
