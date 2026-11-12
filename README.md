@@ -28,7 +28,8 @@ Cross-node remote ops use gRPC exclusively and need the grpc++ and protobuf deve
 An RDMA build fails configuration if these dependencies are missing. There is no ZMQ/DC remote-op fallback.
 The RHT and the peer index each run on one-sided RDMA (XRC or DC) or without it: the RHT on Redis
 (`RADIXSHMEM_RHT_BACKEND=redis`), the peer index on the peers' gRPC remote ops
-(`--peer-index-backend grpc`). With both, the index opens no RDMA device on any node.
+(`RADIXSHMEM_PEER_INDEX_BACKEND=grpc`). Both are the defaults, so by default the index opens no RDMA
+device on any node.
 
 C++ local-only builds (`-DENABLE_RDMA=OFF`) retain `RadixClient`, the standalone
 `radix_server`, and local tests; distributed client/server entry points are rejected.
@@ -38,8 +39,8 @@ The optional data-plane backends are built separately; see [Transfer backends](#
 ### Start the server
 
 Each node runs one `radix-server`, which manages `--data-bytes` of host memory; the slot size is configured
-by the client. In a distributed setup, `--index-dev` and `--transfer-dev` select the devices for the control
-plane and the data plane.
+by the client. In a distributed setup, `--transfer-dev` selects the devices of the data plane. The index uses
+no RDMA by default; an index plane switched to RDMA opens `RADIXSHMEM_INDEX_DEV` (first device if unset).
 
 Single node:
 
@@ -49,15 +50,17 @@ radix-server --name /my_kv_cache --data-bytes 1024G
 
 4 nodes, coordinated through etcd. The RHT lives in a Redis Cluster by default (`RADIXSHMEM_REDIS_ADDRS`;
 [`docs/redis_deployment.md`](docs/redis_deployment.md) shows how to set one up);
-`RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. The `RADIXSHMEM_RHT_*` and
-`RADIXSHMEM_REDIS_*` variables are listed in [`docs/api.md`](docs/api.md).
+`RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. A query continues on a peer's tree
+with gRPC remote ops by default; `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` walks it with one-sided RDMA instead.
+These variables and the RDMA device of such planes (`RADIXSHMEM_INDEX_DEV`, `RADIXSHMEM_INDEX_GID_IDX`) are
+listed in [`docs/api.md`](docs/api.md).
 
 ```bash
 # Same command on every node except --rpc-address
 export RADIXSHMEM_REDIS_ADDRS=10.0.0.1:7001,10.0.0.2:7001
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -66,7 +69,7 @@ Enable the SWA pool:
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G --swa-ratio 0.2 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -75,7 +78,7 @@ Enable the Mamba pool:
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G --mamba-ratio 0.2 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -89,13 +92,13 @@ node ready it recycles the slots at once. Decode nodes write nothing back. 2 pre
 # Prefill nodes 10.0.0.10 and 10.0.0.11
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 
 # Decode nodes 10.0.0.20 and 10.0.0.21
 radix-server --name /my_kv_cache --data-bytes 1024G --decode \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.20 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.20 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -178,7 +181,7 @@ required:
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --transfer-backend nixl --transfer-port 17000 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -197,7 +200,7 @@ Start the server with `--transfer-backend mooncake`:
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --transfer-backend mooncake \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 

@@ -23,9 +23,10 @@ RdmaPeerIndex::RdmaPeerIndex(const ShardMapMsg& sm, PeerRegistry& peers,
           "[RadixClient rank " + std::to_string(peers.my_rank()) + "] peer index",
           cfg.faults)) {
     // QoS (rank 0's SL/TC) is adopted inside the transport before any QP connect.
-    tx_ = std::make_unique<RdmaTransportClient>(cfg_.dev.empty() ? nullptr : cfg_.dev.c_str(),
-                                                cfg_.gid_idx, sm.rdma_sl, sm.rdma_tc,
-                                                peers.world_size());
+    PeerEntry self;
+    const bool has_self = peers.entry(peers.my_rank(), self);
+    tx_ = std::make_unique<RdmaTransportClient>(has_self ? &self : nullptr, sm.rdma_sl,
+                                                sm.rdma_tc, peers.world_size());
     if (transport_ == CLUSTER_TRANSPORT_DC) {
         tx_->shared_dci();
         fprintf(stderr, "[RadixClient rank %d] DC initiator up\n", peers.my_rank());

@@ -340,12 +340,11 @@ def orchestrate(a) -> int:
                    "--swa-ratio", "0.2", "--mamba-ratio", "0.1", "--endpoint", eps[i],
                    "--registry", registry, "--cluster-id", f"push{os.getpid()}",
                    "--expected-min-nodes", "4", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
-                   "--gid-idx", str(a.gid_idx), "--bootstrap-timeout", str(a.bootstrap_timeout), "--interval", "1"]
+                   "--bootstrap-timeout", str(a.bootstrap_timeout), "--interval", "1"]
             if i == 0:
                 cmd += ["--background-evict-ratio", str(EVICT_RATIO), "--writeback-max-held", "0.25"]
             else:
                 cmd += ["--background-evict-ratio", "0"] + (["--decode"] if i < 3 else [])
-            cmd += ["--index-dev", a.index_dev] if a.index_dev else []
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT,
                                             env=dict(os.environ, PYTHONUNBUFFERED="1")))
@@ -404,6 +403,9 @@ def main() -> int:
     ap.add_argument("--gid-idx", type=int, default=3)
     ap.add_argument("--bootstrap-timeout", type=int, default=60)
     a = ap.parse_args()
+    # The device of the planes that run on RDMA; the servers inherit it.
+    os.environ["RADIXSHMEM_INDEX_DEV"] = a.index_dev
+    os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(a.gid_idx)
     a.transfer_dev = a.transfer_dev or [a.index_dev]
     return orchestrate(a)
 

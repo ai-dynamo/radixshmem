@@ -8,7 +8,6 @@
 
 #include <cstdint>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace radixshmem {
@@ -48,8 +47,6 @@ public:
 };
 
 struct PeerIndexConfig {
-    std::string dev;                  // rdma: device of the one-sided QPs, "" = first
-    int gid_idx = 3;
     int bootstrap_timeout_sec = 60;
     PeerFaultCounters* faults = nullptr;
     // Layout a peer's tree must have for its slots to be usable; without one

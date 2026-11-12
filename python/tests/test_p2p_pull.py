@@ -176,9 +176,8 @@ def orchestrate(a) -> int:
                    "--data-name", f"{NAME}_data{i}", "--data-bytes", "64M", "--no-prefault",
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
-                   "--gid-idx", str(a.gid_idx), "--bootstrap-timeout", str(a.bootstrap_timeout),
+                   "--bootstrap-timeout", str(a.bootstrap_timeout),
                    "--background-evict-ratio", "0", "--interval", "0"]
-            cmd += ["--index-dev", a.index_dev] if a.index_dev else []
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT,
                                             env=dict(os.environ, PYTHONUNBUFFERED="1")))
@@ -278,6 +277,9 @@ def main() -> int:
     p.add_argument("--gid-idx", type=int, default=3)
     p.add_argument("--bootstrap-timeout", type=int, default=120)
     a = p.parse_args()
+    # The device of the planes that run on RDMA; the servers inherit it.
+    os.environ["RADIXSHMEM_INDEX_DEV"] = a.index_dev
+    os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(a.gid_idx)
     if a.transfer_dev is None:
         a.transfer_dev = [a.index_dev] if a.index_dev else []
     return orchestrate(a)

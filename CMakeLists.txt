@@ -565,11 +565,17 @@ foreach(_t IN LISTS _skippable_tests)
     endif()
 endforeach()
 
-# The cluster tests run on the RDMA RHT; with RADIXSHMEM_TEST_REDIS the main ones
-# also run on the Redis RHT (<test>_redis).
+# The cluster tests run on the RDMA RHT and, but for <test>_grpc_peer, the rdma
+# peer index; with RADIXSHMEM_TEST_REDIS the main ones also run on the Redis RHT
+# (<test>_redis) and on the defaults, the Redis RHT and the grpc peer index
+# (<test>_no_rdma).
 foreach(_t IN LISTS _skippable_tests)
     if(TEST ${_t} AND NOT _t STREQUAL "test_data_registry")
         set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT "RADIXSHMEM_RHT_BACKEND=rdma")
+        if(NOT _t MATCHES "_grpc_peer$")
+            set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT
+                         "RADIXSHMEM_PEER_INDEX_BACKEND=rdma")
+        endif()
     endif()
 endforeach()
 set(_redis_rht_env "RADIXSHMEM_RHT_BACKEND=redis;RADIXSHMEM_REDIS_ADDRS=${RADIXSHMEM_TEST_REDIS}")
@@ -583,12 +589,12 @@ if(RADIXSHMEM_TEST_REDIS)
         if(TEST ${_name})
             add_test(NAME ${_name}_redis COMMAND ${_exe})
             set_tests_properties(${_name}_redis PROPERTIES SKIP_RETURN_CODE 77
-                ENVIRONMENT "${_redis_rht_env}")
-            # Redis RHT + gRPC peer index use no RDMA: a device that does not
-            # exist fails any plane that would open one.
+                ENVIRONMENT "${_redis_rht_env};RADIXSHMEM_PEER_INDEX_BACKEND=rdma")
+            # The default peer index (grpc) on the Redis RHT uses no RDMA: a device
+            # that does not exist fails any plane that would open one.
             add_test(NAME ${_name}_no_rdma COMMAND ${_exe})
             set_tests_properties(${_name}_no_rdma PROPERTIES SKIP_RETURN_CODE 77
-                ENVIRONMENT "${_redis_rht_env};RADIXSHMEM_PEER_INDEX_BACKEND=grpc;RADIXSHMEM_RDMA_DEV=no_rdma_device")
+                ENVIRONMENT "${_redis_rht_env};RADIXSHMEM_INDEX_DEV=no_rdma_device")
         endif()
     endforeach()
 endif()
@@ -785,7 +791,7 @@ if(BUILD_PYTHON_MODULES)
                    py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)
             set_tests_properties(${_t} PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
-                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;RADIXSHMEM_RHT_BACKEND=rdma"
+                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;RADIXSHMEM_RHT_BACKEND=rdma;RADIXSHMEM_PEER_INDEX_BACKEND=rdma"
                 SKIP_RETURN_CODE 77 TIMEOUT 600)
         endforeach()
         set_tests_properties(py_agentic_stress_3node_threads PROPERTIES TIMEOUT 180)
@@ -815,10 +821,10 @@ if(BUILD_PYTHON_MODULES)
                        py_agentic_stress_3node_threads_redis)
                 set_tests_properties(${_t} PROPERTIES
                     WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
-                    ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env}"
+                    ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env};RADIXSHMEM_PEER_INDEX_BACKEND=rdma"
                     SKIP_RETURN_CODE 77 TIMEOUT 600)
             endforeach()
-            # Redis RHT + gRPC peer index: the index planes use no RDMA.
+            # The defaults, Redis RHT + grpc peer index: the index planes use no RDMA.
             add_test(NAME py_agentic_stress_3node_threads_no_rdma
                      COMMAND ${Python3_EXECUTABLE} tests/agentic_stress.py --nodes 3
                              --base-port 19800 ${_stress_args} --concurrency 32
@@ -826,7 +832,7 @@ if(BUILD_PYTHON_MODULES)
                              --flush-after-insert)
             set_tests_properties(py_agentic_stress_3node_threads_no_rdma PROPERTIES
                 WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python
-                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env};RADIXSHMEM_PEER_INDEX_BACKEND=grpc"
+                ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env};RADIXSHMEM_INDEX_DEV=no_rdma_device"
                 SKIP_RETURN_CODE 77 TIMEOUT 600)
         endif()
         message(STATUS "radixshmem._core + radixshmem._data: building "

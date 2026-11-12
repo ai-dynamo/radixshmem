@@ -54,9 +54,9 @@ private:
 // shard through shm). A holder that fails an op is skipped for a while.
 class RdmaRht final : public RhtBackend {
 public:
-    // Opens `dev` (empty = first device) and connects to the holders `sm` names.
-    RdmaRht(const ShardMapMsg& sm, const std::string& dev, int gid_idx,
-            PeerRegistry& peers, PeerFaultCounters* faults, int bootstrap_timeout_sec);
+    // Opens the index device (RdmaTransportClient) and connects to the holders `sm` names.
+    RdmaRht(const ShardMapMsg& sm, PeerRegistry& peers, PeerFaultCounters* faults,
+            int bootstrap_timeout_sec);
     ~RdmaRht() override;
 
     RdmaRht(const RdmaRht&) = delete;

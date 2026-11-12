@@ -51,8 +51,6 @@ constexpr int    kPrefixLen    = 16;   // prefix B written by node2
 constexpr int    kBootstrapTO  = 30;
 constexpr int    kJoinTO       = 40;   // reader's budget to sense node2 + hit
 constexpr const char* kShmPrefix = "/test_join";
-const char* const kRdmaDev  = test_rdma_dev();
-constexpr int    kGidIdx        = 3;
 
 std::string node_name_for(int rank) { return "node" + std::to_string(rank); }
 std::string shm_name_for(int rank) {
@@ -87,8 +85,6 @@ radixshmem::RadixClientConfig client_cfg(const std::string& node,
     cc.registry   = registry;
     cc.cluster_id = cluster_id;
     cc.node_name  = node;
-    cc.index_dev   = kRdmaDev;
-    cc.gid_idx    = kGidIdx;
     cc.bootstrap_timeout_sec = kBootstrapTO;
     return cc;
 }
@@ -135,8 +131,6 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.rpc_address = "127.0.0.1";
     setenv("RADIXSHMEM_RHT_SHARDS", std::to_string(num_shards).c_str(), 1);
     cfg.expected_min_nodes = min_nodes;
-    cfg.index_dev    = kRdmaDev;
-    cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
 
     radixshmem::RadixServer srv(cfg);
@@ -277,6 +271,7 @@ int wait_one(pid_t pid, const char* who) {
 } // namespace
 
 int main(int argc, char** argv) {
+    default_index_dev();
     if (argc >= 7 && std::strcmp(argv[1], "--server") == 0) {
         return run_server_process(argv[2], argv[3], argv[4],
                                   std::atoi(argv[5]), std::atoi(argv[6]));

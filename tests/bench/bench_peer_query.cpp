@@ -13,13 +13,14 @@
 //   client  RadixClient::query(lock) + finalize end to end, RHT probe included,
 //           on a cluster started with the backend under test.
 //
-// Single host (private etcd, both nodes local):
+// Single host (private etcd, both nodes local, the RDMA RHT unless RADIXSHMEM_RHT_BACKEND):
 //     ./bench_peer_query <index_dev> [gid_idx]
 // Two hosts, one etcd: run the roles by hand (the reader waits for the hints file),
-//     --server <node> <registry> <cluster> <rpc_addr> <dev> <gid>
-//     --writer <node> <registry> <cluster> <hints_file> <dev> <gid>
-//     --reader <node> <registry> <cluster> <hints_file> <dev> <gid> index|client [owner pid]
-// The servers take RADIXSHMEM_PEER_INDEX_BACKEND and RADIXSHMEM_RHT_* from the env.
+//     --server <node> <registry> <cluster> <rpc_addr>
+//     --writer <node> <registry> <cluster> <hints_file>
+//     --reader <node> <registry> <cluster> <hints_file> index|client [owner pid]
+// Every role takes RADIXSHMEM_PEER_INDEX_BACKEND, RADIXSHMEM_RHT_* and the RDMA device
+// (RADIXSHMEM_INDEX_DEV / RADIXSHMEM_INDEX_GID_IDX) from the env.
 
 #include "bench_util.h"
 #include "cluster_protocol.h"
@@ -67,13 +68,11 @@ std::vector<uint64_t> prefix_hashes(int len, int i) {
 }
 
 RadixClientConfig client_cfg(const std::string& node, const std::string& registry,
-                             const std::string& cluster, const std::string& dev, int gid) {
+                             const std::string& cluster) {
     RadixClientConfig cc;
     cc.registry = registry;
     cc.cluster_id = cluster;
     cc.node_name = node;
-    cc.index_dev = dev;
-    cc.gid_idx = gid;
     cc.bootstrap_timeout_sec = kBootstrapTO;
     return cc;
 }
@@ -82,7 +81,7 @@ volatile sig_atomic_t g_term = 0;
 void on_term(int) { g_term = 1; }
 
 int run_server(const std::string& node, const std::string& registry, const std::string& cluster,
-               const std::string& addr, const std::string& dev, int gid) {
+               const std::string& addr) {
     ::signal(SIGTERM, on_term);
     ::signal(SIGINT, on_term);
     RadixServerConfig cfg;
@@ -98,8 +97,6 @@ int run_server(const std::string& node, const std::string& registry, const std::
     cfg.node_name = node;
     cfg.rpc_address = addr;
     cfg.expected_min_nodes = 2;
-    cfg.index_dev = dev;
-    cfg.gid_idx = gid;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
     RadixServer srv(cfg);
     if (!srv.bootstrap()) return 10;
@@ -110,8 +107,8 @@ int run_server(const std::string& node, const std::string& registry, const std::
 
 // Hints file: the owner's rank, then per prefix (kLens order) the node starts on its path.
 int run_writer(const std::string& node, const std::string& registry, const std::string& cluster,
-               const std::string& hints_file, const std::string& dev, int gid) {
-    RadixClient cli(client_cfg(node, registry, cluster, dev, gid));
+               const std::string& hints_file) {
+    RadixClient cli(client_cfg(node, registry, cluster));
     LocalTreeConnector tree(cli.name());
     const std::string tmp = hints_file + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
@@ -250,8 +247,7 @@ void measure(const char* backend, int len, bool lock, int threads, int owner_pid
 }
 
 int bench_index(const std::string& node, const std::string& registry, const std::string& cluster,
-                const std::string& dev, int gid, int owner, int owner_pid,
-                const std::vector<Prefix>& prefixes) {
+                int owner, int owner_pid, const std::vector<Prefix>& prefixes) {
     RegistryClientConfig rc;
     rc.registry = registry;
     rc.cluster_id = cluster;
@@ -264,8 +260,6 @@ int bench_index(const std::string& node, const std::string& registry, const std:
     PeerRegistry peers;
     peers.seed(topo.peers, topo.world_size, topo.my_rank);
     PeerIndexConfig pc;
-    pc.dev = dev;
-    pc.gid_idx = gid;
     pc.has_expected = true;
     pc.expected = topo.peers[owner].component_config;
 
@@ -309,11 +303,10 @@ int bench_index(const std::string& node, const std::string& registry, const std:
 }
 
 int bench_client(const std::string& node, const std::string& registry, const std::string& cluster,
-                 const std::string& dev, int gid, int owner_pid,
-                 const std::vector<Prefix>& prefixes) {
-    RadixClient cli(client_cfg(node, registry, cluster, dev, gid));
+                 int owner_pid, const std::vector<Prefix>& prefixes) {
+    RadixClient cli(client_cfg(node, registry, cluster));
     const char* env = ::getenv("RADIXSHMEM_PEER_INDEX_BACKEND");
-    const std::string name = env ? env : "rdma";
+    const std::string name = env ? env : "grpc";
     print_header(("client: RadixClient::query(lock) + finalize, " + name + " cluster").c_str());
     for (int len : kLens) {
         std::vector<const Prefix*> set;
@@ -343,15 +336,14 @@ int bench_client(const std::string& node, const std::string& registry, const std
 }
 
 int run_reader(const std::string& node, const std::string& registry, const std::string& cluster,
-               const std::string& hints_file, const std::string& dev, int gid,
-               const std::string& mode, int owner_pid) {
+               const std::string& hints_file, const std::string& mode, int owner_pid) {
     int owner = -1;
     std::vector<Prefix> prefixes;
     if (!load_hints(hints_file, owner, prefixes) || owner < 0) return 20;
     try {
         if (mode == "index")
-            return bench_index(node, registry, cluster, dev, gid, owner, owner_pid, prefixes);
-        return bench_client(node, registry, cluster, dev, gid, owner_pid, prefixes);
+            return bench_index(node, registry, cluster, owner, owner_pid, prefixes);
+        return bench_client(node, registry, cluster, owner_pid, prefixes);
     } catch (const std::exception& e) {
         fprintf(stderr, "[reader] %s\n", e.what());
         return 23;
@@ -396,13 +388,13 @@ bool wait_shm_ready(const std::string& shm, int timeout_sec) {
 
 int main(int argc, char** argv) {
     auto arg = [&](int i) { return std::string(argv[i]); };
-    if (argc >= 8 && arg(1) == "--server")
-        return run_server(arg(2), arg(3), arg(4), arg(5), arg(6), std::atoi(argv[7]));
-    if (argc >= 8 && arg(1) == "--writer")
-        return run_writer(arg(2), arg(3), arg(4), arg(5), arg(6), std::atoi(argv[7]));
-    if (argc >= 9 && arg(1) == "--reader")
-        return run_reader(arg(2), arg(3), arg(4), arg(5), arg(6), std::atoi(argv[7]), arg(8),
-                          argc >= 10 ? std::atoi(argv[9]) : 0);
+    if (argc >= 6 && arg(1) == "--server")
+        return run_server(arg(2), arg(3), arg(4), arg(5));
+    if (argc >= 6 && arg(1) == "--writer")
+        return run_writer(arg(2), arg(3), arg(4), arg(5));
+    if (argc >= 7 && arg(1) == "--reader")
+        return run_reader(arg(2), arg(3), arg(4), arg(5), arg(6),
+                          argc >= 8 ? std::atoi(argv[7]) : 0);
     if (argc < 2) {
         fprintf(stderr, "usage: %s <index_dev> [gid_idx]   (or a --server/--writer/--reader role)\n",
                 argv[0]);
@@ -410,6 +402,8 @@ int main(int argc, char** argv) {
     }
     const std::string dev = argv[1];
     const std::string gid = argc >= 3 ? argv[2] : "3";
+    setenv("RADIXSHMEM_INDEX_DEV", dev.c_str(), 1);
+    setenv("RADIXSHMEM_INDEX_GID_IDX", gid.c_str(), 1);
     if (!::getenv("RADIXSHMEM_RHT_BACKEND")) setenv("RADIXSHMEM_RHT_BACKEND", "rdma", 1);
 
     radixshmem_test::EtcdHarness etcd;
@@ -429,22 +423,22 @@ int main(int argc, char** argv) {
             const std::string node = "node" + std::to_string(r);
             ::shm_unlink((std::string(kShm) + "_" + node).c_str());
             servers.push_back(spawn({argv[0], "--server", node, etcd.registry(), cluster,
-                                     "127.0.0.1", dev, gid}));
+                                     "127.0.0.1"}));
         }
         bool ready = true;
         for (int r = 0; r < 2; r++)
             ready = ready && wait_shm_ready(std::string(kShm) + "_node" + std::to_string(r),
                                             kBootstrapTO);
         int rc = ready ? wait_one(spawn({argv[0], "--writer", "node0", etcd.registry(), cluster,
-                                         hints, dev, gid}))
+                                         hints}))
                        : -3;
         const std::string owner_pid = std::to_string(servers[0]);
         if (rc == 0 && std::string(backend) == "rdma")
             rc = wait_one(spawn({argv[0], "--reader", "node1", etcd.registry(), cluster, hints,
-                                 dev, gid, "index", owner_pid}));
+                                 "index", owner_pid}));
         if (rc == 0)
             rc = wait_one(spawn({argv[0], "--reader", "node1", etcd.registry(), cluster, hints,
-                                 dev, gid, "client", owner_pid}));
+                                 "client", owner_pid}));
         if (rc != 0) {
             fprintf(stderr, "FAIL: %s cluster rc=%d\n", backend, rc);
             failures++;

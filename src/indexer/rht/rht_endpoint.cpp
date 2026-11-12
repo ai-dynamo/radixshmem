@@ -142,17 +142,12 @@ struct RdmaRht::Impl {
     }
 };
 
-RdmaRht::RdmaRht(const ShardMapMsg& sm, const std::string& dev, int gid_idx,
-                 PeerRegistry& peers_reg, PeerFaultCounters* faults, int bootstrap_timeout_sec)
+RdmaRht::RdmaRht(const ShardMapMsg& sm, PeerRegistry& peers_reg, PeerFaultCounters* faults,
+                 int bootstrap_timeout_sec)
     : impl_(std::make_unique<Impl>(peers_reg)) {
     const int num_shards = (int)sm.num_shards;
     if (num_shards <= 0 || num_shards > (int)CLUSTER_MAX_SHARDS)
         throw std::runtime_error("RdmaRht: num_shards == " + std::to_string(num_shards));
-    // QoS (rank 0's SL/TC) is adopted inside the transport before any QP connect.
-    impl_->tx = std::make_unique<RdmaTransportClient>(dev.empty() ? nullptr : dev.c_str(),
-                                                      gid_idx, sm.rdma_sl, sm.rdma_tc,
-                                                      peers_reg.world_size(), 0);
-    RdmaTransportClient& tx = *impl_->tx;
     const uint32_t slots_per_bucket = sm.rht_slots ? sm.rht_slots : 4;
     const std::vector<int> holder_of_shard(sm.holder_rank, sm.holder_rank + num_shards);
     impl_->my_rank       = peers_reg.my_rank();
@@ -163,6 +158,13 @@ RdmaRht::RdmaRht(const ShardMapMsg& sm, const std::string& dev, int gid_idx,
         std::shared_lock<std::shared_mutex> lk(peers_reg.mutex());
         peers = peers_reg.peers_locked();
     }
+    // QoS (rank 0's SL/TC) is adopted inside the transport before any QP connect.
+    const int me = impl_->my_rank;
+    const bool has_self = me >= 0 && me < (int)peers.size() && peers[me].rank == me;
+    impl_->tx = std::make_unique<RdmaTransportClient>(has_self ? &peers[me] : nullptr,
+                                                      sm.rdma_sl, sm.rdma_tc,
+                                                      peers_reg.world_size(), 0);
+    RdmaTransportClient& tx = *impl_->tx;
 
     impl_->scratch = std::aligned_alloc(4096, RDMA_RHT_SCRATCH_BYTES);
     if (!impl_->scratch)

@@ -56,8 +56,9 @@ int tcp_listen(uint16_t port, uint16_t* out_port) {
 } // namespace
 
 RdmaHost::RdmaHost(const RdmaHostConfig& cfg) : cfg_(cfg) {
-    ctx_  = std::make_unique<RdmaContext>(cfg_.dev.empty() ? nullptr : cfg_.dev.c_str(), 1,
-                                          cfg_.gid_idx);
+    const IndexDevice d = index_device_env();
+    ctx_  = std::make_unique<RdmaContext>(d.dev.empty() ? nullptr : d.dev.c_str(), 1,
+                                          d.gid_idx >= 0 ? d.gid_idx : 3);
     ctx_->set_qos(cfg_.sl, cfg_.tc);   // the cluster's QoS before any QP connects
     xrcd_ = std::make_unique<RdmaXrcd>(*ctx_);
     cq_.reset(ibv_create_cq(ctx_->ctx(), 256, nullptr, nullptr, 0));
@@ -99,6 +100,7 @@ void RdmaHost::publish_to(PeerEntry& e) const {
         e.shm_base_addr = (uint64_t)tree_mr_->addr();
         e.shm_rkey      = tree_mr_->rkey();
     }
+    std::strncpy(e.index_dev, ctx_->name(), sizeof(e.index_dev) - 1);
     memcpy(e.gid_raw, &ctx_->gid(), 16);
     e.gid_index = ctx_->gid_index();
     ibv_port_attr pa{};

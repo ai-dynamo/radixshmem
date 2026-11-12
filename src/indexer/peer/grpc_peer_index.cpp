@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <utility>
@@ -49,13 +48,7 @@ std::shared_ptr<GrpcPeerIndex::Session> GrpcPeerIndex::session(int rank) {
     auto it = sessions_.find(rank);
     if (it != sessions_.end()) return it->second;
     PeerEntry e;
-    {
-        std::shared_lock<std::shared_mutex> lk(peers_.mutex());
-        if (rank < 0 || rank >= peers_.size_locked() || rank == peers_.my_rank())
-            return nullptr;
-        e = peers_.peers_locked()[rank];
-    }
-    if (e.rank != rank) return nullptr;   // node down
+    if (rank == peers_.my_rank() || !peers_.entry(rank, e)) return nullptr;
     auto s = std::make_shared<Session>();
     try {
         std::string endpoint;

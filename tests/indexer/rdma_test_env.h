@@ -9,19 +9,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <strings.h>
 
-// A Redis RHT and a gRPC peer index: no plane opens an RDMA device.
+// A Redis RHT and the grpc peer index (both defaults): no plane opens an RDMA device.
 inline bool cluster_without_rdma() {
     const char* rht = ::getenv("RADIXSHMEM_RHT_BACKEND");
     const char* peer = ::getenv("RADIXSHMEM_PEER_INDEX_BACKEND");
-    return (!rht || std::string(rht) == "redis") && peer && std::string(peer) == "grpc";
+    return (!rht || strcasecmp(rht, "redis") == 0) && (!peer || strcasecmp(peer, "grpc") == 0);
 }
 
-// Returns RADIXSHMEM_RDMA_DEV else `def`; exits 77 if absent and a plane needs it.
-// Call at top of main(), before forking.
+// Sets RADIXSHMEM_INDEX_DEV (default `def`) for the planes on RDMA and returns it;
+// exits 77 if a plane needs it and it is absent. Call at top of main(), before forking.
 inline std::string resolve_index_dev_or_skip(const char* def) {
-    const char* env = ::getenv("RADIXSHMEM_RDMA_DEV");
+    const char* env = ::getenv("RADIXSHMEM_INDEX_DEV");
     std::string want = env ? env : def;
+    setenv("RADIXSHMEM_INDEX_DEV", want.c_str(), 1);
     if (cluster_without_rdma()) return want;
     int n = 0;
     ibv_device** list = ibv_get_device_list(&n);
@@ -32,7 +34,7 @@ inline std::string resolve_index_dev_or_skip(const char* def) {
     if (list) ibv_free_device_list(list);
     if (!found) {
         printf("SKIP: RDMA device '%s' not found on this host (%d device(s) "
-               "present; set RADIXSHMEM_RDMA_DEV to override)\n",
+               "present; set RADIXSHMEM_INDEX_DEV to override)\n",
                want.c_str(), n);
         exit(77);
     }

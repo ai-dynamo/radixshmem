@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include "cluster_manifest.h"   // PeerEntry
 #include "rdma_transport.hpp"
 
 #include <cstddef>
@@ -23,10 +24,18 @@ class RdmaTransportClient {
 
     // Open the device, size the CQ for `world_size` peers, and register a
     // scratch buffer of `buf_size` bytes (0 = none). QoS is adopted before any
-    // QP connect.
-    RdmaTransportClient(const char* dev, int gid_idx, int sl, int tc,
-                        int world_size, size_t buf_size = BUF_SIZE) {
-        ctx_ = std::make_unique<RdmaContext>(dev, 1, gid_idx);
+    // QP connect. The device and GID index: RADIXSHMEM_INDEX_DEV / _GID_IDX, else
+    // what `self` (this node's /peers entry, null for an observer) published,
+    // else the first device and GID index 3.
+    RdmaTransportClient(const PeerEntry* self, int sl, int tc, int world_size,
+                        size_t buf_size = BUF_SIZE) {
+        IndexDevice d = index_device_env();
+        const bool published = self && self->index_dev[0] != '\0';
+        if (d.dev.empty() && published)
+            d.dev.assign(self->index_dev, strnlen(self->index_dev, sizeof(self->index_dev)));
+        if (d.gid_idx < 0) d.gid_idx = published ? self->gid_index : 3;
+        ctx_ = std::make_unique<RdmaContext>(d.dev.empty() ? nullptr : d.dev.c_str(), 1,
+                                             d.gid_idx);
         ctx_->set_qos(sl, tc);
         int cq_depth = std::max(256, world_size * 128);
         cq_ = ibv_create_cq(ctx_->ctx(), cq_depth, nullptr, nullptr, 0);

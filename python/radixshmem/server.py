@@ -49,8 +49,8 @@ from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
-    "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec",
-    "peer_index_backend", "peer_index_transport", "remote_op_listen_port")
+    "rpc_interface", "rpc_port", "bootstrap_timeout_sec", "lease_ttl_sec",
+    "peer_index_transport", "remote_op_listen_port")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
@@ -60,9 +60,10 @@ ROLES = ("prefill", "decode")
 
 @dataclass
 class ClusterConfig:
-    """etcd rendezvous and the control-plane RDMA of the index (see
-    _core.RadixServerConfig). Distributed when expected_min_nodes > 1; the RHT
-    is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* (docs/api.md)."""
+    """etcd rendezvous of the index (see _core.RadixServerConfig). Distributed
+    when expected_min_nodes > 1; the RHT is configured with RADIXSHMEM_RHT_* and
+    RADIXSHMEM_REDIS_*, the peer index with RADIXSHMEM_PEER_INDEX_BACKEND, and the
+    RDMA device of either with RADIXSHMEM_INDEX_DEV / _GID_IDX (docs/api.md)."""
 
     expected_min_nodes: int = 0
     settle_ms: int = 500
@@ -72,13 +73,9 @@ class ClusterConfig:
     rpc_address: str = ""
     rpc_interface: str = ""
     rpc_port: int = 0
-    index_dev: str = ""              # HCA of the index control plane, "" = first available;
-                                     # the data plane's HCAs are ServerConfig.transfer_devices
-    gid_idx: int = 3
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
-    peer_index_backend: str = "rdma"  # queries into peer trees: "rdma" (walks) | "grpc" (remote ops)
-    peer_index_transport: str = "xrc" # transport of the rdma walks: "xrc" | "dc"
+    peer_index_transport: str = "xrc" # transport of the rdma peer index's walks: "xrc" | "dc"
     remote_op_listen_port: int = 0
 
     @property

@@ -228,7 +228,7 @@ def start_etcd(workdir: str):
     raise RuntimeError("etcd did not come up")
 
 
-def server_cmd(i, n, registry, cluster_id, workdir, index_dev, gid_idx, transports, decode=None):
+def server_cmd(i, n, registry, cluster_id, workdir, transports, decode=None):
     cmd = [
         sys.executable, "-m", "radixshmem.cli",
         "--name", SHM_PREFIX,
@@ -240,12 +240,9 @@ def server_cmd(i, n, registry, cluster_id, workdir, index_dev, gid_idx, transpor
         "--peer-index-transport", transports[1],
         # several servers on one host: the default socket is per name, not per node
         "--endpoint", endpoint(workdir, i),
-        "--gid-idx", str(gid_idx),
         "--lease-ttl", str(LEASE_TTL),
         "--interval", "0",
     ]
-    if index_dev:
-        cmd += ["--index-dev", index_dev]
     if decode if decode is not None else i == n - 1:      # the last node serves decode
         cmd.append("--decode")
     return cmd
@@ -258,12 +255,11 @@ def launch(cmd, path):
     return subprocess.Popen(cmd, stdout=open(path, "ab"), stderr=subprocess.STDOUT, env=env)
 
 
-def start_servers(n, registry, cluster_id, workdir, index_dev, gid_idx, transports=("xrc", "xrc")):
+def start_servers(n, registry, cluster_id, workdir, transports=("xrc", "xrc")):
     procs, logs = [], []
     for i in range(n):
         path = os.path.join(workdir, f"server{i}.log")
-        procs.append(launch(server_cmd(i, n, registry, cluster_id, workdir, index_dev,
-                                       gid_idx, transports), path))
+        procs.append(launch(server_cmd(i, n, registry, cluster_id, workdir, transports), path))
         logs.append(path)
     return procs, logs
 
@@ -394,8 +390,7 @@ def orchestrate(args) -> int:
         print(f"etcd on {registry}   logs in {workdir}")
 
         print(f"\n[1] starting {args.nodes} radix-server processes, then a client configures each")
-        servers, logs = start_servers(args.nodes, registry, cluster_id,
-                                      workdir, args.index_dev, args.gid_idx,
+        servers, logs = start_servers(args.nodes, registry, cluster_id, workdir,
                                       (args.rht_transport, args.peer_index_transport))
         wait_banner(servers, logs, "Waiting for a client's geometry", args.timeout)
         for i in range(args.nodes):
@@ -464,7 +459,7 @@ def orchestrate(args) -> int:
                   f"node{i} local_read_only client hit {r['hit']} blocks locally")
             check(r["refused"] == 3, f"node{i} local_read_only client refused every mutation")
 
-        grpc_peer = os.environ.get("RADIXSHMEM_PEER_INDEX_BACKEND") == "grpc"
+        grpc_peer = os.environ.get("RADIXSHMEM_PEER_INDEX_BACKEND", "grpc").lower() == "grpc"
         print(f"\n[3] reader clients on the other nodes see it over {'gRPC' if grpc_peer else 'RDMA'}")
         for i in range(1, args.nodes):
             r = run_client("reader", f"{SHM_PREFIX}_node{i}")
@@ -506,8 +501,8 @@ def orchestrate(args) -> int:
             os.unlink(stale)
         check(kv.get(geo_key) == geo, "the geometry key outlives a killed holder unchanged")
         mark = len(read(logs[v]))
-        servers[v] = launch(server_cmd(v, args.nodes, registry, cluster_id, workdir, args.index_dev,
-                                       args.gid_idx, (args.rht_transport, args.peer_index_transport),
+        servers[v] = launch(server_cmd(v, args.nodes, registry, cluster_id, workdir,
+                                       (args.rht_transport, args.peer_index_transport),
                                        decode=False),
                             logs[v])
         wait_banner([servers[v]], [logs[v]], "Waiting for a client's geometry", args.timeout, [mark])
@@ -627,6 +622,9 @@ def main() -> int:
                    help="seconds to wait for the cluster to form")
     args = p.parse_args()
     os.environ["RADIXSHMEM_RHT_TRANSPORT"] = args.rht_transport   # the RDMA RHT's, servers inherit it
+    # The device of the planes that run on RDMA; the servers inherit it.
+    os.environ["RADIXSHMEM_INDEX_DEV"] = args.index_dev
+    os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(args.gid_idx)
     return orchestrate(args)
 
 

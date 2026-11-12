@@ -166,21 +166,6 @@ void RadixClient::bootstrap_cluster() {
     const ShardMapMsg sm = read_topology();
 
     int my_rank = peer_reg_->my_rank();
-
-    // Use the server-advertised index_dev / gid_idx unless caller overrode; only
-    // the planes that run on RDMA open the device. Observers (rank < 0) have no
-    // /peers entry, so they rely on config only.
-    std::string dev = cfg_.index_dev;
-    int         gid_idx = cfg_.gid_idx;
-    if (my_rank >= 0) {
-        PeerEntry self;
-        {
-            std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
-            self = peer_reg_->peers_locked()[my_rank];
-        }
-        if (dev.empty() && self.index_dev[0] != '\0') dev = self.index_dev;
-        if (self.gid_index != gid_idx) gid_idx = self.gid_index;
-    }
     rc_breaker_ = std::make_shared<PeerBreaker>(
         "[RadixClient rank " + std::to_string(my_rank) + "] remote ops", peer_faults());
 
@@ -188,8 +173,6 @@ void RadixClient::bootstrap_cluster() {
         fprintf(stderr, "[RadixClient rank %d] RHT-only mode (no peer index)\n", my_rank);
     } else {
         PeerIndexConfig pc;
-        pc.dev                   = dev;
-        pc.gid_idx               = gid_idx;
         pc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
         pc.faults                = peer_faults();
         if (local_) {
@@ -237,7 +220,7 @@ void RadixClient::bootstrap_cluster() {
             };
         rht_ = make_redis_rht(rc, peer_reg_->my_rank(), peer_faults());
     } else
-        rht_ = std::make_unique<RdmaRht>(sm, dev, gid_idx, *peer_reg_, peer_faults(),
+        rht_ = std::make_unique<RdmaRht>(sm, *peer_reg_, peer_faults(),
                                          cfg_.bootstrap_timeout_sec);
     preconnect_peers();
 
@@ -365,13 +348,7 @@ std::shared_ptr<RemotePeer> RadixClient::peer_for(int rank) {
     auto it = peer_cache_.find(rank);
     if (it != peer_cache_.end()) return it->second;
     PeerEntry p;
-    {
-        std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
-        if (rank < 0 || rank >= peer_reg_->size_locked() || rank == peer_reg_->my_rank())
-            return nullptr;
-        p = peer_reg_->peers_locked()[rank];
-    }
-    if (p.rank != rank) return nullptr;   // node down
+    if (rank == peer_reg_->my_rank() || !peer_reg_->entry(rank, p)) return nullptr;
     try {
         std::string endpoint;
         auto rc = std::make_shared<RemotePeer>(make_remote_op_client(p, endpoint),

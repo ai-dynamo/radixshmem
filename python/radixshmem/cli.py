@@ -152,7 +152,9 @@ def parse_args(argv=None) -> argparse.Namespace:
                         "share of a pool (default: 0.05)")
 
     g = p.add_argument_group("distributed (--expected-min-nodes > 1; the RHT is configured with "
-                             "RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, see docs/api.md)")
+                             "RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with "
+                             "RADIXSHMEM_PEER_INDEX_BACKEND, the RDMA device of either with "
+                             "RADIXSHMEM_INDEX_DEV / _GID_IDX, see docs/api.md)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
     g.add_argument("--registry", default="etcd://127.0.0.1:2379")
@@ -161,17 +163,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--rpc-address", default="", help="bootstrap IP peers dial; 0.0.0.0 on one host")
     g.add_argument("--rpc-interface", default="", help="NIC to resolve the bootstrap IP from")
     g.add_argument("--rpc-port", type=int, default=0)
-    g.add_argument("--index-dev", default="",
-                   help="HCA of the index control plane (default: first available); "
-                        "the data plane's is --transfer-dev")
-    g.add_argument("--gid-idx", type=int, default=3)
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
-    g.add_argument("--peer-index-backend", default="rdma", choices=["rdma", "grpc"],
-                   help="queries into peer trees: one-sided RDMA walks or the peer's gRPC remote ops")
     g.add_argument("--peer-index-transport", default="xrc", choices=["xrc", "dc"],
-                   help="transport of the RDMA walks")
+                   help="transport of the rdma peer index's walks")
     g.add_argument("--remote-op-listen-port", type=int, default=0)
     return p.parse_args(argv)
 
@@ -190,10 +186,9 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
     cluster = ClusterConfig(
         expected_min_nodes=a.expected_min_nodes, settle_ms=a.settle_ms, registry=a.registry,
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
-        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, gid_idx=a.gid_idx,
+        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port,
         bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
-        peer_index_backend=a.peer_index_backend, peer_index_transport=a.peer_index_transport,
-        remote_op_listen_port=a.remote_op_listen_port)
+        peer_index_transport=a.peer_index_transport, remote_op_listen_port=a.remote_op_listen_port)
     return ServerConfig(
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,

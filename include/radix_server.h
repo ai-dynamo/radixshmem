@@ -50,8 +50,6 @@ struct RadixServerConfig {
     // rank: etcd-assigned dense rank, filled after bootstrap.
     int          rank        = 0;
     int          world_size  = 1;   // observed count(/peers) overrides at bootstrap
-    std::string  index_dev;          // empty = first available device
-    int          gid_idx     = 3;
     int          bootstrap_timeout_sec = 60;
     // TTL of this node's etcd lease and of the shared cluster lease: how long a
     // killed node's keys, or a fully stopped cluster's /config, outlive it.
@@ -65,9 +63,8 @@ struct RadixServerConfig {
     int          expected_min_nodes = 0;   // > 1 = distributed
     int          settle_ms          = 500;
 
-    // How a query reaches the tree of the peer the RHT picked: "rdma" (one-sided
-    // walks over peer_index_transport) or "grpc" (the peer's Query/Unlock remote ops).
-    std::string       peer_index_backend   = "rdma";
+    // Transport of the rdma peer index's walks: "xrc" or "dc". The peer index
+    // backend itself is RADIXSHMEM_PEER_INDEX_BACKEND.
     std::string       peer_index_transport = "xrc";
 
     uint16_t          remote_op_listen_port = 0;
@@ -169,7 +166,7 @@ private:
     std::unique_ptr<RhtHolder>         rht_holder_;
 
     uint32_t                           rht_transport_ = CLUSTER_TRANSPORT_XRC;
-    uint32_t                           peer_index_backend_ = CLUSTER_PEER_INDEX_RDMA;
+    uint32_t                           peer_index_backend_ = CLUSTER_PEER_INDEX_GRPC;
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
 
@@ -186,6 +183,8 @@ private:
         } rdma;
     };
     RhtEnv rht_env_;
+    // RADIXSHMEM_PEER_INDEX_BACKEND of this node: grpc (default) or rdma.
+    uint32_t peer_index_env_ = CLUSTER_PEER_INDEX_GRPC;
     int rht_min_nodes() const {
         return rht_env_.backend == CLUSTER_RHT_RDMA ? rht_env_.rdma.shards : 0;
     }
@@ -208,6 +207,7 @@ private:
     void fill_local_entry(PeerEntry& e) const;
     int  register_chunk_size() const;
     void read_rht_env();
+    void read_peer_index_env();
     void resolve_shard_map(int ranks);
     void adopt_shard_map(const ShardMapMsg& sm);
     // First field where `sm` disagrees with this node's own settings, "" if none.

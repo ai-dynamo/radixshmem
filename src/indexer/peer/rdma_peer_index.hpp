@@ -27,7 +27,8 @@ class RdmaTransportClient;
 
 class RdmaPeerIndex final : public PeerIndexBackend {
   public:
-    // Opens cfg.dev with the cluster's QoS and peer-index transport (XRC or DC).
+    // Opens the index device (RdmaTransportClient) with the cluster's QoS and
+    // peer-index transport (XRC or DC).
     RdmaPeerIndex(const ShardMapMsg& sm, PeerRegistry& peers, const PeerIndexConfig& cfg);
     ~RdmaPeerIndex() override;
 

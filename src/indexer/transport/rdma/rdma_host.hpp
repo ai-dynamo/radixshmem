@@ -15,15 +15,14 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <vector>
 
 namespace radixshmem {
 
+// The device and GID index come from RADIXSHMEM_INDEX_DEV / _GID_IDX (default:
+// the first device, GID index 3).
 struct RdmaHostConfig {
-    std::string dev;            // empty = first device
-    int         gid_idx = 3;
     int         sl = 5;         // the cluster's QoS
     int         tc = 160;
     uint16_t    port = 0;       // XRC accept loop, 0 = OS-assigned
