@@ -116,7 +116,6 @@ class ServerConfig:
     writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
-    rpc_workers: int = 32            # one blocks per client with jobs in flight
     role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
     # monitoring endpoint (radixshmem.monitor): Prometheus /metrics with the tree, 0 = off
     monitor_port: int = 0            # first port tried; servers sharing a host take the next free one
@@ -436,7 +435,7 @@ class RadixServer:
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
             "Nodes": lambda _: {"nodes": self.nodes()},
-        }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
+        }, self.cfg.resolved_endpoint)
         if self.cfg.transfer_log and self._xlog is None:
             self._xlog = _TransferLog(self.cfg.transfer_log)
         try:

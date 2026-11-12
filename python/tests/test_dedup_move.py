@@ -150,7 +150,7 @@ def orchestrate(a) -> int:
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
                    "--bootstrap-timeout", str(a.bootstrap_timeout),
-                   "--background-evict-ratio", "0", "--interval", "0", "--swa-ratio", "0.1",
+                   "--background-evict-ratio", "0", "--swa-ratio", "0.1",
                    "--mamba-ratio", "0.1"]
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT,

@@ -33,7 +33,6 @@ import argparse
 import signal
 import sys
 import threading
-import time
 
 from radixshmem import _geometry
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
@@ -128,11 +127,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     g = p.add_argument_group("server")
     g.add_argument("--endpoint", default="",
                    help="gRPC endpoint clients connect to (default: unix:///dev/shm/<name>.sock)")
-    g.add_argument("--rpc-workers", type=int, default=32,
-                   help="gRPC threads; one blocks per client with jobs in flight (default: 32)")
     g.add_argument("--decode", action="store_true",
                    help="PD disaggregation: this node serves decode (default: prefill)")
-    g.add_argument("--interval", type=int, default=5, help="stats interval in seconds, 0 = silent")
     g.add_argument("--monitor-port", type=int, default=0,
                    help="serve Prometheus /metrics (with the radix tree for the Grafana dashboard) "
                         "on this port, or the next free one; 0 = off (default: 0, suggested: 9810)")
@@ -191,33 +187,12 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
-        evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
+        evict_policy=a.evict_policy, endpoint=a.endpoint,
         transfer_log=a.transfer_log, role="decode" if a.decode else "prefill",
         monitor_port=a.monitor_port, monitor_interval_s=a.monitor_interval,
         monitor_tree_nodes=a.monitor_tree_nodes, monitor_cluster_nodes=a.monitor_cluster_nodes,
         writeback_max_held_ratio=a.writeback_max_held,
         cluster=cluster, **kw)
-
-
-def _stats_line(srv: RadixServer) -> str:
-    s = srv.stats()
-    if "total_blocks" not in s:
-        return f"[{s['mode']}]"
-    tag = f"[rank {s['rank']}]" if s["world_size"] > 1 else "[stats]"
-    line = (f"{tag} nodes={s['total_radix_nodes']}  blocks={s['total_blocks']}  "
-            f"data_pool={s['data_pool_utilization'] * 100:.1f}%  ins_ok={s['insert_success']}")
-    if s["mempool_total"]:
-        line += f"  mempool={s['mempool_used']}/{s['mempool_total']}"
-    if s["insert_errors"]:
-        line += f"  ins_err={s['insert_errors']}"
-    if s["peer_down_events"]:
-        line += (f"  peer_down={s['peer_down_events']}  rht_drop={s['rht_writes_dropped']}"
-                 f"/{s['rht_removes_dropped']}  lookup_skip={s['rht_lookups_skipped']}"
-                 f"  walk_skip={s['walks_skipped']}")
-    if s["transfers"] or s["pending_jobs"]:
-        line += (f"  xfers={s['transfers']}({s['transfer_failures']} failed, "
-                 f"{fmt_size(s['transfer_bytes'])})  jobs={s['pending_jobs']}")
-    return line
 
 
 def _ready_banner(srv: RadixServer) -> str:
@@ -260,8 +235,7 @@ def main(argv=None) -> None:
     if srv.monitor is not None:
         print(f"  Monitor:        {srv.monitor.url}/metrics  (Prometheus service discovery: {srv.monitor.url}/sd)")
     print("Waiting for a client's geometry (RadixClient(name, Geometry(...))) ...", flush=True)
-    last, seen = 0.0, srv.mode
-    tty = sys.stdout.isatty()
+    seen = srv.mode
     try:
         while not stop.wait(0.2):
             mode = srv.mode
@@ -275,13 +249,6 @@ def main(argv=None) -> None:
                 elif mode == "waiting":
                     print(f"Configuration FAILED: {srv.last_error}\nWaiting for a client's geometry ...",
                           flush=True)
-            if a.interval > 0 and mode == "ready" and time.monotonic() - last >= a.interval:
-                last = time.monotonic()
-                if tty:                 # a terminal: one line rewritten in place
-                    sys.stdout.write(f"\r{_stats_line(srv)}        ")
-                else:                   # a log file: timestamped lines between the transfer lines
-                    sys.stdout.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {_stats_line(srv)}\n")
-                sys.stdout.flush()
     finally:
         print("\nShutting down ...", flush=True)
         srv.close()

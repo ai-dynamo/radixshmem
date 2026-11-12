@@ -340,7 +340,7 @@ def orchestrate(a) -> int:
                    "--swa-ratio", "0.2", "--mamba-ratio", "0.1", "--endpoint", eps[i],
                    "--registry", registry, "--cluster-id", f"push{os.getpid()}",
                    "--expected-min-nodes", "4", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
-                   "--bootstrap-timeout", str(a.bootstrap_timeout), "--interval", "1"]
+                   "--bootstrap-timeout", str(a.bootstrap_timeout)]
             if i == 0:
                 cmd += ["--background-evict-ratio", str(EVICT_RATIO), "--writeback-max-held", "0.25"]
             else:

@@ -37,7 +37,6 @@ static void print_usage(const char* prog) {
     printf("  --background-evict-ratio <float> Background evictor free-fraction target (default: 0.05, 0=disabled)\n");
     printf("  --data-pool-ratio <float>  DataPool size = max_blocks * ratio * block_bytes (default: 4.0)\n");
     printf("  --evict-policy <str>     Eviction policy: lru (default: lru)\n");
-    printf("  --interval <int>         Stats print interval in seconds (default: 5)\n");
     printf("\nDistributed options (expected-min-nodes > 1 enables distributed mode;\n");
     printf("the RHT is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with\n");
     printf("RADIXSHMEM_PEER_INDEX_BACKEND=grpc|rdma and RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=xrc|dc,\n");
@@ -60,7 +59,6 @@ static void print_usage(const char* prog) {
 int main(int argc, char** argv) {
     radixshmem::RadixServerConfig cfg;
     const char* evict_policy_str = "lru";
-    int interval = 5;
 
     for (int i = 1; i < argc; i++) {
         auto arg = [&](const char* flag) { return strcmp(argv[i], flag) == 0; };
@@ -77,7 +75,6 @@ int main(int argc, char** argv) {
         else if (arg("--background-evict-ratio")) cfg.shm.background_evict_ratio = next_flt();
         else if (arg("--data-pool-ratio"))   cfg.shm.data_pool_ratio = next_flt();
         else if (arg("--evict-policy"))      evict_policy_str = next_str();
-        else if (arg("--interval"))          interval = next_int();
         else if (arg("--settle-ms"))         cfg.settle_ms = next_int();
         else if (arg("--registry"))          cfg.registry = next_str();
         else if (arg("--cluster-id"))        cfg.cluster_id = next_str();
@@ -142,7 +139,7 @@ int main(int argc, char** argv) {
         printf("  BG evict ratio: %.2f%s\n", cfg.shm.background_evict_ratio,
                cfg.shm.background_evict_ratio <= 0 ? " (disabled)" : "");
         printf("  Evict policy:   %s\n", evict_policy_str);
-        printf("  Stats interval: %d s\n\n", interval);
+        printf("\n");
     }
 
     radixshmem::RadixServer srv(cfg);
@@ -166,49 +163,8 @@ int main(int argc, char** argv) {
     printf("Press Ctrl+C to shutdown.\n\n");
     fflush(stdout);
 
-    while (g_running) {
-        if (interval <= 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        for (int i = 0; i < interval * 10 && g_running; i++)
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        if (!g_running) break;
-
-        if (distributed) {
-            printf("\r[rank %d] nodes=%u  blocks=%llu  data_pool=%.1f%%",
-                   srv.rank(), srv.total_radix_nodes(),
-                   (unsigned long long)srv.total_blocks(),
-                   srv.data_pool_utilization() * 100.0f);
-            if (cfg.shm.max_blocks > 0)
-                printf("  mempool=%u/%u",
-                       srv.mempool_used(), srv.mempool_total());
-            printf("  ins_ok=%llu",
-                   (unsigned long long)srv.insert_success_count());
-        } else {
-            uint64_t err_np = srv.insert_error_node_pool_count();
-            uint64_t err_dp = srv.insert_error_data_pool_count();
-            uint64_t err_ht = srv.insert_error_ht_pool_count();
-            uint64_t err_total = err_np + err_dp + err_ht;
-            printf("\r[stats] nodes=%u  blocks=%llu  data_pool=%.1f%%",
-                   srv.total_radix_nodes(),
-                   (unsigned long long)srv.total_blocks(),
-                   srv.data_pool_utilization() * 100.0f);
-            if (cfg.shm.max_blocks > 0)
-                printf("  mempool=%u/%u",
-                       srv.mempool_used(), srv.mempool_total());
-            printf("  ins_ok=%llu",
-                   (unsigned long long)srv.insert_success_count());
-            if (err_total > 0)
-                printf("  ins_err=%llu(np=%llu,dp=%llu,ht=%llu)",
-                       (unsigned long long)err_total,
-                       (unsigned long long)err_np,
-                       (unsigned long long)err_dp,
-                       (unsigned long long)err_ht);
-        }
-        printf("        ");
-        fflush(stdout);
-    }
+    while (g_running)
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
     printf("\nShutting down %s...\n",
            distributed ? "cluster node" : "server");

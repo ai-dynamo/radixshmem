@@ -116,8 +116,7 @@ def orchestrate(a) -> int:
                    "--data-name", f"{p2p.NAME}_data{i}", "--data-bytes", "64M", "--no-prefault",
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
-                   "--bootstrap-timeout", str(a.bootstrap_timeout),
-                   "--interval", "0"]
+                   "--bootstrap-timeout", str(a.bootstrap_timeout)]
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
             cmd += ["--background-evict-ratio", "0.01" if i == 1 else "0"]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT, env=env))

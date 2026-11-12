@@ -226,7 +226,6 @@ public:
                       "--background-evict-ratio", evict_str,
                       "--register-chunk-tokens", cs_str,
                       "--data-pool-ratio", dpr_str,
-                      "--interval", "86400",
                       nullptr);
             } else {
                 execl(bin.c_str(), "radix_server",
@@ -234,7 +233,6 @@ public:
                       "--max-nodes", nodes_str,
                       "--background-evict-ratio", evict_str,
                       "--register-chunk-tokens", cs_str,
-                      "--interval", "86400",
                       nullptr);
             }
             _exit(127);

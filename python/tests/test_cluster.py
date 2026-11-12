@@ -240,7 +240,6 @@ def server_cmd(i, n, registry, cluster_id, workdir, decode=None):
         # several servers on one host: the default socket is per name, not per node
         "--endpoint", endpoint(workdir, i),
         "--lease-ttl", str(LEASE_TTL),
-        "--interval", "0",
     ]
     if decode if decode is not None else i == n - 1:      # the last node serves decode
         cmd.append("--decode")
