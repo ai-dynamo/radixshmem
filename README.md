@@ -53,7 +53,8 @@ radix-server --name /my_kv_cache --data-bytes 1024G
 `RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. A query continues on a peer's tree
 with gRPC remote ops by default; `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` walks it with one-sided RDMA instead.
 These variables and the RDMA device of such planes (`RADIXSHMEM_INDEX_DEV`, `RADIXSHMEM_INDEX_GID_IDX`) are
-listed in [`docs/api.md`](docs/api.md).
+listed in [`docs/api.md`](docs/api.md). Peers reach a node on one TCP port, `--rpc-port` (default: picked by
+the OS and published in etcd).
 
 ```bash
 # Same command on every node except --rpc-address

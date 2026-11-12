@@ -71,7 +71,7 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 
 > Note: `RadixServer` provides the convenience overload `RadixServer(name, ShmConfig)`, which bootstraps automatically (for single-node use). Only `RadixServerConfig` lets you specify the etcd registry / node identity / cluster topology.
 
-> **rank and world_size are not here**: they used to be `ShmConfig` fields and have been removed. rank is assigned by etcd, written back into `RadixServerConfig::rank` after bootstrap, and stamped into `my_rank` in the shm header. Whether the deployment is distributed is marked by `is_distributed` in the header (written by the server based on the actually observed `/peers` count); the client reads it at attach time to decide whether to start RDMA.
+> **rank and world_size are not here**: they used to be `ShmConfig` fields and have been removed. rank is assigned by etcd, written back into `RadixServerConfig::rank` after bootstrap, and stamped into `my_rank` in the shm header. Whether the deployment is distributed is marked by `is_distributed` in the header (written by the server based on the actually observed `/peers` count); the client reads it at attach time to decide whether to join the cluster.
 
 
 
@@ -1143,7 +1143,7 @@ The public surface of the Python package is two pure-Python classes: `radixshmem
 
 **Configuration**: `radixshmem.ShmConfig(...)` supports keyword construction; its 13 parameters map one to one to the C++ fields (8 base fields `max_nodes` / `max_blocks` / `block_size` / `register_chunk_tokens` / `background_evict_ratio` / `evict_policy` / `data_pool_ratio` / `hugepage_path`, plus 5 component fields; `effective_register_chunk_size()` gives the converted block count `component_mask` / `swa_window_blocks` / `mamba_state_bytes` / `swa_max_blocks` / `mamba_max_slots`).
 
-`radixshmem.RadixServerConfig` **has only a default constructor**; fields are set by attribute assignment (`cfg.rpc_port = 31001`, etc.). Exposed fields include: `name` / `shm` / `rank` / `world_size` / `registry` / `cluster_id` / `node_name` / `rpc_address` / `rpc_interface` / `rpc_port` / `expected_min_nodes` / `settle_ms` / `bootstrap_timeout_sec` / `register_chunk_size` (the port is read and written as `int` on the Python side).
+`radixshmem.RadixServerConfig` **has only a default constructor**; fields are set by attribute assignment (`cfg.rpc_port = 31001`, etc.). Exposed fields: `name` / `shm` / `rank` / `world_size` / `registry` / `cluster_id` / `node_name` / `rpc_address` / `rpc_interface` / `rpc_port` / `bootstrap_timeout_sec` / `lease_ttl_sec` / `register_chunk_tokens` / `expected_min_nodes` / `settle_ms` / `writeback_enabled` / `writeback_max_held_ratio` (the port is read and written as `int` on the Python side).
 
 **The whole `RadixClientConfig` class is not exported**: on the Python side there are only two constructors, `radixshmem._core.RadixClient(name, local_read_only=False)` and `radixshmem._core.RadixClient(server)`; etcd discovery is done automatically from the identity in the shm header (observer / `rht_only` modes are C++-only); `local_read_only=True` is a lightweight read-only attach that does not join the cluster, see [3.1](#31-construction-and-lifecycle).
 
