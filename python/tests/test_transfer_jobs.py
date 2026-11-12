@@ -342,7 +342,7 @@ def wait_for(cond, timeout=5.0):
 
 @pytest.mark.parametrize("move", ["1", "0"])
 def test_a_full_pull_asks_every_source_to_drop_its_copy(monkeypatch, move):
-    monkeypatch.setenv("RADIXSHMEM_DEDUP_MOVE", move)
+    monkeypatch.setenv("RADIXSHMEM_DISABLE_DEDUP_TAIL_BRANCH_MIGRATION", "0" if move == "1" else "1")
     monkeypatch.setenv("RADIXSHMEM_DEDUP_BRANCH_BLOCKS", "8")
     index = DedupIndex(common=8)
     c = client(index)
