@@ -137,16 +137,16 @@ This document is for users who call RadixShmem directly (C++ or Python). It cent
 >
 > Failures, grpc: a peer that refuses the connection or misses the deadline is marked unreachable; queries to it are skipped (`walks_skipped`) and keep the local result, for 1 s, backing off to 30 s, then one query probes it; a new `/peers` entry of it probes at once. `Unlock` is not idempotent, so it is sent once and repeated only after `RESOURCE_EXHAUSTED`, which the peer returns without running it: a pin on a peer that does not answer stays until the peer restarts, as an rdma pin does when its FAA fails. A pin is bound to the run of the peer that took it (the run's instance id): after a restart its release is not sent to the new run, which never held it. A peer that pins for a query whose caller already gave up (the deadline passed) drops that pin itself.
 >
-> Latency, one client thread, `blocks` = query length (64 blocks per node), node0 holds the prefixes and node1 queries them on one host (gRPC over loopback TCP, RDMA through the NIC; `bench_peer_query`):
+> Latency across nodes (`bench_peer_query`, 2026-11-13): node0 holds the prefixes on one host, node1 queries them from another, over one RoCE v2 bond per host (gRPC over TCP on the same bond). `blocks` = query length (64 blocks per node); p50 of `PeerIndexBackend::query` and `unlock`, one client thread:
 >
 > | blocks | rdma query | grpc query | rdma lock + unlock | grpc lock + unlock |
 > |---|---|---|---|---|
-> | 64 | 15 µs | 34 µs | 17 + 16 µs | 35 + 33 µs |
-> | 512 | 23 µs | 50 µs | 39 + 87 µs | 40 + 34 µs |
-> | 2048 | 46 µs | 63 µs | 125 + 350 µs | 69 + 53 µs |
-> | 8192 | 149 µs | 134 µs | 467 + 1337 µs | 138 + 78 µs |
+> | 64 | 29 µs | 59 µs | 34 + 33 µs | 52 + 49 µs |
+> | 512 | 36 µs | 60 µs | 73 + 174 µs | 65 + 57 µs |
+> | 2048 | 63 µs | 84 µs | 210 + 641 µs | 86 + 70 µs |
+> | 8192 | 191 µs | 208 µs | 783 + 2454 µs | 177 + 109 µs |
 >
-> Across nodes (24 → 25) the same Query/Unlock RPC took 44–52 µs for up to 512 blocks. rdma pins one node per FAA and releases one node per walk step, so its lock grows with the node count; grpc pins and releases in one round trip. rdma walks of one client process are serialized, grpc queries run in parallel (32 threads of one process: 48 k queries/s at 64 blocks, 26 k at 8192, against 57 k and 6.7 k with rdma). grpc costs the peer 30–100 µs of CPU per query, more under contention.
+> A query without a lock is faster on rdma at every length. With a lock, as a pull queries, grpc is faster from 512 blocks on: rdma pins one node per FAA and releases one node per walk step, so its lock grows with the node count, while grpc pins and releases in one round trip. rdma walks of one client process are serialized, grpc queries run in parallel: with a lock and 32 threads, 24.6 k / 22.9 k / 20.4 k / 11.3 k queries/s for 64 / 512 / 2048 / 8192 blocks, against 14.2 k / 4.0 k / 1.2 k / 0.3 k with rdma. End to end (`RadixClient::query(lock)` + finalize, RHT probe included, one thread) the p50 query + unlock is 40 + 33 / 83 + 174 / 234 + 640 / 876 + 2455 µs with rdma and 58 + 50 / 78 + 61 / 113 + 69 / 273 + 120 µs with grpc. On one host a grpc query cost the peer 30–100 µs of CPU, more under contention; an rdma walk costs the peer none and the caller its full latency in busy polling. grpc is the default because pulls query with a lock and because the index then needs no RDMA device; short queries without a lock are faster on rdma.
 
 
 

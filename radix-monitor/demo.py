@@ -149,7 +149,7 @@ def main() -> int:
             launch([sys.executable, "-m", "radixshmem.cli", "--name", NAME, "--node-name", f"node{i}",
                     "--registry", f"etcd://127.0.0.1:{cport}", "--cluster-id", "rmdemo",
                     "--expected-min-nodes", str(a.nodes), "--rpc-address", "0.0.0.0",
-                    "--endpoint", ep(i), "--interval", "0", "--transfer-log", "", "--monitor-port", str(a.monitor_port),
+                    "--endpoint", ep(i), "--transfer-log", "", "--monitor-port", str(a.monitor_port),
                     "--monitor-interval", str(a.monitor_interval)]
                    + (["--decode"] if i == a.nodes - 1 else []), f"server{i}.log")
         for i in range(a.nodes):
