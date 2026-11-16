@@ -4,11 +4,11 @@ RadixShmem is a KV cache index built on a distributed radix tree. The architectu
 keeps its own radix tree in POSIX shared memory. Each tree is both a local and a shared index. It tracks the
 KV cache blocks held in the node's DRAM, and any process on the node can attach to it and insert or look up
 blocks by prefix hash. Other nodes can also query it: a sharded distributed hash table, the Radix Hash Table
-(RHT), records which node holds each prefix, and the querying node reads the peer's tree with one-sided RDMA,
-so the KV cache is indexed globally across the cluster. An inference engine integrates with RadixShmem through
-one client interface, which handles both local and cross-node lookups. The recommended setup uses RadixShmem as
-the index together with an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV cache
-sharing.
+(RHT), records which node holds each prefix, and the querying node continues the match on that peer's tree,
+by default with one gRPC call to the peer, or with one-sided RDMA reads, so the KV cache is indexed globally
+across the cluster. An inference engine integrates with RadixShmem through one client interface, which
+handles both local and cross-node lookups. The recommended setup uses RadixShmem as the index together with
+an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV cache sharing.
 
 ## Framework support
 
