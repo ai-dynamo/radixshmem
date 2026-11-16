@@ -609,9 +609,11 @@ set(_benches
     bench_query
     bench_query_dist
     bench_cluster
-    bench_peer_query
     stress_test_llm
 )
+if(RADIXSHMEM_HAS_ETCD)
+    list(APPEND _benches bench_peer_query)
+endif()
 foreach(_b ${_benches})
     add_executable(${_b} tests/bench/${_b}.cpp)
     target_link_libraries(${_b} PRIVATE radixshmem)
