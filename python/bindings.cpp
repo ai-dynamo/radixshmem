@@ -285,6 +285,9 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("writeback_enabled", &RadixServerConfig::writeback_enabled)
         .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
 
+    // Resolve network settings in place; return a summary or raise on invalid or ambiguous choices.
+    m.def("resolve_cluster_net", &resolve_cluster_net, py::arg("cfg"));
+
     // ==================== Result types ====================
 
     // One-shot cleanup callable: r.finalize() runs once, later calls are no-ops.

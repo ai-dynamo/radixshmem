@@ -63,6 +63,11 @@ A cluster coordinates through etcd. By default the RHT lives in a Redis Cluster
 uses no RDMA; `RADIXSHMEM_RHT_BACKEND=rdma` and `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` move them to one-sided
 RDMA. `--transfer-dev` selects the NICs of the data plane.
 
+The address peers reach a node at is `--rpc-interface`, else `--rpc-address`, else the source IP of the route
+to the registry. An index plane on RDMA discovers a usable local device, port and GID; `RADIXSHMEM_INDEX_DEV`,
+`RADIXSHMEM_INDEX_PORT` and `RADIXSHMEM_INDEX_GID_IDX` ([`docs/api.md`](docs/api.md)) constrain the choice, and
+the default Redis + gRPC index never reads them.
+
 ```bash
 # Same command on every node except --rpc-address
 export RADIXSHMEM_REDIS_ADDRS=10.0.0.1:7001,10.0.0.2:7001

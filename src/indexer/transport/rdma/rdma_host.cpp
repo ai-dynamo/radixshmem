@@ -10,9 +10,10 @@
 namespace radixshmem {
 
 RdmaHost::RdmaHost(const RdmaHostConfig& cfg) : cfg_(cfg) {
-    const IndexDevice d = index_device_env();
-    ctx_  = std::make_unique<RdmaContext>(d.dev.empty() ? nullptr : d.dev.c_str(), 1,
-                                          d.gid_idx >= 0 ? d.gid_idx : 3);
+    const auto selected = resolve_net(cfg_.net);
+    fprintf(stderr, "[RdmaHost] net: %s\n", selected.summary().c_str());
+    ctx_ = std::make_unique<RdmaContext>(selected.index.device.c_str(), selected.index.port,
+                                        selected.index.gid_index);
     ctx_->set_qos(cfg_.sl, cfg_.tc);   // the cluster's QoS before any QP connects
     xrcd_ = std::make_unique<RdmaXrcd>(*ctx_);
     cq_.reset(ibv_create_cq(ctx_->ctx(), 256, nullptr, nullptr, 0));
@@ -45,6 +46,7 @@ void RdmaHost::publish_to(PeerEntry& e) const {
     std::strncpy(e.index_dev, ctx_->name(), sizeof(e.index_dev) - 1);
     memcpy(e.gid_raw, &ctx_->gid(), 16);
     e.gid_index = ctx_->gid_index();
+    e.index_port = static_cast<uint8_t>(ctx_->port());
     ibv_port_attr pa{};
     if (ibv_query_port(ctx_->ctx(), ctx_->port(), &pa) == 0) {
         e.lid        = pa.lid;

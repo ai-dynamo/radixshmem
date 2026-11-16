@@ -60,9 +60,9 @@ The layout of one tree, fixed when the server creates it; processes that attach 
 | `world_size` | `int` | `1` | Output: the cluster's node count after `bootstrap()`. On input, > 1 selects cluster mode. |
 | `registry` | `std::string` | `"etcd://127.0.0.1:2379"` | etcd endpoint. |
 | `cluster_id` | `std::string` | `"default"` | etcd key namespace, `radix/<cluster_id>/`. With the Redis RHT it may not contain `{` or `}`. |
-| `node_name` | `std::string` | `""` | The node's identity in etcd; empty = `node<bind IP>`. |
-| `rpc_address` | `std::string` | `""` | IPv4 address published to peers; `"0.0.0.0"` for tests on one host. |
-| `rpc_interface` | `std::string` | `""` | NIC whose IPv4 address to publish; takes precedence over `rpc_address`. |
+| `node_name` | `std::string` | `""` | The node's identity in etcd; empty = `node<control IP>`. |
+| `rpc_address` | `std::string` | `""` | IPv4 address published to peers; `"0.0.0.0"` for tests on one host (then `node_name` is required). Empty: the address of `rpc_interface`, else the source address of the route to the registry; `bootstrap()` writes the result back. |
+| `rpc_interface` | `std::string` | `""` | NIC whose IPv4 address to publish; takes precedence over `rpc_address`. It also narrows an RDMA index device to the GIDs of that NIC. |
 | `rpc_port` | `uint16_t` | `0` | Port of the gRPC endpoint peers reach (remote operations, the grpc peer index, RDMA connection setup); `0` = chosen by the OS. A single-node server starts no endpoint. |
 | `expected_min_nodes` | `int` | `0` | `bootstrap()` waits until this many nodes (with the RDMA RHT, at least `RADIXSHMEM_RHT_SHARDS`) have registered and stayed unchanged for `settle_ms`. > 1 selects cluster mode. |
 | `settle_ms` | `int` | `500` | See `expected_min_nodes`. |
@@ -72,7 +72,7 @@ The layout of one tree, fixed when the server creates it; processes that attach 
 | `writeback_enabled` | `bool` | `false` | Background eviction holds evicted slots for write-back; see [write-back queue](#write-back-queue). |
 | `writeback_max_held_ratio` | `float` | `0.05` | Background eviction pauses while unfinished write-backs hold this share of a pool. |
 
-Cluster mode is `expected_min_nodes > 1 || world_size > 1`. It needs `rpc_address` or `rpc_interface`; without them `bootstrap()` throws `std::runtime_error`. `RADIXSHMEM_REGISTRY`, `RADIXSHMEM_CLUSTER_ID` and `RADIXSHMEM_NODE_NAME` override `registry`, `cluster_id` and `node_name`.
+Cluster mode is `expected_min_nodes > 1 || world_size > 1`. `resolve_cluster_net()` (in Python, `_core.resolve_cluster_net`) settles the control address first: `rpc_interface`, then `rpc_address`, then the route to the registry; it throws `std::runtime_error` when none gives an IPv4 address, or when `0.0.0.0` is published without `node_name`. RDMA device discovery runs afterwards, only for an RDMA RHT or peer index, and throws with the candidate list when the choice is ambiguous. `RADIXSHMEM_REGISTRY`, `RADIXSHMEM_CLUSTER_ID` and `RADIXSHMEM_NODE_NAME` override `registry`, `cluster_id` and `node_name`.
 
 ### 1.3 `RadixClientConfig`
 
@@ -108,8 +108,9 @@ The RHT (radix hash table) maps a prefix to the nodes that hold it; a query that
 | `RADIXSHMEM_PEER_INDEX_BACKEND` | `grpc` | `grpc`: the peer matches the hashes in one RPC. `rdma`: the caller reads the peer's tree with one-sided RDMA. |
 | `RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT` | `xrc` | rdma peer index: `xrc` or `dc`. |
 | `RADIXSHMEM_PEER_INDEX_TIMEOUT_MS` | `500` | grpc peer index: deadline of one query or release; read by each client process. |
-| `RADIXSHMEM_INDEX_DEV` | first device | RDMA device of the planes that run on RDMA. A client without it uses the device its server published. |
-| `RADIXSHMEM_INDEX_GID_IDX` | `3` | GID index on that device (3 = RoCE v2 over IPv4). |
+| `RADIXSHMEM_INDEX_DEV` | auto | RDMA device of the planes that run on RDMA; read only when the cluster selects an RDMA RHT or peer index. A server discovers an accessible ACTIVE port and publishes device, port and GID in `/peers`; a client without the variables inherits them. Several usable devices without a hint fail with the candidate list; `rpc_interface`, `rpc_address` and the route to the registry narrow the choice. |
+| `RADIXSHMEM_INDEX_PORT` | auto | Port of that device (1–255). |
+| `RADIXSHMEM_INDEX_GID_IDX` | auto | GID index (0–255). Without it, per port: RoCE v2 IPv4, then RoCE v2 global IPv6, RoCE v1 IPv4, RoCE v1 global IPv6; InfiniBand takes an IB GID. Link-local and unknown-type GIDs need an explicit index. |
 | `RADIXSHMEM_RDMA_SL`, `RADIXSHMEM_RDMA_TC` | `5`, `160` | Service level and traffic class of the index's RDMA traffic. |
 | `RADIXSHMEM_LAZY_CONNECT` | `0` | `1`: connect to a peer over RDMA on first use instead of at startup. |
 | `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` | `5000` | Client deadline of one remote operation. |
@@ -130,7 +131,7 @@ RadixServer(const std::string& name, const ShmConfig& cfg = ShmConfig{});
 bool bootstrap();
 ```
 
-The first constructor only stores `cfg`. `bootstrap()` creates the shm, starts background eviction and, in cluster mode, registers the node in etcd, waits for the other nodes (`expected_min_nodes`), takes a rank and starts the endpoint peers reach. It blocks until the node is ready and returns `false` on failure (etcd unreachable, membership timeout, RDMA failure); the server is then unusable. The second constructor creates a single-node server and bootstraps it. All nodes and clients of a cluster must run the same version.
+The first constructor only stores `cfg`. `bootstrap()` creates the shm, starts background eviction and, in cluster mode, registers the node in etcd, waits for the other nodes (`expected_min_nodes`), takes a rank and starts the endpoint peers reach. It blocks until the node is ready and returns `false` on failure (etcd unreachable, membership timeout, RDMA failure); the server is then unusable. An unresolvable control address or an ambiguous RDMA device choice throws `std::runtime_error` instead. The second constructor creates a single-node server and bootstraps it. All nodes and clients of a cluster must run the same version.
 
 The destructor stops background eviction, leaves the cluster and unlinks the shm; attached processes keep their mapping until they detach.
 

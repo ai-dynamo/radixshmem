@@ -51,6 +51,7 @@
     X(mlx5, ibv_qp*, mlx5dv_create_qp,                                                               \
       (ibv_context* context, ibv_qp_init_attr_ex* qp_attr, mlx5dv_qp_init_attr* mlx5_qp_attr),       \
       (context, qp_attr, mlx5_qp_attr), nullptr)                                                     \
+    X(mlx5, bool, mlx5dv_is_supported, (ibv_device* device), (device), false)                        \
     X(mlx5, mlx5dv_qp_ex*, mlx5dv_qp_ex_from_ibv_qp_ex, (ibv_qp_ex* qp), (qp), nullptr)
 
 namespace radixshmem::verbs {
@@ -105,6 +106,8 @@ void* symbol(Library& lib, const char* name) {
     void* h = handle(lib);
     return h ? ::dlsym(h, name) : nullptr;
 }
+
+void* ibverbs_symbol(const char* name) { return symbol(ibverbs, name); }
 
 void require_ibverbs() { require(ibverbs, "RDMA"); }
 

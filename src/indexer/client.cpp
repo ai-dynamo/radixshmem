@@ -149,6 +149,7 @@ void RadixClient::bootstrap_cluster() {
         fprintf(stderr, "[RadixClient rank %d] RHT-only mode (no peer index)\n", my_rank);
     } else {
         PeerIndexConfig pc;
+        pc.registry = cfg_.registry;
         pc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
         pc.faults                = peer_faults();
         if (local_) {
@@ -197,7 +198,7 @@ void RadixClient::bootstrap_cluster() {
         rht_ = make_redis_rht(rc, peer_reg_->my_rank(), peer_faults());
     } else
         rht_ = std::make_unique<RdmaRht>(sm, *peer_reg_, peer_faults(),
-                                         cfg_.bootstrap_timeout_sec);
+                                         cfg_.bootstrap_timeout_sec, cfg_.registry);
     preconnect_peers();
 
     // Watch /peers for members that join, restart or leave. Anchor at the

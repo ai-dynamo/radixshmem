@@ -16,4 +16,7 @@ void require_mlx5();
 // Why libibverbs cannot be used, or empty when it can.
 std::string ibverbs_error();
 
+// A libibverbs function this build does not require, or nullptr when the library or the function is missing.
+void* ibverbs_symbol(const char* name);
+
 }  // namespace radixshmem::verbs
