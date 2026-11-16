@@ -26,7 +26,8 @@ RdmaPeerIndex::RdmaPeerIndex(const ShardMapMsg& sm, PeerRegistry& peers,
     PeerEntry self;
     const bool has_self = peers.entry(peers.my_rank(), self);
     tx_ = std::make_unique<RdmaTransportClient>(has_self ? &self : nullptr, sm.rdma_sl,
-                                                sm.rdma_tc, peers.world_size());
+                                                sm.rdma_tc, peers.world_size(), RdmaTransportClient::BUF_SIZE,
+                                                transport_ == CLUSTER_TRANSPORT_DC, cfg.registry);
     if (transport_ == CLUSTER_TRANSPORT_DC) {
         tx_->shared_dci();
         fprintf(stderr, "[RadixClient rank %d] DC initiator up\n", peers.my_rank());

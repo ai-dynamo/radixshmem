@@ -55,6 +55,7 @@ struct RadixServerConfig {
     // killed node's keys, or a fully stopped cluster's /config, outlive it.
     int          lease_ttl_sec = 30;
 
+    // Resolve the control IPv4 from explicit settings or the registry route into rpc_address.
     std::string  rpc_address;              // explicit IPv4, e.g. "192.168.1.11"
     std::string  rpc_interface;            // NIC name, e.g. "eth0"
     // gRPC endpoint peers reach: remote ops, peer queries, XRC setup; 0 = OS-assigned.
@@ -69,6 +70,11 @@ struct RadixServerConfig {
     std::string       cluster_id = "default";   // etcd key namespace: radix/<cluster_id>/...
     std::string       node_name  = "";          // etcd identity; empty → auto "node<host-ip>"
 };
+
+#ifndef RADIXSHMEM_NO_RDMA
+// Resolve cluster network settings in place and return a summary; throw on invalid or ambiguous choices.
+std::string resolve_cluster_net(RadixServerConfig& cfg);
+#endif
 
 class RadixServer {
 #ifndef RADIXSHMEM_NO_RDMA
@@ -149,7 +155,7 @@ private:
     std::mutex                     svc_client_mu_;
 
     // ---- cluster bring-up ----
-    std::string bind_ip_;   // published as PeerEntry.host
+    std::string publish_ip_;   // PeerEntry.host; listeners bind the wildcard address
 #ifdef RADIXSHMEM_HAS_ETCD
     std::unique_ptr<EtcdRegistry> registry_;   // holds the lease for the server's lifetime
 #endif
