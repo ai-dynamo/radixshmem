@@ -671,21 +671,24 @@ class RadixServer:
                         self._peers.pop(rank, None)
                         self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
                     else:
-                        inflight.append((job, i, h, nd))
+                        inflight.append((job, i, h, nd, False))
             progressed, now, still = False, time.monotonic(), []
-            for job, i, h, nd in inflight:
+            for job, i, h, nd, expired in inflight:
                 st, done = self._xfer.poll(h)
-                if st == _data.XferState.PENDING and now < job.deadline:
-                    still.append((job, i, h, nd))
-                    continue
+                expired = expired or now >= job.deadline
                 if st == _data.XferState.PENDING:
-                    st = _data.XferState.TIMEOUT
+                    # A policy deadline cannot cancel an RDMA write into the
+                    # client's staged slots. Keep ownership until quiescent.
+                    still.append((job, i, h, nd, expired))
+                    continue
                 if self._xfer.release(h) == _data.XFER_EBUSY:
-                    self._zombies.append(h)
-                ok = st == _data.XferState.COMPLETED
+                    still.append((job, i, h, nd, expired))
+                    continue
+                ok = st == _data.XferState.COMPLETED and not expired
                 if not ok:
                     self._peers.pop(job.items[i][0], None)
-                self._resolve(job, i, (ok, int(done), int(nd), "" if ok else str(st)))
+                self._resolve(job, i, (ok, int(done), int(nd),
+                                      "" if ok else ("deadline exceeded" if expired else str(st))))
                 progressed = True
             inflight = still
             if now - last_gc > 1.0:
