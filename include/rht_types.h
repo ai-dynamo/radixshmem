@@ -24,11 +24,6 @@ struct RhtInsertEntry {
     uint32_t num_blocks;
 };
 
-struct RhtRawCell {
-    uint64_t head;
-    uint64_t ext;
-};
-
 struct RhtRemoveEntry {
     uint64_t key;
     int32_t  node_id;

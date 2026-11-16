@@ -3,11 +3,12 @@
 RadixShmem is a KV cache index built on a distributed radix tree. The architecture is decentralized: each node
 keeps its own radix tree in POSIX shared memory. Each tree is both a local and a shared index. It tracks the
 KV cache blocks held in the node's DRAM, and any process on the node can attach to it and insert or look up
-blocks by prefix hash. Other nodes can also query it: a sharded distributed hash table records which node
-holds each prefix, and the querying node reads the peer's tree with one-sided RDMA, so the KV cache is indexed
-globally across the cluster. An inference engine integrates with RadixShmem through one client interface,
-which handles both local and cross-node lookups. The recommended setup uses RadixShmem as the index together
-with an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV cache sharing.
+blocks by prefix hash. Other nodes can also query it: a sharded distributed hash table, the Radix Hash Table
+(RHT), records which node holds each prefix, and the querying node continues the match on that peer's tree,
+by default with one gRPC call to the peer, or with one-sided RDMA reads, so the KV cache is indexed globally
+across the cluster. An inference engine integrates with RadixShmem through one client interface, which
+handles both local and cross-node lookups. The recommended setup uses RadixShmem as the index together with
+an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV cache sharing.
 
 ## Framework support
 
@@ -22,13 +23,24 @@ with an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-pe
 cd python && pip install -e .
 ```
 
+Cross-node remote ops use gRPC exclusively and need the grpc++ and protobuf development packages
+(Ubuntu: `apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc`).
+An RDMA build fails configuration if these dependencies are missing. There is no ZMQ/DC remote-op fallback.
+The RHT and the peer index each run on one-sided RDMA (XRC or DC) or without it: the RHT on Redis
+(`RADIXSHMEM_RHT_BACKEND=redis`), the peer index on the peers' gRPC remote ops
+(`RADIXSHMEM_PEER_INDEX_BACKEND=grpc`). Both are the defaults, so by default the index opens no RDMA
+device on any node.
+
+C++ local-only builds (`-DENABLE_RDMA=OFF`) retain `RadixClient`, the standalone
+`radix_server`, and local tests; distributed client/server entry points are rejected.
+
 The optional data-plane backends are built separately; see [Transfer backends](#transfer-backends).
 
 ### Start the server
 
 Each node runs one `radix-server`, which manages `--data-bytes` of host memory; the slot size is configured
-by the client. In a distributed setup, `--index-dev` and `--transfer-dev` select the devices for the control
-plane and the data plane.
+by the client. In a distributed setup, `--transfer-dev` selects the devices of the data plane. The index uses
+no RDMA by default; an index plane switched to RDMA opens `RADIXSHMEM_INDEX_DEV` (first device if unset).
 
 Single node:
 
@@ -36,13 +48,20 @@ Single node:
 radix-server --name /my_kv_cache --data-bytes 1024G
 ```
 
-4 nodes, coordinated through etcd:
+4 nodes, coordinated through etcd. The RHT lives in a Redis Cluster by default (`RADIXSHMEM_REDIS_ADDRS`;
+[`docs/redis_deployment.md`](docs/redis_deployment.md) shows how to set one up);
+`RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. A query continues on a peer's tree
+with gRPC remote ops by default; `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` walks it with one-sided RDMA instead.
+These variables and the RDMA device of such planes (`RADIXSHMEM_INDEX_DEV`, `RADIXSHMEM_INDEX_GID_IDX`) are
+listed in [`docs/api.md`](docs/api.md). Peers reach a node on one TCP port, `--rpc-port` (default: picked by
+the OS and published in etcd).
 
 ```bash
 # Same command on every node except --rpc-address
+export RADIXSHMEM_REDIS_ADDRS=10.0.0.1:7001,10.0.0.2:7001
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -51,7 +70,7 @@ Enable the SWA pool:
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G --swa-ratio 0.2 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -60,13 +79,33 @@ Enable the Mamba pool:
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G --mamba-ratio 0.2 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+```
+
+Prefill/decode disaggregation: decode nodes run the same command with `--decode` and join the same cluster,
+so `--expected-min-nodes` counts both roles. A prefill node writes the KV its background eviction takes
+(`--background-evict-ratio`, default 0.05) back to a ready decode node instead of dropping it, and pauses
+eviction while unfinished write-backs hold `--writeback-max-held` of a pool (default 0.05); with no decode
+node ready it recycles the slots at once. Decode nodes write nothing back. 2 prefill + 2 decode nodes:
+
+```bash
+# Prefill nodes 10.0.0.10 and 10.0.0.11
+radix-server --name /my_kv_cache --data-bytes 1024G \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.10 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+
+# Decode nodes 10.0.0.20 and 10.0.0.21
+radix-server --name /my_kv_cache --data-bytes 1024G --decode \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.20 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
 ### Client API
 
-A client connects to the local server by name and provides `query`, `pull_async`, and `insert`.
+A client connects to the local server by name and provides `query`, `pull_async`, `push_async`, and `insert`.
 
 1. **Initialize.** Construct the client with the server name and a `Geometry` (tokens per block and bytes per
    slot), then wait until the server is ready.
@@ -101,7 +140,17 @@ for slot in r.full_slots:
 r.finalize()                           # release the pin on the hit blocks
 ```
 
-4. **Insert.** To add new KV cache, query the local hit, allocate slots for the remaining blocks, copy the KV
+4. **Push.** `push_async()` is the reverse: it writes local slots to a peer and publishes them in the peer's
+   radix tree. A prefill server pushes its background-evicted KV to the decode nodes with it.
+
+```python
+q = client.query(hashes, local_only=True, lock=True)
+full = np.concatenate([s for _, _, s in q.full_fragments])
+r = client.push_async(peer_rank, hashes[:q.common_hit], full).wait()   # the peer holds [0, r.common_hit)
+q.finalize()
+```
+
+5. **Insert.** To add new KV cache, query the local hit, allocate slots for the remaining blocks, copy the KV
    from GPU straight into the slots through their memoryviews (zero-copy D2H), then insert.
 
 ```python
@@ -133,7 +182,7 @@ required:
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --transfer-backend nixl --transfer-port 17000 \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
@@ -152,7 +201,7 @@ Start the server with `--transfer-backend mooncake`:
 radix-server --name /my_kv_cache --data-bytes 1024G \
     --transfer-backend mooncake \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 --index-dev mlx5_bond_0 \
+    --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 

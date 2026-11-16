@@ -1,0 +1,31 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+#pragma once
+
+#include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
+
+#ifndef RADIXSHMEM_NO_RDMA
+
+#include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
+
+#include <cstdint>
+#include <memory>
+#include <string>
+
+namespace radixshmem {
+
+struct PeerEntry;
+
+// Creates the gRPC transport behind the typed service interface; `xrc` serves
+// XrcConnect on a server with an RDMA side.
+std::unique_ptr<IRemoteOpServerTransport> make_remote_op_server(
+    uint16_t listen_port, uint64_t instance_id, XrcAcceptor xrc, RemoteOpAddr& addr);
+
+// timeout_ms bounds each op; 0 = RADIXSHMEM_REMOTE_OP_TIMEOUT_MS, else 5000.
+std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
+    const PeerEntry& peer, std::string& endpoint, int timeout_ms = 0);
+
+}  // namespace radixshmem
+
+#endif  // !RADIXSHMEM_NO_RDMA

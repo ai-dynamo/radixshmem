@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace radixshmem {
@@ -21,11 +22,36 @@ namespace radixshmem {
 struct MatchedNodeSpanView;
 class HealthAuditor;   // src/indexer/health_check.cpp (read-only audit)
 
-// Evicted node reported to the RHT-cleanup callback. first_hash = RHT key
-// (block-0 hash); tree_node_id = registered slot id.
-struct EvictedNode {
+// A node by its RHT key (block-0 hash), its id and its length.
+struct NodeHead {
     uint64_t first_hash;
     uint32_t tree_node_id;
+    uint32_t num_blocks;
+};
+
+// A background-evicted leaf with its root path [0, end): [evicted_from, end)
+// left the tree with its slots held, [0, evicted_from) stays pinned.
+struct HeldEviction {
+    std::vector<uint64_t> hashes;       // [0, end)
+    std::vector<int32_t>  full_slots;   // [0, end)
+    std::vector<int32_t>  swa_slots;    // [0, end), INVALID_COMPONENT_SLOT where none; empty without SWA
+    std::vector<uint32_t> mamba_ends;   // END positions of the path's checkpoints, ascending
+    std::vector<int32_t>  mamba_slots;  // parallel to mamba_ends
+    uint32_t evicted_from = 0;
+    uint64_t generation = 0;            // ShmHeader::reset_generation at eviction
+
+    uint32_t end() const { return (uint32_t)hashes.size(); }
+    void covered(uint64_t out[NUM_COMPONENT_TYPES]) const;
+};
+
+// What plan_dedup() moves, pinned until finish_dedup(); `moved` holds the source's slots.
+struct DedupPlan {
+    std::vector<MovedPath> moved;
+    uint64_t top_hash = 0;                  // first block of the topmost dropped node
+    uint64_t generation = 0;
+    std::unordered_set<uint64_t> blocks;    // every block below and in that node
+    std::unordered_set<uint64_t> swa;       // blocks whose SWA cell moves
+    std::unordered_set<int32_t> mamba;      // checkpoints that move
 };
 
 // Result of one merge_leaf_into_parent() call.
@@ -79,21 +105,50 @@ public:
 
     // Clear all tree data in place under the write lock (empty tree, single root,
     // slots free); layout/magic/locks untouched. Invalidates prior slot/node IDs.
-    void reset();
+    // With `left`, lists there the nodes it drops if a route was published since
+    // route_publishes() returned `since`.
+    void reset(std::vector<NodeHead>* left = nullptr, uint64_t since = 0);
+    // One reset at a time across processes (flock on the shm file).
+    void lock_reset();
+    void unlock_reset();
+    void note_route_publish();
+    uint64_t route_publishes() const;
 
     // Background eviction: non-blocking write_lock, evict up to target_blocks.
-    // Returns blocks freed (0 if lock was busy).
-    int try_evict_batch(int target_blocks);
+    // Returns blocks freed (0 if lock was busy). With `held`, each task is a chain:
+    // the leaf and every ancestor it leaves childless and unpinned.
+    // budget: per pool, nullptr = none; a batch stops at the task that uses one up.
+    int try_evict_batch(int target_blocks, std::vector<HeldEviction>* held = nullptr,
+                        const uint64_t* budget = nullptr);
+    void release_held(const std::vector<HeldEviction>& hs);
+    uint32_t held_slots(ComponentType component) const;
+    uint64_t reset_generation() const;
 
     int try_evict_component_batch(ComponentType component, int target_slots);
+
+    int dedup_prefix(const uint64_t* hashes, int n);
+
+    // Dedup that moves what would block it: the subtree below the match (<= tail_cap
+    // blocks), each fork's side subtrees (<= branch_cap blocks) and the cells of the
+    // dropped path, within budget[component] slots. False when nothing can be dropped.
+    bool plan_dedup(const uint64_t* hashes, int n, int tail_cap, int branch_cap,
+                    const uint32_t budget[NUM_COMPONENT_TYPES], DedupPlan& plan);
+    // Unpins the plan; with `commit`, drops its subtree unless it changed. Returns blocks
+    // freed, or -1 after a reset(): the plan's slots may hold other data by now.
+    int finish_dedup(DedupPlan& plan, bool commit);
+    // Publishes a moved path [0, n) and leaves what is already there untouched; new
+    // entries take now - age as their access time. Slots not taken go to `unused`.
+    InsertResult adopt(const uint64_t* hashes, int n, const MovedPath& p,
+                       std::vector<int32_t> unused[NUM_COMPONENT_TYPES]);
 
     std::vector<NodeBoundary> get_node_boundaries(const uint64_t* hashes, int n);
 
     // Component-aware peer of query(): mask selects enabled components, lock
     // pins whole-node ranges, and update_meta controls Full LRU metadata.
+    // A `window` limits the pin to the part another rank folds in.
     [[nodiscard]] TreeComponentQueryResult query_components(
         const uint64_t* hashes, int n, uint32_t mask, bool lock = false,
-        bool update_meta = true);
+        bool update_meta = true, const PinWindow* window = nullptr);
 
     // Positional SWA publish: the slots cover the trailing positions
     // [n - num_slots, n), 1 <= num_slots <= n. The window W only gates queries.
@@ -123,8 +178,9 @@ public:
 
     // Allocate slot IDs from the component's pool (FULL auto-evicts LRU and may
     // return fewer; SWA/Mamba are all-or-none — insufficient capacity returns 0).
+    // Without `may_evict`, takes up to num_slots of the free ones.
     int allocate_slots(int num_slots, std::vector<int32_t>& out,
-                       ComponentType component = ComponentType::FULL);
+                       ComponentType component = ComponentType::FULL, bool may_evict = true);
 
     // Return allocated slot IDs to the component's pool; safe on never-inserted slots.
     void recycle_slots(const int32_t* slots, int num,
@@ -137,11 +193,13 @@ public:
     EvictPolicy evict_policy() const { return evict_policy_; }
 
     // Optional eviction callback (RHT cleanup), fired AFTER the write lock drops.
-    using EvictCallback = std::function<void(const std::vector<EvictedNode>&)>;
+    using EvictCallback = std::function<void(const std::vector<NodeHead>&)>;
     void set_evict_callback(EvictCallback cb) { evict_cb_ = std::move(cb); }
     // True iff node_id is live again with this first hash: the evicted id was
     // recycled (LIFO pool) for the same prefix before its RHT removal ran.
     bool node_head_matches(uint32_t node_id, uint64_t first_hash);
+    // Every node holding blocks, i.e. what this tree has routes for in the RHT.
+    std::vector<NodeHead> node_heads();
 
     // Stats
     uint32_t total_radix_nodes() const;
@@ -182,8 +240,10 @@ public:
 
 private:
     friend class HealthAuditor;
+    friend class TreeDumper;
 
     RadixShmemTree() = default;
+    std::vector<NodeHead> collect_heads();
 
     void init_pools();
 
@@ -191,9 +251,12 @@ private:
     void alloc_root();
 
     // Core insert; ext_slots positionally bound from `start`, new nodes align to cs_.
+    // With `ts` (parallel to ext_slots) nothing on the path is touched and new nodes
+    // take those access times.
     InsertResult insert_impl(const uint64_t* hashes, int n,
                              const int32_t* ext_slots, int ext_num_slots,
-                             int start, bool auto_recycle);
+                             int start, bool auto_recycle,
+                             const uint64_t* ts = nullptr);
 
     void* base_ = nullptr;
     size_t size_ = 0;
@@ -222,7 +285,7 @@ private:
 
     // Eviction-cleanup plumbing (RHT); pending buffer is thread_local.
     EvictCallback evict_cb_;
-    static std::vector<EvictedNode>& evicted_pending();
+    static std::vector<NodeHead>& evicted_pending();
     void flush_evicted();
 
     // ---- Shared memory accessors ----
@@ -262,10 +325,21 @@ private:
     // ---- Eviction internals ----
     // Pin-eligibility: full/swa/mamba ref classes on the node are all zero.
     bool component_refs_zero(uint32_t node_id) const;
-    int  evict_node(uint32_t node_id, std::vector<int32_t>& out);
+    int  evict_node(uint32_t node_id, std::vector<int32_t>& out, bool hold = false);
+    int  detach_node(uint32_t node_id, std::vector<int32_t>& out, bool hold = false);
+    std::vector<uint32_t> dedup_chain(const uint64_t* hashes, int n);
+    struct MoveCost;
+    // Paths of the subtree from block `skip` of `top` down, hanging at request position
+    // `base`; stops once cost.blocks passes `cap`.
+    void scan_moved(uint32_t top, int skip, int base, int cap, uint64_t now,
+                    MoveCost& cost, std::vector<MovedPath>& out);
+    int  evict_held_chain(uint32_t leaf, std::vector<int32_t>& out, HeldEviction& h);
+    // Path [0, end of leaf) into h; the ancestors above `top` are pinned.
+    void hold_path(uint32_t leaf, uint32_t top, HeldEviction& h);
     // protect: node to pin for the walk (INVALID_NODE_ID = none).
     int  evict(int need, uint32_t protect = INVALID_NODE_ID);
-    int  evict_walk(int need);
+    int  evict_walk(int need, std::vector<HeldEviction>* held = nullptr,
+                    const uint64_t* budget = nullptr);
     void post_evict_fixup(uint32_t parent_id);
     void touch_node(uint32_t node_id);
 
@@ -286,11 +360,11 @@ private:
     // Counter primitive: bounded decrement (floors at 0); true if decremented.
     static bool dec_ref(std::atomic<int64_t>& ref) noexcept;
 
-    // Caller holds the read lock. Whole-node coverage: Full over [0, full_hit),
+    // Caller holds the read lock. Whole-node coverage: Full over [full_lo, full_hi),
     // SWA/Mamba at common_hit; `pin` is filled before the first increment.
     void inc_ref(const std::vector<MatchedNodeSpanView>& spans,
                  uint32_t mask, uint32_t common_hit, uint32_t swa_start,
-                 uint32_t full_hit, PinRecord& pin);
+                 uint32_t full_lo, uint32_t full_hi, PinRecord& pin);
 
     // Leaf-list move for a Full hit (node timestamps come from query_internal).
     void touch_full(const std::vector<MatchedNodeSpanView>& spans, uint32_t mask,

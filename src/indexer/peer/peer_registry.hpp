@@ -69,6 +69,14 @@ class PeerRegistry {
         if (rank >= 0 && rank < (int)peers_.size()) peers_[rank].rank = -1;
     }
 
+    // `rank`'s entry; false when the rank is out of range or down.
+    bool entry(int rank, PeerEntry& out) const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        if (rank < 0 || rank >= (int)peers_.size() || peers_[rank].rank != rank) return false;
+        out = peers_[rank];
+        return true;
+    }
+
     // Caller must hold at least a shared lock on mutex().
     const std::vector<PeerEntry>& peers_locked() const { return peers_; }
     int size_locked() const { return (int)peers_.size(); }

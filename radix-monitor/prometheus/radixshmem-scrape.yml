@@ -1,0 +1,10 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Add under scrape_configs: in prometheus.yml. Any server's /sd lists every
+# server of its cluster; list one or two per cluster.
+  - job_name: radixshmem
+    scrape_interval: 10s
+    http_sd_configs:
+      - {url: 'http://10.6.131.24:9810/sd', refresh_interval: 30s}
+      - {url: 'http://10.6.131.25:9810/sd', refresh_interval: 30s}

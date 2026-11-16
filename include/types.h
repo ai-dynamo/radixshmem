@@ -22,7 +22,7 @@ using HashType = uint64_t;
 static constexpr uint32_t INVALID_NODE_ID = UINT32_MAX;
 static constexpr uint64_t INVALID_OFFSET = UINT64_MAX;
 static constexpr uint64_t SHM_MAGIC = 0x534852444958ULL;
-static constexpr uint32_t SHM_VERSION = 26;   // 26: peer fault counters
+static constexpr uint32_t SHM_VERSION = 29;
 // cluster_ready_magic sentinel — same-host clients spin on it as a local ready flag.
 static constexpr uint64_t CLUSTER_MANIFEST_MAGIC = 0x434c5354524d4644ULL; // "CLSTRMFD"
 static constexpr size_t HUGEPAGE_SIZE = 2ULL * 1024 * 1024;
@@ -58,10 +58,12 @@ struct ComponentConfig {
 static_assert(sizeof(ComponentConfig) == 24, "ComponentConfig must be 24 bytes");
 
 struct alignas(64) NodeComponentState {
-    std::atomic<int64_t>  swa_ref_count;
-    std::atomic<int64_t>  mamba_ref_count;
+    std::atomic<int64_t>  remote_swa_ref_count;
+    std::atomic<int64_t>  remote_mamba_ref_count;
     uint32_t swa_live_blocks;
-    uint8_t  reserved[44];
+    std::atomic<int64_t>  local_swa_ref_count;
+    std::atomic<int64_t>  local_mamba_ref_count;
+    uint8_t  reserved[24];
 };
 
 static constexpr uint32_t INVALID_SLOT_LINK = UINT32_MAX;
@@ -94,6 +96,9 @@ enum class RemoteStatus : uint16_t {
     BAD_REPLY     = 5,  // reply received but magic/version/req_id check failed
     BAD_TARGET    = 6,  // remote_* target out of range / == own rank (client synthesized)
     INTERNAL      = 7,
+    UNAVAILABLE   = 8,  // target unreachable or not serving (may still have executed the op)
+    RESOURCE_EXHAUSTED = 9,  // target refused the op: concurrent admission limit reached
+    STALE_TARGET  = 10,
 };
 
 struct QueryResult {
@@ -197,7 +202,7 @@ struct ShmHeader {
     uint32_t leaf_list_head;
     uint32_t leaf_list_tail;
 
-    std::atomic<uint64_t> access_counter;
+    std::atomic<uint64_t> route_publishes;
 
     uint64_t node_pool_offset;
 
@@ -254,6 +259,11 @@ struct ShmHeader {
     AuxListAnchors swa_list;               // slot ids
     AuxListAnchors mamba_list;
 
+    // Slots held for write-back; reset() zeroes them and bumps reset_generation.
+    std::atomic<uint32_t> held_slots[NUM_COMPONENT_TYPES];
+    uint32_t _held_pad;
+    std::atomic<uint64_t> reset_generation;
+
     alignas(64) std::atomic<int64_t> rdma_write_flag{0};
     char _rwf_pad[56];
     alignas(64) std::atomic<int64_t> rdma_reader_count{0};
@@ -286,13 +296,13 @@ struct alignas(64) TreeNode {
     uint64_t data_offset;                   // into DataPool data blocks
     std::atomic<uint64_t> last_access_time;
 
-    std::atomic<int64_t> ref_count;         // 8B aligned for RDMA Fetch-and-Add
+    std::atomic<int64_t> remote_ref_count;  // 8B aligned for RDMA Fetch-and-Add
 
     uint32_t next_free;
     uint32_t leaf_prev;
     uint32_t leaf_next;
     uint32_t first_child_entry;   // head of per-parent sibling chain in HT entry pool
-    uint64_t _pad_version;
+    std::atomic<int64_t> local_ref_count;
 };
 static_assert(sizeof(TreeNode) == 64, "TreeNode must be 64 bytes");
 
@@ -300,7 +310,7 @@ static_assert(sizeof(TreeNode) == 64, "TreeNode must be 64 bytes");
 
 struct ChainHTEntry {
     uint64_t token_hash;
-    uint32_t parent_id;
+    uint32_t sibling_prev;
     uint32_t child_node_id;
     uint32_t hash_next;       // next in hash bucket chain (or free list next when free)
     uint32_t sibling_next;    // next child of same parent
@@ -374,8 +384,63 @@ struct QueryInternalDetail {
     int last_node_matched_blocks = 0;
 };
 
+struct AllocateReply {
+    RemoteStatus status = RemoteStatus::OK;
+    InsertError  error  = InsertError::OK;   // MEMPOOL_FULL when status is OK but nothing was allocated
+    std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
+};
+
+struct ComponentCount {
+    ComponentType component = ComponentType::FULL;
+    int n = 0;
+};
+
+struct AllocateComponentsReply {
+    RemoteStatus status = RemoteStatus::OK;
+    InsertError  error  = InsertError::OK;
+    std::vector<std::vector<int32_t>> slots;
+};
+
+// An SWA cell at block `pos`, or a Mamba checkpoint at the END pos + 1.
+struct MovedCell {
+    ComponentType component = ComponentType::SWA;
+    int32_t pos = 0;
+    int32_t slot = INVALID_COMPONENT_SLOT;
+    uint64_t age_ns = 0;
+};
+
+// A path a dedup source hands to the puller: the request's [0, base) plus `hashes`;
+// FULL slots cover [full_from, base + hashes.size()).
+struct MovedPath {
+    int32_t base = 0;
+    std::vector<uint64_t> hashes;
+    int32_t full_from = 0;
+    std::vector<int32_t> full;
+    std::vector<uint64_t> full_age_ns;
+    std::vector<MovedCell> cells;
+};
+
+// Without landing slots the source only drops; with them it also moves what blocks
+// the drop into those slots of the puller's pools.
+struct DedupRequest {
+    int32_t rank = -1;
+    int32_t tail_cap = 0;
+    int32_t branch_cap = 0;
+    std::vector<int32_t> landing[NUM_COMPONENT_TYPES];
+};
+
+struct DedupReply {
+    RemoteStatus status = RemoteStatus::OK;
+    int freed = 0;
+    std::vector<MovedPath> moved;                       // slots are landing slots
+    // Landing slots nothing was written to; the others not in `moved` may still be.
+    std::vector<int32_t> unused[NUM_COMPONENT_TYPES];
+};
+
 struct InsertResult {
     InsertError error = InsertError::OK;
+    // remote_insert only: the comms status behind error == REMOTE_FAILED.
+    RemoteStatus remote_status = RemoteStatus::OK;
     // Slots not consumed (leading redundant prefix + unlanded suffix, merged).
     // Always populated; auto-recycled inside insert when auto_recycle=true.
     std::vector<int32_t> unused_slots;
@@ -387,6 +452,18 @@ struct InsertResult {
     uint32_t split_node_id = INVALID_NODE_ID;
     uint32_t split_num_blocks = 0;
     uint64_t split_first_hash = 0;
+};
+
+struct ComponentRun {
+    ComponentType component = ComponentType::SWA;
+    int end = 0;
+    std::vector<int32_t> slots;
+};
+
+struct InsertPathResult {
+    RemoteStatus remote_status = RemoteStatus::OK;
+    InsertResult full;
+    std::vector<InsertResult> runs;
 };
 
 struct NodeBoundary {

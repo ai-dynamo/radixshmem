@@ -7,7 +7,8 @@
 Methods: Describe() -> NodeInfo; WaitReady({"timeout_ms"}) -> NodeInfo;
 Configure({"geometry"}) -> NodeInfo; Submit({"items", "timeout_ms"}) ->
 {"ticket"}; WaitAny({"tickets", "timeout_ms"}) -> {"done": {ticket: [[ok,
-bytes, descriptors, error], ...]}, "unknown": [ticket, ...]}; Stats() -> dict.
+bytes, descriptors, error], ...]}, "unknown": [ticket, ...]}; Stats() -> dict;
+Nodes() -> {"nodes": [node record, ...]}.
 The slot geometry is what a client configured (or a peer published);
 Describe publishes it and clients adopt it.
 """
@@ -22,7 +23,10 @@ from typing import Any, Callable, Dict, Optional
 import grpc
 
 SERVICE = "radixshmem.RadixNode"
-_OPTIONS = [("grpc.max_receive_message_length", -1), ("grpc.max_send_message_length", -1)]
+_OPTIONS = [("grpc.max_receive_message_length", -1), ("grpc.max_send_message_length", -1),
+            ("grpc.enable_http_proxy", 0)]
+# WaitReady and WaitAny hold a thread until they return, one per client with jobs in flight.
+MAX_GRPC_THREADS = 128
 
 
 class DataPlaneUnavailable(RuntimeError):
@@ -90,7 +94,7 @@ def _raise(e: grpc.RpcError) -> Exception:
     return RuntimeError(f"{code.name}: {msg}")
 
 
-def serve(handlers: Dict[str, Callable[[Any], Any]], endpoint: str, workers: int) -> grpc.Server:
+def serve(handlers: Dict[str, Callable[[Any], Any]], endpoint: str) -> grpc.Server:
     """``handlers[method](request)`` returns a JSON-able reply or raises."""
     def wrap(fn):
         def behavior(req, ctx):
@@ -106,7 +110,7 @@ def serve(handlers: Dict[str, Callable[[Any], Any]], endpoint: str, workers: int
             os.unlink(endpoint[len("unix://"):])
         except OSError:
             pass
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=workers), options=_OPTIONS)
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=MAX_GRPC_THREADS), options=_OPTIONS)
     server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(
         SERVICE, {m: wrap(fn) for m, fn in handlers.items()}),))
     if server.add_insecure_port(endpoint) == 0:

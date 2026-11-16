@@ -1,37 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Server half of the remote-op plane: RadixServer::rc_* endpoint + op handlers,
-// the pollers that serve a peer's insert/query/release against our local tree.
-// Client half (RemotePeer) lives in peer/remote_op.cpp.
+// Local-tree remote ops and endpoint lifecycle; transport creation stays in the factory.
 #include "radix_server.h"
 
 #ifndef RADIXSHMEM_NO_RDMA
 
+#include "remote_op_service.hpp"
 #include "local.h"                 // LocalTreeConnector (svc_tree_)
 #include "radix_client.h"          // RadixClient (svc_client_)
-#include "cluster_protocol.h"      // remote-op wire structs
+#include "cluster_protocol.h"      // MAX_REMOTE_OP_BLOCKS
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "cluster_manifest.h"      // REMOTE_OP_TRANSPORT_*
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-#include "dc_bilateral.hpp"                 // DcServerTransport
-#endif
-#ifdef RADIXSHMEM_HAS_ZMQ
-#include "zmq_transport.hpp"                // ZmqServerTransport (fallback)
-#endif
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -39,308 +28,251 @@ namespace radixshmem {
 
 namespace {
 
-int rc_resolve_lanes() {
-    int lanes = 1;
-    if (const char* e = ::getenv("RADIXSHMEM_RC_LANES")) {
-        int v = std::atoi(e);
-        if (v >= 1 && v <= 8) lanes = v;
-    }
-    return lanes;
+bool valid_count(int n) { return n >= 0 && n <= MAX_REMOTE_OP_BLOCKS; }
+
+bool valid_component(ComponentType c) { return (int)c < NUM_COMPONENT_TYPES; }
+
+// [start, start + length) inside [0, n).
+bool valid_range(int start, int length, int n) {
+    return start >= 0 && length >= 0 && start <= n - length;
 }
 
-// Header-only reply carrying a request-level status (BAD_REQUEST etc.).
-std::vector<char> make_status_reply(const RemoteOpReqHeader& req, RemoteStatus st) {
-    std::vector<char> buf(sizeof(RemoteOpReplyHeader));
-    auto* r = reinterpret_cast<RemoteOpReplyHeader*>(buf.data());
-    *r = {};
-    r->magic   = REMOTE_OP_REPLY_MAGIC;
-    r->version = REMOTE_OP_PROTOCOL_VERSION;
-    r->op      = req.op;
-    r->status  = static_cast<uint16_t>(st);
-    r->req_id  = req.req_id;
-    return buf;
+constexpr int64_t DEDUP_WRITE_TIMEOUT_MS = 3000;
+constexpr int64_t DEDUP_WRITE_MARGIN_MS = 1500;
+constexpr int64_t DEDUP_REPLY_MARGIN_MS = 200;
+
+bool expired(RemoteOpService::Deadline deadline) {
+    return std::chrono::system_clock::now() + std::chrono::milliseconds(10) >= deadline;
 }
 
 }  // namespace
 
-RemoteOpAddr RadixServer::rc_build_endpoint(uint32_t rot_auth,
-                                            uint64_t dc_access_key,
-                                            RdmaContext& ctx) {
-    // Body of the build_remote_op callback.
-    RemoteOpAddr addr{};
-    if (rot_auth == REMOTE_OP_TRANSPORT_DC) {
-#ifdef RADIXSHMEM_REMOTE_OP_RDMA
-        int k_pool = 64;
-        if (const char* e = ::getenv("RADIXSHMEM_RC_KPOOL")) {
-            int v = std::atoi(e);
-            if (v >= 1 && v <= 4096) k_pool = v;
-        }
-        auto t = std::make_unique<DcServerTransport>(
-            ctx, dc_access_key, std::min(rc_resolve_lanes(), 4), k_pool);
-        for (int i = 0; i < t->lanes() && i < 4; ++i)
-            addr.dctns[i] = t->dct_num(i);
-        rc_server_ = std::move(t);
-        return addr;   // addr.port stays 0 — DC has no TCP endpoint
-#else
-        throw std::runtime_error(
-            "remote-op: cluster authoritative transport is dc but this build "
-            "has no RDMA control-plane backend");
-#endif
-    }
-    if (rot_auth != REMOTE_OP_TRANSPORT_ZMQ) {
-        throw std::runtime_error(
-            "remote-op: cluster authoritative transport enum " +
-            std::to_string(rot_auth) + " is not served by this build "
-            "(removed xrc/rdma backend?) — redeploy rank 0 with "
-            "remote_op_transport = dc or zmq");
-    }
-#ifdef RADIXSHMEM_HAS_ZMQ
-    auto z = std::make_unique<ZmqServerTransport>(cfg_.zmq_listen_port);
-    addr.port = z->bind();   // actual bound port (throws on failure)
-    rc_server_ = std::move(z);
-    return addr;
-#else
-    throw std::runtime_error(
-        "remote-op: cluster authoritative transport is zmq but ZMQ is not "
-        "compiled into this build");
-#endif
+// ==================== RemoteOpService ====================
+
+RemoteOpService::RemoteOpService(LocalTreeConnector& tree, RadixClient& client,
+                                 std::mutex& insert_mu)
+    : tree_(tree), client_(client), insert_mu_(insert_mu) {
+    const char* e = ::getenv("RADIXSHMEM_DISABLE_AUTO_DEDUP");
+    dedup_off_ = e != nullptr && std::string(e) == "1";
 }
+
+AllocateReply RemoteOpService::allocate(int n, Deadline deadline,
+                                        ComponentType component) {
+    // Allocate without hashes or dedup; insert consumes only the unmatched tail.
+    AllocateReply out;
+    if (!valid_count(n) || !valid_component(component)) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    if (n == 0) return out;
+    std::lock_guard<std::mutex> g(insert_mu_);
+    if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
+    int got = tree_.allocate_slots(n, out.slots, component);
+    if (got < n) {
+        tree_.recycle_slots(out.slots.data(), got, component);
+        out.slots.clear();
+        out.error = InsertError::MEMPOOL_FULL;
+    }
+    return out;
+}
+
+AllocateComponentsReply RemoteOpService::allocate_components(
+        const std::vector<ComponentCount>& components, Deadline deadline) {
+    AllocateComponentsReply out;
+    bool seen[NUM_COMPONENT_TYPES] = {};
+    int64_t total = 0;
+    for (const ComponentCount& c : components) {
+        if (!valid_component(c.component) || seen[(int)c.component] || !valid_count(c.n)) {
+            out.status = RemoteStatus::BAD_REQUEST;
+            return out;
+        }
+        seen[(int)c.component] = true;
+        total += c.n;
+    }
+    if (total > MAX_REMOTE_OP_BLOCKS) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    if (components.empty()) return out;
+    std::lock_guard<std::mutex> g(insert_mu_);
+    if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
+    out.slots.resize(components.size());
+    for (size_t i = 0; i < components.size(); i++) {
+        const ComponentCount& c = components[i];
+        if (c.n == 0 || tree_.allocate_slots(c.n, out.slots[i], c.component) == c.n) continue;
+        for (size_t j = 0; j <= i; j++)
+            tree_.recycle_slots(out.slots[j].data(), (int)out.slots[j].size(),
+                                components[j].component);
+        out.slots.clear();
+        out.error = InsertError::MEMPOOL_FULL;
+        return out;
+    }
+    return out;
+}
+
+QueryReply RemoteOpService::query(const uint64_t* hashes, int n, const RemoteQuery& q,
+                                  Deadline deadline) {
+    QueryReply out;
+    if (!valid_count(n) || (n > 0 && !hashes)) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
+    TreeComponentQueryResult r = tree_.tree().query_components(
+        hashes, n, q.mask, q.lock, q.update_meta, &q.window);
+    if (r.status != RemoteStatus::OK) { out.status = r.status; return out; }
+    const uint32_t hit = r.common_hit;
+    out.hit_length = (int)hit;
+    if (!r.full_slots.empty())
+        out.slots.assign(r.full_slots.begin() + std::min(q.window.full_from, hit),
+                         r.full_slots.begin() + hit);
+    out.swa_start  = r.swa_start;
+    out.swa_slots  = std::move(r.swa_slots);
+    out.mamba_slot = r.mamba_checkpoint_slot;
+    out.pin        = std::move(r.pin);
+    return out;
+}
+
+InsertResult RemoteOpService::insert(const uint64_t* hashes, int n, int start,
+                                     int length, const int32_t* slots,
+                                     bool auto_recycle, ComponentType component) {
+    InsertResult out;
+    if (!valid_count(n) || !valid_range(start, length, n) || !valid_component(component) ||
+        (n > 0 && !hashes) || (length > 0 && !slots)) {
+        out.error = InsertError::REMOTE_FAILED;
+        out.remote_status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    if (length == 0) return out;
+    std::lock_guard<std::mutex> g(insert_mu_);
+    // auto_recycle: the target recycles the surplus; else the initiator does.
+    return client_.insert(hashes, n, slots, length, start, auto_recycle, component);
+}
+
+InsertPathResult RemoteOpService::insert_path(const uint64_t* hashes, int n, int start,
+                                              int length, const int32_t* full_slots,
+                                              const std::vector<ComponentRun>& runs,
+                                              bool auto_recycle) {
+    InsertPathResult out;
+    out.runs.resize(runs.size());
+    bool sane = valid_count(n) && valid_range(start, length, n) && (n == 0 || hashes) &&
+                (length == 0 || full_slots) && runs.size() <= (size_t)MAX_REMOTE_OP_BLOCKS;
+    for (const ComponentRun& r : runs)
+        sane = sane && (r.component == ComponentType::SWA || r.component == ComponentType::MAMBA) &&
+               r.end > 0 && r.end <= n && !r.slots.empty() && (int)r.slots.size() <= r.end &&
+               (r.component == ComponentType::SWA || r.slots.size() == 1);
+    if (!sane) {
+        out.remote_status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    std::lock_guard<std::mutex> g(insert_mu_);
+    if (length > 0)
+        out.full = client_.insert(hashes, n, full_slots, length, start, auto_recycle,
+                                  ComponentType::FULL);
+    for (size_t i = 0; i < runs.size(); i++)
+        out.runs[i] = client_.insert(hashes, runs[i].end, runs[i].slots.data(),
+                                     (int)runs[i].slots.size(), 0, auto_recycle,
+                                     runs[i].component);
+    return out;
+}
+
+RemoteStatus RemoteOpService::recycle(const int32_t* slots, int num_slots,
+                                      ComponentType component) {
+    if (!valid_count(num_slots) || (num_slots > 0 && !slots) || !valid_component(component))
+        return RemoteStatus::BAD_REQUEST;
+    if (num_slots > 0) tree_.recycle_slots(slots, num_slots, component);
+    return RemoteStatus::OK;
+}
+
+RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, PinRecord&& pin) {
+    if (!valid_count(n) || (n > 0 && !hashes) || !valid_count((int)pin.tail.size()) ||
+        pin.full.start > pin.full.end || pin.swa.start > pin.swa.end)
+        return RemoteStatus::BAD_REQUEST;
+    if (pin.empty()) return RemoteStatus::OK;
+    return tree_.tree().dec_ref(hashes, n, std::move(pin)) ? RemoteStatus::OK
+                                                           : RemoteStatus::BAD_REQUEST;
+}
+
+DedupReply RemoteOpService::dedup_prefix(const uint64_t* hashes, int n,
+                                         const DedupRequest& req, Deadline deadline) {
+    DedupReply out;
+    size_t landing = 0;
+    for (const std::vector<int32_t>& l : req.landing) landing += l.size();
+    if (!valid_count(n) || (n > 0 && !hashes) || landing > (size_t)MAX_REMOTE_OP_BLOCKS) {
+        out.status = RemoteStatus::BAD_REQUEST;
+        return out;
+    }
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) out.unused[k] = req.landing[k];
+    if (dedup_off_ || n == 0) return out;
+    if (landing == 0 || writer_ == nullptr || !writer_->active() || req.rank < 0) {
+        std::lock_guard<std::mutex> g(insert_mu_);
+        out.freed = tree_.tree().dedup_prefix(hashes, n);
+        return out;
+    }
+    uint32_t budget[NUM_COMPONENT_TYPES];
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) budget[k] = (uint32_t)req.landing[k].size();
+    DedupPlan plan;
+    {
+        std::lock_guard<std::mutex> g(insert_mu_);
+        if (!tree_.tree().plan_dedup(hashes, n, req.tail_cap, req.branch_cap, budget, plan))
+            return out;
+    }
+    std::vector<int32_t> local[NUM_COMPONENT_TYPES], remote[NUM_COMPONENT_TYPES];
+    auto land = [&](int k, int32_t& slot) {
+        local[k].push_back(slot);
+        slot = req.landing[k][remote[k].size()];
+        remote[k].push_back(slot);
+    };
+    for (MovedPath& p : plan.moved) {
+        for (int32_t& s : p.full) land((int)ComponentType::FULL, s);
+        for (MovedCell& c : p.cells) land((int)c.component, c.slot);
+    }
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+        out.unused[k].assign(req.landing[k].begin() + remote[k].size(), req.landing[k].end());
+    DedupWriter::Result r = DedupWriter::OK;
+    if (!plan.moved.empty()) {
+        // The writer may wait past its timeout; the caller's deadline must still hold.
+        int64_t ms = DEDUP_WRITE_TIMEOUT_MS;
+        if (deadline != Deadline::max())
+            ms = std::min<int64_t>(ms, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           deadline - std::chrono::system_clock::now()).count() -
+                                           DEDUP_WRITE_MARGIN_MS);
+        r = ms > 0 ? writer_->write(req.rank, local, remote, (int)ms) : DedupWriter::FAILED;
+    }
+    std::lock_guard<std::mutex> g(insert_mu_);
+    // A caller that gives up adopts nothing: past its deadline the copy stays here.
+    const bool in_time = deadline == Deadline::max() ||
+                         std::chrono::system_clock::now() +
+                                 std::chrono::milliseconds(DEDUP_REPLY_MARGIN_MS) < deadline;
+    const int freed = tree_.tree().finish_dedup(plan, r == DedupWriter::OK && in_time);
+    out.freed = std::max(freed, 0);
+    if (r == DedupWriter::OK && freed >= 0)
+        out.moved = std::move(plan.moved);
+    else if (r != DedupWriter::LATE)
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            out.unused[k].insert(out.unused[k].end(), remote[k].begin(), remote[k].end());
+    return out;
+}
+
+// ==================== RadixServer remote-op endpoint ====================
 
 void RadixServer::rc_spawn() {
     if (!rc_server_) return;
     if (!svc_client_ || !svc_tree_) {
         throw std::runtime_error(
-            "rc_spawn: enable_remote_insert/_query set but svc_* not built "
+            "rc_spawn: remote-op server is up but svc_* not built "
             "(need world_size>1 + successful svc RadixClient bootstrap)");
     }
-    int lanes = rc_resolve_lanes();
-    if (lanes > rc_server_->lanes()) {
-        fprintf(stderr, "[RadixServer] rc_lanes=%d exceeds backend lanes()=%d "
-                "— capping\n", lanes, rc_server_->lanes());
-        lanes = rc_server_->lanes();
-    }
-    // Every poller dispatches inline
-    rc_running_.store(true);
-    rc_threads_.reserve(lanes);
-    for (int i = 0; i < lanes; ++i)
-        rc_threads_.emplace_back(&RadixServer::rc_loop, this, i);   // pollers
+    rc_service_ = std::make_unique<RemoteOpService>(*svc_tree_, *svc_client_,
+                                                    svc_client_mu_);
+    rc_service_->set_dedup_writer(dedup_writes_.get());
+    rc_server_->start(*rc_service_);
 }
 
 void RadixServer::rc_stop() {
-    if (rc_running_.exchange(false)) {
-        // The pollers exit on rc_running_ == false; nothing else to wake.
-        for (auto& t : rc_threads_)
-            if (t.joinable()) t.join();
-        rc_threads_.clear();
-    }
+    if (rc_server_) rc_server_->stop();
     rc_server_.reset();
-}
-
-std::vector<char> RadixServer::handle_insert(const RemoteOpReqHeader& req,
-                                             const uint64_t* /*hashes*/) {
-    // ALLOCATE: pure slot alloc of req.n (no hashes, no dedup). Dedup happens
-    // in the phase-2 INSERT (local insert consumes only the unmatched tail).
-    std::vector<int32_t> slots;
-    uint16_t error = static_cast<uint16_t>(InsertError::OK);
-    if (req.n > 0) {
-        std::lock_guard<std::mutex> g(svc_client_mu_);
-        int got = svc_tree_->allocate_slots(req.n, slots);
-        if (got < req.n) {
-            svc_tree_->recycle_slots(slots.data(), got);
-            slots.clear();
-            error = static_cast<uint16_t>(InsertError::MEMPOOL_FULL);
-        }
-    }
-    int matched = 0;   // no server-side dedup
-    int num_slots = (int)slots.size();
-    std::vector<char> buf(sizeof(RemoteOpReplyHeader) +
-                          (size_t)num_slots * sizeof(int32_t));
-    auto* rep = reinterpret_cast<RemoteOpReplyHeader*>(buf.data());
-    *rep = {};
-    rep->magic   = REMOTE_OP_REPLY_MAGIC;
-    rep->version = REMOTE_OP_PROTOCOL_VERSION;
-    rep->op      = REMOTE_OP_INSERT_RESERVE;
-    rep->status  = static_cast<uint16_t>(RemoteStatus::OK);
-    rep->error   = error;
-    rep->req_id  = req.req_id;
-    rep->u.reserve.matched_prefix = matched;
-    rep->u.reserve.inserted_count = num_slots;
-    rep->u.reserve.num_slots      = num_slots;
-    if (num_slots > 0)
-        std::memcpy(rep + 1, slots.data(), (size_t)num_slots * sizeof(int32_t));
-    return buf;
-}
-
-std::vector<char> RadixServer::handle_finalize_like(const RemoteOpReqHeader& req,
-                                                    const uint64_t* hashes) {
-    const auto& f = req.u.insert;
-    const int32_t* slots = reinterpret_cast<const int32_t*>(hashes + req.n);
-    uint16_t error = 0;
-    std::vector<int32_t> unused;   // INSERT: slots this publish did not consume
-    if (f.length > 0) {
-        if (req.op == REMOTE_OP_INSERT) {
-            std::lock_guard<std::mutex> g(svc_client_mu_);
-            // Recycle by flag: unset → server recycles; set → initiator recycles.
-            bool ar = !(req.flags & REMOTE_OP_FLAG_NO_AUTO_RECYCLE);
-            InsertResult r = svc_client_->insert(hashes, req.n, slots, f.length,
-                                                 f.start, /*auto_recycle=*/ar);
-            error  = static_cast<uint16_t>(r.error);
-            unused = std::move(r.unused_slots);
-        } else if (req.op == REMOTE_OP_INSERT_RELEASE) {
-            svc_tree_->recycle_slots(slots, f.length);
-        } else {   // REMOTE_OP_QUERY_RELEASE
-            // Drop the pin a query(lock=true) placed: rebuild the fully-inside
-            // record from the wire range and release through the component pair.
-            PinRecord pin;
-            pin.full = {(uint32_t)f.start, (uint32_t)(f.start + f.length)};
-            (void)svc_tree_->tree().dec_ref(hashes, req.n, std::move(pin));
-        }
-    }
-    int num_unused = (int)unused.size();   // 0 for *_RELEASE
-    std::vector<char> buf(sizeof(RemoteOpReplyHeader) +
-                          (size_t)num_unused * sizeof(int32_t));
-    auto* rep = reinterpret_cast<RemoteOpReplyHeader*>(buf.data());
-    *rep = {};
-    rep->magic   = REMOTE_OP_REPLY_MAGIC;
-    rep->version = REMOTE_OP_PROTOCOL_VERSION;
-    rep->op      = req.op;   // echo (INSERT or *_RELEASE), not hardcoded
-    rep->status  = static_cast<uint16_t>(RemoteStatus::OK);
-    rep->error   = error;
-    rep->req_id  = req.req_id;
-    rep->u.insert.num_unused = num_unused;
-    if (num_unused > 0)
-        std::memcpy(rep + 1, unused.data(),
-                    (size_t)num_unused * sizeof(int32_t));
-    return buf;
-}
-
-std::vector<char> RadixServer::handle_query(const RemoteOpReqHeader& req,
-                                            const uint64_t* hashes) {
-    const auto& q = req.u.query;   // only legal after op == REMOTE_OP_QUERY
-    TreeComponentQueryResult r = svc_tree_->tree().query_components(
-        hashes, req.n, COMPONENT_MASK_FULL,
-        /*lock=*/q.lock != 0,
-        /*update_meta=*/q.update_meta != 0);
-    int num_slots = (int)r.full_slots.size();
-    std::vector<char> buf(sizeof(RemoteOpReplyHeader) +
-                          (size_t)num_slots * sizeof(int32_t));
-    auto* rep = reinterpret_cast<RemoteOpReplyHeader*>(buf.data());
-    *rep = {};
-    rep->magic   = REMOTE_OP_REPLY_MAGIC;
-    rep->version = REMOTE_OP_PROTOCOL_VERSION;
-    rep->op      = REMOTE_OP_QUERY;
-    rep->status  = static_cast<uint16_t>(RemoteStatus::OK);
-    rep->error   = 0;          // query never yields InsertError
-    rep->req_id  = req.req_id;
-    rep->u.query.hit_length = (int)r.common_hit;
-    rep->u.query.num_slots  = num_slots;   // == hit_length
-    if (num_slots > 0)
-        std::memcpy(rep + 1, r.full_slots.data(),
-                    (size_t)num_slots * sizeof(int32_t));
-    return buf;
-}
-
-// Poller for one lane — the SOLE thread that polls that lane of rc_server_.
-void RadixServer::rc_loop(int lane) {
-    std::vector<char> rbuf(REMOTE_OP_MAX_REQ_BYTES);
-
-    int idle = 0;                 // consecutive no-progress iterations
-    constexpr int kSpinBudget = 2048;  // spin ~this many idle iters before sleeping
-
-    while (rc_running_.load(std::memory_order_relaxed)) {
-        bool progress = false;
-        try {
-            ReplyContext ctx;
-            int got = rc_server_->recv_request(rbuf, ctx, /*non-blocking*/0, lane);
-            if (got >= 0) {
-                progress = true;
-                if (got < (int)sizeof(RemoteOpReqHeader)) {
-                    RemoteOpReqHeader dummy{};
-                    auto reply = make_status_reply(dummy, RemoteStatus::BAD_REQUEST);
-                    rc_server_->send_reply(ctx, reply.data(), reply.size());
-                } else {
-                    auto* h = reinterpret_cast<RemoteOpReqHeader*>(rbuf.data());
-                    bool ok = h->magic == REMOTE_OP_REQ_MAGIC &&
-                              h->version == REMOTE_OP_PROTOCOL_VERSION &&
-                              h->n >= 0 && h->n <= MAX_REMOTE_OP_BLOCKS;
-                    if (ok) {
-                        // RESERVE carries no hashes (h->n is the alloc count);
-                        // every other op is preceded by n hashes.
-                        size_t want = sizeof(RemoteOpReqHeader) +
-                            (h->op == REMOTE_OP_INSERT_RESERVE
-                                 ? 0
-                                 : (size_t)h->n * sizeof(uint64_t));
-                        // INSERT / INSERT_RELEASE carry the phase-1 slots
-                        // behind the hashes (u.insert.length int32s).
-                        if (h->op == REMOTE_OP_INSERT ||
-                            h->op == REMOTE_OP_INSERT_RELEASE) {
-                            int ns = h->u.insert.length;
-                            ok = ns >= 0 &&
-                                 (h->op == REMOTE_OP_INSERT
-                                      ? ns <= h->n
-                                      : ns <= MAX_REMOTE_OP_BLOCKS);
-                            want += (size_t)(ns > 0 ? ns : 0) * sizeof(int32_t);
-                        }
-                        ok = ok && got == (int)want;
-                    }
-                    if (!ok) {
-                        auto reply = make_status_reply(*h, RemoteStatus::BAD_REQUEST);
-                        rc_server_->send_reply(ctx, reply.data(), reply.size());
-                    } else {
-                        // Dispatch + reply in place. hashes point into rbuf —
-                        // valid for the duration of the handler, no copy needed.
-                        const uint64_t* hashes =
-                            reinterpret_cast<const uint64_t*>(h + 1);
-                        std::vector<char> reply;
-                        try {
-                            switch (h->op) {
-                                case REMOTE_OP_INSERT_RESERVE:
-                                    reply = handle_insert(*h, hashes); break;
-                                case REMOTE_OP_QUERY:
-                                    reply = handle_query(*h, hashes); break;
-                                case REMOTE_OP_INSERT:
-                                case REMOTE_OP_QUERY_RELEASE:
-                                case REMOTE_OP_INSERT_RELEASE:
-                                    reply = handle_finalize_like(*h, hashes);
-                                    break;
-                                default:
-                                    reply = make_status_reply(
-                                        *h, RemoteStatus::UNKNOWN_OP);
-                            }
-                        } catch (const std::exception& e) {
-                            static std::atomic<uint64_t> thrown{0};
-                            uint64_t k = thrown.fetch_add(1,
-                                             std::memory_order_relaxed);
-                            if (k < 8 || (k & 1023) == 0)
-                                fprintf(stderr, "[RadixServer] rc handler threw "
-                                        "(op=%u req_id=%llu n=%d, occ %llu): %s\n",
-                                        (unsigned)h->op,
-                                        (unsigned long long)h->req_id, h->n,
-                                        (unsigned long long)(k + 1), e.what());
-                            reply = make_status_reply(*h, RemoteStatus::INTERNAL);
-                        }
-                        rc_server_->send_reply(ctx, reply.data(), reply.size());
-                    }
-                }
-            }
-        } catch (const std::exception& e) {
-            static std::atomic<uint64_t> thrown{0};
-            uint64_t k = thrown.fetch_add(1, std::memory_order_relaxed);
-            if (k < 8 || (k & 1023) == 0)
-                fprintf(stderr, "[RadixServer] rc_loop lane %d transport error "
-                        "(occurrence %llu): %s\n", lane,
-                        (unsigned long long)(k + 1), e.what());
-            // Do not hot-spin a persistently failing transport.
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        if (progress) {
-            idle = 0;
-        } else if (++idle < kSpinBudget) {
-            // hot: keep polling (event caught within µs)
-        } else {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
-        }
-    }
+    rc_service_.reset();
 }
 
 }  // namespace radixshmem

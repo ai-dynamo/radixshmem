@@ -10,7 +10,7 @@
 #include "cluster_protocol.h"
 
 #include "etcd_client.hpp"
-#include "xrc_connect.hpp"
+#include "net_util.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -21,8 +21,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <unistd.h>
 
 namespace radixshmem {
 
@@ -100,19 +98,14 @@ bool EtcdRegistry::reclaim_previous_run() {
     int64_t lease = 0;
     if (!impl_->cli.get_with_lease(K.peer(node_name_), val, lease)) return true;
 
-    PeerEntry old{}, mine{};
-    rs_.fill_local_entry(mine);
-    if (etcd::decode_peer(val, old) && old.xrc_listen_port != 0 &&
-        !(old.xrc_listen_port == mine.xrc_listen_port &&
-          std::strcmp(old.host, mine.host) == 0)) {
-        int fd = xrc_tcp_connect(old.host, old.xrc_listen_port, 1);
-        if (fd >= 0) {
-            ::close(fd);
-            fprintf(stderr, "[EtcdRegistry %s] node name is held by a live "
-                    "radix-server at %s:%u\n", node_name_.c_str(), old.host,
-                    old.xrc_listen_port);
-            return false;
-        }
+    // This run listens on nothing yet: if the old entry's RPC port answers, a live
+    // server holds the name.
+    PeerEntry old{};
+    if (etcd::decode_peer(val, old) && old.rpc_port &&
+        tcp_port_open(old.host, old.rpc_port, 1)) {
+        fprintf(stderr, "[EtcdRegistry %s] node name is held by a live "
+                "radix-server at %s:%u\n", node_name_.c_str(), old.host, old.rpc_port);
+        return false;
     }
     if (lease > 0) {
         try { impl_->cli.revoke(lease); } catch (const std::exception&) {}   // expired meanwhile
@@ -147,8 +140,10 @@ bool EtcdRegistry::attach_cluster_lease() {
 bool EtcdRegistry::adopt_config(const std::string& cfg_val) {
     ShardMapMsg sm{};
     if (!etcd::decode_shardmap(cfg_val, sm)) {
-        fprintf(stderr, "[EtcdRegistry %s] bad shard-map blob\n",
-                node_name_.c_str());
+        fprintf(stderr, "[EtcdRegistry %s] bad shard-map blob: corrupt, or "
+                "written by a build of another cluster protocol version "
+                "(this build: v%u)\n",
+                node_name_.c_str(), CLUSTER_PROTOCOL_VERSION);
         return false;
     }
     if (!attach_cluster_lease()) return false;
@@ -194,6 +189,7 @@ bool EtcdRegistry::run_rendezvous(std::vector<PeerEntry>& out) {
             ok = is_leader ? leader_flow(out) : follower_flow(out, false);
         }
         if (!ok) return false;
+        if (config_preexisting_) rs_.drop_stale_routes(false);
 
         // etcd barrier: mark ready, wait for every registered node.
         int world = world_size();
@@ -230,11 +226,10 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);
     impl_->cli.put(K.shm(node_name_), shm_name_, lease_id_);
 
-    // Membership gate: at least max(num_rht_shards, expected_min_nodes) nodes, stable.
-    int gate = std::max(rs_.cfg_.num_rht_shards, rs_.cfg_.expected_min_nodes);
+    // Membership gate: at least max(RDMA RHT shards, expected_min_nodes) nodes, stable.
+    int gate = std::max(rs_.rht_min_nodes(), rs_.cfg_.expected_min_nodes);
     if (gate < 1) gate = 1;
-    int n_obs = await_membership(gate);
-    if (n_obs < 0) {
+    if (await_membership(gate) < 0) {
         fprintf(stderr, "[EtcdRegistry leader] membership gate timeout "
                 "(%ld/%d peers)\n",
                 (long)impl_->cli.count(K.peers_prefix()), gate);
@@ -249,8 +244,9 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
 
     // Assign dense ranks by sorted /peers key order (deterministic).
     auto peers = impl_->cli.get_prefix(K.peers_prefix());
-    for (size_t i = 0; i < peers.size(); i++)
-        impl_->cli.put(K.rank_slot((int)i), leaf(peers[i].key), cluster_lease_);
+    const int ranks = (int)peers.size();
+    for (int i = 0; i < ranks; i++)
+        impl_->cli.put(K.rank_slot(i), leaf(peers[i].key), cluster_lease_);
 
     // Learn our own rank, then resolve the authoritative shard map.
     int my_rank = read_my_rank();
@@ -261,13 +257,13 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     rs_.cfg_.rank = my_rank;
 
     // RHT min-node barrier: never build a partial shard set.
-    if (rs_.cfg_.num_rht_shards > 0 && n_obs < rs_.cfg_.num_rht_shards) {
-        fprintf(stderr, "[EtcdRegistry leader] node count %d < num_rht_shards %d — "
-                "refusing RHT bring-up\n", n_obs, rs_.cfg_.num_rht_shards);
+    if (rs_.rht_min_nodes() > 0 && ranks < rs_.rht_min_nodes()) {
+        fprintf(stderr, "[EtcdRegistry leader] node count %d < RADIXSHMEM_RHT_SHARDS %d — "
+                "refusing RHT bring-up\n", ranks, rs_.rht_min_nodes());
         return false;
     }
 
-    rs_.resolve_shard_map(n_obs);
+    rs_.resolve_shard_map(ranks);
 
     ShardMapMsg sm{};
     sm.magic         = CLUSTER_SHARDMAP_MAGIC;
@@ -277,21 +273,23 @@ bool EtcdRegistry::leader_flow(std::vector<PeerEntry>& out) {
     sm.rdma_sl       = rs_.rdma_sl_;
     sm.rdma_tc       = rs_.rdma_tc_;
     sm.rht_transport        = rs_.rht_transport_;
+    sm.peer_index_backend   = rs_.peer_index_backend_;
     sm.peer_index_transport = rs_.peer_index_transport_;
     sm.rht_slots     = rs_.rht_slots_;
+    sm.rht_backend   = rs_.rht_backend_;
+    sm.rht_redis_timeout_ms = rs_.rht_redis_timeout_ms_;
+    std::strncpy(sm.rht_redis_seeds, rs_.rht_redis_.c_str(), sizeof(sm.rht_redis_seeds) - 1);
     sm.dc_access_key = rs_.dc_access_key_;
-    sm.remote_op_transport = rs_.remote_op_transport_;
     sm.register_chunk_size = (uint32_t)rs_.register_chunk_size();
     for (int s = 0; s < rs_.num_shards_; s++)
         sm.holder_rank[s] = (uint32_t)rs_.holder_of_shard_[s];
+    rs_.drop_stale_routes(true);
     impl_->cli.put(K.config(), etcd::encode_shardmap(sm), cluster_lease_);
     config_published_ = true;
 
-    // Round 2: leader's own RHT shard + remote-op + DCT; re-publish with rank set.
+    // Round 2: leader's planes; re-publish with rank set.
     mine.rank = my_rank;
-    rs_.setup_local_rht_shard(mine);
-    rs_.setup_remote_op(mine);
-    rs_.setup_dct(mine);
+    rs_.setup_planes(mine);
     impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);
 
     // stamp_shm_ready() happens in run_rendezvous() once world_size is known.
@@ -330,11 +328,10 @@ bool EtcdRegistry::follower_flow(std::vector<PeerEntry>& out, bool published) {
         }
         if (!adopt_config(cfg_val)) return false;
 
-        // Round 2: holders build RHT + remote-op + DCT; re-publish with rank set.
+        // Round 2: this node's planes (holders also their RHT shard); re-publish
+        // with rank set.
         mine.rank = my_rank;
-        rs_.setup_local_rht_shard(mine);
-        rs_.setup_remote_op(mine);
-        rs_.setup_dct(mine);
+        rs_.setup_planes(mine);
         impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);
     }
 
@@ -409,12 +406,11 @@ bool EtcdRegistry::join_existing(std::vector<PeerEntry>& out) {
     }
     rs_.cfg_.rank = my_rank;
 
-    // 4. Set up remote-op + DCT so existing nodes can reach us; no local RHT shard.
+    // 4. Set up the planes so existing nodes can reach us; no local RHT shard.
     PeerEntry mine{};
     rs_.fill_local_entry(mine);
     mine.rank = my_rank;
-    rs_.setup_remote_op(mine);
-    rs_.setup_dct(mine);
+    rs_.setup_planes(mine);
 
     int world = world_size();
     impl_->cli.put(K.peer(node_name_), etcd::encode_peer(mine), lease_id_);

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // test_remote_api — e2e gate for RadixClient rank-first remote ops:
-// remote_query, two-phase remote_allocate→remote_insert, remote_recycle, remote_unlock.
+// remote_query, two-phase remote_allocate→remote_insert, remote_recycle.
 //
 // Servers are registry-named by node identity (node0/node1 → ranks 0/1 in
 // sorted /peers order). Every server AND client case is a re-exec'd image: the
@@ -38,8 +38,6 @@ constexpr int    kWorldSize      = 2;
 constexpr int    kBlockSize      = 1;
 constexpr int    kBootstrapTO    = 30;
 constexpr const char* kShmPrefix = "/test_remote_routing";
-std::string kRdmaDev = "mlx5_bond_0";   // default; resolved in main() (env override + SKIP)
-constexpr int    kGidIdx         = 3;
 constexpr int    kTargetRank     = 0;   // B: remote insert + query enabled
 constexpr int    kInitiatorRank  = 1;   // A: remote ops off
 
@@ -67,13 +65,7 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.cluster_id  = cluster_id;
     cfg.node_name   = node;
     cfg.rpc_address = "127.0.0.1";   // single-host peers connect over loopback
-    cfg.index_dev    = kRdmaDev;
-    cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
-    if (node == node_name_for(kTargetRank)) {
-        cfg.enable_remote_insert = true;
-        cfg.enable_remote_query  = true;
-    }
 
     try {
         radixshmem::RadixServer srv(cfg);
@@ -283,8 +275,6 @@ int run_bad_target() {
                     != radixshmem::RemoteStatus::BAD_TARGET) return 82;
             if (cli.remote_insert(t, h.data(), n, 0, n, dummy_slots.data()).error
                     != radixshmem::InsertError::REMOTE_FAILED) return 83;
-            if (cli.remote_unlock(t, h.data(), n, n)
-                    != radixshmem::RemoteStatus::BAD_TARGET) return 84;
             if (cli.remote_recycle(t, dummy_slots.data(), n)
                     != radixshmem::RemoteStatus::BAD_TARGET) return 84;
         }
@@ -463,10 +453,51 @@ int run_full_dedup() {
     }
 }
 
-// ---- #2 + #3: target unresponsive → TIMEOUT; cached session stays safe ----
-// The two sync fds are passed by number on the re-exec'd child's argv; they
-// survive execv (not CLOEXEC).
+// ---- #11: remote_query(lock) pin across a split at the hit — finalize releases both halves ----
+int run_lock_split() {
+    try {
+        auto old_path = make_hashes(8000, 8);
+        if (seed_prefix_on_B(old_path, /*pin=*/false) != 8) return 130;
+        std::vector<int64_t> tok = {8000, 8001, 8002, 8500, 8501};
+        auto h = radixshmem::RadixClient::compute_hashes(tok.data(), 5, kBlockSize);
+
+        radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
+        auto q = cli.remote_query(kTargetRank, h.data(), 5, /*lock=*/true);
+        if (q.status != radixshmem::RemoteStatus::OK || q.total_hit_length != 3 || !q.finalize)
+            return 131;
+        evict_pressure_on_B();
+        if (b_local_hit(old_path) != 8) {
+            fprintf(stderr, "[lock_split] pinned terminal was evicted\n");
+            return 132;
+        }
+
+        auto rep = cli.remote_allocate(kTargetRank, 2);
+        if (rep.status != radixshmem::RemoteStatus::OK || rep.slots.size() != 2) return 133;
+        auto ins = cli.remote_insert(kTargetRank, h.data(), 5, 3, 2, rep.slots.data());
+        if (ins.error != radixshmem::InsertError::OK || !ins.unused_slots.empty()) return 134;
+
+        q.finalize();
+        evict_pressure_on_B();
+        if (b_local_hit(old_path) != 0 || b_local_hit(h) != 0) {
+            fprintf(stderr, "[lock_split] a half of the split survived eviction (leaked ref?)\n");
+            return 135;
+        }
+        fprintf(stderr, "[lock_split] OK pin held the terminal, finalize released both halves\n");
+        return 0;
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[lock_split] exception: %s\n", e.what());
+        return 136;
+    }
+}
+
+// ---- #2 + #3: target dead → TIMEOUT or UNAVAILABLE; cached session stays safe ----
+// The two sync fds reach the re-exec'd child as argv numbers; they survive execv (not CLOEXEC).
 int g_to_parent_fd = -1, g_from_parent_fd = -1;
+// A dead target can return a deadline expiry or a refused gRPC connection.
+bool target_down(radixshmem::RemoteStatus st) {
+    return st == radixshmem::RemoteStatus::TIMEOUT ||
+           st == radixshmem::RemoteStatus::UNAVAILABLE;
+}
 int run_timeout_and_rebuild() {
     try {
         radixshmem::RadixClient cli(shm_name_for(kInitiatorRank));
@@ -478,20 +509,36 @@ int run_timeout_and_rebuild() {
         if (::write(g_to_parent_fd, &b, 1) != 1) return 181;
         if (::read(g_from_parent_fd, &b, 1) != 1) return 182;   // B is dead now
 
-        // #2: TIMEOUT reported in status, no hang, no throw.
+        // #2: the failure is reported in status, no hang, no throw.
         auto r = cli.remote_query(kTargetRank, h.data(), 4);
-        if (r.status != radixshmem::RemoteStatus::TIMEOUT) {
-            fprintf(stderr, "[timeout] status=%d expected TIMEOUT\n",
+        if (!target_down(r.status)) {
+            fprintf(stderr, "[timeout] status=%d expected TIMEOUT/UNAVAILABLE\n",
                     (int)r.status);
             return 183;
         }
-        // #3: the cached session survives; repeated ops keep reporting TIMEOUT,
-        // never crash (no per-call handle to invalidate).
+        // #3: the cached session survives; repeated ops keep reporting the failure, never crash (no per-call handle to invalidate).
         auto q = cli.remote_query(kTargetRank, h.data(), 4);
-        if (q.status != radixshmem::RemoteStatus::TIMEOUT) return 184;
+        if (!target_down(q.status)) return 184;
         auto rep = cli.remote_allocate(kTargetRank, 4);
-        if (rep.status != radixshmem::RemoteStatus::TIMEOUT) return 185;
-        fprintf(stderr, "[timeout] OK TIMEOUT + cached session safe\n");
+        if (!target_down(rep.status)) return 185;
+        fprintf(stderr, "[timeout] OK status=%d + cached session safe\n",
+                (int)r.status);
+
+        // #10: B restarts on a new endpoint; the same client reopens its session from the new /peers entry.
+        if (::write(g_to_parent_fd, &b, 1) != 1) return 187;
+        if (::read(g_from_parent_fd, &b, 1) != 1 || b != 1) return 188;   // B is back
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        radixshmem::RemoteStatus st;
+        do {
+            st = cli.remote_query(kTargetRank, h.data(), 4).status;
+            if (st == radixshmem::RemoteStatus::OK) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        } while (std::chrono::steady_clock::now() < deadline);
+        if (st != radixshmem::RemoteStatus::OK) {
+            fprintf(stderr, "[rebuild] restarted B unreachable, status=%d\n", (int)st);
+            return 189;
+        }
+        fprintf(stderr, "[rebuild] OK old client reached restarted B\n");
         return 0;
     } catch (const std::exception& e) {
         fprintf(stderr, "[timeout] exception: %s\n", e.what());
@@ -510,6 +557,7 @@ int client_main(int argc, char** argv) {
     if (cs == "insert_finalize")   return run_insert_finalize();
     if (cs == "release_abort")     return run_release_abort();
     if (cs == "full_dedup")        return run_full_dedup();
+    if (cs == "lock_split")        return run_lock_split();
     if (cs == "timeout_rebuild") {
         // argv[3]/argv[4]: fd numbers for parent sync (survive execv).
         g_to_parent_fd   = std::atoi(argv[3]);
@@ -525,16 +573,16 @@ int client_main(int argc, char** argv) {
 int main(int argc, char** argv) {
     // Re-exec'd server: --server <node> <registry> <cluster_id>.
     if (argc >= 5 && std::strcmp(argv[1], "--server") == 0) {
-        kRdmaDev = resolve_index_dev_or_skip(kRdmaDev.c_str());
+        resolve_index_dev_or_skip("mlx5_bond_0");
         return run_server_process(argv[2], argv[3], argv[4]);
     }
     // Re-exec'd client: --client <case> [<fd_to_parent> <fd_from_parent>].
     if (argc >= 3 && std::strcmp(argv[1], "--client") == 0) {
-        kRdmaDev = resolve_index_dev_or_skip(kRdmaDev.c_str());
+        resolve_index_dev_or_skip("mlx5_bond_0");
         return client_main(argc, argv);
     }
 
-    kRdmaDev = resolve_index_dev_or_skip(kRdmaDev.c_str());
+    resolve_index_dev_or_skip("mlx5_bond_0");
 
     // Private etcd — sole cluster bootstrap backend; no etcd binary → SKIP.
     radixshmem_test::EtcdHarness etcd;
@@ -585,8 +633,9 @@ int main(int argc, char** argv) {
     run_case("insert_finalize");   // #7
     run_case("release_abort");     // #8
     run_case("full_dedup");        // #9
+    run_case("lock_split");        // #11
 
-    // #2/#3 last: pipe-synchronized kill of B (nothing runs after it). The child
+    // #2/#3/#10 last: pipe-synchronized kill and restart of B (nothing runs after it). The child
     // is re-exec'd; the two sync-pipe fd numbers ride on its argv (not CLOEXEC).
     {
         int to_parent[2], from_parent[2];
@@ -607,6 +656,15 @@ int main(int argc, char** argv) {
                     server_pids[kTargetRank] = -1;
                     char ack = 1;
                     if (::write(from_parent[1], &ack, 1) != 1) { /* child sees EOF */ }
+                }
+                // #10: restart B (port 0 and a fresh DCT give it a new endpoint), then release the child.
+                if (::read(to_parent[0], &b, 1) == 1) {
+                    ::shm_unlink(shm_name_for(kTargetRank).c_str());
+                    server_pids[kTargetRank] = spawn({argv[0], "--server",
+                        node_name_for(kTargetRank), registry, cluster_id});
+                    char up = server_pids[kTargetRank] > 0 &&
+                              wait_shm_ready(shm_name_for(kTargetRank), kBootstrapTO);
+                    if (::write(from_parent[1], &up, 1) != 1) { /* child sees EOF */ }
                 }
                 int rc = wait_one(p, "timeout_rebuild");
                 fprintf(stderr, "[case] %-18s rc=%d\n", "timeout_rebuild", rc);

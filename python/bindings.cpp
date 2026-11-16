@@ -17,6 +17,7 @@
 #include "etcd_client.hpp"   // src/registry: the Go-wrapper etcd client, bound as _core.EtcdKv
 #endif
 
+#include <array>
 #include <optional>
 
 namespace py = pybind11;
@@ -28,6 +29,55 @@ static py::array_t<int32_t> vec_to_npy_i32(const std::vector<int32_t>& v) {
     return arr;
 }
 
+
+static py::tuple writeback_task_tuple(const WritebackTask& t) {
+    const HeldEviction& h = t.h;
+    py::array_t<uint64_t> hashes(static_cast<py::ssize_t>(h.hashes.size()));
+    std::memcpy(hashes.mutable_data(), h.hashes.data(), h.hashes.size() * sizeof(uint64_t));
+    py::array_t<uint32_t> ends(static_cast<py::ssize_t>(h.mamba_ends.size()));
+    std::memcpy(ends.mutable_data(), h.mamba_ends.data(), h.mamba_ends.size() * sizeof(uint32_t));
+    return py::make_tuple(t.id, hashes, vec_to_npy_i32(h.full_slots), vec_to_npy_i32(h.swa_slots),
+                          ends, vec_to_npy_i32(h.mamba_slots), h.evicted_from, h.generation);
+}
+
+template <typename T>
+static py::array_t<T> vec_to_npy(const std::vector<T>& v) {
+    py::array_t<T> arr(static_cast<py::ssize_t>(v.size()));
+    std::memcpy(arr.mutable_data(), v.data(), v.size() * sizeof(T));
+    return arr;
+}
+
+static py::dict tree_dump_dict(const TreeDump& d) {
+    py::dict out;
+    out["parent"] = vec_to_npy(d.parent);
+    out["level"] = vec_to_npy(d.level);
+    out["depth"] = vec_to_npy(d.depth);
+    out["num_blocks"] = vec_to_npy(d.num_blocks);
+    out["swa_blocks"] = vec_to_npy(d.swa_blocks);
+    out["ref_count"] = vec_to_npy(d.ref_count);
+    out["last_access"] = vec_to_npy(d.last_access);
+    out["mamba"] = vec_to_npy(d.mamba);
+    out["hashes"] = vec_to_npy(d.hashes);
+    out["now"] = d.now;
+    out["nodes_in_pool"] = d.nodes_in_pool;
+    out["total_blocks"] = d.total_blocks;
+    out["torn"] = d.torn;
+    out["truncated"] = d.truncated;
+    out["block_size"] = d.block_size;
+    out["register_chunk_size"] = d.register_chunk_size;
+    out["reset_generation"] = d.reset_generation;
+    out["is_distributed"] = d.is_distributed;
+    out["rank"] = d.rank;
+    out["node_name"] = d.node_name;
+    out["cluster_id"] = d.cluster_id;
+    return out;
+}
+
+static WritebackQueue& writeback_of(RadixServer& s) {
+    WritebackQueue* q = s.writeback();
+    if (!q) throw std::runtime_error("write-back is not enabled on this server");
+    return *q;
+}
 
 static py::dict peer_fault_dict(const PeerFaultCounters* c) {
     auto v = [&](const std::atomic<uint64_t> PeerFaultCounters::*f) {
@@ -90,7 +140,10 @@ PYBIND11_MODULE(_core, m) {
         .value("TIMEOUT", RemoteStatus::TIMEOUT)
         .value("BAD_REPLY", RemoteStatus::BAD_REPLY)
         .value("BAD_TARGET", RemoteStatus::BAD_TARGET)
-        .value("INTERNAL", RemoteStatus::INTERNAL);
+        .value("INTERNAL", RemoteStatus::INTERNAL)
+        .value("UNAVAILABLE", RemoteStatus::UNAVAILABLE)
+        .value("RESOURCE_EXHAUSTED", RemoteStatus::RESOURCE_EXHAUSTED)
+        .value("STALE_TARGET", RemoteStatus::STALE_TARGET);
 
 
     m.attr("MAX_REMOTE_OP_BLOCKS") = MAX_REMOTE_OP_BLOCKS;
@@ -209,39 +262,23 @@ PYBIND11_MODULE(_core, m) {
         // and wins over rpc_address.
         .def_readwrite("rpc_address", &RadixServerConfig::rpc_address)
         .def_readwrite("rpc_interface", &RadixServerConfig::rpc_interface)
-        // Bootstrap / XRC listen port; 0 = OS-assigned (the real port is published).
+        // gRPC endpoint peers reach (remote ops, peer queries, XRC setup); 0 = OS-assigned,
+        // the real port is published.
         .def_property("rpc_port",
                       [](const RadixServerConfig& c) { return (int)c.rpc_port; },
                       [](RadixServerConfig& c, int v) { c.rpc_port = (uint16_t)v; })
-        .def_readwrite("index_dev", &RadixServerConfig::index_dev)
-        .def_readwrite("gid_idx", &RadixServerConfig::gid_idx)
         .def_readwrite("bootstrap_timeout_sec",
                        &RadixServerConfig::bootstrap_timeout_sec)
         .def_readwrite("lease_ttl_sec", &RadixServerConfig::lease_ttl_sec)
         .def_readwrite("register_chunk_tokens",
                        &RadixServerConfig::register_chunk_tokens)
-        // Membership gate: bootstrap waits for max(num_rht_shards, expected_min_nodes)
-        // peers, stable for settle_ms. > 1 also enables distributed mode.
+        // Membership gate: bootstrap waits for max(RADIXSHMEM_RHT_SHARDS of an RDMA
+        // RHT, expected_min_nodes) peers, stable for settle_ms. > 1 enables distributed mode.
         .def_readwrite("expected_min_nodes",
                        &RadixServerConfig::expected_min_nodes)
         .def_readwrite("settle_ms", &RadixServerConfig::settle_ms)
-        .def_readwrite("num_rht_shards", &RadixServerConfig::num_rht_shards)
-        .def_readwrite("rht_shard_holders", &RadixServerConfig::rht_shard_holders)
-        .def_readwrite("rht_transport", &RadixServerConfig::rht_transport)
-        .def_readwrite("peer_index_transport",
-                       &RadixServerConfig::peer_index_transport)
-        .def_readwrite("rht_slots_per_bucket",
-                       &RadixServerConfig::rht_slots_per_bucket)
-        .def_readwrite("enable_remote_insert",
-                       &RadixServerConfig::enable_remote_insert)
-        .def_readwrite("enable_remote_query",
-                       &RadixServerConfig::enable_remote_query)
-        // Control-plane transport backend: "zmq" or "dc"; rank 0 authoritative.
-        .def_readwrite("remote_op_transport",
-                       &RadixServerConfig::remote_op_transport)
-        .def_property("zmq_listen_port",
-                      [](const RadixServerConfig& c) { return (int)c.zmq_listen_port; },
-                      [](RadixServerConfig& c, int v) { c.zmq_listen_port = (uint16_t)v; });
+        .def_readwrite("writeback_enabled", &RadixServerConfig::writeback_enabled)
+        .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
 
     // ==================== Result types ====================
 
@@ -316,9 +353,15 @@ PYBIND11_MODULE(_core, m) {
 
     py::class_<InsertResult>(m, "InsertResult")
         .def_readonly("error", &InsertResult::error)
+        .def_readonly("remote_status", &InsertResult::remote_status)
         .def_property_readonly("unused_slots", [](const InsertResult& r) {
             return vec_to_npy_i32(r.unused_slots);
         });
+
+    py::class_<InsertPathResult>(m, "InsertPathResult")
+        .def_readonly("remote_status", &InsertPathResult::remote_status)
+        .def_readonly("full", &InsertPathResult::full)
+        .def_readonly("runs", &InsertPathResult::runs);
 
     // ==================== Health audit ====================
 
@@ -344,6 +387,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readonly("leaked",    &HealthReport::Pool::leaked)
         .def_readonly("dangling",  &HealthReport::Pool::dangling)
         .def_readonly("duplicate", &HealthReport::Pool::duplicate)
+        .def_readonly("held",      &HealthReport::Pool::held)
         .def("ok", &HealthReport::Pool::ok)
         .def("__repr__", [](const HealthReport::Pool& p) {
             return "HealthPoolReport(enabled=" + std::to_string(p.enabled) +
@@ -405,7 +449,9 @@ PYBIND11_MODULE(_core, m) {
         .def("mempool_free", &RadixServer::mempool_free)
         .def("mempool_used", &RadixServer::mempool_used)
         .def("swa_mempool_total", &RadixServer::swa_mempool_total)
+        .def("swa_mempool_free", &RadixServer::swa_mempool_free)
         .def("mamba_mempool_total", &RadixServer::mamba_mempool_total)
+        .def("mamba_mempool_free", &RadixServer::mamba_mempool_free)
         .def_property_readonly("component_config", &RadixServer::component_config)
         .def("insert_success_count", &RadixServer::insert_success_count)
         .def("peer_fault_counts",
@@ -418,13 +464,87 @@ PYBIND11_MODULE(_core, m) {
              "Lock-free leak audit; returns HealthFlag bits (0 == healthy).")
         .def("health_report", [](const RadixServer& s) {
             HealthReport r; s.check_health(&r); return r;
-        }, "Lock-free leak audit; returns the full HealthReport.");
+        }, "Lock-free leak audit; returns the full HealthReport.")
+        .def("dump_tree", [](RadixServer& s, uint32_t max_nodes, uint64_t max_blocks) {
+            TreeDump d;
+            { py::gil_scoped_release rel; d = dump_tree(s.tree(), max_nodes, max_blocks); }
+            return tree_dump_dict(d);
+        }, py::arg("max_nodes") = 0, py::arg("max_blocks") = 0,
+           "Lock-free copy of this server's tree; see RadixClient.dump_tree.")
+        .def("pop_writeback", [](RadixServer& s, size_t max_tasks, int timeout_ms) {
+            WritebackQueue& q = writeback_of(s);
+            std::vector<WritebackTask> ts;
+            {
+                py::gil_scoped_release nogil;
+                ts = q.pop(max_tasks, timeout_ms);
+            }
+            py::list out;
+            for (const WritebackTask& t : ts) out.append(writeback_task_tuple(t));
+            return out;
+        }, py::arg("max_tasks") = 64, py::arg("timeout_ms") = 200)
+        .def("complete_writeback", [](RadixServer& s, const std::vector<uint64_t>& ids) {
+            WritebackQueue& q = writeback_of(s);
+            py::gil_scoped_release nogil;
+            return q.complete(ids);
+        }, py::arg("task_ids"))
+        .def("set_writeback_active", [](RadixServer& s, bool on) { writeback_of(s).set_active(on); },
+             py::arg("on"), "Whether background eviction holds what it takes for write-back.")
+        .def("pop_dedup_writes", [](RadixServer& s, size_t max_writes, int timeout_ms) {
+            std::vector<DedupWrite> ws;
+            {
+                py::gil_scoped_release nogil;
+                ws = s.dedup_writes()->pop(max_writes, timeout_ms);
+            }
+            py::list out;
+            for (const DedupWrite& w : ws) {
+                py::list local, remote;
+                for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
+                    local.append(py::cast(w.local[k]));
+                    remote.append(py::cast(w.remote[k]));
+                }
+                out.append(py::make_tuple(w.id, w.rank, w.timeout_ms, local, remote));
+            }
+            return out;
+        }, py::arg("max_writes") = 16, py::arg("timeout_ms") = 200,
+           "Copies DedupPrefix handlers wait for: (id, rank, timeout_ms, local[k], remote[k]).")
+        .def("complete_dedup_write", [](RadixServer& s, uint64_t id, int result) {
+            s.dedup_writes()->complete(id, result);
+        }, py::arg("id"), py::arg("result"), "0 copied, 1 failed, 2 failed and may still land.")
+        .def("set_dedup_writer_active", [](RadixServer& s, bool on) {
+            s.dedup_writes()->set_active(on);
+        }, py::arg("on"), py::call_guard<py::gil_scoped_release>(),
+           "Off: DedupPrefix handlers stop waiting and only drop.")
+        .def("drop_writeback", [](RadixServer& s) {
+            WritebackQueue& q = writeback_of(s);
+            py::gil_scoped_release nogil;
+            q.drop_all();
+        })
+        .def("reset_generation", [](RadixServer& s) { return s.tree().reset_generation(); })
+        .def("writeback_stats", [](RadixServer& s) -> py::object {
+            WritebackQueue* q = s.writeback();
+            if (!q) return py::none();
+            WritebackStats st = q->stats();
+            const RadixShmemTree& t = s.tree();
+            py::dict d;
+            d["queued"] = st.queued;
+            d["popped"] = st.popped;
+            d["produced"] = st.produced;
+            d["completed"] = st.completed;
+            d["dropped"] = st.dropped;
+            d["active"] = q->active();
+            d["inflight_slots"] = py::make_tuple(st.inflight_slots[0], st.inflight_slots[1],
+                                                 st.inflight_slots[2]);
+            d["held_slots"] = py::make_tuple(t.held_slots(ComponentType::FULL),
+                                             t.held_slots(ComponentType::SWA),
+                                             t.held_slots(ComponentType::MAMBA));
+            return d;
+        });
 
 #ifdef RADIXSHMEM_HAS_ETCD
     // ==================== EtcdKv ====================
     // Plain key/value access to the cluster's etcd, sharing the process-global
     // connection with RadixServer / DataPlaneRegistry. Values are text (JSON,
-    // base64). Used by radixshmem.server for radix/<cluster_id>/geometry/<node>.
+    // base64). Used by radixshmem.server for radix/<cluster_id>/geometry and nodes/<node>.
 
     py::class_<etcd::Client>(m, "EtcdKv")
         .def(py::init([](const std::string& registry) {
@@ -467,6 +587,9 @@ PYBIND11_MODULE(_core, m) {
              py::arg("ttl_s"), py::call_guard<py::gil_scoped_release>())
         .def("keep_alive", [](etcd::Client& c, int64_t lease) { c.keep_alive(lease); },
              py::arg("lease"), py::call_guard<py::gil_scoped_release>())
+        .def("keep_alive_stop", [](etcd::Client& c, int64_t lease) { c.keep_alive_stop(lease); },
+             py::arg("lease"), py::call_guard<py::gil_scoped_release>(),
+             "Stop renewing without revoking; the keys live on while another holder renews.")
         .def("revoke", [](etcd::Client& c, int64_t lease) { c.revoke(lease); },
              py::arg("lease"), py::call_guard<py::gil_scoped_release>());
 #endif
@@ -585,20 +708,47 @@ PYBIND11_MODULE(_core, m) {
         .def("health_report", [](const RadixClient& c) {
             HealthReport r; c.check_health(&r); return r;
         }, "Lock-free leak audit; returns the full HealthReport.")
+        .def("dump_tree", [](const RadixClient& c, uint32_t max_nodes, uint64_t max_blocks) {
+            TreeDump d;
+            { py::gil_scoped_release rel; d = c.dump_tree(max_nodes, max_blocks); }
+            return tree_dump_dict(d);
+        }, py::arg("max_nodes") = 0, py::arg("max_blocks") = 0,
+           "Lock-free copy of the local tree for monitoring: a dict of numpy arrays, one entry\n"
+           "per node in BFS order (parent, level, depth, num_blocks, swa_blocks, ref_count,\n"
+           "last_access in steady_clock ns, mamba), the concatenated block hashes, and header\n"
+           "fields. A racing writer can make it slightly inconsistent (counted in `torn`).\n"
+           "0 = no limit; `truncated` reports a limit reached.")
 #ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
-        .def("remote_allocate", [](RadixClient& c, int rank, int n) {
+        .def("remote_allocate", [](RadixClient& c, int rank, int n,
+                                   ComponentType component) {
             AllocateReply rep;
-            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n); }
+            { py::gil_scoped_release rel; rep = c.remote_allocate(rank, n, component); }
             return rep;
-        }, py::arg("rank"), py::arg("n"),
-           "Phase 1: allocate `n` slots on `rank` (no hashes, no dedup).")
+        }, py::arg("rank"), py::arg("n"), py::arg("component") = ComponentType::FULL,
+           "Phase 1: allocate `n` slots from `rank`'s `component` pool (no hashes, no dedup).")
+
+        .def("remote_allocate_components", [](RadixClient& c, int rank, py::list components) {
+            std::vector<ComponentCount> counts;
+            counts.reserve(components.size());
+            for (const py::handle& item : components) {
+                auto t = item.cast<py::tuple>();
+                if (t.size() != 2)
+                    throw std::runtime_error("components entries are (component, n)");
+                counts.push_back(ComponentCount{t[0].cast<ComponentType>(), t[1].cast<int>()});
+            }
+            AllocateComponentsReply rep;
+            { py::gil_scoped_release rel; rep = c.remote_allocate_components(rank, counts); }
+            return rep;
+        }, py::arg("rank"), py::arg("components"),
+           "Phase 1 for several pools: allocate n slots from each (component, n) pool of `rank`, "
+           "all of them or none.")
 
         .def("remote_insert", [](RadixClient& c, int rank,
                                    py::array_t<uint64_t> hashes,
                                    int start, int length,
                                    py::array_t<int32_t> slots,
-                                   bool auto_recycle) {
+                                   bool auto_recycle, ComponentType component) {
             auto [ptr, len] = npy_1d(hashes, "hashes");
             auto [sptr, slen] = npy_1d(slots, "slots");
             if (slen < length)
@@ -606,20 +756,46 @@ PYBIND11_MODULE(_core, m) {
             InsertResult res;
             { py::gil_scoped_release rel;
               res = c.remote_insert(rank, ptr, len, start, length, sptr,
-                                    auto_recycle); }
+                                    auto_recycle, component); }
             return res;
         }, py::arg("rank"), py::arg("hashes"), py::arg("start"),
            py::arg("length"), py::arg("slots"),
-           py::arg("auto_recycle") = true,
+           py::arg("auto_recycle") = true, py::arg("component") = ComponentType::FULL,
            "Phase 2: publish `slots` on `rank`; auto_recycle frees the unmatched surplus.")
 
+        .def("remote_insert_path", [](RadixClient& c, int rank, py::array_t<uint64_t> hashes,
+                                      int start, py::array_t<int32_t> full_slots, py::list runs,
+                                      bool auto_recycle) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            auto [fptr, flen] = npy_1d(full_slots, "full_slots");
+            std::vector<ComponentRun> parts;
+            parts.reserve(runs.size());
+            for (const py::handle& run : runs) {
+                auto t = run.cast<py::tuple>();
+                if (t.size() != 3)
+                    throw std::runtime_error("runs entries are (component, end, slots)");
+                auto slots = t[2].cast<py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                if (slots.ndim() != 1)
+                    throw std::runtime_error("run slots must be 1-D array");
+                parts.push_back(ComponentRun{t[0].cast<ComponentType>(), t[1].cast<int>(),
+                                             std::vector<int32_t>(slots.data(), slots.data() + slots.size())});
+            }
+            InsertPathResult res;
+            { py::gil_scoped_release rel;
+              res = c.remote_insert_path(rank, ptr, len, start, flen, fptr, parts, auto_recycle); }
+            return res;
+        }, py::arg("rank"), py::arg("hashes"), py::arg("start"), py::arg("full_slots"),
+           py::arg("runs"), py::arg("auto_recycle") = true,
+           "Publish on `rank`, in one request, FULL slots for hashes[start:] and each (component, "
+           "end, slots) run: SWA slots for hashes[end - len(slots):end], or the MAMBA checkpoint at end.")
+
         .def("remote_recycle", [](RadixClient& c, int rank,
-                                  py::array_t<int32_t> slots) {
+                                  py::array_t<int32_t> slots, ComponentType component) {
             auto [sptr, slen] = npy_1d(slots, "slots");
             RemoteStatus st;
-            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen); }
+            { py::gil_scoped_release rel; st = c.remote_recycle(rank, sptr, slen, component); }
             return st;
-        }, py::arg("rank"), py::arg("slots"),
+        }, py::arg("rank"), py::arg("slots"), py::arg("component") = ComponentType::FULL,
            "Return unpublished slots to `rank`'s pool (abort / surplus); returns RemoteStatus.")
 
         .def("remote_query", [](RadixClient& c, int rank,
@@ -634,19 +810,26 @@ PYBIND11_MODULE(_core, m) {
             return result;
         }, py::arg("rank"), py::arg("hashes"), py::arg("lock") = false,
            py::arg("update_meta") = true,
-           // keep_alive<0,1>: lock=True result's finalize calls back into client.
-           py::keep_alive<0, 1>(),
            "Query `rank`'s own tree (1 RTT); lock=True releases via finalize().")
 
-        .def("remote_unlock", [](RadixClient& c, int rank,
-                                 py::array_t<uint64_t> hashes, int hit_length) {
+        .def("remote_dedup_prefix", [](RadixClient& c, int rank, py::array_t<uint64_t> hashes) {
             auto [ptr, len] = npy_1d(hashes, "hashes");
-            RemoteStatus st;
-            { py::gil_scoped_release rel;
-              st = c.remote_unlock(rank, ptr, len, hit_length); }
-            return st;
-        }, py::arg("rank"), py::arg("hashes"), py::arg("hit_length"),
-           "Manually drop a remote_query(lock=True) pin: dec_ref over [0, hit_length); returns RemoteStatus.")
+            DedupReply rep;
+            { py::gil_scoped_release rel; rep = c.remote_dedup_prefix(rank, ptr, len); }
+            return rep;
+        }, py::arg("rank"), py::arg("hashes"))
+        .def("dedup_move", [](RadixClient& c, int rank, py::array_t<uint64_t> hashes, int tail_cap,
+                              int branch_cap, std::array<int, NUM_COMPONENT_TYPES> landing) {
+            auto [ptr, len] = npy_1d(hashes, "hashes");
+            int freed;
+            {
+                py::gil_scoped_release rel;
+                freed = c.dedup_move(rank, ptr, len, tail_cap, branch_cap, landing.data());
+            }
+            return freed;
+        }, py::arg("rank"), py::arg("hashes"), py::arg("tail_cap"), py::arg("branch_cap"),
+           py::arg("landing"),
+           "Dedup on `rank` that also moves what blocks the drop into `landing` (per pool) slots.")
 #endif
 
         .def_static("compute_hashes", &py_compute_hashes,
@@ -658,9 +841,23 @@ PYBIND11_MODULE(_core, m) {
 
     py::class_<AllocateReply>(m, "AllocateReply")
         .def_readonly("status", &AllocateReply::status)
+        .def_readonly("error", &AllocateReply::error)
         .def_property_readonly("slots", [](const AllocateReply& r) {
             return vec_to_npy_i32(r.slots);
         });
+
+    py::class_<AllocateComponentsReply>(m, "AllocateComponentsReply")
+        .def_readonly("status", &AllocateComponentsReply::status)
+        .def_readonly("error", &AllocateComponentsReply::error)
+        .def_property_readonly("slots", [](const AllocateComponentsReply& r) {
+            py::list out;
+            for (const std::vector<int32_t>& s : r.slots) out.append(vec_to_npy_i32(s));
+            return out;
+        });
+
+    py::class_<DedupReply>(m, "DedupReply")
+        .def_readonly("status", &DedupReply::status)
+        .def_readonly("freed", &DedupReply::freed);
 #endif  // !RADIXSHMEM_NO_RDMA
 
     // ==================== Free functions ====================

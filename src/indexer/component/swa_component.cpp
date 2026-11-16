@@ -117,7 +117,9 @@ int RadixShmemTree::evict_swa_walk(int need_slots) {
         const SlotLruEntry e = swa_lru_.entry(slot);
         cur = e.next;
         NodeComponentState* cs = nodes_.component_state(e.node_id);
-        if (cs->swa_ref_count.load(std::memory_order_relaxed) != 0) continue;
+        if (cs->local_swa_ref_count.load(std::memory_order_relaxed) != 0 ||
+            cs->remote_swa_ref_count.load(std::memory_order_relaxed) != 0)
+            continue;
         TreeNode* node = nodes_.get(e.node_id);
         data_.get_swa_slots(node->data_offset, (int)node->num_blocks)[e.idx] =
             INVALID_COMPONENT_SLOT;

@@ -10,7 +10,7 @@ identity and cluster, the SlotStore budget (``data_bytes``, 0 = index-only)
 and its split between the pools (``swa_ratio`` / ``mamba_ratio``; FULL takes
 the rest), memory, transfer-engine and index tuning. What a slot looks like
 comes from a client: ``configure(Geometry)`` (the Configure RPC) or, in a
-cluster, the geometry another node's server already published in etcd.
+cluster, the geometry another node's server already created in etcd.
 Until then the server is ``waiting``. ``configure`` validates and plans
 synchronously and returns; a thread then creates the regions and joins the
 cluster (``configuring`` -> ``ready``, or back to ``waiting`` with
@@ -18,7 +18,10 @@ cluster (``configuring`` -> ``ready``, or back to ``waiting`` with
 
 Transfers are jobs: ``submit`` queues one, a single transfer thread feeds the
 engine and polls completions, ``wait_any`` sleeps on an Event until one of the
-caller's jobs is done. Nothing else polls.
+caller's jobs is done. Nothing else polls. With ``transfer_log`` set, every
+transfer that moved data is logged as one line (time, size, bandwidth); the
+transfer thread only stamps times and queues a tuple, a log thread formats and
+writes them.
 """
 
 from __future__ import annotations
@@ -27,35 +30,39 @@ import fcntl
 import json
 import socket
 import struct
+import sys
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from radixshmem import _core, _geometry, rpc
 from radixshmem._core import ComponentType, EvictPolicy
 from radixshmem.client import (MODE_CLOSED, MODE_CONFIGURING, MODE_READY, MODE_STARTING, MODE_WAITING,
-                             NodeInfo, TransferItem, TransferReply)
+                             XFER_IN_FLIGHT, XFER_READ, XFER_WRITE, NodeInfo, RadixClient, TransferItem,
+                             TransferReply)
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy
+from radixshmem.writeback import PeerWriteback, WritebackHandler, _Worker
 
 # ClusterConfig fields copied one to one onto _core.RadixServerConfig.
 _CLUSTER_FIELDS = (
     "expected_min_nodes", "settle_ms", "registry", "cluster_id", "node_name", "rpc_address",
-    "rpc_interface", "rpc_port", "index_dev", "gid_idx", "bootstrap_timeout_sec", "lease_ttl_sec", "rht_transport",
-    "peer_index_transport", "num_rht_shards", "rht_shard_holders", "rht_slots_per_bucket",
-    "enable_remote_insert",
-    "enable_remote_query", "zmq_listen_port", "remote_op_transport")
+    "rpc_interface", "rpc_port", "bootstrap_timeout_sec", "lease_ttl_sec")
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
-_LEASE_TTL_S = 10    # etcd lease of the geometry key; kept alive while the server runs
+_LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
+
+ROLES = ("prefill", "decode")
 
 
 @dataclass
 class ClusterConfig:
-    """etcd rendezvous and the control-plane RDMA of the index (see
-    _core.RadixServerConfig). Distributed when expected_min_nodes or
-    num_rht_shards is > 1."""
+    """etcd rendezvous of the index (see _core.RadixServerConfig). Distributed
+    when expected_min_nodes > 1; the RHT is configured with RADIXSHMEM_RHT_* and
+    RADIXSHMEM_REDIS_*, the peer index with RADIXSHMEM_PEER_INDEX_*, and the RDMA
+    device of either with RADIXSHMEM_INDEX_DEV / _GID_IDX (docs/api.md)."""
 
     expected_min_nodes: int = 0
     settle_ms: int = 500
@@ -64,25 +71,13 @@ class ClusterConfig:
     node_name: str = ""
     rpc_address: str = ""
     rpc_interface: str = ""
-    rpc_port: int = 0
-    index_dev: str = ""              # HCA of the index control plane, "" = first available;
-                                     # the data plane's HCAs are ServerConfig.transfer_devices
-    gid_idx: int = 3
+    rpc_port: int = 0                 # gRPC endpoint peers reach, 0 = OS-assigned
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
-    rht_transport: str = "xrc"        # client -> RHT shard holder QPs: "xrc" | "dc"
-    peer_index_transport: str = "xrc" # remote walk into peer trees: "xrc" | "dc"
-    num_rht_shards: int = 0
-    rht_shard_holders: List[int] = field(default_factory=list)
-    rht_slots_per_bucket: int = 4
-    enable_remote_insert: bool = False
-    enable_remote_query: bool = False
-    zmq_listen_port: int = 0
-    remote_op_transport: str = "zmq"
 
     @property
     def distributed(self) -> bool:
-        return self.expected_min_nodes > 1 or self.num_rht_shards > 1
+        return self.expected_min_nodes > 1
 
 
 @dataclass
@@ -111,15 +106,22 @@ class ServerConfig:
     max_inflight: int = 256          # batches in flight at the engine
     max_pending_jobs: int = 4096     # queued + running + uncollected jobs before Submit is refused
     job_ttl_s: float = 60.0          # seconds an uncollected job is kept
+    transfer_log: str = ""           # one line per transfer with bytes > 0: "-" = stdout, a path appends, "" = off
     # index tuning
     max_nodes: int = 0               # radix node pool, 0 = auto
     register_chunk_tokens: int = 4096  # RHT registration granularity unless the geometry brings its own
     background_evict_ratio: float = 0.05
     data_pool_ratio: float = 4.0     # DataPool bytes = full_slots x ratio x (12 | 16 with SWA)
     evict_policy: str = "lru"
+    writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
-    rpc_workers: int = 32            # one blocks per client with jobs in flight
+    role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
+    # monitoring endpoint (radixshmem.monitor): Prometheus /metrics with the tree, 0 = off
+    monitor_port: int = 0            # first port tried; servers sharing a host take the next free one
+    monitor_interval_s: float = 10.0  # tree copy period
+    monitor_tree_nodes: int = 150    # nodes of this server's tree exported per copy, 0 = none
+    monitor_cluster_nodes: int = 300  # nodes of the merged cluster tree the leader exports, 0 = none
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
 
     def __post_init__(self) -> None:
@@ -140,6 +142,14 @@ class ServerConfig:
             raise ValueError(f"unknown evict_policy {self.evict_policy!r}")
         if self.transfer_backend not in ("mooncake", "nixl"):
             raise ValueError(f"unknown transfer_backend {self.transfer_backend!r}")
+        if self.role not in ROLES:
+            raise ValueError(f"unknown role {self.role!r}")
+        if not 0.0 < self.writeback_max_held_ratio <= 1.0:
+            raise ValueError("writeback_max_held_ratio must be in (0, 1]")
+        if not 0 <= self.monitor_port < 65536:
+            raise ValueError("monitor_port must be in [0, 65536)")
+        if self.monitor_tree_nodes < 0 or self.monitor_cluster_nodes < 0:
+            raise ValueError("monitor_tree_nodes / monitor_cluster_nodes must be >= 0")
 
     @property
     def index_only(self) -> bool:
@@ -177,33 +187,115 @@ def _nic_ip(ifname: str) -> str:
     return socket.inet_ntoa(packed[20:24])
 
 
-class _GeometryRegistry:
-    """``radix/<cluster_id>/geometry/<node>``: the uniform part of a node's
-    geometry as JSON. Published when the node accepts a geometry, before its
+class _ServerRegistry:
+    """The server's keys under ``radix/<cluster_id>/``, as JSON.
+
+    ``geometry``: the uniform part of the cluster's geometry, ``{"geometry",
+    "lease", "node"}``. The first node to accept a geometry creates it
+    (put-if-absent, so concurrent configures cannot both win), before its
     rendezvous (the peers it waits for at the membership gate may be waiting
-    for exactly this key), on a lease this server keeps alive for its
-    lifetime, so the key goes away with the process."""
+    for exactly this key). It lives on a lease every node that accepted it
+    renews, so it goes away TTL after the last of them stops.
+
+    ``nodes/<node>``: the node's record (role, rank, mode, ...), on this
+    server's own lease. Published at start and rewritten on every mode change."""
+
+    _HOLD_ATTEMPTS = 10
+    # The Go wrapper keeps one renewal per lease id per process; servers of one
+    # process that hold the same geometry lease share it by count.
+    _renewals: Dict[int, int] = {}
+    _renewals_mu = threading.Lock()
 
     def __init__(self, registry: str, cluster_id: str):
         self._kv = _core.EtcdKv(registry)
-        self._prefix = f"radix/{cluster_id}/geometry/"
+        self._base = f"radix/{cluster_id}/"
         self.lease = self._kv.grant_lease(_LEASE_TTL_S)
         self._kv.keep_alive(self.lease)
+        self.geometry_lease = 0          # the shared lease this server renews, 0 = none
 
-    def list(self) -> List[Tuple[str, Dict[str, Any]]]:
+    def _list(self, sub: str) -> List[Tuple[str, Dict[str, Any]]]:
+        prefix = self._base + sub
         out = []
-        for key, value in self._kv.get_prefix(self._prefix):
+        for key, value in self._kv.get_prefix(prefix):
             try:
-                out.append((key[len(self._prefix):], json.loads(value)))
+                out.append((key[len(prefix):], json.loads(value)))
             except ValueError:
                 continue
         return out
 
-    def publish(self, node: str, uniform: Dict[str, Any]) -> None:
-        self._kv.put(self._prefix + node, json.dumps(uniform, sort_keys=True), self.lease)
+    def _put(self, key: str, value: Dict[str, Any]) -> None:
+        self._kv.put(self._base + key, json.dumps(value, sort_keys=True), self.lease)
 
-    def unpublish(self, node: str) -> None:
-        self._kv.delete(self._prefix + node)
+    def geometry(self) -> Optional[Dict[str, Any]]:
+        """The published record, or None."""
+        raw = self._kv.get(self._base + "geometry")
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return None
+
+    def hold_geometry(self, uniform: Dict[str, Any], node: str,
+                      compare: Callable[[Dict[str, Any]], List[str]]) -> None:
+        """Create the cluster's geometry from ``uniform``, or join the one
+        already there when ``compare(published)`` finds no difference
+        (``GeometryMismatch`` otherwise); either way renew its lease."""
+        key = self._base + "geometry"
+        for _ in range(self._HOLD_ATTEMPTS):
+            raw = self._kv.get(key)
+            if raw is None:
+                lease = self._kv.grant_lease(_LEASE_TTL_S)
+                value = json.dumps({"geometry": uniform, "lease": lease, "node": node}, sort_keys=True)
+                if self._kv.create(key, value, lease):
+                    self._renew(lease)
+                    return
+                self._kv.revoke(lease)
+                continue
+            rec = json.loads(raw)
+            diffs = compare(rec["geometry"])
+            if diffs:
+                raise GeometryMismatch(
+                    f"geometry differs from the cluster's (created by {rec.get('node', '?')}): "
+                    + "; ".join(diffs) + "; use another cluster_id or stop every node of the cluster")
+            self._renew(int(rec["lease"]))
+            if self._kv.get(key) == raw:
+                return
+            self.release_geometry()     # the lease expired between the two reads
+        raise RuntimeError(f"{key} kept changing over {self._HOLD_ATTEMPTS} attempts")
+
+    def _renew(self, lease: int) -> None:
+        if lease == self.geometry_lease:
+            return
+        self.release_geometry()
+        with self._renewals_mu:
+            n = self._renewals.get(lease, 0)
+            if n == 0:
+                self._kv.keep_alive(lease)
+            self._renewals[lease] = n + 1
+        self.geometry_lease = lease
+
+    def release_geometry(self) -> None:
+        """Stop renewing the geometry's lease without revoking it: other
+        nodes may still hold it."""
+        lease, self.geometry_lease = self.geometry_lease, 0
+        if not lease:
+            return
+        with self._renewals_mu:
+            n = self._renewals.pop(lease, 1) - 1
+            if n > 0:
+                self._renewals[lease] = n
+            else:
+                self._kv.keep_alive_stop(lease)
+
+    def list_nodes(self) -> List[Dict[str, Any]]:
+        return [rec for _, rec in self._list("nodes/")]
+
+    def publish_node(self, node: str, record: Dict[str, Any]) -> None:
+        self._put("nodes/" + node, record)
+
+    def unpublish_node(self, node: str) -> None:
+        self._kv.delete(self._base + "nodes/" + node)
 
     def close(self) -> None:
         try:
@@ -212,10 +304,21 @@ class _GeometryRegistry:
             pass
 
 
+def _parse_item(item) -> Tuple[int, int, List[int], List[int], str]:
+    """A TransferItem with its op made explicit (4-tuples are reads)."""
+    r, k, rs, ls = item[:4]
+    op = item[4] if len(item) > 4 else XFER_READ
+    if op not in (XFER_READ, XFER_WRITE):
+        raise ValueError(f"unknown transfer op {op!r}")
+    return int(r), int(k), [int(x) for x in rs], [int(x) for x in ls], op
+
+
 class _Job:
-    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters")
+    __slots__ = ("ticket", "items", "segs", "replies", "left", "deadline", "done", "done_at", "waiters",
+                 "submitted_ns")
 
     def __init__(self, items: List[TransferItem], deadline: float):
+        self.submitted_ns = time.perf_counter_ns()
         self.ticket = 0
         self.items = items
         self.segs: List[Optional[str]] = []
@@ -227,15 +330,77 @@ class _Job:
         self.waiters: List[threading.Event] = []
 
 
+class _TransferLog:
+    """Per-transfer log lines. ``add`` (transfer thread) only appends a tuple
+    of perf_counter_ns stamps and counts; a daemon thread formats and writes
+    the queued records once per ``period_s``, and ``close`` writes the rest.
+
+    Line: ``xfer <UTC end time> peer=<rank> kind=<pool> slots=<n> desc=<n>
+    bytes=<n> us=<issue to completion> MBps=<bytes/us> wait_us=<submit to
+    issue> inflight=<batches already in flight at issue>`` plus ``op=write``
+    for a write and ``state=<..>`` when the transfer did not complete."""
+
+    def __init__(self, target: str, period_s: float = 1.0):
+        self._q: Deque[tuple] = deque()
+        self._own = target != "-"
+        self._out = open(target, "a", buffering=1) if self._own else sys.stdout
+        self._base_ns = time.time_ns() - time.perf_counter_ns()
+        self._period = period_s
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="radixshmem-xferlog", daemon=True)
+        self._thread.start()
+
+    def add(self, rec: tuple) -> None:
+        self._q.append(rec)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._period):
+            self.flush()
+
+    def flush(self) -> None:
+        lines = []
+        while True:
+            try:
+                submitted, issued, done, rank, kind, slots, ndesc, nbytes, state, inflight, op = self._q.popleft()
+            except IndexError:
+                break
+            us = max(done - issued, 1) / 1000
+            end = datetime.fromtimestamp((self._base_ns + done) / 1e9, timezone.utc)
+            lines.append(f"xfer {end.strftime('%Y-%m-%dT%H:%M:%S.%f')}Z peer={rank} kind={_kind_name(kind)} "
+                         f"slots={slots} desc={ndesc} bytes={nbytes} us={us:.1f} MBps={nbytes / us:.1f} "
+                         f"wait_us={(issued - submitted) / 1000:.1f} inflight={inflight}"
+                         f"{' op=write' if op == XFER_WRITE else ''}{'' if not state else ' state=' + state}\n")
+        if lines:
+            self._out.write("".join(lines))
+            self._out.flush()
+
+    def close(self) -> None:
+        self._stop.set()
+        self._thread.join(2 * self._period + 1)
+        self.flush()
+        if self._own:
+            self._out.close()
+
+
+def _kind_name(kind: int) -> str:
+    try:
+        return ComponentType(kind).name
+    except Exception:  # noqa: BLE001
+        return str(kind)
+
+
 class RadixServer:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
+        self._wb_handler = self._make_writeback_handler()
+        self._wb: Optional[_Worker] = None
+        self._wb_closed = False
         self._geometry: Optional[Dict[str, Any]] = None
         self.last_error = ""
         self._cv = threading.Condition(threading.RLock())
         self._mode = MODE_STARTING
         self._index = self._iclient = self._store = self._backend = self._xfer = self._dreg = None
-        self._greg: Optional[_GeometryRegistry] = None
+        self._greg: Optional[_ServerRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
         self._zombies: List[int] = []
@@ -251,6 +416,9 @@ class RadixServer:
         self._thread: Optional[threading.Thread] = None
         self._running = False
         self.transfers = self.transfer_failures = self.transfer_bytes = 0
+        self._xlog: Optional[_TransferLog] = None
+        self.monitor = None
+        self._dw: Optional[Tuple[threading.Thread, threading.Event, Any]] = None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -266,12 +434,19 @@ class RadixServer:
             "Submit": lambda r: {"ticket": self.submit(r["items"], r["timeout_ms"])},
             "WaitAny": lambda r: self.wait_any(r["tickets"], r["timeout_ms"]),
             "Stats": lambda _: self.stats(),
-        }, self.cfg.resolved_endpoint, self.cfg.rpc_workers)
+            "Nodes": lambda _: {"nodes": self.nodes()},
+        }, self.cfg.resolved_endpoint)
+        if self.cfg.transfer_log and self._xlog is None:
+            self._xlog = _TransferLog(self.cfg.transfer_log)
         try:
             self._preflight()
+            self._start_monitor()
         except BaseException:
             self._rpc.stop(grace=0).wait()
             self._rpc = None
+            if self._greg is not None:
+                self._greg.close()
+                self._greg = None
             with self._cv:
                 self._mode = MODE_CLOSED
                 self._cv.notify_all()
@@ -279,6 +454,7 @@ class RadixServer:
         with self._cv:
             self._mode = MODE_WAITING
             self._cv.notify_all()
+        self._publish_node()
         if self._greg is not None and not self.cfg.index_only:
             self._poller = threading.Thread(target=self._follow_cluster, name="radixshmem-geometry",
                                             daemon=True)
@@ -295,9 +471,19 @@ class RadixServer:
             raise ValueError("distributed mode requires cluster.rpc_address or cluster.rpc_interface")
         if not hasattr(_core, "EtcdKv"):
             raise RuntimeError("radixshmem was built without etcd; a cluster needs it")
-        self._greg = _GeometryRegistry(c.cluster.registry, c.cluster.cluster_id)
+        self._greg = _ServerRegistry(c.cluster.registry, c.cluster.cluster_id)
         if not c.index_only:
             self._backend = self._make_backend()
+
+    def _start_monitor(self) -> None:
+        c = self.cfg
+        if not c.monitor_port or self.monitor is not None:
+            return
+        from radixshmem.monitor import MonitorProcess
+        host = c.cluster.rpc_address if c.cluster.rpc_address not in ("", "0.0.0.0") else ""
+        if c.cluster.rpc_interface:
+            host = _nic_ip(c.cluster.rpc_interface)
+        self.monitor = MonitorProcess(c, host)   # a child process: no share of this one's GIL
 
     def _make_backend(self):
         from radixshmem import _data
@@ -317,7 +503,12 @@ class RadixServer:
         return backend
 
     def close(self) -> None:
+        self._stop_writeback(closing=True)   # first: its handler may still pull while it stops
+        self._stop_dedup_writes()
         self._stop.set()
+        if self.monitor is not None:
+            self.monitor.close()
+            self.monitor = None
         if self._poller is not None:
             self._poller.join(2)
             self._poller = None
@@ -326,14 +517,19 @@ class RadixServer:
             self._rpc = None
         if self._worker is not None and self._worker.is_alive():
             self._worker.join(self.cfg.cluster.bootstrap_timeout_sec + 30)
-        self._running = False
+        with self._jobs_mu:
+            self._running = False
+            thread, self._thread = self._thread, None
         self._wake.set()
-        if self._thread is not None:
-            self._thread.join(2)
-            self._thread = None
+        if thread is not None:
+            thread.join(2)
+        if self._xlog is not None:
+            self._xlog.close()
+            self._xlog = None
         if self._greg is not None:
+            self._greg.release_geometry()
             try:
-                self._greg.unpublish(self._node_key())
+                self._greg.unpublish_node(self._node_key())
             except Exception:  # noqa: BLE001
                 pass
             self._greg.close()
@@ -343,10 +539,88 @@ class RadixServer:
             self._mode = MODE_CLOSED
             self._cv.notify_all()
 
+    def _make_writeback_handler(self) -> Optional[WritebackHandler]:
+        c = self.cfg
+        if c.role == "prefill" and c.distributed and not c.index_only and c.background_evict_ratio > 0:
+            return PeerWriteback()
+        return None
+
+    def _start_writeback(self) -> None:
+        if self._wb_handler is None:
+            return
+        worker = _Worker(self._index, self._wb_handler, RadixClient._in_process(self))
+        with self._cv:
+            closed = self._wb_closed
+            if not closed:
+                self._wb = worker
+        if closed:
+            worker.stop()
+        else:
+            worker.start()
+
+    def _stop_writeback(self, closing: bool = False) -> None:
+        with self._cv:
+            wb, self._wb = self._wb, None
+            self._wb_closed |= closing
+        if wb is not None:
+            wb.stop()
+
+    def _start_dedup_writes(self) -> None:
+        with self._cv:
+            index = self._index
+            if index is None or self._xfer is None or self._dw is not None:
+                return
+            stop = threading.Event()
+            t = threading.Thread(target=self._dedup_write_loop, args=(index, stop),
+                                 name="radixshmem-dedup-write", daemon=True)
+            self._dw = (t, stop, index)
+        index.set_dedup_writer_active(True)
+        t.start()
+
+    def _stop_dedup_writes(self) -> None:
+        with self._cv:
+            dw, self._dw = self._dw, None
+        if dw is not None:
+            t, stop, index = dw
+            stop.set()
+            index.set_dedup_writer_active(False)
+            t.join(10)
+
+    def _dedup_write_loop(self, index, stop: threading.Event) -> None:
+        """Runs the RDMA writes DedupPrefix handlers wait for (moves to the puller)."""
+        while not stop.is_set():
+            tickets: Dict[int, int] = {}
+            try:
+                batch = index.pop_dedup_writes(16, 200)
+            except Exception as e:  # noqa: BLE001 - handlers fall back to dropping only
+                print(f"radixshmem: dedup writes stopped: {type(e).__name__}: {e}", file=sys.stderr)
+                index.set_dedup_writer_active(False)
+                return
+            for wid, rank, timeout_ms, local, remote in batch:
+                items = [(rank, k, remote[k], local[k], XFER_WRITE) for k in range(len(local)) if local[k]]
+                try:
+                    tickets[self.submit(items, timeout_ms)] = wid
+                except Exception:  # noqa: BLE001 - not issued: the handler keeps its copy
+                    index.complete_dedup_write(wid, 1)
+            while tickets:
+                if stop.is_set():
+                    for wid in tickets.values():
+                        index.complete_dedup_write(wid, 2)
+                    return
+                r = self.wait_any(list(tickets), 1000)
+                for t, replies in r["done"].items():
+                    ok = all(rep[0] for rep in replies)
+                    late = any(rep[3] == XFER_IN_FLIGHT for rep in replies)
+                    index.complete_dedup_write(tickets.pop(t), 0 if ok else 2 if late else 1)
+                for t in r["unknown"]:
+                    index.complete_dedup_write(tickets.pop(t), 2)
+
     def _teardown_regions(self) -> None:
         """Drop the index, the SlotStore and the data-plane entry; the transfer
         engine and the etcd connection stay (they are the server's, not the
         geometry's)."""
+        self._stop_writeback()
+        self._stop_dedup_writes()
         with self._cv:
             index, store, dreg = self._index, self._store, self._dreg
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
@@ -372,6 +646,10 @@ class RadixServer:
     @property
     def index(self):
         return self._index
+
+    @property
+    def writeback_handler(self) -> Optional[WritebackHandler]:
+        return self._wb_handler
 
     @property
     def geometry(self) -> Optional[Dict[str, Any]]:
@@ -401,7 +679,33 @@ class RadixServer:
                 data_bytes=c.data_bytes,
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
-                mamba_ratio=float(c.mamba_ratio))
+                mamba_ratio=float(c.mamba_ratio),
+                role=c.role)
+
+    def _node_record(self) -> Dict[str, Any]:
+        info = self.describe()
+        rec = {"node_name": self._node_key() if self.cfg.distributed else info.node_name,
+               "role": info.role, "rank": info.rank, "mode": info.mode,
+               "data_plane": info.data_plane, "endpoint": self.cfg.resolved_endpoint}
+        if self.monitor is not None:
+            rec["monitor"] = self.monitor.url
+        return rec
+
+    def _publish_node(self) -> None:
+        if self._greg is None:
+            return
+        try:
+            self._greg.publish_node(self._node_key(), self._node_record())
+        except Exception as e:  # noqa: BLE001 - etcd hiccup; the next mode change rewrites it
+            print(f"radixshmem: publishing nodes/{self._node_key()} failed: {e}", file=sys.stderr)
+
+    def nodes(self) -> List[Dict[str, Any]]:
+        """Every live server's record in this cluster (``nodes/`` in etcd),
+        ranked nodes first in rank order; a standalone server only has its own."""
+        if self._greg is None:
+            return [self._node_record()]
+        recs = self._greg.list_nodes()
+        return sorted(recs, key=lambda r: (r.get("rank", -1) < 0, r.get("rank", -1), r.get("node_name", "")))
 
     def configure(self, geometry) -> NodeInfo:
         """Take a client's geometry: validate it, plan the pools, check it
@@ -422,11 +726,9 @@ class RadixServer:
                     raise GeometryMismatch("server serves another geometry: " + "; ".join(diffs))
                 return self.describe()
             if self._greg is not None:
-                for node, published in self._greg.list():
-                    diffs = _geometry.diff_geometry(planned, published, counts=False)
-                    if diffs:
-                        raise GeometryMismatch(f"geometry differs from node {node}'s: " + "; ".join(diffs))
-                self._greg.publish(self._node_key(), _geometry.uniform_fields(planned))
+                self._greg.hold_geometry(
+                    _geometry.uniform_fields(planned), self._node_key(),
+                    lambda published: _geometry.diff_geometry(planned, published, counts=False))
             self._geometry, self.last_error = planned, ""
             self._mode = MODE_CONFIGURING
             self._worker = threading.Thread(target=self._configure_thread, name="radixshmem-configure",
@@ -436,7 +738,7 @@ class RadixServer:
             return self.describe()
 
     def _node_key(self) -> str:
-        """This node's name under geometry/: the configured node_name, else the
+        """This node's name under nodes/: the configured node_name, else the
         one the index derives from its bind IP (node<ip>)."""
         c = self.cfg.cluster
         if c.node_name:
@@ -449,19 +751,20 @@ class RadixServer:
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
+            self._publish_node()
+            self._start_writeback()
+            self._start_dedup_writes()
         except Exception as e:  # noqa: BLE001 - reported through last_error, the server stays up
             self._teardown_regions()
             if self._greg is not None:
-                try:
-                    self._greg.unpublish(self._node_key())
-                except Exception:  # noqa: BLE001
-                    pass
+                self._greg.release_geometry()
             with self._cv:
                 self.last_error = f"{type(e).__name__}: {e}"
                 self._rejected = _geometry.uniform_fields(self._geometry)
                 self._geometry = None
                 self._mode = MODE_WAITING
                 self._cv.notify_all()
+            self._publish_node()
 
     def _follow_cluster(self) -> None:
         """Data-mode cluster node: adopt the geometry a peer published. A
@@ -472,12 +775,12 @@ class RadixServer:
                 if self._mode != MODE_WAITING:
                     continue
             try:
-                entries = self._greg.list()
+                rec = self._greg.geometry()
             except Exception:  # noqa: BLE001 - etcd hiccup, try again next round
                 continue
-            if not entries:
+            if rec is None:
                 continue
-            node, published = entries[0]
+            node, published = rec.get("node", "?"), rec["geometry"]
             if self._rejected is not None and not _geometry.diff_geometry(published, self._rejected,
                                                                           counts=False):
                 continue
@@ -510,6 +813,10 @@ class RadixServer:
             out = {"mode": self._mode, "transfers": self.transfers,
                    "transfer_failures": self.transfer_failures, "transfer_bytes": self.transfer_bytes,
                    "pending_jobs": len(self._jobs), "queued_jobs": len(self._queue)}
+        wb = self._wb
+        if idx is not None and self._wb_handler is not None:
+            out["writeback"] = {**self._wb_handler.stats(), **idx.writeback_stats(),
+                                "failed": wb.failed if wb else 0}
         if idx is not None:
             out.update(rank=idx.rank(), world_size=idx.world_size(),
                        total_radix_nodes=idx.total_radix_nodes(), total_blocks=idx.total_blocks(),
@@ -519,6 +826,10 @@ class RadixServer:
                        insert_errors=idx.insert_error_node_pool_count()
                        + idx.insert_error_data_pool_count() + idx.insert_error_ht_pool_count(),
                        **idx.peer_fault_counts())
+            pools = {"full": (idx.mempool_used(), idx.mempool_total()),
+                     "swa": (idx.swa_mempool_total() - idx.swa_mempool_free(), idx.swa_mempool_total()),
+                     "mamba": (idx.mamba_mempool_total() - idx.mamba_mempool_free(), idx.mamba_mempool_total())}
+            out["pools"] = {k: [int(u), int(n)] for k, (u, n) in pools.items() if n > 0}   # [used, total]
         return out
 
     # ------------------------------------------------------------ bring-up
@@ -527,6 +838,8 @@ class RadixServer:
         cc = _core.RadixServerConfig()
         cc.name, cc.shm = self.cfg.name, shm
         cc.register_chunk_tokens = int(g["register_chunk_tokens"])
+        cc.writeback_enabled = self._wb_handler is not None
+        cc.writeback_max_held_ratio = float(self.cfg.writeback_max_held_ratio)
         for k in _CLUSTER_FIELDS:
             setattr(cc, k, getattr(self.cfg.cluster, k))
         return cc
@@ -582,9 +895,8 @@ class RadixServer:
             raise DataPlaneUnavailable("index-only server has no data plane")
         if self._xfer is None:
             raise DataPlaneUnavailable("standalone server has no peers")
-        job = _Job([(int(r), int(k), [int(x) for x in rs], [int(x) for x in ls])
-                    for r, k, rs, ls in items], time.monotonic() + timeout_ms / 1000)
-        for i, (rank, _, _, _) in enumerate(job.items):
+        job = _Job([_parse_item(it) for it in items], time.monotonic() + timeout_ms / 1000)
+        for i, (rank, _, _, _, _) in enumerate(job.items):
             try:
                 job.segs.append(self._peer(rank))
             except Exception as e:  # noqa: BLE001
@@ -592,6 +904,8 @@ class RadixServer:
                 job.replies[i] = (False, 0, 0, str(e))
                 job.left -= 1
         with self._jobs_mu:
+            if self._stop.is_set():   # close() has stopped, or is stopping, the transfer loop
+                raise DataPlaneUnavailable("server is closing")
             if len(self._jobs) >= self.cfg.max_pending_jobs:
                 raise ServerBusy(f"{len(self._jobs)} jobs pending")
             job.ticket = self._next_ticket
@@ -652,6 +966,8 @@ class RadixServer:
         from radixshmem import _data
 
         c = self.cfg
+        xlog = self._xlog
+        clock = time.perf_counter_ns
         inflight: List[tuple] = []
         last_gc = time.monotonic()
         while self._running:
@@ -660,32 +976,48 @@ class RadixServer:
                     job = self._queue.popleft() if self._queue else None
                 if job is None:
                     break
-                for i, (rank, kind, remote, local) in enumerate(job.items):
+                expired = time.monotonic() >= job.deadline
+                for i, (rank, kind, remote, local, op) in enumerate(job.items):
                     if job.replies[i] is not None:
                         continue
+                    if expired:
+                        self._resolve(job, i, (False, 0, 0, "deadline passed before the transfer was issued"))
+                        continue
+                    issued = clock() if xlog is not None else 0
                     try:
-                        h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
+                        if op == XFER_WRITE:
+                            h, nd = self._xfer.write(job.segs[i], local, remote, kind=ComponentType(kind))
+                        else:
+                            h, nd = self._xfer.read(job.segs[i], remote, local, kind=ComponentType(kind))
                     except Exception as e:  # noqa: BLE001
                         h, nd = _data.INVALID_BATCH, str(e)
                     if h == _data.INVALID_BATCH:
                         self._peers.pop(rank, None)
-                        self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else "read rejected"))
+                        self._resolve(job, i, (False, 0, 0, nd if isinstance(nd, str) else
+                                               "write rejected" if op == XFER_WRITE else "read rejected"))
                     else:
-                        inflight.append((job, i, h, nd))
+                        inflight.append((job, i, h, nd, issued, len(inflight)))
             progressed, now, still = False, time.monotonic(), []
-            for job, i, h, nd in inflight:
+            for job, i, h, nd, issued, ahead in inflight:
                 st, done = self._xfer.poll(h)
                 if st == _data.XferState.PENDING and now < job.deadline:
-                    still.append((job, i, h, nd))
+                    still.append((job, i, h, nd, issued, ahead))
                     continue
+                if xlog is not None and done:
+                    rank, kind, _, local, op = job.items[i]
+                    xlog.add((job.submitted_ns, issued, clock(), rank, kind, len(local), int(nd), int(done),
+                              "" if st == _data.XferState.COMPLETED else
+                              ("TIMEOUT" if st == _data.XferState.PENDING else st.name), ahead, op))
                 if st == _data.XferState.PENDING:
                     st = _data.XferState.TIMEOUT
-                if self._xfer.release(h) == _data.XFER_EBUSY:
+                busy = self._xfer.release(h) == _data.XFER_EBUSY
+                if busy:
                     self._zombies.append(h)
                 ok = st == _data.XferState.COMPLETED
                 if not ok:
                     self._peers.pop(job.items[i][0], None)
-                self._resolve(job, i, (ok, int(done), int(nd), "" if ok else str(st)))
+                err = "" if ok else XFER_IN_FLIGHT if busy else str(st)
+                self._resolve(job, i, (ok, int(done), int(nd), err))
                 progressed = True
             inflight = still
             if now - last_gc > 1.0:

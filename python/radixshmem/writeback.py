@@ -1,0 +1,250 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Write-back of background-evicted KV: a thread of the server process hands
+``WritebackTask`` batches to a ``WritebackHandler``; ``PeerWriteback`` pushes
+them to the decode nodes."""
+
+from __future__ import annotations
+
+import concurrent.futures
+import sys
+import threading
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+
+from radixshmem._core import INVALID_COMPONENT_SLOT, MAX_REMOTE_OP_BLOCKS
+from radixshmem.client import MODE_READY, PushJob
+
+PUSH_THREADS = 16
+
+_STOP_WAIT_S = 5.0   # how long close() waits for a running write() before handler.stop()
+
+
+@dataclass
+class WritebackTask:
+    """An evicted chain (a leaf and the ancestors it left childless) with its
+    root path [0, end): [evicted_from, end) left the tree, [0, evicted_from) is
+    still in it, and no slot is recycled until done."""
+
+    task_id: int
+    hashes: np.ndarray        # uint64[end]
+    full_slots: np.ndarray    # int32[end]
+    swa_slots: np.ndarray     # int32[end], -1 where the tree has none; empty without an SWA pool
+    mamba_ends: np.ndarray    # uint32[k]: END positions of the path's Mamba checkpoints
+    mamba_slots: np.ndarray   # int32[k]
+    evicted_from: int
+    generation: int           # the index's reset() count at eviction
+    _check: Optional[Callable[[WritebackTask], bool]] = field(default=None, repr=False, compare=False)
+
+    @property
+    def end(self) -> int:
+        return len(self.hashes)
+
+    def valid(self) -> bool:
+        return self._check is not None and self._check(self)
+
+
+class WritebackHandler:
+    """``start(client)`` runs once the server is ready. ``write`` calls
+    ``done(task_ids)`` from any thread, possibly later; data read from the slots
+    may be stored only if ``task.valid()`` is still True after the read (a
+    ``reset()`` or ``done`` ends it). ``close()`` calls ``stop`` first, while the
+    client can still pull, once ``write`` returned or after 5 s; tasks not done
+    by then are dropped. While ``active()`` is False, background eviction
+    recycles what it takes at once and hands nothing to ``write``."""
+
+    def start(self, client) -> None:
+        pass
+
+    def active(self) -> bool:
+        return True
+
+    def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
+        raise NotImplementedError
+
+    def stop(self) -> None:
+        pass
+
+    def stats(self) -> Dict[str, int]:
+        return {}
+
+
+class PeerWriteback(WritebackHandler):
+    """Pushes each evicted path to a ready decode node with ``push_async``,
+    picked by the hash of its first block so that a prefix tree stays on one
+    node. On prefill nodes it extends them with the decode nodes' memory.
+    ``timeout_ms``: the deadline of each push."""
+
+    def __init__(self, timeout_ms: int = 30000):
+        self.timeout_ms = int(timeout_ms)
+        self.client = None
+        self._decode = False
+        self._targets: List[int] = []
+        self._error: Optional[str] = None
+        self._stopping = threading.Event()
+        self._stats = dict.fromkeys(("pushed", "incomplete", "no_space", "no_target", "too_long"), 0)
+        self._pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+    def start(self, client) -> None:
+        self.client = client
+        self._decode = client.info.role == "decode"
+        self._pool = concurrent.futures.ThreadPoolExecutor(max_workers=PUSH_THREADS,
+                                                           thread_name_prefix="radixshmem-writeback")
+        if self._decode:
+            print("radixshmem: PeerWriteback on a decode node pushes nothing", file=sys.stderr)
+        else:
+            threading.Thread(target=self._watch, name="radixshmem-writeback-nodes", daemon=True).start()
+
+    def active(self) -> bool:
+        return bool(self._targets)
+
+    def stats(self) -> Dict[str, int]:
+        return dict(self._stats)
+
+    def stop(self) -> None:
+        self._stopping.set()
+        if self._pool is not None:
+            self._pool.shutdown(wait=False, cancel_futures=True)
+
+    def write(self, tasks: Sequence[WritebackTask], done: Callable[[Sequence[int]], None]) -> None:
+        targets = self._targets
+        picked = []
+        for t in tasks:
+            rank = targets[int(t.hashes[0]) % len(targets)] if targets else -1
+            if rank < 0:
+                self._stats["no_target"] += 1
+            elif t.end > MAX_REMOTE_OP_BLOCKS:
+                self._stats["too_long"] += 1
+            else:
+                picked.append((t, rank))
+        jobs = list(self._pool.map(lambda p: self._push(*p), picked))
+        for job in jobs:
+            self._stats["pushed" if job.wait().complete else "no_space" if job.no_space else "incomplete"] += 1
+        done([t.task_id for t in tasks])
+
+    def _watch(self) -> None:
+        while True:
+            self._refresh()
+            if self._stopping.wait(1.0):
+                return
+
+    def _refresh(self) -> None:
+        try:
+            nodes, me = self.client.nodes(), self.client.rank()
+        except Exception as e:  # noqa: BLE001 - etcd or the server is away: the last list stays
+            if self._error is None:
+                print(f"radixshmem: PeerWriteback cannot read the node list, keeps the last one: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr)
+            self._error = str(e)
+            return
+        self._error = None
+        self._targets = sorted(int(r["rank"]) for r in nodes if r.get("mode") == MODE_READY and r.get("data_plane")
+                               and r.get("role") == "decode" and int(r.get("rank", -1)) not in (-1, me))
+
+    def _push(self, t: WritebackTask, rank: int) -> PushJob:
+        mamba = [(int(e), int(s)) for e, s in zip(t.mamba_ends, t.mamba_slots) if e > t.evicted_from]
+        return self.client.push_async(rank, t.hashes, t.full_slots, _swa_runs(t.swa_slots, t.evicted_from),
+                                      mamba, valid=t.valid, timeout_ms=self.timeout_ms)
+
+
+def _swa_runs(slots: np.ndarray, past: int) -> List[Tuple[int, np.ndarray]]:
+    live = np.flatnonzero(slots != INVALID_COMPONENT_SLOT)
+    if not len(live):
+        return []
+    runs = np.split(live, np.flatnonzero(np.diff(live) != 1) + 1)
+    return [(int(r[-1]) + 1, slots[r[0]:r[-1] + 1]) for r in runs if r[-1] >= past]
+
+
+class _Worker:
+    def __init__(self, index, handler: WritebackHandler, client, batch: int = 64, poll_ms: int = 200):
+        self._index, self._handler, self._client = index, handler, client
+        self._batch, self._poll_ms = batch, poll_ms
+        self._stop = threading.Event()
+        self._life = threading.Lock()   # start() and stop() do not overlap
+        self._started = False
+        self._mu = threading.Lock()     # held across index calls, so stop() waits for them
+        self._open: Set[int] = set()    # handed to the handler, not done yet
+        self.failed = 0
+        self._active: Optional[bool] = None
+        self._thread = threading.Thread(target=self._run, name="radixshmem-writeback", daemon=True)
+
+    def start(self) -> None:
+        with self._life:
+            if self._stop.is_set():
+                return
+            self._sync_active()
+            self._handler.start(self._client)
+            self._started = True
+            self._thread.start()
+
+    def done(self, task_ids: Sequence[int]) -> None:
+        with self._mu:
+            ids = [int(i) for i in task_ids if int(i) in self._open]
+            self._open.difference_update(ids)
+            if ids and self._index is not None:
+                self._index.complete_writeback(ids)
+
+    def _valid(self, task: WritebackTask) -> bool:
+        with self._mu:
+            return (task.task_id in self._open and self._index is not None
+                    and self._index.reset_generation() == task.generation)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            ids: List[int] = []
+            try:
+                self._sync_active()
+                raw = self._index.pop_writeback(self._batch, self._poll_ms)
+                ids = [int(r[0]) for r in raw]
+                with self._mu:
+                    self._open.update(ids)
+                if raw:
+                    self._handler.write([WritebackTask(*r, _check=self._valid) for r in raw], self.done)
+            except BaseException as e:  # noqa: BLE001 - the batch is given up, the thread goes on
+                self._give_up(ids, e)
+
+    def _sync_active(self) -> None:
+        active = bool(self._handler.active())
+        if active != self._active:
+            self._index.set_writeback_active(active)
+            self._active = active
+
+    def _give_up(self, ids: List[int], e: BaseException) -> None:
+        with self._mu:
+            left = [i for i in ids if i in self._open]
+        self.failed += len(left)
+        try:
+            print(f"radixshmem: write-back failed on {len(left)} task(s): {type(e).__name__}: {e}",
+                  file=sys.stderr)
+        except Exception:  # noqa: BLE001 - no stderr: the tasks are given up all the same
+            pass
+        self.done(left)
+        if not ids:
+            self._stop.wait(self._poll_ms / 1000)
+
+    def stop(self) -> None:
+        self._stop.set()
+        with self._life:
+            if self._started:
+                if self._thread.ident is not None:
+                    self._thread.join(_STOP_WAIT_S)
+                if self._thread.is_alive():
+                    print(f"radixshmem: write-back handler still in write() after {_STOP_WAIT_S:g}s; "
+                          "stopping it", file=sys.stderr)
+                try:
+                    self._handler.stop()
+                except Exception as e:  # noqa: BLE001
+                    print(f"radixshmem: write-back handler stop failed: {type(e).__name__}: {e}",
+                          file=sys.stderr)
+        # The handler may keep `done`, which must not keep the index alive.
+        with self._mu:
+            if self._index is not None:
+                self._index.set_writeback_active(False)
+            self._index = None
+            self._open.clear()
+        client, self._client = self._client, None
+        if client is not None:
+            client.close()

@@ -66,14 +66,15 @@ bool ChildTable::insert(uint32_t parent_id, uint64_t token_hash,
     if (ei == HT_END) return false;
     ChainHTEntry& e = entries_[ei];
     e.token_hash = token_hash;
-    e.parent_id = parent_id;
     e.child_node_id = child_node_id;
 
     uint32_t bi = bucket_index(token_hash);
     e.hash_next = buckets_[bi];
     buckets_[bi] = ei;
 
+    e.sibling_prev = HT_END;
     e.sibling_next = parent_node->first_child_entry;
+    if (e.sibling_next != HT_END) entries_[e.sibling_next].sibling_prev = ei;
     parent_node->first_child_entry = ei;
     return true;
 }
@@ -99,16 +100,10 @@ void ChildTable::remove(uint32_t parent_id, uint64_t token_hash,
     }
     if (found == HT_END) return;
 
-    uint32_t* sprev = &parent_node->first_child_entry;
-    uint32_t sidx = *sprev;
-    while (sidx != HT_END) {
-        if (sidx == found) {
-            *sprev = entries_[sidx].sibling_next;
-            break;
-        }
-        sprev = &entries_[sidx].sibling_next;
-        sidx = entries_[sidx].sibling_next;
-    }
+    const ChainHTEntry& f = entries_[found];
+    if (f.sibling_prev == HT_END) parent_node->first_child_entry = f.sibling_next;
+    else entries_[f.sibling_prev].sibling_next = f.sibling_next;
+    if (f.sibling_next != HT_END) entries_[f.sibling_next].sibling_prev = f.sibling_prev;
 
     free_entry(found);
 }

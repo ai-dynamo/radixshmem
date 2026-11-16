@@ -16,6 +16,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <string>
+#include <strings.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -121,8 +122,20 @@ inline int reap_servers(std::vector<pid_t>& pids) {
     return unhealthy;
 }
 
+// The test host's bonded HCA for the planes that run on RDMA, unless
+// RADIXSHMEM_INDEX_DEV names another; spawned servers and clients inherit it.
+inline void default_index_dev() {
+    setenv("RADIXSHMEM_INDEX_DEV", "mlx5_bond_0", 0);
+}
+
 inline int32_t remote_src(const radixshmem::ComponentQueryResult& r) {
     return r.full_fragments.empty() ? -1 : r.full_fragments.back().source_rank;
+}
+
+// A remote hit counts one-sided reads only on the rdma peer index (grpc is the default).
+inline bool remote_reads_ok(const radixshmem::ComponentQueryResult& r) {
+    const char* b = getenv("RADIXSHMEM_PEER_INDEX_BACKEND");
+    return b && strcasecmp(b, "rdma") == 0 ? r.rdma_read_count > 0 : r.rdma_read_count == 0;
 }
 
 inline const std::vector<int32_t>&
@@ -213,7 +226,6 @@ public:
                       "--background-evict-ratio", evict_str,
                       "--register-chunk-tokens", cs_str,
                       "--data-pool-ratio", dpr_str,
-                      "--interval", "86400",
                       nullptr);
             } else {
                 execl(bin.c_str(), "radix_server",
@@ -221,7 +233,6 @@ public:
                       "--max-nodes", nodes_str,
                       "--background-evict-ratio", evict_str,
                       "--register-chunk-tokens", cs_str,
-                      "--interval", "86400",
                       nullptr);
             }
             _exit(127);

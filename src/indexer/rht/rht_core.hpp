@@ -27,6 +27,7 @@
 #include <exception>
 #include <functional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace radixshmem {
@@ -145,8 +146,18 @@ public:
     int num_shards() const { return num_shards_; }
 
 private:
-    bool remove(uint64_t key, int32_t expected_node_id,
-                uint32_t expected_tree_node_id);
+    using BucketFn = std::function<void(int, const RhtSlot*)>;
+    // Reads every key's bucket (local directly, remote in chained rounds) into
+    // on_bucket; keys whose holder is skipped or fails count as dropped `op`.
+    // With retry, keys dropped only because another holder failed are read
+    // once more.
+    void read_buckets(const uint64_t* keys, int count, PeerBreaker::Op op,
+                      const char* what, const BucketFn& on_bucket, bool retry = false);
+    uint64_t bucket_id(uint64_t key) const;
+    using Buckets = std::unordered_map<uint64_t, std::vector<RhtSlot>>;
+    template <typename Entry>
+    Buckets read_entry_buckets(const Entry* entries, int count, PeerBreaker::Op op,
+                               std::vector<char>& have);
 
     // Pack head: [key_tag(16) | node_id+1(16) | tree_node_id(32)] = 8 bytes
     // Empty = 0 (node_id+1 == 0 means no entry).

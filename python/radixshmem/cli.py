@@ -33,7 +33,6 @@ import argparse
 import signal
 import sys
 import threading
-import time
 
 from radixshmem import _geometry
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
@@ -128,11 +127,30 @@ def parse_args(argv=None) -> argparse.Namespace:
     g = p.add_argument_group("server")
     g.add_argument("--endpoint", default="",
                    help="gRPC endpoint clients connect to (default: unix:///dev/shm/<name>.sock)")
-    g.add_argument("--rpc-workers", type=int, default=32,
-                   help="gRPC threads; one blocks per client with jobs in flight (default: 32)")
-    g.add_argument("--interval", type=int, default=5, help="stats interval in seconds, 0 = silent")
+    g.add_argument("--decode", action="store_true",
+                   help="PD disaggregation: this node serves decode (default: prefill)")
+    g.add_argument("--monitor-port", type=int, default=0,
+                   help="serve Prometheus /metrics (with the radix tree for the Grafana dashboard) "
+                        "on this port, or the next free one; 0 = off (default: 0, suggested: 9810)")
+    g.add_argument("--monitor-interval", type=float, default=10.0,
+                   help="seconds between tree copies for /metrics (default: 10)")
+    g.add_argument("--monitor-tree-nodes", type=int, default=150,
+                   help="nodes of this server's tree exported, 0 = none (default: 150)")
+    g.add_argument("--monitor-cluster-nodes", type=int, default=300,
+                   help="nodes of the merged cluster tree the leader exports, 0 = none (default: 300)")
+    g.add_argument("--transfer-log", default="-",
+                   help="one line per transfer that moved data (time, bytes, bandwidth): '-' = stdout, "
+                        "a path appends there, '' = off (default: -)")
 
-    g = p.add_argument_group("distributed (--expected-min-nodes or --num-rht-shards > 1)")
+    g = p.add_argument_group("write-back of background-evicted KV")
+    g.add_argument("--writeback-max-held", type=float, default=0.05,
+                   help="background eviction pauses while unfinished write-backs cover this "
+                        "share of a pool (default: 0.05)")
+
+    g = p.add_argument_group("distributed (--expected-min-nodes > 1; the RHT is configured with "
+                             "RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with "
+                             "RADIXSHMEM_PEER_INDEX_*, the RDMA device of either with "
+                             "RADIXSHMEM_INDEX_DEV / _GID_IDX, see docs/api.md)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
     g.add_argument("--registry", default="etcd://127.0.0.1:2379")
@@ -140,25 +158,12 @@ def parse_args(argv=None) -> argparse.Namespace:
     g.add_argument("--node-name", default="")
     g.add_argument("--rpc-address", default="", help="bootstrap IP peers dial; 0.0.0.0 on one host")
     g.add_argument("--rpc-interface", default="", help="NIC to resolve the bootstrap IP from")
-    g.add_argument("--rpc-port", type=int, default=0)
-    g.add_argument("--index-dev", default="",
-                   help="HCA of the index control plane (default: first available); "
-                        "the data plane's is --transfer-dev")
-    g.add_argument("--gid-idx", type=int, default=3)
+    g.add_argument("--rpc-port", type=int, default=0,
+                   help="port of the gRPC endpoint peers reach: remote ops, peer queries, "
+                        "RDMA connection setup (default: 0 = OS-assigned)")
     g.add_argument("--bootstrap-timeout", type=int, default=60)
     g.add_argument("--lease-ttl", type=int, default=30,
                    help="etcd lease TTL: how long a killed node's keys outlive it")
-    g.add_argument("--rht-transport", default="xrc", choices=["xrc", "dc"],
-                   help="client -> RHT shard holder QPs")
-    g.add_argument("--peer-index-transport", default="xrc", choices=["xrc", "dc"],
-                   help="remote walks into peer trees")
-    g.add_argument("--num-rht-shards", type=int, default=0)
-    g.add_argument("--rht-shard-holders", default="", help="comma-separated ranks")
-    g.add_argument("--rht-slots", type=int, default=4, choices=[1, 2, 4, 8])
-    g.add_argument("--enable-remote-insert", action="store_true")
-    g.add_argument("--enable-remote-query", action="store_true")
-    g.add_argument("--zmq-listen-port", type=int, default=0)
-    g.add_argument("--remote-op-transport", default="zmq", choices=["zmq", "dc"])
     return p.parse_args(argv)
 
 
@@ -176,41 +181,18 @@ def build_config(a: argparse.Namespace) -> ServerConfig:
     cluster = ClusterConfig(
         expected_min_nodes=a.expected_min_nodes, settle_ms=a.settle_ms, registry=a.registry,
         cluster_id=a.cluster_id, node_name=a.node_name, rpc_address=a.rpc_address,
-        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port, index_dev=a.index_dev, gid_idx=a.gid_idx,
-        bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl,
-        rht_transport=a.rht_transport,
-        peer_index_transport=a.peer_index_transport, num_rht_shards=a.num_rht_shards,
-        rht_shard_holders=[int(x) for x in a.rht_shard_holders.split(",") if x.strip()],
-        rht_slots_per_bucket=a.rht_slots, enable_remote_insert=a.enable_remote_insert,
-        enable_remote_query=a.enable_remote_query, zmq_listen_port=a.zmq_listen_port,
-        remote_op_transport=a.remote_op_transport)
+        rpc_interface=a.rpc_interface, rpc_port=a.rpc_port,
+        bootstrap_timeout_sec=a.bootstrap_timeout, lease_ttl_sec=a.lease_ttl)
     return ServerConfig(
         name=a.name, data_bytes=a.data_bytes or 0, hugepage_path=a.hugepage_path,
         max_nodes=a.max_nodes, register_chunk_tokens=a.register_chunk_tokens,
         background_evict_ratio=a.background_evict_ratio, data_pool_ratio=a.data_pool_ratio,
-        evict_policy=a.evict_policy, endpoint=a.endpoint, rpc_workers=a.rpc_workers,
+        evict_policy=a.evict_policy, endpoint=a.endpoint,
+        transfer_log=a.transfer_log, role="decode" if a.decode else "prefill",
+        monitor_port=a.monitor_port, monitor_interval_s=a.monitor_interval,
+        monitor_tree_nodes=a.monitor_tree_nodes, monitor_cluster_nodes=a.monitor_cluster_nodes,
+        writeback_max_held_ratio=a.writeback_max_held,
         cluster=cluster, **kw)
-
-
-def _stats_line(srv: RadixServer) -> str:
-    s = srv.stats()
-    if "total_blocks" not in s:
-        return f"[{s['mode']}]"
-    tag = f"[rank {s['rank']}]" if s["world_size"] > 1 else "[stats]"
-    line = (f"{tag} nodes={s['total_radix_nodes']}  blocks={s['total_blocks']}  "
-            f"data_pool={s['data_pool_utilization'] * 100:.1f}%  ins_ok={s['insert_success']}")
-    if s["mempool_total"]:
-        line += f"  mempool={s['mempool_used']}/{s['mempool_total']}"
-    if s["insert_errors"]:
-        line += f"  ins_err={s['insert_errors']}"
-    if s["peer_down_events"]:
-        line += (f"  peer_down={s['peer_down_events']}  rht_drop={s['rht_writes_dropped']}"
-                 f"/{s['rht_removes_dropped']}  lookup_skip={s['rht_lookups_skipped']}"
-                 f"  walk_skip={s['walks_skipped']}")
-    if s["transfers"] or s["pending_jobs"]:
-        line += (f"  xfers={s['transfers']}({s['transfer_failures']} failed, "
-                 f"{fmt_size(s['transfer_bytes'])})  jobs={s['pending_jobs']}")
-    return line
 
 
 def _ready_banner(srv: RadixServer) -> str:
@@ -226,7 +208,6 @@ def main(argv=None) -> None:
         cfg = build_config(a)
     except (ValueError, TypeError) as e:
         sys.exit(f"ERROR: {e}")
-
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
@@ -235,6 +216,10 @@ def main(argv=None) -> None:
     print(f"Starting radix-server ({'index only' if cfg.index_only else 'index + data plane'})")
     print(f"  Name:           {cfg.name}")
     print(f"  Endpoint:       {cfg.resolved_endpoint}")
+    print(f"  Role:           {cfg.role}")
+    if srv.writeback_handler is not None:
+        print(f"  Write-back:     {type(srv.writeback_handler).__name__}  (pause at "
+              f"{cfg.writeback_max_held_ratio:g} of a pool in flight)")
     if not cfg.index_only:
         print(f"  Data name:      {cfg.resolved_data_name}")
         print(f"  Data budget:    {fmt_size(cfg.data_bytes)}  (swa {cfg.swa_ratio:g}, "
@@ -247,8 +232,10 @@ def main(argv=None) -> None:
     except Exception as e:  # noqa: BLE001
         srv.close()
         sys.exit(f"Start FAILED: {e}")
+    if srv.monitor is not None:
+        print(f"  Monitor:        {srv.monitor.url}/metrics  (Prometheus service discovery: {srv.monitor.url}/sd)")
     print("Waiting for a client's geometry (RadixClient(name, Geometry(...))) ...", flush=True)
-    last, seen = 0.0, srv.mode
+    seen = srv.mode
     try:
         while not stop.wait(0.2):
             mode = srv.mode
@@ -262,10 +249,6 @@ def main(argv=None) -> None:
                 elif mode == "waiting":
                     print(f"Configuration FAILED: {srv.last_error}\nWaiting for a client's geometry ...",
                           flush=True)
-            if a.interval > 0 and mode == "ready" and time.monotonic() - last >= a.interval:
-                last = time.monotonic()
-                sys.stdout.write(f"\r{_stats_line(srv)}        ")
-                sys.stdout.flush()
     finally:
         print("\nShutting down ...", flush=True)
         srv.close()

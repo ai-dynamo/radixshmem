@@ -456,7 +456,7 @@ static void test_independent_eviction() {
     shm_unlink(name);
     auto t = RadixShmemTree::create(name, cfg(4, 4, 64));
     int cascades = 0;
-    t.set_evict_callback([&](const std::vector<EvictedNode>&) { cascades++; });
+    t.set_evict_callback([&](const std::vector<NodeHead>&) { cascades++; });
     auto ha = seq(0x8000, 4), hb = seq(0x9000, 4), hc = seq(0xA000, 4);
     for (auto* h : {&ha, &hb, &hc}) {
         insert_fresh(t, h->data(), 4);

@@ -6,6 +6,7 @@
 #include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "component_types.h"
 #include "health_check.h"
+#include "tree_dump.h"
 #include "types.h"
 
 #include <cstddef>
@@ -24,36 +25,18 @@ struct RemoteHit;
 class LocalTreeConnector;
 class RadixServer;
 #ifndef RADIXSHMEM_NO_RDMA
-class RdmaTransportClient;
-class RdmaContext;
 class PeerRegistry;
-class PeerConnector;
-class RhtConsumer;   // src/indexer/rht/rht_endpoint.h
-class IRdmaEndpoint;
+class PeerIndexBackend;   // include/peer_index.h
+class RhtBackend;         // include/rht_backend.h
 struct PeerEntry;
 struct PeerFaultCounters;
 struct ShardMapMsg;
 
 class IRemoteOpClientTransport;
-
-struct AllocateReply {
-    RemoteStatus status = RemoteStatus::OK;
-    std::vector<int32_t> slots;   // target-local reserved slot ids (empty on failure)
-};
-
-struct QueryReply {
-    RemoteStatus status = RemoteStatus::OK;
-    int hit_length       = 0;   // B local-tree total matched blocks
-    std::vector<int32_t> slots; // target-local physical slot ids (len == hit_length)
-};
+class PeerBreaker;
 
 class RemotePeer {
 public:
-#ifdef RADIXSHMEM_HAS_ZMQ
-    explicit RemotePeer(const std::string& endpoint,
-                        int recv_timeout_ms = 5000,
-                        int max_retry = 3);
-#endif
     RemotePeer(std::unique_ptr<IRemoteOpClientTransport> transport,
                std::string endpoint);
 
@@ -64,45 +47,42 @@ public:
     RemotePeer(const RemotePeer&) = delete;
     RemotePeer& operator=(const RemotePeer&) = delete;
 
-    AllocateReply allocate(int n);   // pure slot alloc; no hashes, no dedup
+    // pure slot alloc from the target's `component` pool; no hashes, no dedup
+    AllocateReply allocate(int n, ComponentType component = ComponentType::FULL);
+
+    AllocateComponentsReply allocate_components(const std::vector<ComponentCount>& components);
 
     InsertResult insert(const uint64_t* hashes, int n, int start, int length,
-                        const int32_t* slots, bool auto_recycle = true);
+                        const int32_t* slots, bool auto_recycle = true,
+                        ComponentType component = ComponentType::FULL);
 
-    QueryReply query(const uint64_t* hashes, int n, bool lock = false,
-                     bool update_meta = true);
+    InsertPathResult insert_path(const uint64_t* hashes, int n, int start, int length,
+                                 const int32_t* full_slots, const std::vector<ComponentRun>& runs,
+                                 bool auto_recycle = true);
 
-    // Returns the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
-    RemoteStatus release(const uint64_t* hashes, int n, int start, int length,
-                 const int32_t* slots = nullptr);
+    QueryReply query(const uint64_t* hashes, int n, const RemoteQuery& q);
+
+    // Both return the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
+    RemoteStatus recycle(const int32_t* slots, int num_slots,
+                         ComponentType component = ComponentType::FULL);
+    RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin);
+    DedupReply dedup_prefix(const uint64_t* hashes, int n, const DedupRequest& req = {});
 
     const std::string& endpoint() const { return endpoint_; }
 
     // The peer rank this session talks to (set by peer_for; -1 when built directly).
     int  peer_rank() const { return peer_rank_; }
     void set_peer_rank(int r) { peer_rank_ = r; }
-
-    void set_op_mu(std::shared_ptr<std::mutex> mu) { op_mu_ = std::move(mu); }
+    void set_breaker(std::shared_ptr<PeerBreaker> breaker) { breaker_ = std::move(breaker); }
 
 private:
-
-    RemoteStatus request(const void* req, size_t req_len,
-                         std::vector<char>& reply_out);
-
-    RemoteStatus send_ack_op(uint16_t op, const uint64_t* hashes, int n,
-                     int start, int length, const int32_t* slots,
-                     uint16_t flags = 0);
-
-    std::unique_lock<std::mutex> guard() const {
-        return op_mu_ ? std::unique_lock<std::mutex>(*op_mu_)
-                      : std::unique_lock<std::mutex>();
-    }
+    bool skipped();
+    void observe(const char* op, RemoteStatus st, double secs);
 
     std::unique_ptr<IRemoteOpClientTransport> transport_;
     std::string endpoint_;
-    uint64_t    next_req_id_  = 0;
-    std::shared_ptr<std::mutex> op_mu_;
     int         peer_rank_    = -1;
+    std::shared_ptr<PeerBreaker> breaker_;
 };
 
 #endif  // !RADIXSHMEM_NO_RDMA
@@ -113,8 +93,6 @@ struct RadixClientConfig {
     std::string registry   = "etcd://127.0.0.1:2379";
     std::string cluster_id = "default";
     std::string node_name  = "";     // identity whose shm to attach (/shm/<node_name>)
-    std::string index_dev;            // empty = first available
-    int         gid_idx    = 3;
     int         bootstrap_timeout_sec = 60;
     bool        rht_only   = false;  // build only RHT-plane QPs (eviction client)
     bool        no_local_tree = false;  // observer: no local server, rank -1, remote-only
@@ -189,30 +167,47 @@ public:
     // (only cells still matching this rank). Empty list ok; flushes at end.
     struct EvictedKey { uint64_t first_hash; uint32_t tree_node_id; };
     void remove_evicted_from_rht(const EvictedKey* entries, int count);
-    // Zero every RHT shard THIS rank holds (local memset, no RDMA).
-    void reset_owned_rht_shard();
 
 #ifndef RADIXSHMEM_NO_RDMA
     // Remote ops are rank-first and stateless from the caller's view: the client
     // opens/reuses one cached session per rank internally. An illegal rank yields
     // BAD_TARGET / REMOTE_FAILED in the op result (never throws).
 
-    // Phase 1: allocate `n` slots on the peer (no hashes, no dedup).
-    AllocateReply remote_allocate(int rank, int n);
+    // Phase 1: allocate `n` slots from the peer's `component` pool (no hashes, no dedup).
+    AllocateReply remote_allocate(int rank, int n,
+                                  ComponentType component = ComponentType::FULL);
+
+    AllocateComponentsReply remote_allocate_components(
+        int rank, const std::vector<ComponentCount>& components);
 
     // Phase 2: publish `slots` on the peer; dedup + surplus recycle happen here.
+    // FULL is the positional prefix insert; SWA / MAMBA follow the local insert's
+    // component contract (start == 0, slots cover the tail / the END).
     InsertResult remote_insert(int rank, const uint64_t* hashes, int n,
                                int start, int length, const int32_t* slots,
-                               bool auto_recycle = true);
+                               bool auto_recycle = true,
+                               ComponentType component = ComponentType::FULL);
 
-    // Recycle unpublished slots on the peer (abort / auto_recycle=false surplus).
-    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots);
+    InsertPathResult remote_insert_path(int rank, const uint64_t* hashes, int n, int start,
+                                        int length, const int32_t* full_slots,
+                                        const std::vector<ComponentRun>& runs,
+                                        bool auto_recycle = true);
+
+    // Recycle unpublished slots into the peer's `component` pool (abort / surplus).
+    RemoteStatus remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                ComponentType component = ComponentType::FULL);
 
     QueryResult remote_query(int rank, const uint64_t* hashes, int n,
                              bool lock = false, bool update_meta = true);
 
-    // Drop a remote_query(lock=true) pin: dec_ref over [0, hit_length).
-    RemoteStatus remote_unlock(int rank, const uint64_t* hashes, int n, int hit_length);
+    DedupReply remote_dedup_prefix(int rank, const uint64_t* hashes, int n,
+                                   const DedupRequest& req = {});
+
+    // After pulling [0, n) from `rank`: it drops its copy and writes what blocks the
+    // drop into landing slots taken from our free ones, which we adopt. Returns the
+    // blocks it freed.
+    int dedup_move(int rank, const uint64_t* hashes, int n, int tail_cap, int branch_cap,
+                   const int landing[NUM_COMPONENT_TYPES]);
 #endif
 
     // ==================== Stats / accessors ====================
@@ -244,6 +239,10 @@ public:
     // (0 == healthy); HEALTH_NOT_ATTACHED for an observer. Never blocks.
     int check_health(HealthReport* report = nullptr) const;
 
+    // Lock-free copy of the attached local tree for monitoring (see tree_dump.h);
+    // throws for an observer. 0 = no limit.
+    TreeDump dump_tree(uint32_t max_nodes = 0, uint64_t max_blocks = 0) const;
+
 private:
     // `local_` attaches the node-local shm (null for an observer). The cluster
     // machinery below is built (bootstrap_cluster) only when distributed.
@@ -252,40 +251,42 @@ private:
     std::unique_ptr<LocalTreeConnector> local_;
     bool owns_local_ = true;
     bool local_read_only_ = false;   // read-only attach, never joins the cluster
+    std::mutex reset_mu_;
     void require_writable(const char* op) const;
 
     // Pin release, reachable only through a query(lock=true) finalize:
-    // one PinRecord on the local tree / on peer `remote_node`.
+    // one PinRecord on the local tree / on peer pin.source_rank.
     void dec_ref(const uint64_t* hashes, int n, PinRecord pin);
-    void dec_ref_remote(int remote_node, const uint64_t* hashes, int n,
-                        PinRecord pin);
+    void dec_ref_remote(const uint64_t* hashes, int n, PinRecord pin);
 
 #ifndef RADIXSHMEM_NO_RDMA
     // ---- Cluster bring-up + teardown ----
     RadixClientConfig cfg_;            // set on the distributed ctors
     bool distributed_ = false;         // cluster machinery live
 
-    // Run the etcd rendezvous + RDMA/RHT bring-up. Throws on failure.
+    // Run the etcd rendezvous + peer index / RHT bring-up. Throws on failure.
     void bootstrap_cluster();
-    // Ordered teardown of the RDMA/RHT plane (watcher → peers → RHT → transport).
+    // Ordered teardown of the cluster planes (watcher → sessions → peer index → RHT).
     void teardown_cluster();
     bool wait_for_ready();
-    void read_topology();
-    IRdmaEndpoint* connect_rht_holder(int holder);
+    ShardMapMsg read_topology();
     void admit_peer(const PeerEntry& e);
     void remove_peer(int rank);
-    void setup_rht();
     void update_rht(const uint64_t* hashes, int n, const InsertResult& r);
     // Distributed datapath (renamed to avoid colliding with the public facade).
     InsertResult dist_insert(const uint64_t* hashes, int n,
                              const int32_t* slots, int num_slots,
                              int start, bool auto_recycle);
+    // Republish the root→leaf chain of [0, n) plus a split suffix off it (idempotent).
+    void publish_chain(const uint64_t* hashes, int n, const InsertResult& r, int start);
     void         dist_flush();
     // Cached per-rank session; nullptr on illegal rank (self/oob/negative).
-    RemotePeer*  peer_for(int rank);
+    std::shared_ptr<RemotePeer> peer_for(int rank);
+    void drop_peer_session(int rank);
+    RemoteStatus missing_peer_status(int rank) const;
 
-    // RHT probe from the deepest position not past the incumbent, with the
-    // chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
+    // Step one, RHT probe from the deepest position not past the incumbent, with
+    // the chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
     int find_component_source(const uint64_t* hashes, int n, int incumbent,
                               std::vector<RemoteHit>& hits_out);
     // Authoritative local query/pin + RHT republish, then at most one remote
@@ -294,8 +295,8 @@ private:
                                                uint32_t component_mask,
                                                bool lock, bool update_meta,
                                                std::vector<PinRecord>& pins);
-    // Legacy shape: takes the local public result, returns it (folded) after
-    // at most one remote continuation.
+    // Takes the local public result, returns it after at most one remote
+    // continuation (step two, peer_index_), folded when it extends the hit.
     ComponentQueryResult query_components_remote_from(
         ComponentQueryResult result, const uint64_t* hashes, int n,
         uint32_t component_mask, bool lock, std::vector<PinRecord>& pins);
@@ -304,35 +305,24 @@ private:
     std::unique_ptr<Impl> etcd_;
 
     std::unique_ptr<PeerRegistry> peer_reg_;
-    uint32_t remote_op_transport_ = 0;   // authoritative control-plane transport (/config)
-    int      rdma_sl_ = 5;
-    int      rdma_tc_ = 160;
     int      cluster_cs_ = 0;
 
-    std::unique_ptr<RdmaTransportClient> tx_;
-    std::unique_ptr<PeerConnector> peer_conn_;
+    // Step two of a query; none on an rht_only client.
+    std::unique_ptr<PeerIndexBackend> peer_index_;
 
     // Per-rank remote-op sessions, opened lazily by peer_for(), reused across
-    // allocate→insert / query→unlock. Cleared before peer_conn_ in teardown.
+    // allocate→insert / query→unlock.
     std::unordered_map<int, std::shared_ptr<RemotePeer>> peer_cache_;
     std::mutex peer_cache_mu_;
+    std::shared_ptr<PeerBreaker> rc_breaker_;
     bool debug_route_ = ::getenv("RADIXSHMEM_DEBUG_ROUTE") != nullptr;
     bool lazy_connect_ = ::getenv("RADIXSHMEM_LAZY_CONNECT") &&
                          ::getenv("RADIXSHMEM_LAZY_CONNECT")[0] == '1';
     void preconnect_peers();
 
-    uint32_t rht_transport_ = 0;         // ClusterTransport, client -> RHT holders
-    uint32_t peer_index_transport_ = 0;  // ClusterTransport, remote walks
-    uint64_t dc_access_key_ = 0;
     int64_t  peers_snapshot_rev_ = 0;
 
-    // ---- RHT plane (from /config) ----
-    int              num_shards_ = 0;
-    uint32_t         rht_capacity_ = 0;
-    uint32_t         rht_slots_ = 4;
-    std::vector<int> holder_of_shard_;
-    std::unordered_map<int, std::unique_ptr<IRdmaEndpoint>> rht_holder_qps_;
-    std::unique_ptr<RhtConsumer> rht_conn_;
+    std::unique_ptr<RhtBackend> rht_;
 #endif
 };
 

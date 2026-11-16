@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // RadixServer — public server surface. Owns the shm region + radix tree, runs the
-// background evictor, and (distributed) brings up the RDMA/XRC/RHT cluster plane +
-// remote-op control plane. The embedded eviction service borrows LocalTreeConnector
-// into an rht_only RadixClient. This TU is the sole home of the heavy RDMA headers;
-// radix_server.h stays verbs-free for the python bindings + tests.
+// background evictor, and (distributed) joins the cluster through etcd and brings
+// up its planes: the RDMA side (RdmaHost) when the RHT or the peer index runs on
+// RDMA, the RHT shard, and the remote-op endpoint. The embedded eviction service
+// borrows LocalTreeConnector into an rht_only RadixClient.
 
 #include "radix_server.h"
 
@@ -18,26 +18,24 @@
 #include "cluster_manifest.h"
 #include "cluster_protocol.h"
 #include "cluster_registry.h"
-#include "rdma_transport.hpp"
+#include "rdma_host.hpp"
 #include "rht_endpoint.h"
+#include "rht_redis.h"
+#include "remote_op_service.hpp"
+#include "remote_op_factory.hpp"
 #include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path; self-guards on RADIXSHMEM_HAS_ETCD)
-
-#include <arpa/inet.h>
-#include <cerrno>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #endif
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -70,6 +68,8 @@ uint32_t RadixServer::mempool_free()  const { return tree_->mempool_free();  }
 uint32_t RadixServer::mempool_used()  const { return tree_->mempool_used();  }
 uint32_t RadixServer::swa_mempool_total()   const { return tree_->swa_mempool_total();   }
 uint32_t RadixServer::mamba_mempool_total() const { return tree_->mamba_mempool_total(); }
+uint32_t RadixServer::swa_mempool_free()    const { return tree_->swa_mempool_free();    }
+uint32_t RadixServer::mamba_mempool_free()  const { return tree_->mamba_mempool_free();  }
 ComponentConfig RadixServer::component_config() const { return tree_->component_config(); }
 
 uint64_t RadixServer::insert_success_count() const { return tree_->insert_success_count(); }
@@ -113,6 +113,17 @@ void RadixServer::evictor_loop() {
     static constexpr float DP_HIGH_WATERMARK = 0.90f;
     static constexpr int LOCK_BATCH = 50;
 
+    uint64_t wb_limit[NUM_COMPONENT_TYPES] = {};   // 0 = pool absent
+    if (writeback_) {
+        const uint32_t totals[NUM_COMPONENT_TYPES] = {
+            mp_total, tree_->swa_mempool_total(), tree_->mamba_mempool_total()};
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            if (totals[k] > 0)
+                wb_limit[k] = std::max<uint64_t>(
+                    1, (uint64_t)(totals[k] * cfg_.writeback_max_held_ratio));
+    }
+    std::vector<HeldEviction> held;
+
     while (evictor_running_.load(std::memory_order_relaxed)) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
 
@@ -123,75 +134,42 @@ void RadixServer::evictor_loop() {
             need_evict = true;
         if (tree_->node_pool_free() < np_threshold)
             need_evict = true;
-
-        if (need_evict)
+        if (!need_evict)
+            continue;
+        if (!writeback_ || !writeback_->active()) {
             tree_->try_evict_batch(LOCK_BATCH);
+            continue;
+        }
+
+        // Held slots are not free: the in-flight watermark bounds the eviction.
+        uint64_t inflight[NUM_COMPONENT_TYPES];
+        writeback_->inflight_slots(inflight);
+        bool paused = false;
+        uint64_t budget[NUM_COMPONENT_TYPES];
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
+            paused |= wb_limit[k] > 0 && inflight[k] >= wb_limit[k];
+            budget[k] = wb_limit[k] > 0 ? wb_limit[k] - inflight[k] : UINT64_MAX;
+        }
+        if (paused)
+            continue;
+        held.clear();
+        tree_->try_evict_batch(LOCK_BATCH, &held, budget);
+        if (!held.empty())
+            writeback_->push(std::move(held));
     }
 }
 
 #ifndef RADIXSHMEM_NO_RDMA
 
 // =====================================================================
-// cluster bring-up — TCP + shard-map helpers
+// cluster bring-up — shard-map helpers
 // =====================================================================
 
 namespace {
 
-// Local remote-op transport cfg string → manifest enum.
-uint32_t rot_from_cfg(const std::string& s) {
-    return (s == "dc") ? REMOTE_OP_TRANSPORT_DC : REMOTE_OP_TRANSPORT_ZMQ;
-}
-
-bool send_all(int fd, const void* data, size_t len) {
-    const char* p = static_cast<const char*>(data);
-    while (len > 0) {
-        ssize_t n = ::send(fd, p, len, MSG_NOSIGNAL);
-        if (n <= 0) return false;
-        p += n; len -= (size_t)n;
-    }
-    return true;
-}
-
-bool recv_all(int fd, void* data, size_t len) {
-    char* p = static_cast<char*>(data);
-    while (len > 0) {
-        ssize_t n = ::recv(fd, p, len, 0);
-        if (n <= 0) return false;
-        p += n; len -= (size_t)n;
-    }
-    return true;
-}
-
-// Bind+listen on `port` (0 = OS-assigned); returns fd, writes bound port to *out_port.
-int tcp_listen(uint16_t port, uint16_t* out_port) {
-    constexpr int kMaxAttempts = 12;
-    constexpr auto kBackoff = std::chrono::milliseconds(500);
-    int last_errno = 0;
-    for (int attempt = 0; attempt < kMaxAttempts; attempt++) {
-        int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) { last_errno = errno; continue; }
-        int opt = 1;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-        if (::bind(fd, (sockaddr*)&addr, sizeof(addr)) == 0 &&
-            ::listen(fd, 64) == 0) {
-            socklen_t alen = sizeof(addr);
-            ::getsockname(fd, (sockaddr*)&addr, &alen);
-            if (out_port) *out_port = ntohs(addr.sin_port);
-            return fd;
-        }
-        last_errno = errno;
-        ::close(fd);
-        std::this_thread::sleep_for(kBackoff);
-    }
-    fprintf(stderr, "[RadixServer] tcp_listen(:%u) gave up: %s\n",
-            port, strerror(last_errno));
-    errno = last_errno;
-    return -1;
+int env_int(const char* name, int fallback) {
+    const char* v = ::getenv(name);
+    return v ? std::atoi(v) : fallback;
 }
 
 } // namespace
@@ -200,6 +178,7 @@ int RadixServer::register_chunk_size() const {
     return tree_->register_chunk_size();
 }
 
+// The RDMA fields come later, from setup_rdma().
 void RadixServer::fill_local_entry(PeerEntry& e) const {
     memset(&e, 0, sizeof(e));
     e.rank = cfg_.rank;
@@ -207,11 +186,7 @@ void RadixServer::fill_local_entry(PeerEntry& e) const {
 
     const char* host = bind_ip_.empty() ? "127.0.0.1" : bind_ip_.c_str();
     std::strncpy(e.host, host, sizeof(e.host) - 1);
-    e.xrc_listen_port = actual_listen_port_;
-
-    e.shm_base_addr = (uint64_t)shm_mr_->addr();
-    e.shm_size      = (uint64_t)shm_mr_->length();
-    e.shm_rkey      = shm_mr_->rkey();
+    e.shm_size = (uint64_t)tree_->shm_size();
 
     auto* hdr = static_cast<ShmHeader*>(tree_->shm_base());
     e.node_pool_offset    = hdr->node_pool_offset;
@@ -227,99 +202,152 @@ void RadixServer::fill_local_entry(PeerEntry& e) const {
     e.root_node_id        = hdr->root_node_id;
     e.component_config       = hdr->component_config;
     e.component_state_offset = hdr->component_state_offset;
-
-    memcpy(e.gid_raw, &ctx_->gid(), 16);
-    e.gid_index  = ctx_->gid_index();
-
-    ibv_port_attr pa{};
-    if (ibv_query_port(ctx_->ctx(), ctx_->port(), &pa) == 0) {
-        e.lid        = pa.lid;
-        e.link_layer = (uint8_t)pa.link_layer;
-    }
-    e.srq_num = srq_ ? srq_->srq_num() : 0;
-
-    std::strncpy(e.index_dev, cfg_.index_dev.c_str(), sizeof(e.index_dev) - 1);
 }
 
-void RadixServer::resolve_shard_map(int n_obs) {
-    // Authoritative on the leader; other ranks overwrite from the broadcast map.
-    int M = cfg_.num_rht_shards;
-    if (M <= 0) M = n_obs;                           // M == N
-    if (M > (int)CLUSTER_MAX_SHARDS) M = CLUSTER_MAX_SHARDS;
-    if (M > n_obs) {                                 // can't have more holders than nodes
-        char msg[128];
-        snprintf(msg, sizeof(msg),
-                 "RadixServer: num_rht_shards (%d) exceeds node count (%d)",
-                 M, n_obs);
-        throw std::runtime_error(msg);
+void RadixServer::read_rht_env() {
+    auto env = [](const char* name) {
+        const char* v = ::getenv(name);
+        return std::string(v ? v : "");
+    };
+    auto bad = [](const char* name, const std::string& v) {
+        return std::runtime_error(std::string("RadixServer: invalid ") + name + "=" + v);
+    };
+    RhtEnv e;
+    std::string v = env("RADIXSHMEM_RHT_BACKEND");
+    if (v == "rdma") e.backend = CLUSTER_RHT_RDMA;
+    else if (!v.empty() && v != "redis") throw bad("RADIXSHMEM_RHT_BACKEND", v);
+    if (e.backend == CLUSTER_RHT_REDIS) {
+        e.redis = env("RADIXSHMEM_REDIS_ADDRS");
+        v = env("RADIXSHMEM_REDIS_TIMEOUT_MS");
+        if (!v.empty() && (e.redis_timeout_ms = std::atoi(v.c_str())) <= 0)
+            throw bad("RADIXSHMEM_REDIS_TIMEOUT_MS", v);
+    } else {
+        v = env("RADIXSHMEM_RHT_SHARDS");
+        if (!v.empty() && (e.rdma.shards = std::atoi(v.c_str())) < 0) throw bad("RADIXSHMEM_RHT_SHARDS", v);
+        v = env("RADIXSHMEM_RHT_SHARD_HOLDERS");
+        for (const char* p = v.c_str(); *p;) {
+            char* end = nullptr;
+            long r = std::strtol(p, &end, 10);
+            if (end == p || r < 0 || r > INT_MAX) throw bad("RADIXSHMEM_RHT_SHARD_HOLDERS", v);
+            e.rdma.holders.push_back((int)r);
+            for (p = end; *p == ',' || *p == ' '; p++) {}
+        }
+        v = env("RADIXSHMEM_RHT_SLOTS");
+        if (!v.empty()) e.rdma.slots = std::atoi(v.c_str());
+        if (e.rdma.slots != 1 && e.rdma.slots != 2 && e.rdma.slots != 4 && e.rdma.slots != 8)
+            throw bad("RADIXSHMEM_RHT_SLOTS", v);
+        v = env("RADIXSHMEM_RHT_TRANSPORT");
+        if (v == "dc") e.rdma.transport = CLUSTER_TRANSPORT_DC;
+        else if (!v.empty() && v != "xrc") throw bad("RADIXSHMEM_RHT_TRANSPORT", v);
     }
+    rht_env_ = e;
+}
+
+void RadixServer::read_peer_index_env() {
+    auto bad = [](const char* name, const char* v, const char* values) {
+        return std::runtime_error(std::string("RadixServer: invalid ") + name + "=" + v + " (" +
+                                  values + ")");
+    };
+    PeerIndexEnv e;
+    const char* v = ::getenv("RADIXSHMEM_PEER_INDEX_BACKEND");
+    if (v && *v && strcasecmp(v, "rdma") == 0)
+        e.backend = CLUSTER_PEER_INDEX_RDMA;
+    else if (v && *v && strcasecmp(v, "grpc") != 0)
+        throw bad("RADIXSHMEM_PEER_INDEX_BACKEND", v, "grpc or rdma");
+    v = ::getenv("RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT");
+    if (e.backend == CLUSTER_PEER_INDEX_RDMA && v && *v) {
+        if (strcasecmp(v, "dc") == 0)
+            e.rdma_transport = CLUSTER_TRANSPORT_DC;
+        else if (strcasecmp(v, "xrc") != 0)
+            throw bad("RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT", v, "xrc or dc");
+    }
+    peer_index_env_ = e;
+}
+
+void RadixServer::resolve_shard_map(int ranks) {
+    // Authoritative on the leader; other ranks overwrite from the broadcast map.
+    rdma_sl_ = env_int("RADIXSHMEM_RDMA_SL", 5);
+    rdma_tc_ = env_int("RADIXSHMEM_RDMA_TC", 160);
+    peer_index_backend_   = peer_index_env_.backend;
+    peer_index_transport_ = peer_index_env_.rdma_transport;
+    dc_access_key_ = 0xD0C0ACCE5500F00DULL;   // every plane that runs DC shares it
+    rht_backend_ = rht_env_.backend;
+    num_shards_ = 0;
+    holder_of_shard_.clear();
+    my_local_shard_ = -1;
+    rht_capacity_ = 0;
+    rht_slots_ = 0;
+    rht_transport_ = CLUSTER_TRANSPORT_XRC;
+
+    if (rht_backend_ == CLUSTER_RHT_REDIS) {
+        if (cfg_.cluster_id.find_first_of("{}") != std::string::npos)
+            throw std::runtime_error("RadixServer: the redis RHT needs a cluster id without { "
+                                     "or }, not '" + cfg_.cluster_id + "'");
+        rht_redis_ = rht_env_.redis;
+        rht_redis_timeout_ms_ = (uint32_t)rht_env_.redis_timeout_ms;
+        if (rht_redis_.empty() || rht_redis_.size() >= CLUSTER_RHT_SEEDS_LEN)
+            throw std::runtime_error(
+                "RadixServer: the redis RHT needs RADIXSHMEM_REDIS_ADDRS=host:port,... "
+                "(under 256 chars); RADIXSHMEM_RHT_BACKEND=rdma selects the RDMA RHT");
+        std::string why = redis_rht_check({rht_redis_, "", rht_env_.redis_timeout_ms});
+        if (!why.empty())
+            throw std::runtime_error("RadixServer: Redis RHT at " + rht_redis_ + ": " + why);
+        return;
+    }
+
+    int M = rht_env_.rdma.shards;
+    if (M <= 0) M = ranks;                           // M == N
+    if (M > (int)CLUSTER_MAX_SHARDS) M = CLUSTER_MAX_SHARDS;
+    if (M > ranks)                                   // can't have more holders than nodes
+        throw std::runtime_error("RadixServer: RADIXSHMEM_RHT_SHARDS (" + std::to_string(M) +
+                                 ") exceeds node count (" + std::to_string(ranks) + ")");
     num_shards_ = M;
 
+    const std::vector<int>& holders = rht_env_.rdma.holders;
+    for (int h : holders)
+        if (h >= ranks)
+            throw std::runtime_error("RadixServer: RADIXSHMEM_RHT_SHARD_HOLDERS names rank " +
+                                     std::to_string(h) + ", but the ranks are 0.." +
+                                     std::to_string(ranks - 1));
     holder_of_shard_.assign(M, 0);
-    if (!cfg_.rht_shard_holders.empty()) {
-        // Round-robin over the candidate holder list.
-        int nh = (int)cfg_.rht_shard_holders.size();
-        for (int s = 0; s < M; s++)
-            holder_of_shard_[s] = cfg_.rht_shard_holders[s % nh];
-    } else {
-        // Default: holders are ranks [0, M).
-        for (int s = 0; s < M; s++)
-            holder_of_shard_[s] = s;
-    }
+    for (int s = 0; s < M; s++)   // round-robin over the candidates, default ranks [0, M)
+        holder_of_shard_[s] = holders.empty() ? s : holders[s % holders.size()];
 
     // Per-shard capacity REQUEST: global buckets ~= 2*R*N (load ~0.5), so each
     // shard asks for 2*R*N/M. Rounding (power of two, floor) is the RHT
     // module's business; it applies the same rule on holder and consumer.
     auto* hdr = static_cast<ShmHeader*>(tree_->shm_base());
     uint64_t R = hdr->node_pool_capacity;
-    uint64_t per_shard = (2 * R * (uint64_t)n_obs) / (uint64_t)M;
+    uint64_t per_shard = (2 * R * (uint64_t)ranks) / (uint64_t)M;
     rht_capacity_ = per_shard > UINT32_MAX ? UINT32_MAX : (uint32_t)per_shard;
 
-    // Which shard (if any) does this rank hold? (first match)
-    my_local_shard_ = -1;
     for (int s = 0; s < M; s++) {
         if (holder_of_shard_[s] == cfg_.rank) { my_local_shard_ = s; break; }
     }
-
-    // Authoritative QoS = rank 0's ctx values (seeded from its env).
-    rdma_sl_ = ctx_->sl();
-    rdma_tc_ = ctx_->traffic_class();
-
-    // Authoritative RHT / peer-index transports (rank 0's cfg). DC access key
-    // is unconditional: every plane that runs DC shares it.
-    rht_transport_ = (cfg_.rht_transport == "dc") ? CLUSTER_TRANSPORT_DC
-                                                   : CLUSTER_TRANSPORT_XRC;
-    peer_index_transport_ = (cfg_.peer_index_transport == "dc")
-                                ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
-    dc_access_key_ = 0xD0C0ACCE5500F00DULL;
-
-    // Authoritative remote-op control-plane transport (rank 0's cfg).
-    remote_op_transport_ = rot_from_cfg(cfg_.remote_op_transport);
-
-    // Authoritative RHT slots-per-bucket (W). Validate ∈ {1,2,4,8}; default 4.
-    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 4;
-    if (W != 1 && W != 2 && W != 4 && W != 8) {
-        fprintf(stderr,
-                "[RadixServer rank 0] WARN: rht_slots=%d not in {1,2,4,8}, "
-                "using 4\n", W);
-        W = 4;
-    }
-    rht_slots_ = (uint32_t)W;
+    rht_transport_ = rht_env_.rdma.transport;
+    rht_slots_ = (uint32_t)rht_env_.rdma.slots;
 }
 
 void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
     // Follower path: install the leader's authoritative shard map + QoS. Mirrors
     // what resolve_shard_map() computes on the leader, but from the wire message.
+#ifndef RADIXSHMEM_HAS_REDIS
+    if (sm.rht_backend == CLUSTER_RHT_REDIS)
+        throw std::runtime_error("RadixServer: the cluster keeps its RHT in Redis, and this "
+                                 "radixshmem was built without hiredis");
+#endif
+    rht_backend_  = sm.rht_backend;
+    rht_redis_.assign(sm.rht_redis_seeds, strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds)));
+    rht_redis_timeout_ms_ = sm.rht_redis_timeout_ms;
     num_shards_   = (int)sm.num_shards;
     rht_capacity_ = sm.rht_capacity;
     rdma_sl_      = sm.rdma_sl;
     rdma_tc_      = sm.rdma_tc;
     rht_transport_        = sm.rht_transport;
+    peer_index_backend_   = sm.peer_index_backend;
     peer_index_transport_ = sm.peer_index_transport;
-    rht_slots_     = sm.rht_slots ? sm.rht_slots : 4;
+    rht_slots_     = sm.rht_slots;
     dc_access_key_ = sm.dc_access_key;
-    remote_op_transport_ = sm.remote_op_transport;
-    ctx_->set_qos(rdma_sl_, rdma_tc_);   // adopt authoritative QoS before QPs connect
     holder_of_shard_.assign(num_shards_, 0);
     my_local_shard_ = -1;
     for (int s = 0; s < num_shards_; s++) {
@@ -327,20 +355,43 @@ void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
         if (holder_of_shard_[s] == cfg_.rank && my_local_shard_ < 0)
             my_local_shard_ = s;
     }
-    // Warn if local cfg disagreed with the authoritative map (non-fatal).
-    if (cfg_.num_rht_shards > 0 && cfg_.num_rht_shards != num_shards_) {
-        fprintf(stderr,
-                "[RadixServer rank %d] WARN: local --num-rht-shards=%d ignored, "
-                "cluster authoritative M=%d\n",
-                cfg_.rank, cfg_.num_rht_shards, num_shards_);
-    }
+    if (rht_env_.backend != rht_backend_)
+        fprintf(stderr, "[RadixServer rank %d] WARN: local RADIXSHMEM_RHT_BACKEND ignored, "
+                "the cluster uses the %s RHT\n", cfg_.rank,
+                rht_backend_ == CLUSTER_RHT_REDIS ? "redis" : "rdma");
+    if (peer_index_env_.backend != peer_index_backend_)
+        fprintf(stderr, "[RadixServer rank %d] WARN: local RADIXSHMEM_PEER_INDEX_BACKEND "
+                "ignored, the cluster uses the %s peer index\n", cfg_.rank,
+                peer_index_backend_ == CLUSTER_PEER_INDEX_GRPC ? "grpc" : "rdma");
+}
+
+void RadixServer::setup_planes(PeerEntry& e) {
+    setup_rdma(e);
+    setup_local_rht_shard(e);
+    setup_remote_op(e);
+}
+
+void RadixServer::setup_rdma(PeerEntry& e) {
+    const bool rht = rht_backend_ == CLUSTER_RHT_RDMA;
+    const bool walks = peer_index_backend_ == CLUSTER_PEER_INDEX_RDMA;
+    if (!rht && !walks) return;   // Redis RHT + gRPC peer index: no RDMA at all
+    RdmaHostConfig hc;
+    hc.sl      = rdma_sl_;
+    hc.tc      = rdma_tc_;
+    hc.dc      = (rht && rht_transport_ == CLUSTER_TRANSPORT_DC) ||
+                 (walks && peer_index_transport_ == CLUSTER_TRANSPORT_DC);
+    hc.dc_access_key = dc_access_key_;
+    hc.rank    = cfg_.rank;
+    rdma_ = std::make_unique<RdmaHost>(hc);
+    if (walks) rdma_->expose_tree(tree_->shm_base(), tree_->shm_size());
+    rdma_->publish_to(e);
 }
 
 void RadixServer::setup_local_rht_shard(PeerEntry& e) {
     if (my_local_shard_ < 0) return;   // not a holder
 
     rht_holder_ = std::make_unique<RhtHolder>(
-        ctx_->pd(), shm_name_, my_local_shard_, cfg_.rank,
+        rdma_->pd(), shm_name_, my_local_shard_, cfg_.rank,
         rht_capacity_, rht_slots_);
     const RhtShardAddr& m = rht_holder_->addr();
     m.publish_to(e);
@@ -351,38 +402,18 @@ void RadixServer::setup_local_rht_shard(PeerEntry& e) {
             m.capacity, m.rkey);
 }
 
-void RadixServer::setup_dct(PeerEntry& e) {
-    if (rht_transport_ != CLUSTER_TRANSPORT_DC &&
-        peer_index_transport_ != CLUSTER_TRANSPORT_DC)
-        return;   // both planes XRC: no DCT
-    // One read target per node. Reuse the remote-op lane-0 DCT if it exists
-    // (setup_remote_op ran first): one dctn serves both planes.
-    if (rc_lane0_dctn_ != 0) {
-        e.dct_num = rc_lane0_dctn_;
-        fprintf(stderr, "[RadixServer rank %d] DC target: reusing ctrl "
-                "lane-0 DCT dctn=%u\n", cfg_.rank, e.dct_num);
-        return;
-    }
-    dct_ = std::make_unique<DcTarget>(*ctx_, dc_access_key_, /*srq_max_wr=*/1);
-    e.dct_num = dct_->open_dct();
-    fprintf(stderr, "[RadixServer rank %d] DC target up: dctn=%u\n",
-            cfg_.rank, e.dct_num);
-}
-
 void RadixServer::setup_remote_op(PeerEntry& e) {
-    // Remote ops off for this rank unless the control plane was requested.
-    if (!(cfg_.enable_remote_insert || cfg_.enable_remote_query)) return;
-
-    RemoteOpAddr a = rc_build_endpoint(remote_op_transport_, dc_access_key_, *ctx_);
-    e.zmq_listen_port = a.port;
-    e.rc_dct_num     = a.dctns[0];
-    for (int i = 1; i < 4; ++i) e.rc_dct_num_extra[i - 1] = a.dctns[i];
-    rc_lane0_dctn_ = a.dctns[0];   // setup_dct (runs after us) may reuse as read target
-    fprintf(stderr, "[RadixServer rank %d] remote-op endpoint up: %s "
-            "(port=%u rc_dctn=%u/%u/%u/%u)\n", cfg_.rank,
-            remote_op_transport_ == REMOTE_OP_TRANSPORT_DC ? "dc" : "zmq",
-            e.zmq_listen_port, e.rc_dct_num, e.rc_dct_num_extra[0],
-            e.rc_dct_num_extra[1], e.rc_dct_num_extra[2]);
+    std::random_device rd;
+    instance_id_ = (((uint64_t)rd() << 32) | rd()) | 1;
+    e.instance_id = instance_id_;
+    // Peers set up their XRC QPs to rdma_ through it from now on, the rest after rc_spawn().
+    XrcAcceptor xrc;
+    if (rdma_) xrc = [h = rdma_.get()](const XrcConnInfo& c) { return h->accept_xrc(c); };
+    RemoteOpAddr addr;
+    rc_server_ = make_remote_op_server(cfg_.rpc_port, instance_id_, std::move(xrc), addr);
+    e.rpc_port = addr.port;
+    fprintf(stderr, "[RadixServer rank %d] RPC endpoint up: grpc (port=%u)\n",
+            cfg_.rank, e.rpc_port);
 }
 
 std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
@@ -390,31 +421,46 @@ std::string RadixServer::shard_map_mismatch(const ShardMapMsg& sm) const {
         return std::string(what) + " " + std::to_string(have) + " != local " +
                std::to_string(want);
     };
-    if (cfg_.num_rht_shards > 0 && (int)sm.num_shards != cfg_.num_rht_shards)
-        return diff("num_rht_shards", sm.num_shards, cfg_.num_rht_shards);
-    if (!cfg_.rht_shard_holders.empty()) {
-        int nh = (int)cfg_.rht_shard_holders.size();
-        for (int s = 0; s < (int)sm.num_shards; s++)
-            if ((int)sm.holder_rank[s] != cfg_.rht_shard_holders[s % nh])
+    if (sm.rht_backend != rht_env_.backend)
+        return diff("RHT backend", sm.rht_backend, rht_env_.backend);
+    if (sm.rht_backend == CLUSTER_RHT_RDMA) {
+        const auto& e = rht_env_.rdma;
+        if (e.shards > 0 && (int)sm.num_shards != e.shards)
+            return diff("RADIXSHMEM_RHT_SHARDS", sm.num_shards, e.shards);
+        for (int s = 0; !e.holders.empty() && s < (int)sm.num_shards; s++)
+            if ((int)sm.holder_rank[s] != e.holders[s % e.holders.size()])
                 return diff(("holder of shard " + std::to_string(s)).c_str(),
-                            sm.holder_rank[s], cfg_.rht_shard_holders[s % nh]);
+                            sm.holder_rank[s], e.holders[s % e.holders.size()]);
+        if ((int)sm.rht_slots != e.slots) return diff("RADIXSHMEM_RHT_SLOTS", sm.rht_slots, e.slots);
+        if (sm.rht_transport != e.transport)
+            return diff("RADIXSHMEM_RHT_TRANSPORT", sm.rht_transport, e.transport);
     }
-    int W = cfg_.rht_slots_per_bucket > 0 ? cfg_.rht_slots_per_bucket : 4;
-    if (W != 1 && W != 2 && W != 4 && W != 8) W = 4;
-    if ((int)sm.rht_slots != W) return diff("rht_slots", sm.rht_slots, W);
-    auto tp = [](const std::string& s) {
-        return s == "dc" ? CLUSTER_TRANSPORT_DC : CLUSTER_TRANSPORT_XRC;
-    };
-    if (sm.rht_transport != (uint32_t)tp(cfg_.rht_transport))
-        return "rht_transport differs from local " + cfg_.rht_transport;
-    if (sm.peer_index_transport != (uint32_t)tp(cfg_.peer_index_transport))
-        return "peer_index_transport differs from local " + cfg_.peer_index_transport;
-    if (sm.remote_op_transport != rot_from_cfg(cfg_.remote_op_transport))
-        return "remote_op_transport differs from local " + cfg_.remote_op_transport;
+    auto peer = [](uint32_t b) { return b == CLUSTER_PEER_INDEX_GRPC ? "grpc" : "rdma"; };
+    auto tp = [](uint32_t t) { return t == CLUSTER_TRANSPORT_DC ? "dc" : "xrc"; };
+    const PeerIndexEnv& pe = peer_index_env_;
+    if (sm.peer_index_backend != pe.backend)
+        return std::string("RADIXSHMEM_PEER_INDEX_BACKEND ") + peer(sm.peer_index_backend) +
+               " != local " + peer(pe.backend);
+    if (sm.peer_index_backend == CLUSTER_PEER_INDEX_RDMA &&
+        sm.peer_index_transport != pe.rdma_transport)
+        return std::string("RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT ") +
+               tp(sm.peer_index_transport) + " != local " + tp(pe.rdma_transport);
     int cs = register_chunk_size();
     if (sm.register_chunk_size && cs > 0 && (int)sm.register_chunk_size != cs)
         return diff("register_chunk_size", sm.register_chunk_size, cs);
     return "";
+}
+
+void RadixServer::drop_stale_routes(bool whole_cluster) {
+    if (rht_backend_ != CLUSTER_RHT_REDIS) return;
+    const RedisRhtConfig rc{rht_redis_, redis_rht_prefix(cfg_.cluster_id),
+                            (int)rht_redis_timeout_ms_};
+    auto t0 = std::chrono::steady_clock::now();
+    const bool clean = whole_cluster ? redis_rht_clear(rc) : redis_rht_drop_rank(rc, cfg_.rank);
+    fprintf(stderr, "[RadixServer] stale routes of %s %s %.1f s\n",
+            whole_cluster ? "the cluster" : ("rank " + std::to_string(cfg_.rank)).c_str(),
+            clean ? "dropped in" : "not all dropped after",
+            std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
 }
 
 void RadixServer::stamp_shm_ready(int assigned_rank, int n_obs) {
@@ -428,105 +474,13 @@ void RadixServer::stamp_shm_ready(int assigned_rank, int n_obs) {
                                     std::memory_order_release);
 }
 
-// ==================== Listener / hello-reply ====================
-
-void RadixServer::xrc_listener_loop() {
-    while (!stopping_.load()) {
-        int conn = ::accept(xrc_listen_fd_, nullptr, nullptr);
-        if (conn < 0) {
-            if (stopping_.load()) break;
-            if (errno == EINTR) continue;
-            fprintf(stderr, "[RadixServer] accept failed: %s\n", strerror(errno));
-            break;
-        }
-        int one = 1;
-        setsockopt(conn, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        try {
-            handle_client(conn);
-        } catch (const std::exception& e) {
-            fprintf(stderr, "[RadixServer] handle_client: %s\n", e.what());
-        }
-        ::close(conn);
-    }
-}
-
-void RadixServer::handle_client(int conn_fd) {
-    ClusterHelloMsg hello{};
-    if (!recv_all(conn_fd, &hello, sizeof(hello)))
-        throw std::runtime_error("hello recv short");
-    if (hello.magic != CLUSTER_HELLO_MAGIC)
-        throw std::runtime_error("bad hello magic");
-    if (hello.version != CLUSTER_PROTOCOL_VERSION)
-        throw std::runtime_error("hello version mismatch");
-
-    auto recv_qp = std::make_unique<XrcRecvQp>(*ctx_, *xrcd_, *srq_, cq_);
-
-    XrcPeerInfo peer{};
-    peer.recv_qp_num = 0;
-    peer.remote_srqn = 0;
-    peer.gid         = hello.gid;
-    peer.gid_index   = hello.gid_index;
-    peer.lid         = hello.lid;
-    peer.link_layer  = hello.link_layer;
-    recv_qp->connect(hello.client_send_qp_num, peer);
-
-    uint32_t my_recv = recv_qp->qp_num();
-
-    ibv_port_attr pa{};
-    if (ibv_query_port(ctx_->ctx(), ctx_->port(), &pa) != 0)
-        throw std::runtime_error("ibv_query_port failed");
-
-    ClusterReplyMsg reply{};
-    reply.magic              = CLUSTER_REPLY_MAGIC;
-    reply.version            = CLUSTER_PROTOCOL_VERSION;
-    reply.server_rank        = cfg_.rank;
-    reply.server_recv_qp_num = my_recv;
-    reply.server_srq_num     = srq_->srq_num();
-    reply.link_layer         = (uint8_t)pa.link_layer;
-    reply.lid                = pa.lid;
-    reply.gid_index          = ctx_->gid_index();
-    reply.gid                = ctx_->gid();
-    if (!send_all(conn_fd, &reply, sizeof(reply)))
-        throw std::runtime_error("reply send short");
-
-    auto slot = std::make_unique<ClientSlot>();
-    slot->recv_qp           = std::move(recv_qp);
-    slot->client_rank       = hello.client_rank;
-    slot->client_send_qp_num = hello.client_send_qp_num;
-    slot->recv_qp_num       = my_recv;
-    {
-        std::lock_guard<std::mutex> g(clients_mu_);
-        clients_.emplace(next_client_id_++, std::move(slot));
-    }
-}
-
 // ==================== cluster bootstrap ====================
 
 bool RadixServer::cluster_bootstrap() {
     if (cfg_.registry.empty()) return true;   // standalone — caller bypasses
 
-    const char* dev = cfg_.index_dev.empty() ? nullptr : cfg_.index_dev.c_str();
-    ctx_  = std::make_unique<RdmaContext>(dev, 1, cfg_.gid_idx);
-    xrcd_ = std::make_unique<RdmaXrcd>(*ctx_);
-    // cq_ dormant under one-sided traffic; exists only because XRC SRQ/RECV QPs need one.
-    cq_   = ibv_create_cq(ctx_->ctx(), 256, nullptr, nullptr, 0);
-    if (!cq_) throw std::runtime_error("RadixServer: ibv_create_cq failed");
-    srq_  = std::make_unique<XrcSrq>(*ctx_, *xrcd_, cq_);
-
-    // Tree shm MR: READ + ATOMIC only (no REMOTE_WRITE). RHT writes use the separate RHT-MR.
-    shm_mr_ = std::make_unique<RdmaMemoryRegion>(
-        ctx_->pd(), tree_->shm_base(), tree_->shm_size(),
-        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
-        IBV_ACCESS_REMOTE_ATOMIC);
-
-    // XRC accept-loop listener
-    xrc_listen_fd_ = tcp_listen(cfg_.rpc_port, &actual_listen_port_);
-    if (xrc_listen_fd_ < 0) return false;
-    listener_thread_ = std::thread(&RadixServer::xrc_listener_loop, this);
-    fprintf(stderr, "[RadixServer rank %d] XRC accept loop on :%u\n",
-            cfg_.rank, actual_listen_port_);
-
-    // etcd rendezvous: discover peers + order bringup via etcd (sole path).
+    // etcd rendezvous: discover peers + order bringup via etcd (sole path); the
+    // planes come up in its round 2, once the shard map says which ones run.
 #ifdef RADIXSHMEM_HAS_ETCD
     // registry uri = "etcd://host:port" → strip scheme to "host:port".
     std::string ep = cfg_.registry;
@@ -558,10 +512,10 @@ bool RadixServer::cluster_bootstrap() {
 // =====================================================================
 
 namespace {
-// Distributed when the caller asks for a multi-node cluster: a min-node gate or
-// shard count above 1, or a legacy world_size hint.
+// Distributed when the caller asks for a multi-node cluster: a min-node gate
+// above 1, or a legacy world_size hint.
 bool want_cluster(const RadixServerConfig& c) {
-    return c.expected_min_nodes > 1 || c.num_rht_shards > 1 || c.world_size > 1;
+    return c.expected_min_nodes > 1 || c.world_size > 1;
 }
 } // namespace
 
@@ -582,12 +536,14 @@ RadixServer::RadixServer(const std::string& name, const ShmConfig& shm) {
 }
 
 RadixServer::~RadixServer() {
+    dedup_writes_->set_active(false);
 #ifndef RADIXSHMEM_NO_RDMA
-    // Stop remote-op serving thread FIRST (holds refs to svc_* + REP socket).
+    // Stop remote-op serving before tearing down svc_*.
     rc_stop();
 #endif
     // Stop the evictor before anything that touches tree_ is torn down.
     stop_evictor();
+    writeback_.reset();
 #ifndef RADIXSHMEM_NO_RDMA
     // Release the eviction-service client (its evict callback touches tree_).
     svc_client_.reset();   // releases (not frees) the borrowed svc_tree_
@@ -595,26 +551,8 @@ RadixServer::~RadixServer() {
 #ifdef RADIXSHMEM_HAS_ETCD
     registry_.reset();     // revokes the lease: peers see this node leave at once
 #endif
-
-    // Ordered RDMA teardown (all bound to ctx_ / tree_ shm).
-    stopping_.store(true);
-    if (xrc_listen_fd_ >= 0) {
-        ::shutdown(xrc_listen_fd_, SHUT_RDWR);
-        ::close(xrc_listen_fd_);
-        xrc_listen_fd_ = -1;
-    }
-    if (listener_thread_.joinable()) listener_thread_.join();
-    {
-        std::lock_guard<std::mutex> g(clients_mu_);
-        clients_.clear();
-    }
-    dct_.reset();            // destroy DCT before PD/ctx teardown
-    shm_mr_.reset();
-    rht_holder_.reset();     // MR + shard shm released before PD teardown
-    srq_.reset();
-    if (cq_) { ibv_destroy_cq(cq_); cq_ = nullptr; }
-    xrcd_.reset();
-    ctx_.reset();
+    rht_holder_.reset();   // its MR lives on rdma_'s PD
+    rdma_.reset();
 #endif
     // Finally drop the tree shm region.
     if (tree_) { tree_->destroy(); tree_.reset(); }
@@ -622,6 +560,15 @@ RadixServer::~RadixServer() {
 
 bool RadixServer::bootstrap() {
     const bool distributed = want_cluster(cfg_);
+    const float held_ratio = cfg_.writeback_max_held_ratio;
+    if (cfg_.writeback_enabled && !(held_ratio > 0.0f && held_ratio <= 1.0f))
+        throw std::runtime_error("RadixServer: writeback_max_held_ratio must be in (0, 1]");
+#ifndef RADIXSHMEM_NO_RDMA
+    if (distributed) {
+        read_rht_env();
+        read_peer_index_env();
+    }
+#endif
 
     ShmConfig shm = cfg_.shm;
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;
@@ -649,6 +596,8 @@ bool RadixServer::bootstrap() {
     // Bring up the shm region + evictor.
     tree_ = std::make_unique<RadixShmemTree>(RadixShmemTree::create(shm_name, shm));
     shm_name_        = shm_name;
+    if (cfg_.writeback_enabled)
+        writeback_ = std::make_unique<WritebackQueue>(*tree_);
     start_evictor();
 
 #ifndef RADIXSHMEM_NO_RDMA
@@ -656,14 +605,6 @@ bool RadixServer::bootstrap() {
         bind_ip_ = bind_ip;   // published as PeerEntry.host
 
         // Deployment-level env overrides.
-        if (const char* t = ::getenv("RADIXSHMEM_RHT_TRANSPORT"))
-            cfg_.rht_transport = t;
-        if (const char* t = ::getenv("RADIXSHMEM_PEER_INDEX_TRANSPORT"))
-            cfg_.peer_index_transport = t;
-        if (const char* w = ::getenv("RADIXSHMEM_RHT_SLOTS"))
-            cfg_.rht_slots_per_bucket = atoi(w);
-        if (const char* rot = ::getenv("RADIXSHMEM_REMOTE_OP_TRANSPORT"))
-            cfg_.remote_op_transport = rot;
         if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))
             cfg_.registry = r;
         if (const char* c = ::getenv("RADIXSHMEM_CLUSTER_ID"))
@@ -671,77 +612,65 @@ bool RadixServer::bootstrap() {
         if (const char* n = ::getenv("RADIXSHMEM_NODE_NAME"))
             cfg_.node_name = n;
 
-        // Removed backend: fail loud rather than remap to zmq.
-        if (cfg_.remote_op_transport == "rdma" ||
-            cfg_.remote_op_transport == "xrc") {
-            throw std::runtime_error(
-                "RadixServer: the xrc/rdma control-plane backend was "
-                "removed — use remote_op_transport = dc (RDMA) or zmq "
-                "(TCP fallback)");
-        }
-
         if (!cluster_bootstrap()) {
-            rc_stop();   // endpoint lives on ctx_ — destroy BEFORE tree_/ctx_
+            rc_stop();
+            rht_holder_.reset();
+            rdma_.reset();       // deregisters the tree MR before the shm goes
             stop_evictor();
+            writeback_.reset();
             if (tree_) { tree_->destroy(); tree_.reset(); }
             return false;
         }
         // rank + observed world size were written by the rendezvous into cfg_.
         const bool want_evict = cfg_.shm.background_evict_ratio > 0.0f;
-        const bool want_svc   = want_evict || cfg_.enable_remote_insert
-                                           || cfg_.enable_remote_query;
-        if (want_svc) {
-            svc_tree_ = std::make_unique<LocalTreeConnector>(shm_name);
-            RadixClientConfig cc;
-            cc.index_dev = cfg_.index_dev;
-            cc.gid_idx  = cfg_.gid_idx;
-            cc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
-            cc.rht_only = true;
-            cc.registry           = cfg_.registry;
-            cc.cluster_id         = cfg_.cluster_id;
-            cc.node_name          = cfg_.node_name;
-            cc.expected_min_nodes = cfg_.expected_min_nodes;
-            cc.settle_ms          = cfg_.settle_ms;
-            try {
-                // Borrows svc_tree_ (no second attach); builds the RHT plane only.
-                svc_client_ = std::make_unique<RadixClient>(cc, svc_tree_.get());
-            } catch (const std::exception& e) {
-                fprintf(stderr, "[RadixServer] svc RadixClient bootstrap failed: %s\n",
-                        e.what());
-                svc_client_.reset();
-                svc_tree_.reset();
-                rc_stop();
-                stop_evictor();
-                if (tree_) { tree_->destroy(); tree_.reset(); }
-                return false;
-            }
-            if (want_evict) {
-                RadixClient*  ec = svc_client_.get();
-                std::mutex*    mu = &svc_client_mu_;
-                tree_->set_evict_callback(
-                    [ec, mu](const std::vector<EvictedNode>& evicted) {
-                        std::vector<RadixClient::EvictedKey> keys;
-                        keys.reserve(evicted.size());
-                        for (const auto& e : evicted)
-                            keys.push_back({e.first_hash, e.tree_node_id});
-                        std::lock_guard<std::mutex> g(*mu);
-                        ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
-                    });
-            }
-            if (cfg_.enable_remote_insert) {
-                // No svc_client_mu_ here: handle_insert already holds it
-                // around allocate_slots, so locking would self-deadlock.
-                RadixClient* ec = svc_client_.get();
-                svc_tree_->tree().set_evict_callback(
-                    [ec](const std::vector<EvictedNode>& evicted) {
-                        std::vector<RadixClient::EvictedKey> keys;
-                        keys.reserve(evicted.size());
-                        for (const auto& e : evicted)
-                            keys.push_back({e.first_hash, e.tree_node_id});
-                        ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
-                    });
-            }
+        svc_tree_ = std::make_unique<LocalTreeConnector>(shm_name);
+        RadixClientConfig cc;
+        cc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
+        cc.rht_only = true;
+        cc.registry           = cfg_.registry;
+        cc.cluster_id         = cfg_.cluster_id;
+        cc.node_name          = cfg_.node_name;
+        cc.expected_min_nodes = cfg_.expected_min_nodes;
+        cc.settle_ms          = cfg_.settle_ms;
+        try {
+            // Borrows svc_tree_ (no second attach); builds the RHT plane only.
+            svc_client_ = std::make_unique<RadixClient>(cc, svc_tree_.get());
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[RadixServer] svc RadixClient bootstrap failed: %s\n",
+                    e.what());
+            svc_client_.reset();
+            svc_tree_.reset();
+            rc_stop();
+            rht_holder_.reset();
+            rdma_.reset();
+            stop_evictor();
+            writeback_.reset();
+            if (tree_) { tree_->destroy(); tree_.reset(); }
+            return false;
         }
+        if (want_evict) {
+            RadixClient*  ec = svc_client_.get();
+            std::mutex*    mu = &svc_client_mu_;
+            tree_->set_evict_callback(
+                [ec, mu](const std::vector<NodeHead>& evicted) {
+                    std::vector<RadixClient::EvictedKey> keys;
+                    keys.reserve(evicted.size());
+                    for (const auto& e : evicted)
+                        keys.push_back({e.first_hash, e.tree_node_id});
+                    std::lock_guard<std::mutex> g(*mu);
+                    ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
+                });
+        }
+        // RemoteOpService::allocate holds svc_client_mu_; relocking here would self-deadlock.
+        RadixClient* ec = svc_client_.get();
+        svc_tree_->tree().set_evict_callback(
+            [ec](const std::vector<NodeHead>& evicted) {
+                std::vector<RadixClient::EvictedKey> keys;
+                keys.reserve(evicted.size());
+                for (const auto& e : evicted)
+                    keys.push_back({e.first_hash, e.tree_node_id});
+                ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
+            });
     }
 #endif
 #ifndef RADIXSHMEM_NO_RDMA

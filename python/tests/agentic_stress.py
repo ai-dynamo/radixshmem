@@ -21,6 +21,7 @@ bytes are a function of the block hash h: FULL [h, h+1, ...], SWA [~h, ~h+1,
 
     python tests/agentic_stress.py                      # defaults: 8 nodes, 128 sessions, 60 s
     python tests/agentic_stress.py --nodes 2 --concurrency 16 --duration 20 --index-only
+    python tests/agentic_stress.py --nodes 4 --monitor-port 9810 --trace .../traces.jsonl --trace-speedup 100
 """
 
 import argparse
@@ -75,7 +76,7 @@ class Config:
     max_nodes: int = 1_000_000
     swa_max_blocks: int = 1_000_000
     mamba_max_slots: int = 1_000_000
-    register_chunk_size: int = 1024
+    register_chunk_size: int = 0      # 0 = the server default (4096 tokens)
     data_pool_ratio: float = 4.0
     index_only: bool = False          # False: the server owns a SlotStore, requests move bytes
     full_slot_bytes: int = 128
@@ -96,6 +97,15 @@ class Config:
     slow_us: float = 0.0              # log every request slower than this (query or insert)
     rht_slots: int = 4                # RHT slots per bucket (W)
     flush_after_insert: bool = False  # drain async RHT writes before DONE
+    writeback_delay_ms: float = -1.0  # >= 0: background eviction writes back, done after this delay
+    monitor_port: int = 0             # > 0: servers serve /metrics and /sd for Prometheus + Grafana
+    monitor_interval: float = 10.0
+    trace: str = ""                   # AgentX (WekaTrace) jsonl replayed instead of synthetic sessions
+    trace_sessions: int = 0           # 0 = every trace in the file
+    trace_speedup: float = 1.0
+    trace_stagger: float = 1.0        # seconds between the first traces' starts
+    subagent_sticky: float = 0.0      # chance a subagent starts on the main stream's worker
+    decode_nodes: int = 0
     # internal (filled by the launcher)
     run_id: str = ""
     etcd_port: int = 0
@@ -156,6 +166,22 @@ def parse_args():
                    default=d.flush_after_insert,
                    help="client.flush() after insert so RHT routes land before DONE")
     # internal
+    p.add_argument("--writeback-delay-ms", type=float, default=d.writeback_delay_ms,
+                   help=">= 0 enables write-back with a handler that stores nothing and calls "
+                        "done after this delay (default: off)")
+    p.add_argument("--monitor-port", type=int, default=d.monitor_port,
+                   help="first port of the servers' monitors (Prometheus /sd on worker 0); 0 = off")
+    p.add_argument("--monitor-interval", type=float, default=d.monitor_interval)
+    p.add_argument("--trace", default=d.trace,
+                   help="AgentX trace jsonl (e.g. cc-traces-weka-062126-256k/traces.jsonl): sessions "
+                        "replayed at their timestamps; --turns/--isl-step/--osl/--block-size are ignored")
+    p.add_argument("--trace-sessions", type=int, default=d.trace_sessions, help="0 = all")
+    p.add_argument("--trace-speedup", type=float, default=d.trace_speedup)
+    p.add_argument("--trace-stagger", type=float, default=d.trace_stagger)
+    p.add_argument("--subagent-sticky", type=float, default=d.subagent_sticky)
+    p.add_argument("--decode-nodes", type=int, default=d.decode_nodes,
+                   help="the last N ranks are decode servers: prefill ranks write back to them, "
+                        "requests go to prefill ranks only")
     p.add_argument("--role", choices=["launcher", "worker"], default="launcher")
     p.add_argument("--rank", type=int, default=-1)
     p.add_argument("--config-json", default="")
@@ -165,6 +191,8 @@ def parse_args():
     else:
         cfg = Config(**{k: getattr(a, k) for k in Config.__dataclass_fields__
                         if hasattr(a, k)})
+    if not 0 <= cfg.decode_nodes < cfg.nodes:
+        p.error("--decode-nodes must leave at least one prefill rank")
     return cfg, a.role, a.rank
 
 
@@ -191,19 +219,36 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
     dev = [devs[rank % len(devs)]] if devs else []
     cluster = radixshmem.ClusterConfig()
     if cfg.nodes > 1:
+        os.environ["RADIXSHMEM_RHT_SLOTS"] = str(cfg.rht_slots)   # read by the RDMA RHT only
         cluster = radixshmem.ClusterConfig(
             expected_min_nodes=cfg.nodes, registry=f"etcd://127.0.0.1:{cfg.etcd_port}",
             cluster_id=f"agentic_{cfg.run_id}", node_name=f"node{rank}", rpc_address="0.0.0.0",
-            num_rht_shards=cfg.nodes, rht_shard_holders=list(range(cfg.nodes)),
-            index_dev=dev[0] if dev else "", gid_idx=cfg.gid_idx,
-            bootstrap_timeout_sec=cfg.bootstrap_timeout, rht_slots_per_bucket=cfg.rht_slots,
-            enable_remote_query=cfg.diag_misses)
+            bootstrap_timeout_sec=cfg.bootstrap_timeout)
+    monitor = ({"monitor_port": cfg.monitor_port, "monitor_interval_s": cfg.monitor_interval}
+               if cfg.monitor_port else {})
     return radixshmem.ServerConfig(
-        name=f"/agentic_{cfg.run_id}_r{rank}", data_bytes=data_bytes,
+        **monitor, name=f"/agentic_{cfg.run_id}_r{rank}", data_bytes=data_bytes,
         swa_ratio=swa_bytes / data_bytes if data_bytes else 0.0,
         mamba_ratio=mamba_bytes / data_bytes if data_bytes else 0.0,
         slot_align=64, transfer_devices=dev, max_nodes=cfg.max_nodes,
-        data_pool_ratio=cfg.data_pool_ratio, cluster=cluster)
+        data_pool_ratio=cfg.data_pool_ratio, cluster=cluster,
+        role="decode" if rank >= cfg.nodes - cfg.decode_nodes else "prefill")
+
+
+class DelayedWriteback(radixshmem.WritebackHandler):
+    """Writes nothing: hands the tasks back after a fixed delay."""
+
+    def __init__(self, delay_ms: float):
+        self.delay = delay_ms / 1000
+
+    def write(self, tasks, done):
+        ids = [t.task_id for t in tasks]
+        if self.delay <= 0:
+            done(ids)
+            return
+        t = threading.Timer(self.delay, done, args=(ids,))
+        t.daemon = True
+        t.start()
 
 
 def geometry(cfg: Config) -> radixshmem.Geometry:
@@ -285,18 +330,29 @@ def recv_msg(sock: socket.socket):
 def create_node(cfg: Config, rank: int):
     """The engine's bootstrap: start the node's server, build the client with
     the geometry (handed to the server at once), wait for the cluster."""
+    devs = rdma_devices(cfg)
+    if devs:   # the node's own HCA for the index planes that run on RDMA
+        os.environ.setdefault("RADIXSHMEM_INDEX_DEV", devs[rank % len(devs)])
+    os.environ.setdefault("RADIXSHMEM_INDEX_GID_IDX", str(cfg.gid_idx))
     sc = server_config(cfg, rank)
-    server = radixshmem.RadixServer(sc).start()
+    delay = cfg.writeback_delay_ms
+
+    class Server(radixshmem.RadixServer):
+        def _make_writeback_handler(self):
+            return DelayedWriteback(delay) if delay >= 0 else super()._make_writeback_handler()
+
+    server = Server(sc).start()
     client = radixshmem.RadixClient(sc.name, geometry(cfg))
     client.wait_ready(cfg.bootstrap_timeout + 120)
     return server, client
 
 
 class Worker:
-    def __init__(self, cfg: Config, rank: int, client):
+    def __init__(self, cfg: Config, rank: int, client, server):
         self.cfg = cfg
         self.rank = rank
         self.client = client
+        self.server = server
         self.own = int(client.rank()) if client.is_distributed() else 0
         self.mask = query_mask(cfg)
         self.think = cfg.think_ms / 1000.0
@@ -401,7 +457,8 @@ class Worker:
                                                           update_meta=False).total_hit_length)
                     except Exception as e:
                         peer_hits[r] = f"err:{type(e).__name__}"
-            cs = self.cfg.register_chunk_size
+            cs = self.cfg.register_chunk_size or radixshmem._core.ShmConfig(
+                block_size=self.cfg.block_size).effective_register_chunk_size()
             diag = {"h0": "%08x" % (int(hashes[0]) & 0xffffffff),
                     "hk": {p: "%08x" % (int(hashes[p]) & 0xffffffff)
                            for p in range(0, len(inp), cs)},
@@ -510,8 +567,19 @@ class Worker:
                 break
             send_msg(sock, MSG_DONE, item)
 
+    def drain_writeback(self, timeout: float = 30.0) -> Optional[dict]:
+        if self.server.writeback_handler is None:
+            return None
+        deadline, quiet = time.monotonic() + timeout, 0
+        while time.monotonic() < deadline and quiet < 3:
+            wb = self.server.stats()["writeback"]
+            quiet = quiet + 1 if wb["queued"] == 0 and wb["popped"] == 0 else 0
+            time.sleep(0.1)
+        return self.server.stats()["writeback"]
+
     def stats(self) -> dict:
         c = self.client
+        wb = self.drain_writeback()   # held slots would show as leaks in the audit
         return {
             "worker": self.rank, "own_rank": self.own,
             "total_blocks": int(c.total_blocks()),
@@ -528,6 +596,7 @@ class Worker:
             # end-of-run leak audit (locks / slots / pins); 0 == clean
             "health": int(c.check_health()),
             "health_report": c.health_report().describe().strip(),
+            "writeback": wb,
         }
 
 
@@ -538,6 +607,8 @@ def run_worker(cfg: Config, rank: int) -> int:
     server, client = create_node(cfg, rank)
     print(f"[W{rank}] ready: shm={client.info.index_name} rank={client.rank()} "
           f"world={client.world_size()}")
+    if server.monitor is not None:
+        print(f"[W{rank}] monitor {server.monitor.url}")
 
     ls = socket.socket()
     ls.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -547,7 +618,7 @@ def run_worker(cfg: Config, rank: int) -> int:
     conn, _ = ls.accept()
     conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-    w = Worker(cfg, rank, client)
+    w = Worker(cfg, rank, client, server)
     threads = [threading.Thread(target=w.recv_loop, args=(conn,), daemon=True),
                threading.Thread(target=w.send_loop, args=(conn,), daemon=True)]
     execs = [threading.Thread(target=w.exec_loop, daemon=True)
@@ -754,6 +825,115 @@ async def session_loop(cfg: Config, conns: List[WorkerConn], rec: Recorder,
             rec.sessions_done += 1
 
 
+@dataclass
+class TraceStream:
+    times: List[float]
+    hashes: List[np.ndarray]
+    subagent: bool
+
+
+def load_trace(line: str):
+    """One AgentX session: the main stream and one stream per subagent group.
+    hash_ids are local to the session, so a session salt keeps them apart."""
+    r = json.loads(line)
+    salt = int(r["id"][:15], 16)
+
+    def stream(reqs, sub):
+        reqs = [q for q in reqs if q.get("hash_ids")]
+        return TraceStream([float(q["t"]) for q in reqs],
+                           [radixshmem.compute_hashes(np.asarray([salt] + q["hash_ids"], dtype=np.int64), 1)[1:]
+                            for q in reqs], sub)
+
+    reqs = r["requests"]
+    streams = [stream([q for q in reqs if q.get("type") != "subagent"], False)]
+    streams += [stream(g["requests"], True) for g in reqs if g.get("type") == "subagent"]
+    return [st for st in streams if st.times]
+
+
+def trace_block_size(path: str) -> int:
+    with open(path) as f:
+        return int(json.loads(f.readline())["block_size"])
+
+
+class TraceFeed:
+    def __init__(self, cfg: Config):
+        self.f = open(cfg.trace)
+        self.left = cfg.trace_sessions or -1
+        self.sid = 0
+        self.lock = threading.Lock()
+
+    def next(self):
+        with self.lock:
+            line = self.f.readline() if self.left != 0 else ""
+            if not line:
+                return None
+            self.left -= 1
+            sid, self.sid = self.sid, self.sid + 1
+        return sid, load_trace(line)
+
+
+async def trace_loop(cfg: Config, conns: List[WorkerConn], rec: Recorder,
+                     rng: random.Random, feed: TraceFeed, stop_new: asyncio.Event,
+                     drain_deadline: List[float], in_flight: List[int], delay: float):
+    await asyncio.sleep(delay)
+    while not stop_new.is_set():
+        item = await asyncio.to_thread(feed.next)
+        if item is None:
+            return
+        sid, streams = item
+        seen: set = set()
+        main_w = [rng.randrange(len(conns))]
+        base = min(st.times[0] for st in streams)
+        t0 = time.monotonic()
+        seq = [0]
+
+        async def play(st: TraceStream) -> bool:
+            w = -1
+            for i, (t, h) in enumerate(zip(st.times, st.hashes)):
+                wait = t0 + (t - base) / cfg.trace_speedup - time.monotonic()
+                if wait > 0:
+                    try:
+                        await asyncio.wait_for(stop_new.wait(), wait)
+                        return True
+                    except asyncio.TimeoutError:
+                        pass
+                if drain_deadline[0] and time.time() > drain_deadline[0]:
+                    return True
+                if w < 0:
+                    w = main_w[0] if not st.subagent or rng.random() < cfg.subagent_sticky \
+                        else rng.randrange(len(conns))
+                elif rng.random() >= cfg.sticky:
+                    w = rng.randrange(len(conns))
+                if not st.subagent:
+                    main_w[0] = w
+                ids = h.tolist()
+                hist = 0
+                while hist < len(ids) and ids[hist] in seen:
+                    hist += 1
+                req = {"req_id": (sid << 20) | seq[0], "session_id": sid, "turn": i,
+                       "history_blocks": hist, "input_blocks": len(ids), "output_blocks": 0,
+                       "visits": []}
+                seq[0] += 1
+                conn = conns[w]
+                fut = asyncio.get_running_loop().create_future()
+                conn.futures[req["req_id"]] = fut
+                in_flight[0] += 1
+                try:
+                    await conn.send(MSG_REQ, req, h.tobytes())
+                    done = await fut
+                finally:
+                    in_flight[0] -= 1
+                rec.record(req, done)
+                seen.update(ids)
+            return False
+
+        truncated = await asyncio.gather(*(play(st) for st in streams))
+        if any(truncated):
+            rec.sessions_truncated += 1
+        else:
+            rec.sessions_done += 1
+
+
 async def run_generator(cfg: Config) -> dict:
     conns: List[WorkerConn] = []
     for i in range(cfg.nodes):
@@ -773,9 +953,16 @@ async def run_generator(cfg: Config) -> dict:
     drain_deadline = [0.0]
     next_sid = [0]
     in_flight = [0]
-    tasks = [asyncio.create_task(session_loop(cfg, conns, rec, rng, stop_new,
-                                              drain_deadline, next_sid, in_flight))
-             for _ in range(cfg.concurrency)]
+    serving = conns[:cfg.nodes - cfg.decode_nodes]
+    if cfg.trace:
+        feed = TraceFeed(cfg)
+        tasks = [asyncio.create_task(trace_loop(cfg, serving, rec, rng, feed, stop_new, drain_deadline,
+                                                in_flight, i * cfg.trace_stagger))
+                 for i in range(cfg.concurrency)]
+    else:
+        tasks = [asyncio.create_task(session_loop(cfg, serving, rec, rng, stop_new,
+                                                  drain_deadline, next_sid, in_flight))
+                 for _ in range(cfg.concurrency)]
 
     async def clock():
         await asyncio.sleep(cfg.warmup_sec)
@@ -922,7 +1109,7 @@ def print_report(rep: dict):
     print(f"agentic_stress  mode={'index' if rep['config']['index_only'] else 'data'}  "
           f"nodes={rep['config']['nodes']}  "
           f"concurrency={rep['config']['concurrency']}  aux={rep['config']['aux']}  "
-          f"W={rep['config']['swa_window']}  cs={rep['config']['register_chunk_size']}  "
+          f"W={rep['config']['swa_window']}  cs={rep['config']['register_chunk_size'] or 'default'}  "
           f"rht_slots={rep['config']['rht_slots']}  flush={rep['config']['flush_after_insert']}  "
           f"max_blocks={rep['config']['max_blocks']}")
     print(f"warmup {t['warmup_sec']:.1f}s  measured {t['measured_sec']:.1f}s "
@@ -972,6 +1159,10 @@ def print_report(rep: dict):
                   f"staging_short={s.get('staging_shortfalls', 0)}  "
                   f"promo_short={s.get('promotion_shortfalls', 0)}  "
                   f"health={'ok' if s.get('health', 0) == 0 else f'0x{s["health"]:x}'}")
+            if s.get("writeback"):
+                wb = s["writeback"]
+                print(f"      write-back: tasks {wb['produced']} produced, {wb['completed']} completed, "
+                      f"{wb['dropped']} dropped, {wb['failed']} failed; held {wb['held_slots']}")
             if s.get("health", 0):
                 for line in s["health_report"].splitlines():
                     print(f"      {line}")
@@ -1034,7 +1225,7 @@ def spawn_workers(cfg: Config, workdir: str):
                 f.flush()
                 if line.startswith(b"READY "):
                     ev.set()
-                elif line.startswith(b"[W") and b"done" in line:
+                elif line.startswith(b"[W") and (b"done" in line or (idx == 0 and b"] monitor " in line)):
                     sys.stdout.write(line.decode(errors="replace"))
             f.close()
         threading.Thread(target=tee, daemon=True).start()
@@ -1083,6 +1274,10 @@ def run_launcher(cfg: Config) -> int:
             print(f"SKIP: --nodes {cfg.nodes} needs {', '.join(missing)}")
             return 77
     cfg.run_id = f"{os.getpid():x}{int(time.time()) & 0xffff:x}"
+    if cfg.trace:
+        cfg.block_size = trace_block_size(cfg.trace)
+        print(f"trace {cfg.trace}: block {cfg.block_size} tokens, sessions {cfg.trace_sessions or 'all'}, "
+              f"speedup {cfg.trace_speedup:g}, {cfg.concurrency} at a time")
     workdir = cfg.workdir or f"/tmp/agentic_stress_{os.getpid()}"
     os.makedirs(workdir, exist_ok=True)
     cfg.workdir = workdir
@@ -1114,6 +1309,9 @@ def run_launcher(cfg: Config) -> int:
                           f"{tail(os.path.join(workdir, f'worker{i}.log'))}")
                     return 1
         print(f"all {cfg.nodes} workers ready; starting {cfg.concurrency} sessions")
+        if cfg.monitor_port:
+            print(f"grafana: cluster {f'agentic_{cfg.run_id}' if cfg.nodes > 1 else 'default'} "
+                  f"(Prometheus finds the servers through worker 0's /sd)")
         rep = asyncio.run(run_generator(cfg))
         print_report(rep)
         if cfg.json_out:

@@ -7,12 +7,14 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <stdexcept>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -170,9 +172,10 @@ void RadixShmemTree::alloc_root() {
     root->parent_id = INVALID_NODE_ID;
 }
 
-void RadixShmemTree::reset() {
+void RadixShmemTree::reset(std::vector<NodeHead>* left, uint64_t since) {
     set_write_op("reset");
     write_lock();
+    if (left && route_publishes() != since) *left = collect_heads();
 
     nodes_.reset();   // also resets every ComponentStateTable entry
     data_.reset();
@@ -190,13 +193,14 @@ void RadixShmemTree::reset() {
     hdr->leaf_list_head = INVALID_NODE_ID;
     hdr->leaf_list_tail = INVALID_NODE_ID;
     hdr->total_blocks.store(0, std::memory_order_relaxed);
-    hdr->access_counter.store(0, std::memory_order_relaxed);
     hdr->insert_success.store(0, std::memory_order_relaxed);
     hdr->insert_error_node_pool.store(0, std::memory_order_relaxed);
     hdr->insert_error_data_pool.store(0, std::memory_order_relaxed);
     hdr->insert_error_ht_pool.store(0, std::memory_order_relaxed);
     hdr->insert_error_mempool.store(0, std::memory_order_relaxed);
-    hdr->peer_faults.clear();
+    for (auto& held : hdr->held_slots)
+        held.store(0, std::memory_order_relaxed);
+    hdr->reset_generation.fetch_add(1, std::memory_order_relaxed);
 
     alloc_root();
 
@@ -398,7 +402,7 @@ RadixShmemTree RadixShmemTree::create(const std::string& name,
     hdr->total_blocks.store(0, std::memory_order_relaxed);
     hdr->leaf_list_head = INVALID_NODE_ID;
     hdr->leaf_list_tail = INVALID_NODE_ID;
-    hdr->access_counter.store(0, std::memory_order_relaxed);
+    hdr->route_publishes.store(0, std::memory_order_relaxed);
     hdr->node_pool_size.store(0, std::memory_order_relaxed);
     hdr->insert_success.store(0, std::memory_order_relaxed);
     hdr->insert_error_node_pool.store(0, std::memory_order_relaxed);
@@ -769,20 +773,25 @@ uint32_t RadixShmemTree::split_node(uint32_t node_id, int prefix_length) {
     TreeNode* prefix_node = nodes_.get(prefix_id);
     node = nodes_.get(node_id);
 
-    int64_t orig_rc = node->ref_count.load(std::memory_order_relaxed);
+    int64_t orig_local = node->local_ref_count.load(std::memory_order_relaxed);
+    int64_t orig_remote = node->remote_ref_count.load(std::memory_order_relaxed);
     uint64_t orig_at = node->last_access_time.load(std::memory_order_relaxed);
 
     prefix_node->num_blocks = prefix_length;
     prefix_node->data_offset = prefix_data;
     prefix_node->parent_id = parent_id;
-    prefix_node->ref_count.fetch_add(orig_rc, std::memory_order_relaxed);
+    prefix_node->local_ref_count.fetch_add(orig_local, std::memory_order_relaxed);
+    prefix_node->remote_ref_count.fetch_add(orig_remote, std::memory_order_relaxed);
     // Whole-node component pins follow the split: Full/SWA refs copy to the
     // prefix, Mamba stays with the suffix END; live counts follow the lanes.
     if (has_aux_) {
         NodeComponentState* pre_cs = nodes_.component_state(prefix_id);
         NodeComponentState* suf_cs = nodes_.component_state(node_id);
-        pre_cs->swa_ref_count.store(
-            suf_cs->swa_ref_count.load(std::memory_order_relaxed),
+        pre_cs->local_swa_ref_count.store(
+            suf_cs->local_swa_ref_count.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        pre_cs->remote_swa_ref_count.store(
+            suf_cs->remote_swa_ref_count.load(std::memory_order_relaxed),
             std::memory_order_relaxed);
     }
     // Inherit access_time from split node to preserve strict LRU ordering.
@@ -810,12 +819,16 @@ uint32_t RadixShmemTree::split_node(uint32_t node_id, int prefix_length) {
 // Pin-eligibility for restructuring/eviction: all three component ref
 // classes (full/swa/mamba) on the node must be zero.
 bool RadixShmemTree::component_refs_zero(uint32_t node_id) const {
-    if (nodes_.get(node_id)->ref_count.load(std::memory_order_relaxed) != 0)
+    const TreeNode* node = nodes_.get(node_id);
+    if (node->local_ref_count.load(std::memory_order_relaxed) != 0 ||
+        node->remote_ref_count.load(std::memory_order_relaxed) != 0)
         return false;
     if (!has_aux_) return true;
     NodeComponentState* cs = nodes_.component_state(node_id);
-    return cs->swa_ref_count.load(std::memory_order_relaxed) == 0 &&
-           cs->mamba_ref_count.load(std::memory_order_relaxed) == 0;
+    return cs->local_swa_ref_count.load(std::memory_order_relaxed) == 0 &&
+           cs->remote_swa_ref_count.load(std::memory_order_relaxed) == 0 &&
+           cs->local_mamba_ref_count.load(std::memory_order_relaxed) == 0 &&
+           cs->remote_mamba_ref_count.load(std::memory_order_relaxed) == 0;
 }
 
 // Fold an only-child ready leaf up into its ready parent (inverse of split_node,
@@ -1029,7 +1042,14 @@ bool RadixShmemTree::is_in_leaf_list(uint32_t node_id) const {
 
 // ==================== Eviction internals ====================
 
-int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out) {
+int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out, bool hold) {
+    const uint32_t parent_id = nodes_.get(node_id)->parent_id;
+    const int n = detach_node(node_id, out, hold);
+    post_evict_fixup(parent_id);
+    return n;
+}
+
+int RadixShmemTree::detach_node(uint32_t node_id, std::vector<int32_t>& out, bool hold) {
     TreeNode* node = nodes_.get(node_id);
     int n = (int)node->num_blocks;
     uint32_t parent_id = node->parent_id;
@@ -1037,7 +1057,7 @@ int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out) {
 
     // Record (first_hash, node_id) for distributed RHT cleanup (flushed after unlock).
     if (evict_cb_)
-        evicted_pending().push_back({head_hash, node_id});
+        evicted_pending().push_back({head_hash, node_id, (uint32_t)n});
 
     int32_t* slots = data_.get_slots(node->data_offset, n);
     for (int i = 0; i < n; i++)
@@ -1057,19 +1077,153 @@ int RadixShmemTree::evict_node(uint32_t node_id, std::vector<int32_t>& out) {
     data_.free(node->data_offset, n);
     node = nodes_.get(node_id);
     remove_child(parent_id, head_hash, node_id);
-    if (swa_retired > 0)
-        swa_mempool_.recycle(retired.data(), (int)swa_retired);
-    if (retired.size() > swa_retired)
-        mamba_mempool_.recycle(retired.data() + swa_retired,
-                               (int)(retired.size() - swa_retired));
+    ShmHeader* hdr = header();
+    if (hold) {
+        hdr->held_slots[(int)ComponentType::SWA].fetch_add(
+            (uint32_t)swa_retired, std::memory_order_relaxed);
+        hdr->held_slots[(int)ComponentType::MAMBA].fetch_add(
+            (uint32_t)(retired.size() - swa_retired), std::memory_order_relaxed);
+    } else {
+        if (swa_retired > 0)
+            swa_mempool_.recycle(retired.data(), (int)swa_retired);
+        if (retired.size() > swa_retired)
+            mamba_mempool_.recycle(retired.data() + swa_retired,
+                                   (int)(retired.size() - swa_retired));
+    }
     nodes_.free(node_id);
-    header()->total_blocks.fetch_sub(n, std::memory_order_relaxed);
+    hdr->total_blocks.fetch_sub(n, std::memory_order_relaxed);
 
-    if (mempool_.enabled())
-        mempool_.recycle(out.data() + recycle_start, n);
-
-    post_evict_fixup(parent_id);
+    if (mempool_.enabled()) {
+        if (hold)
+            hdr->held_slots[(int)ComponentType::FULL].fetch_add(n, std::memory_order_relaxed);
+        else
+            mempool_.recycle(out.data() + recycle_start, n);
+    }
     return n;
+}
+
+int RadixShmemTree::evict_held_chain(uint32_t leaf, std::vector<int32_t>& out,
+                                     HeldEviction& h) {
+    const uint32_t root = header()->root_node_id;
+    uint32_t top = leaf;
+    for (uint32_t p = nodes_.get(leaf)->parent_id;
+         p != root && nodes_.get(p)->children_count == 1 && component_refs_zero(p);
+         p = nodes_.get(p)->parent_id)
+        top = p;
+    hold_path(leaf, top, h);   // before retire_swa clears the lanes
+    int freed = 0;
+    for (uint32_t id = leaf;;) {
+        const uint32_t parent = nodes_.get(id)->parent_id;
+        freed += evict_node(id, out, true);
+        if (id == top) break;
+        id = parent;
+    }
+    return freed;
+}
+
+void RadixShmemTree::hold_path(uint32_t leaf, uint32_t top, HeldEviction& h) {
+    const uint32_t root = header()->root_node_id;
+    std::vector<uint32_t> path;
+    for (uint32_t id = leaf; id != root && id != INVALID_NODE_ID;
+         id = nodes_.get(id)->parent_id)
+        path.push_back(id);
+    std::reverse(path.begin(), path.end());
+
+    h.generation = header()->reset_generation.load(std::memory_order_relaxed);
+    bool pin = true;
+    for (uint32_t id : path) {
+        TreeNode* nd = nodes_.get(id);
+        if (id == top) {
+            pin = false;
+            h.evicted_from = h.end();
+        }
+        const int nb = (int)nd->num_blocks;
+        const uint64_t* hs = data_.get_hashes(nd->data_offset);
+        const int32_t* fs = data_.get_slots(nd->data_offset, nb);
+        h.hashes.insert(h.hashes.end(), hs, hs + nb);
+        h.full_slots.insert(h.full_slots.end(), fs, fs + nb);
+        if (const int32_t* ss = has_swa_ ? data_.get_swa_slots(nd->data_offset, nb) : nullptr)
+            h.swa_slots.insert(h.swa_slots.end(), ss, ss + nb);
+        const bool ckpt = has_mamba_ && nd->mamba_checkpoint_slot != INVALID_COMPONENT_SLOT;
+        if (ckpt) {
+            h.mamba_ends.push_back((uint32_t)h.hashes.size());
+            h.mamba_slots.push_back(nd->mamba_checkpoint_slot);
+        }
+        if (!pin) continue;
+        nd->local_ref_count.fetch_add(1, std::memory_order_relaxed);
+        if (has_aux_) {
+            NodeComponentState* cs = nodes_.component_state(id);
+            if (has_swa_) cs->local_swa_ref_count.fetch_add(1, std::memory_order_relaxed);
+            if (ckpt) cs->local_mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+
+void HeldEviction::covered(uint64_t out[NUM_COMPONENT_TYPES]) const {
+    out[(int)ComponentType::FULL] = end();
+    out[(int)ComponentType::SWA] = (uint64_t)std::count_if(
+        swa_slots.begin(), swa_slots.end(),
+        [](int32_t s) { return s != INVALID_COMPONENT_SLOT; });
+    out[(int)ComponentType::MAMBA] = mamba_slots.size();
+}
+
+void RadixShmemTree::release_held(const std::vector<HeldEviction>& hs) {
+    if (hs.empty()) return;
+    set_write_op("release_held");
+    write_lock();
+    ShmHeader* hdr = header();
+    const uint64_t gen = hdr->reset_generation.load(std::memory_order_relaxed);
+    std::vector<int32_t> swa;
+    for (const HeldEviction& h : hs) {
+        if (h.generation != gen) continue;
+        const uint32_t a = h.evicted_from, end = h.end();
+        if (mempool_.enabled() && end > a) {
+            mempool_.recycle(h.full_slots.data() + a, (int)(end - a));
+            hdr->held_slots[(int)ComponentType::FULL].fetch_sub(end - a, std::memory_order_relaxed);
+        }
+        swa.clear();
+        for (size_t i = a; i < h.swa_slots.size(); i++)
+            if (h.swa_slots[i] != INVALID_COMPONENT_SLOT) swa.push_back(h.swa_slots[i]);
+        if (!swa.empty()) {
+            swa_mempool_.recycle(swa.data(), (int)swa.size());
+            hdr->held_slots[(int)ComponentType::SWA].fetch_sub(
+                (uint32_t)swa.size(), std::memory_order_relaxed);
+        }
+        // Checkpoints past evicted_from are the chain's own, held; the ones before are pinned.
+        const size_t k = std::upper_bound(h.mamba_ends.begin(), h.mamba_ends.end(), a) -
+                         h.mamba_ends.begin();
+        if (k < h.mamba_slots.size()) {
+            mamba_mempool_.recycle(h.mamba_slots.data() + k, (int)(h.mamba_slots.size() - k));
+            hdr->held_slots[(int)ComponentType::MAMBA].fetch_sub(
+                (uint32_t)(h.mamba_slots.size() - k), std::memory_order_relaxed);
+        }
+        if (a == 0) continue;
+        // Re-walk by hash: a split copies Full/SWA refs to both halves, Mamba stays on the END.
+        QueryInternalDetail m = query_internal(h.hashes.data(), (int)a, 0, false);
+        for (const MatchedNodeSpanView& v : path_spans(m)) {
+            const uint32_t e = v.absolute_start + v.node_blocks;
+            if (e > a) break;
+            (void)dec_ref(nodes_.get(v.node_id)->local_ref_count);
+            if (!has_aux_) continue;
+            NodeComponentState* cs = nodes_.component_state(v.node_id);
+            if (has_swa_) (void)dec_ref(cs->local_swa_ref_count);
+            if (has_mamba_ &&
+                std::binary_search(h.mamba_ends.begin(), h.mamba_ends.end(), e))
+                (void)dec_ref(cs->local_mamba_ref_count);
+        }
+    }
+    write_unlock();
+}
+
+uint32_t RadixShmemTree::held_slots(ComponentType component) const {
+    return header()->held_slots[(int)component].load(std::memory_order_relaxed);
+}
+
+uint64_t RadixShmemTree::reset_generation() const {
+    // Slot reads before this call stay before the load: if it still returns a task's
+    // generation, no reset() has handed that task's slots out again.
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return header()->reset_generation.load(std::memory_order_relaxed);
 }
 
 void RadixShmemTree::post_evict_fixup(uint32_t check_id) {
@@ -1082,7 +1236,7 @@ void RadixShmemTree::post_evict_fixup(uint32_t check_id) {
 
 TreeComponentQueryResult RadixShmemTree::query_components(
         const uint64_t* hashes, int n, uint32_t mask, bool lock,
-        bool update_meta) {
+        bool update_meta, const PinWindow* window) {
     const ComponentConfig& config = header()->component_config;
 
     // mask must be a non-empty subset of the enabled components; invalid
@@ -1119,26 +1273,30 @@ TreeComponentQueryResult RadixShmemTree::query_components(
         touch_full(spans, mask, full_hit, m.last_node_id);
         aux_touch(spans, mask, detail.common_hit, detail.swa_start, ts);
     }
-    if (lock) {
-        if (detail.common_hit > 0 || full_hit > 0)
-            inc_ref(spans, mask, detail.common_hit, detail.swa_start, full_hit,
-                    detail.pin);
+    const uint32_t L = detail.common_hit;
+    if (lock && !window) {
+        if (L > 0 || full_hit > 0)
+            inc_ref(spans, mask, L, detail.swa_start, 0, full_hit, detail.pin);
+    } else if (lock && L > window->incumbent) {
+        // Full is the hit itself here: the folding rank uses no block past L.
+        inc_ref(spans, mask, L, detail.swa_start, std::min(window->full_from, L), L,
+                detail.pin);
     }
     read_unlock();
     return detail;
 }
 
 // Runs under the read lock; eviction needs the write lock, so no gap opens.
-// Full covers [0, full_hit); SWA/Mamba cover the aux boundary common_hit.
+// Full covers [full_lo, full_hi); SWA/Mamba cover the aux boundary common_hit.
 void RadixShmemTree::inc_ref(const std::vector<MatchedNodeSpanView>& spans,
                            uint32_t mask, uint32_t common_hit,
-                           uint32_t swa_start, uint32_t full_hit,
+                           uint32_t swa_start, uint32_t full_lo, uint32_t full_hi,
                            PinRecord& pin) {
     const uint32_t L = common_hit;
     // Index math plus, for a partial terminal, a copy of its tail hashes.
     PinCoverage cov = compute_pin_coverage(spans.data(), spans.size(), mask, L,
-                                           swa_start, 0, full_hit);
-    record_pin_tail(spans.data(), spans.size(), cov, full_hit, L, pin);
+                                           swa_start, full_lo, full_hi);
+    record_pin_tail(spans.data(), spans.size(), cov, full_hi, L, pin);
     if (cov.swa_from < spans.size())
         pin.swa = {spans[cov.swa_from].absolute_start, cov.aux_cover_end};
     // With MAMBA in the mask, acceptance at L implies L is spans[aux_k]'s
@@ -1148,13 +1306,13 @@ void RadixShmemTree::inc_ref(const std::vector<MatchedNodeSpanView>& spans,
     if (cov.has_full)
         for (size_t i = cov.full_from; i <= cov.full_k; i++)
             nodes_.get(spans[i].node_id)
-                ->ref_count.fetch_add(1, std::memory_order_relaxed);
+                ->local_ref_count.fetch_add(1, std::memory_order_relaxed);
     for (size_t i = cov.swa_from; i <= cov.aux_k && i < spans.size(); i++)
         nodes_.component_state(spans[i].node_id)
-            ->swa_ref_count.fetch_add(1, std::memory_order_relaxed);
+            ->local_swa_ref_count.fetch_add(1, std::memory_order_relaxed);
     if (cov.pin_mamba)
         nodes_.component_state(spans[cov.aux_k].node_id)
-            ->mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
+            ->local_mamba_ref_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RadixShmemTree::touch_full(const std::vector<MatchedNodeSpanView>& spans,
@@ -1230,11 +1388,11 @@ bool RadixShmemTree::dec_ref(const uint64_t* hashes, int n,
         const uint32_t e = s + v.node_blocks;
         if (e > end) break;   // only nodes fully inside [0, end)
         if (full_present && s >= pin.full.start && s < pin.full.end)
-            (void)dec_ref(nodes_.get(v.node_id)->ref_count);
+            (void)dec_ref(nodes_.get(v.node_id)->local_ref_count);
         if (swa_present && s >= pin.swa.start && s < pin.swa.end)
-            (void)dec_ref(nodes_.component_state(v.node_id)->swa_ref_count);
+            (void)dec_ref(nodes_.component_state(v.node_id)->local_swa_ref_count);
         if (mamba_present && e == (uint32_t)pin.mamba_end)
-            (void)dec_ref(nodes_.component_state(v.node_id)->mamba_ref_count);
+            (void)dec_ref(nodes_.component_state(v.node_id)->local_mamba_ref_count);
     }
     read_unlock();
     return true;
@@ -1333,7 +1491,7 @@ std::vector<MatchedNodeSpanView> RadixShmemTree::path_spans(
 
 
 void RadixShmemTree::inc_ref(uint32_t node_id) {
-    nodes_.get(node_id)->ref_count.fetch_add(1, std::memory_order_relaxed);
+    nodes_.get(node_id)->local_ref_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 bool RadixShmemTree::dec_ref(std::atomic<int64_t>& ref) noexcept {
@@ -1347,7 +1505,7 @@ bool RadixShmemTree::dec_ref(std::atomic<int64_t>& ref) noexcept {
 
 void RadixShmemTree::dec_ref(uint32_t node_id) {
     // Legacy semantics: silently clamp at zero.
-    (void)dec_ref(nodes_.get(node_id)->ref_count);
+    (void)dec_ref(nodes_.get(node_id)->local_ref_count);
 }
 
 std::vector<NodeBoundary> RadixShmemTree::get_node_boundaries(
@@ -1426,7 +1584,8 @@ InsertResult RadixShmemTree::insert(const uint64_t* hashes, int n,
 InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
                                        const int32_t* ext_slots,
                                        int ext_num_slots,
-                                       int start, bool auto_recycle) {
+                                       int start, bool auto_recycle,
+                                       const uint64_t* ts) {
     set_write_op("insert");
     InsertResult result;
 
@@ -1448,10 +1607,10 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
     }
 
     write_lock();
-    QueryInternalDetail match = query_internal(hashes, n, now_ts());
+    QueryInternalDetail match = query_internal(hashes, n, ts ? 0 : now_ts(), ts == nullptr);
 
     // Strict-LRU: promote terminal leaf to tail (safe under write_lock).
-    if (match.last_node_id != INVALID_NODE_ID &&
+    if (!ts && match.last_node_id != INVALID_NODE_ID &&
         is_in_leaf_list(match.last_node_id))
         leaf_list_move_to_tail(match.last_node_id);
 
@@ -1592,9 +1751,14 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
         header()->total_blocks.fetch_add(chunk, std::memory_order_relaxed);
 
         // Only the last chunk is a real leaf.
-        new_node->last_access_time.store(now_ts(), std::memory_order_relaxed);
-        if (chunk == remaining)
-            leaf_list_add(new_id);
+        uint64_t at = ts ? 0 : now_ts();
+        for (int i = 0; ts && i < chunk; i++)
+            at = std::max(at, ts[skip + slot_idx + i]);
+        new_node->last_access_time.store(at, std::memory_order_relaxed);
+        if (chunk == remaining) {
+            if (ts) leaf_list_insert_by_access_time(new_id);
+            else leaf_list_add(new_id);
+        }
 
         new_leaf_ids.push_back(new_id);
 
@@ -1625,7 +1789,7 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
     }
 
     // Auto-merge (single-chunk extension): fold only-child leaf into its parent.
-    if (result.error == InsertError::OK && new_leaf_ids.size() == 1) {
+    if (!ts && result.error == InsertError::OK && new_leaf_ids.size() == 1) {
         uint32_t leaf_id = new_leaf_ids.back();
         uint32_t p_id = nodes_.get(leaf_id)->parent_id;
         if (p_id != header()->root_node_id &&
@@ -1650,18 +1814,33 @@ static inline uint64_t access_time_of(const TreeNode* n) {
     return n->last_access_time.load(std::memory_order_relaxed);
 }
 
-int RadixShmemTree::evict_walk(int need) {
+int RadixShmemTree::evict_walk(int need, std::vector<HeldEviction>* held,
+                               const uint64_t* budget) {
     int freed = 0;
+    uint64_t covered[NUM_COMPONENT_TYPES] = {};
+    auto within_budget = [&] {
+        for (int k = 0; budget && k < NUM_COMPONENT_TYPES; k++)
+            if (covered[k] >= budget[k]) return false;
+        return true;
+    };
     std::vector<int32_t> tmp;
     // Restart from head after each eviction (evict_node mutates leaf_list);
     // skip pinned/root, stop when a full pass evicts nothing.
-    while (freed < need) {
+    while (freed < need && within_budget()) {
         uint32_t cur = header()->leaf_list_head;
         bool evicted_one = false;
         while (cur != INVALID_NODE_ID) {
             TreeNode* node = nodes_.get(cur);
             if (cur != header()->root_node_id && component_refs_zero(cur)) {
-                freed += evict_node(cur, tmp);
+                if (held) {
+                    held->emplace_back();
+                    freed += evict_held_chain(cur, tmp, held->back());
+                    uint64_t c[NUM_COMPONENT_TYPES];
+                    held->back().covered(c);
+                    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) covered[k] += c[k];
+                } else {
+                    freed += evict_node(cur, tmp);
+                }
                 evicted_one = true;
                 break;
             }
@@ -1690,9 +1869,42 @@ bool RadixShmemTree::node_head_matches(uint32_t node_id, uint64_t first_hash) {
     return live;
 }
 
-std::vector<EvictedNode>& RadixShmemTree::evicted_pending() {
+std::vector<NodeHead> RadixShmemTree::node_heads() {
+    read_lock();
+    std::vector<NodeHead> out = collect_heads();
+    read_unlock();
+    return out;
+}
+
+std::vector<NodeHead> RadixShmemTree::collect_heads() {
+    std::vector<NodeHead> out;
+    const uint32_t cap = header()->node_pool_capacity;
+    for (uint32_t id = 0; id < cap; id++) {
+        const TreeNode* nd = nodes_.get(id);
+        if (nd->parent_id != INVALID_NODE_ID && nd->num_blocks > 0 &&
+            nd->data_offset != INVALID_OFFSET)
+            out.push_back({data_.get_hashes(nd->data_offset)[0], id, nd->num_blocks});
+    }
+    return out;
+}
+
+void RadixShmemTree::lock_reset() {
+    while (::flock(fd_, LOCK_EX) != 0 && errno == EINTR) {}
+}
+
+void RadixShmemTree::unlock_reset() { ::flock(fd_, LOCK_UN); }
+
+void RadixShmemTree::note_route_publish() {
+    header()->route_publishes.fetch_add(1, std::memory_order_relaxed);
+}
+
+uint64_t RadixShmemTree::route_publishes() const {
+    return header()->route_publishes.load(std::memory_order_relaxed);
+}
+
+std::vector<NodeHead>& RadixShmemTree::evicted_pending() {
     // Per-thread buffer: foreground inserter and background evictor never share.
-    static thread_local std::vector<EvictedNode> buf;
+    static thread_local std::vector<NodeHead> buf;
     return buf;
 }
 
@@ -1705,10 +1917,12 @@ void RadixShmemTree::flush_evicted() {
     batch.clear();
 }
 
-int RadixShmemTree::try_evict_batch(int target_blocks) {
+int RadixShmemTree::try_evict_batch(int target_blocks,
+                                    std::vector<HeldEviction>* held,
+                                    const uint64_t* budget) {
     set_write_op("evict_bg");
     if (!try_write_lock()) return 0;
-    int freed = evict_walk(target_blocks);
+    int freed = evict_walk(target_blocks, held, budget);
     write_unlock();
     flush_evicted();
     return freed;
@@ -1729,6 +1943,42 @@ int RadixShmemTree::try_evict_component_batch(ComponentType component,
     return freed;
 }
 
+int RadixShmemTree::dedup_prefix(const uint64_t* hashes, int n) {
+    if (n <= 0 || hashes == nullptr) return 0;
+    set_write_op("dedup");
+    write_lock();
+    const std::vector<uint32_t> chain = dedup_chain(hashes, n);
+    int freed = 0;
+    if (!chain.empty()) {
+        const uint32_t stop = nodes_.get(chain.back())->parent_id;
+        std::vector<int32_t> slots;
+        for (uint32_t id : chain)
+            freed += detach_node(id, slots);
+        post_evict_fixup(stop);
+    }
+    write_unlock();
+    flush_evicted();
+    return freed;
+}
+
+std::vector<uint32_t> RadixShmemTree::dedup_chain(const uint64_t* hashes, int n) {
+    std::vector<uint32_t> chain;
+    const std::vector<MatchedNodeSpanView> spans =
+        path_spans(query_internal(hashes, n, 0, false));
+    if (spans.empty()) return chain;
+    const MatchedNodeSpanView& leaf = spans.back();
+    if (leaf.matched_blocks != leaf.node_blocks ||
+        nodes_.get(leaf.node_id)->children_count != 0 || !component_refs_zero(leaf.node_id))
+        return chain;
+    chain.push_back(leaf.node_id);
+    for (int i = (int)spans.size() - 2; i >= 0; i--) {
+        const uint32_t id = spans[i].node_id;
+        if (nodes_.get(id)->children_count != 1 || !component_refs_zero(id)) break;
+        chain.push_back(id);
+    }
+    return chain;
+}
+
 // ==================== Slot allocation (for external slot mgmt)
 
 Mempool* RadixShmemTree::try_component_pool(ComponentType component) noexcept {
@@ -1744,7 +1994,7 @@ Mempool* RadixShmemTree::try_component_pool(ComponentType component) noexcept {
 }
 
 int RadixShmemTree::allocate_slots(int num_slots, std::vector<int32_t>& out,
-                                 ComponentType component) {
+                                 ComponentType component, bool may_evict) {
     set_write_op("alloc");
     out.clear();
     Mempool* pool = try_component_pool(component);
@@ -1752,11 +2002,17 @@ int RadixShmemTree::allocate_slots(int num_slots, std::vector<int32_t>& out,
     if (!pool->enabled()) return 0;
     // Bad args: non-positive, or larger than the pool can ever hold. Signal -1
     // rather than silently returning 0 / a truncated set.
-    if (num_slots <= 0 || (uint32_t)num_slots > pool->total()) return -1;
+    if (num_slots <= 0 || (may_evict && (uint32_t)num_slots > pool->total())) return -1;
 
     write_lock();
     int free_now = (int)pool->num_free();
-    if (free_now < num_slots) {
+    if (!may_evict) {
+        num_slots = std::min(num_slots, free_now);
+        if (num_slots == 0) {
+            write_unlock();
+            return 0;
+        }
+    } else if (free_now < num_slots) {
         if (component != ComponentType::FULL) {
             // All-or-none: evict from this component's own chain, then retry
             // the same request exactly once.

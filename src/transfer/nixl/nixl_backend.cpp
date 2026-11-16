@@ -101,6 +101,7 @@ private:
         nixlXferReqH*  req      = nullptr;
         uint64_t       bytes    = 0;
         bool           completed_at_post = false;
+        bool           failed   = false;
     };
 
     bool covers_local(const void* addr, uint64_t len) const;   // mu_ held
@@ -541,8 +542,11 @@ BatchHandle NixlBackend::submit(const TransferDesc* descs, int n) {
     if (st != NIXL_SUCCESS && st != NIXL_IN_PROG) {
         fprintf(stderr, "[radixshmem] NixlBackend: postXferReq to '%s' failed: %d\n",
                 remote_agent.c_str(), (int)st);
-        agent_->releaseXferReq(req);
-        return INVALID_BATCH;
+        if (agent_->releaseXferReq(req) == NIXL_SUCCESS) return INVALID_BATCH;
+        lk.lock();
+        const BatchHandle h = next_batch_++;
+        batches_[h] = Batch{false, req, total, false, true};
+        return h;
     }
     lk.lock();
 
@@ -562,6 +566,10 @@ XferState NixlBackend::poll(BatchHandle h, uint64_t* done_bytes) {
     if (b.is_local) {
         if (done_bytes) *done_bytes = b.bytes;
         return XferState::COMPLETED;
+    }
+    if (b.failed) {
+        if (done_bytes) *done_bytes = 0;
+        return XferState::FAILED;
     }
     if (b.completed_at_post) {
         if (done_bytes) *done_bytes = b.bytes;

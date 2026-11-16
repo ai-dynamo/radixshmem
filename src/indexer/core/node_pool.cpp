@@ -27,8 +27,10 @@ void NodePool::init_free_list(TreeNode* nodes, uint32_t capacity,
 }
 
 void NodePool::reset_component_state(NodeComponentState& s) {
-    s.swa_ref_count.store(0, std::memory_order_relaxed);
-    s.mamba_ref_count.store(0, std::memory_order_relaxed);
+    s.local_swa_ref_count.store(0, std::memory_order_relaxed);
+    s.remote_swa_ref_count.store(0, std::memory_order_relaxed);
+    s.local_mamba_ref_count.store(0, std::memory_order_relaxed);
+    s.remote_mamba_ref_count.store(0, std::memory_order_relaxed);
     s.swa_live_blocks = 0;
 }
 
@@ -48,7 +50,8 @@ uint32_t NodePool::alloc() {
     node->leaf_prev = INVALID_NODE_ID;
     node->leaf_next = INVALID_NODE_ID;
     node->first_child_entry = HT_END;
-    node->ref_count.store(0, std::memory_order_relaxed);
+    node->local_ref_count.store(0, std::memory_order_relaxed);
+    node->remote_ref_count.store(0, std::memory_order_relaxed);
     node->last_access_time.store(0, std::memory_order_relaxed);
     if (cst_)
         reset_component_state(cst_[id]);

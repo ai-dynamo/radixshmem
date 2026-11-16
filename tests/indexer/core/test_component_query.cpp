@@ -7,6 +7,7 @@
 
 #include "radixshmem_config.h"
 #include "radix_client.h"
+#include "local.h"
 #include "radix_tree.h"
 #include "test_utils.h"
 
@@ -20,6 +21,8 @@
 #include <cassert>
 #include <cstdint>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -1075,6 +1078,69 @@ static void test_facade_bad_mask_and_crop_to_zero() {
     TEST_PASS();
 }
 
+#ifdef RADIXSHMEM_NO_RDMA
+static void test_nordma_client_boundaries() {
+    TEST_BEGIN("no RDMA: local access works and distributed entry points reject");
+    auto requires_rdma = [](auto&& action) {
+        bool rejected = false;
+        try {
+            action();
+        } catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()).find("RDMA") != std::string::npos;
+        }
+        assert(rejected);
+    };
+
+    RadixClientConfig client_config;
+    requires_rdma([&] { RadixClient client(client_config); });
+    const std::string name = "/test_cq_nordma_" + std::to_string(::getpid());
+    for (int criterion = 0; criterion < 2; ++criterion) {
+        RadixServerConfig server_config;
+        server_config.name = name;
+        if (criterion == 0) server_config.world_size = 2;
+        if (criterion == 1) server_config.expected_min_nodes = 2;
+        requires_rdma([&] {
+            RadixServer server(server_config);
+            server.bootstrap();
+        });
+    }
+
+    auto tree = RadixShmemTree::create(name, cfg(4, 4, 32));
+    auto hashes = seq(4000, 4);
+    {
+        RadixClient client(name);
+        assert(!client.is_distributed() && client.world_size() == 1);
+        assert(insert_auto(client, hashes.data(), 4).error == InsertError::OK);
+    }
+    {
+        LocalTreeConnector borrowed(name);
+        requires_rdma([&] { RadixClient client(client_config, &borrowed); });
+        assert(borrowed.check_health() == 0);
+    }
+    auto* header = static_cast<ShmHeader*>(tree.shm_base());
+    header->is_distributed = 1;
+    header->my_rank = 3;
+    requires_rdma([&] { RadixClient client(name); });
+    {
+        RadixClient reader(name, true);
+        assert(!reader.is_distributed() && reader.rank() == 3);
+        auto result = reader.query(hashes.data(), 4, COMPONENT_MASK_FULL);
+        assert(result.status == RemoteStatus::OK && result.common_hit == 4);
+        bool rejected = false;
+        try {
+            std::vector<int32_t> slots;
+            reader.allocate_slots(1, slots);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        assert(rejected);
+    }
+    expect_healthy(tree);
+    tree.destroy();
+    TEST_PASS();
+}
+#endif
+
 static void test_client_component_insert() {
     TEST_BEGIN("facade: unified insert publishes every component end to end");
 
@@ -1274,6 +1340,51 @@ static void test_remote_pin_incumbent_release() {
     assert(r.ep.faas == 3);
     pressure(t, 8);
     assert(hit(t, ha.data(), 4) == 0);
+
+    expect_healthy(t);
+    t.destroy();
+    TEST_PASS();
+}
+
+static bool same_pin(const PinRecord& a, const PinRecord& b) {
+    return a.full.start == b.full.start && a.full.end == b.full.end &&
+           a.swa.start == b.swa.start && a.swa.end == b.swa.end &&
+           a.mamba_end == b.mamba_end && a.tail == b.tail;
+}
+
+// The peer index over gRPC pins on the peer's CPU what an RDMA walk pins by FAA.
+static void test_window_pin_matches_remote_walk() {
+    TEST_BEGIN("remote: a windowed CPU pin equals the RDMA walk's, case by case");
+
+    const char* name = "/test_cq_window_pin";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, cfg(4, 3, 128));
+    auto h = seq(1000, 12);
+    insert_fresh(t, h.data(), 12);
+    for (int e : {3, 6, 9}) publish_at(t, h.data(), e, 4);
+    mamba_ok(t, h.data(), 9);
+
+    Rig r(t);
+    const uint32_t masks[] = {COMPONENT_MASK_FULL, FS, FM, FSM,
+                              COMPONENT_MASK_SWA, COMPONENT_MASK_MAMBA};
+    int pinned = 0;
+    for (uint32_t mask : masks)
+        for (int len : {12, 10, 9, 5, 3})
+            for (int inc : {0, 2, 6, 9})
+                for (int from : {0, 1, 4, 12}) {
+                    PinWindow w{(uint32_t)inc, (uint32_t)from};
+                    auto cpu = t.query_components(h.data(), len, mask, true, false, &w);
+                    auto rdma = r.walker.walk_components(r.info, h.data(), len, mask,
+                                                         true, inc, from);
+                    assert_same(cpu, rdma.tree);
+                    assert(same_pin(cpu.pin, rdma.remote_pin));
+                    pinned += !cpu.pin.empty();
+                    assert(t.dec_ref(h.data(), len, std::move(cpu.pin)));
+                    if (!rdma.remote_pin.empty())
+                        assert(r.walker.dec_ref_components_remote(
+                            r.info, h.data(), len, std::move(rdma.remote_pin)));
+                }
+    assert(pinned > 0);
 
     expect_healthy(t);
     t.destroy();
@@ -1595,6 +1706,61 @@ static void test_remote_multinode_cut_and_release_guards() {
     TEST_PASS();
 }
 
+static void test_local_and_remote_refs_are_separate() {
+    TEST_BEGIN("remote: CPU pins use local_*, RDMA pins remote_*; split copies both");
+
+    const char* name = "/test_cq_split_refs";
+    shm_unlink(name);
+    auto t = RadixShmemTree::create(name, cfg(4, 4, 8));
+    auto h = seq(2600, 4);
+    insert_fresh(t, h.data(), 4);
+    publish_at(t, h.data(), 4, 4);
+    mamba_ok(t, h.data(), 4);
+
+    auto* base = static_cast<char*>(t.shm_base());
+    auto* hdr = reinterpret_cast<ShmHeader*>(base);
+    auto* nodes = reinterpret_cast<TreeNode*>(base + hdr->node_pool_offset);
+    auto* cst = reinterpret_cast<NodeComponentState*>(base + hdr->component_state_offset);
+    const uint32_t id = hdr->leaf_list_head;
+    auto refs = [&](uint32_t n) {
+        return std::vector<int64_t>{nodes[n].local_ref_count.load(), nodes[n].remote_ref_count.load(),
+                                    cst[n].local_swa_ref_count.load(), cst[n].remote_swa_ref_count.load(),
+                                    cst[n].local_mamba_ref_count.load(), cst[n].remote_mamba_ref_count.load()};
+    };
+
+    auto q = qp(t, h.data(), 4, FSM);
+    assert(q.common_hit == 4);
+    assert(refs(id) == (std::vector<int64_t>{1, 0, 1, 0, 1, 0}));
+
+    Rig r(t);
+    auto res = r.walker.walk_components(r.info, h.data(), 4, FSM, /*lock=*/true);
+    assert(res.tree.common_hit == 4 && !res.remote_pin.empty());
+    assert(refs(id) == (std::vector<int64_t>{1, 1, 1, 1, 1, 1}));
+
+    auto g = h;
+    g[2] = 2690;
+    g[3] = 2691;
+    insert_fresh(t, g.data(), 4, 2);
+    const uint32_t pre = nodes[id].parent_id;
+    assert(pre != hdr->root_node_id && nodes[pre].num_blocks == 2 && nodes[id].num_blocks == 2);
+    assert(refs(pre) == (std::vector<int64_t>{1, 1, 1, 1, 0, 0}));
+    assert(refs(id) == (std::vector<int64_t>{1, 1, 1, 1, 1, 1}));
+
+    assert(t.dec_ref(h.data(), 4, std::move(q.pin)));
+    assert(refs(pre) == (std::vector<int64_t>{0, 1, 0, 1, 0, 0}));
+    assert(refs(id) == (std::vector<int64_t>{0, 1, 0, 1, 0, 1}));
+    assert(t.dedup_prefix(h.data(), 4) == 0 && hit(t, h.data(), 4) == 4);
+
+    assert(r.walker.dec_ref_components_remote(r.info, h.data(), 4, std::move(res.remote_pin)));
+    assert(refs(pre) == (std::vector<int64_t>{0, 0, 0, 0, 0, 0}));
+    assert(refs(id) == (std::vector<int64_t>{0, 0, 0, 0, 0, 0}));
+    assert(t.dedup_prefix(h.data(), 4) == 2 && hit(t, h.data(), 4) == 2);
+
+    expect_healthy(t);
+    t.destroy();
+    TEST_PASS();
+}
+
 #endif
 
 int main() {
@@ -1623,15 +1789,20 @@ int main() {
     test_facade_shape_and_finalize();
     test_facade_bad_mask_and_crop_to_zero();
     test_client_component_insert();
+#ifdef RADIXSHMEM_NO_RDMA
+    test_nordma_client_boundaries();
+#endif
 #ifndef RADIXSHMEM_NO_RDMA
     test_remote_parity_and_abi_gate();
     test_remote_pin_incumbent_release();
+    test_window_pin_matches_remote_walk();
     test_remote_throw_releases_reader_count();
     test_remote_pin_swa_terminal_past_query();
     test_remote_pin_swa_only_terminal_past_query();
     test_remote_hints_and_failstop();
     test_remote_hint_chain_is_the_walk();
     test_remote_multinode_cut_and_release_guards();
+    test_local_and_remote_refs_are_separate();
 #endif
     return tests_report();
 }

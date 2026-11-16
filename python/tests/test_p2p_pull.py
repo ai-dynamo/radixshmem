@@ -67,6 +67,11 @@ def client_main(role: str, endpoint: str) -> int:
             r.finalize()
         out["local_hit_after"] = sum(int(c.query(h, local_only=True, update_meta=False).common_hit)
                                      for h in hs)
+        src, left, deadline = results[0].source_rank, -1, time.monotonic() + 10
+        while left != 0 and time.monotonic() < deadline:
+            left = sum(int(c.remote_query(src, h, False, False).total_hit_length) for h in hs)
+            time.sleep(0.05)
+        out["source_hit_after"] = left
     elif role == "health":
         out["health"] = int(c.check_health())
         out["report"] = c.health_report().describe().strip()
@@ -171,9 +176,8 @@ def orchestrate(a) -> int:
                    "--data-name", f"{NAME}_data{i}", "--data-bytes", "64M", "--no-prefault",
                    "--endpoint", endpoints[i], "--registry", registry, "--cluster-id", cluster_id,
                    "--expected-min-nodes", "2", "--rpc-address", "0.0.0.0", "--transfer-ip", "127.0.0.1",
-                   "--gid-idx", str(a.gid_idx), "--bootstrap-timeout", str(a.bootstrap_timeout),
-                   "--background-evict-ratio", "0", "--interval", "0"]
-            cmd += ["--index-dev", a.index_dev] if a.index_dev else []
+                   "--bootstrap-timeout", str(a.bootstrap_timeout),
+                   "--background-evict-ratio", "0"]
             cmd += [f"--transfer-dev={d}" for d in a.transfer_dev]
             servers.append(subprocess.Popen(cmd, stdout=open(logs[i], "wb"), stderr=subprocess.STDOUT,
                                             env=dict(os.environ, PYTHONUNBUFFERED="1")))
@@ -231,6 +235,7 @@ def orchestrate(a) -> int:
               f"all blocks came from rank {ranks[0]}")
         check(r["bytes_ok"] == total, "every slot holds the writer's bytes")
         check(r["local_hit_after"] == total, "node1 now serves the prefixes locally")
+        check(r["source_hit_after"] == 0, "node0 dropped the prefixes node1 pulled")
 
         print("\n[5] both trees are leak-free")
         for i, h in enumerate(run_clients([("health", endpoints[0]), ("health", endpoints[1])])):
@@ -272,6 +277,9 @@ def main() -> int:
     p.add_argument("--gid-idx", type=int, default=3)
     p.add_argument("--bootstrap-timeout", type=int, default=120)
     a = p.parse_args()
+    # The device of the planes that run on RDMA; the servers inherit it.
+    os.environ["RADIXSHMEM_INDEX_DEV"] = a.index_dev
+    os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(a.gid_idx)
     if a.transfer_dev is None:
         a.transfer_dev = [a.index_dev] if a.index_dev else []
     return orchestrate(a)

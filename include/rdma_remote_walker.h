@@ -4,6 +4,7 @@
 #pragma once
 
 #include "component_types.h"
+#include "peer_index.h"          // RemoteHit
 #include "rdma_transport.hpp"
 #include "types.h"
 #include <cstdint>
@@ -41,20 +42,15 @@ struct TreeNodeData {
     int32_t  mamba_checkpoint_slot;
     uint64_t data_offset;
     uint64_t last_access_time;
-    int64_t ref_count;
+    int64_t remote_ref_count;
     uint32_t next_free;
     uint32_t leaf_prev;
     uint32_t leaf_next;
     uint32_t first_child_entry;
-    uint64_t _pad_version;
+    int64_t local_ref_count;
 };
 static_assert(sizeof(TreeNodeData) == sizeof(TreeNode),
               "TreeNodeData must match TreeNode layout");
-
-struct RemoteHit {
-    int position;
-    uint32_t tree_node_id;
-};
 
 struct RemoteComponentWalkResult {
     TreeComponentQueryResult tree;

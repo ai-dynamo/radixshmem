@@ -5,7 +5,9 @@
 
 #include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "health_check.h"
+#include "dedup_writer.h"
 #include "types.h"
+#include "writeback.h"
 
 #include <cstdint>
 #include <memory>
@@ -17,7 +19,7 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include <unordered_map>
+#include "cluster_manifest.h"      // CLUSTER_TRANSPORT_*, CLUSTER_RHT_*, CLUSTER_PEER_INDEX_*
 #endif
 
 namespace radixshmem {
@@ -27,22 +29,12 @@ class RadixShmemTree;
 #ifndef RADIXSHMEM_NO_RDMA
 class LocalTreeConnector;
 class RadixClient;
-class RdmaContext;
-class RdmaXrcd;
-class XrcSrq;
-class RdmaMemoryRegion;
+class RdmaHost;    // src/indexer/transport/rdma/rdma_host.hpp
 class RhtHolder;   // src/indexer/rht/rht_endpoint.h
-class DcTarget;
-class XrcRecvQp;
 class EtcdRegistry;
 struct PeerEntry;
 struct ShardMapMsg;
-struct RemoteOpReqHeader;
-
-struct RemoteOpAddr {
-    uint16_t port = 0;        // zmq: actual bound TCP port (0 = not zmq / off)
-    uint32_t dctns[4] = {};   // dc: lane DCT numbers, lane 0 first, 0-padded
-};
+class RemoteOpService;
 #endif
 
 struct RadixServerConfig {
@@ -52,11 +44,12 @@ struct RadixServerConfig {
     // Shm sizing / eviction policy.
     ShmConfig shm;
 
+    bool  writeback_enabled = false;         // background eviction holds slots for write-back
+    float writeback_max_held_ratio = 0.05f;  // it pauses at this in-flight share of a pool
+
     // rank: etcd-assigned dense rank, filled after bootstrap.
     int          rank        = 0;
     int          world_size  = 1;   // observed count(/peers) overrides at bootstrap
-    std::string  index_dev;          // empty = first available device
-    int          gid_idx     = 3;
     int          bootstrap_timeout_sec = 60;
     // TTL of this node's etcd lease and of the shared cluster lease: how long a
     // killed node's keys, or a fully stopped cluster's /config, outlive it.
@@ -64,27 +57,12 @@ struct RadixServerConfig {
 
     std::string  rpc_address;              // explicit IPv4, e.g. "192.168.1.11"
     std::string  rpc_interface;            // NIC name, e.g. "eth0"
-    uint16_t     rpc_port    = 0;          // 0 = OS-assigned bootstrap / XRC listen port
+    // gRPC endpoint peers reach: remote ops, peer queries, XRC setup; 0 = OS-assigned.
+    uint16_t     rpc_port    = 0;
     int          register_chunk_tokens = DEFAULT_REGISTER_CHUNK_TOKENS;   // copied onto shm at bootstrap
 
-    int          expected_min_nodes = 0;   // 0 = gate on num_rht_shards only
+    int          expected_min_nodes = 0;   // > 1 = distributed
     int          settle_ms          = 500;
-
-    int               num_rht_shards = 0;      // M
-    std::vector<int>  rht_shard_holders;       // candidate holder ranks
-
-    std::string       rht_transport = "xrc";
-    std::string       peer_index_transport = "xrc";
-
-    // RHT slots per bucket (W): must be in {1,2,4,8}. rank 0 authoritative (broadcast).
-    int               rht_slots_per_bucket = 4;
-
-    bool              enable_remote_insert = false;   // remote-insert control plane
-    bool              enable_remote_query = false;    // remote-query control plane
-    uint16_t          zmq_listen_port = 0;            // remote-op endpoint TCP port
-
-    // Control-plane backend: "zmq" | "dc" ("dc" needs world_size>1 + mlx5). rank 0 authoritative.
-    std::string       remote_op_transport = "zmq";
 
     // Cluster bootstrap registry: "etcd://host:port" (etcd dynamic discovery).
     std::string       registry   = "etcd://127.0.0.1:2379";
@@ -131,7 +109,9 @@ public:
     uint32_t mempool_free() const;
     uint32_t mempool_used() const;
     uint32_t swa_mempool_total() const;
+    uint32_t swa_mempool_free() const;
     uint32_t mamba_mempool_total() const;
+    uint32_t mamba_mempool_free() const;
     ComponentConfig component_config() const;
 
     uint64_t insert_success_count() const;
@@ -144,6 +124,9 @@ public:
     // Lock-free leak audit of the owned tree (see RadixClient::check_health).
     int check_health(HealthReport* report = nullptr) const;
 
+    WritebackQueue* writeback() { return writeback_.get(); }
+    DedupWriteQueue* dedup_writes() { return dedup_writes_.get(); }
+
 private:
     RadixServerConfig cfg_;
 
@@ -152,6 +135,8 @@ private:
     std::string shm_name_;
     std::thread evictor_thread_;
     std::atomic<bool> evictor_running_{false};
+    std::unique_ptr<WritebackQueue> writeback_;   // refers to *tree_: reset before it
+    std::unique_ptr<DedupWriteQueue> dedup_writes_ = std::make_unique<DedupWriteQueue>();
 
     void start_evictor();
     void stop_evictor();
@@ -169,24 +154,44 @@ private:
     std::unique_ptr<EtcdRegistry> registry_;   // holds the lease for the server's lifetime
 #endif
 
-    std::unique_ptr<RdmaContext>      ctx_;
-    std::unique_ptr<RdmaXrcd>         xrcd_;
-    std::unique_ptr<XrcSrq>           srq_;
-    ibv_cq*                            cq_ = nullptr;
-    std::unique_ptr<RdmaMemoryRegion> shm_mr_;       // tree shm MR: READ|ATOMIC
+    // The RDMA side peers' one-sided QPs reach; only when a plane runs on RDMA.
+    std::unique_ptr<RdmaHost>          rdma_;
 
-    // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE).
+    // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE) on rdma_.
     std::unique_ptr<RhtHolder>         rht_holder_;
 
-    // DC read target — only when either plane is DC and no lane-0 DCT donated.
-    std::unique_ptr<DcTarget>          dct_;
-    uint32_t                           rc_lane0_dctn_ = 0;   // remote-op lane-0 dctn (0 = none)
     uint32_t                           rht_transport_ = CLUSTER_TRANSPORT_XRC;
+    uint32_t                           peer_index_backend_ = CLUSTER_PEER_INDEX_GRPC;
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
-    uint32_t                           remote_op_transport_ = REMOTE_OP_TRANSPORT_ZMQ;
 
-    // Authoritative shard map (resolved on rank 0, broadcast to all).
+    // RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_* of this node.
+    struct RhtEnv {
+        uint32_t    backend = CLUSTER_RHT_REDIS;
+        std::string redis;                      // "host:port,..."
+        int         redis_timeout_ms = 50;
+        struct {                                // backend rdma only
+            int              shards = 0;        // M, 0 = one per node
+            std::vector<int> holders;           // candidate holder ranks
+            int              slots = 4;         // W
+            uint32_t         transport = CLUSTER_TRANSPORT_XRC;
+        } rdma;
+    };
+    RhtEnv rht_env_;
+    // RADIXSHMEM_PEER_INDEX_* of this node.
+    struct PeerIndexEnv {
+        uint32_t backend = CLUSTER_PEER_INDEX_GRPC;
+        uint32_t rdma_transport = CLUSTER_TRANSPORT_XRC;   // backend rdma only
+    };
+    PeerIndexEnv peer_index_env_;
+    int rht_min_nodes() const {
+        return rht_env_.backend == CLUSTER_RHT_RDMA ? rht_env_.rdma.shards : 0;
+    }
+
+    // Authoritative RHT (resolved on rank 0, broadcast to all).
+    uint32_t             rht_backend_ = CLUSTER_RHT_REDIS;
+    std::string          rht_redis_;
+    uint32_t             rht_redis_timeout_ms_ = 50;
     int                  num_shards_ = 0;       // M
     uint32_t             rht_capacity_ = 0;     // requested per-shard buckets (RHT normalizes)
     uint32_t             rht_slots_ = 4;        // W: slots per bucket
@@ -195,59 +200,37 @@ private:
     int                  rdma_sl_ = 5;          // authoritative QoS (rank 0)
     int                  rdma_tc_ = 160;
 
-    // TCP XRC listener
-    int       xrc_listen_fd_ = -1;
-    uint16_t  actual_listen_port_ = 0;
-    std::thread listener_thread_;
-    std::atomic<bool> stopping_{false};
-
-    // Per-client XRC RECV QP table, keyed by an internal counter.
-    struct ClientSlot {
-        std::unique_ptr<XrcRecvQp> recv_qp;
-        int32_t  client_rank   = -1;
-        uint32_t client_send_qp_num = 0;
-        uint32_t recv_qp_num       = 0;
-    };
-    mutable std::mutex clients_mu_;
-    std::unordered_map<uint64_t, std::unique_ptr<ClientSlot>> clients_;
-    uint64_t next_client_id_ = 1;
-
-    // etcd rendezvous, install manifest, start XRC accept loop; true when all peers ready.
+    // etcd rendezvous, install manifest, bring up the planes; true when all peers ready.
     bool cluster_bootstrap();
 
     void fill_local_entry(PeerEntry& e) const;
     int  register_chunk_size() const;
-    void resolve_shard_map(int n_obs);
+    void read_rht_env();
+    void read_peer_index_env();
+    void resolve_shard_map(int ranks);
     void adopt_shard_map(const ShardMapMsg& sm);
     // First field where `sm` disagrees with this node's own settings, "" if none.
     std::string shard_map_mismatch(const ShardMapMsg& sm) const;
     void stamp_shm_ready(int assigned_rank, int n_obs);
+    // The tree is new, so routes published before this start are stale: the
+    // leader of a new cluster deletes all of them, a node rejoining a formed
+    // cluster those of its rank. Redis only.
+    void drop_stale_routes(bool whole_cluster);
+    // Round 2 of the rendezvous, once the shard map is known: the RDMA side if a
+    // plane needs it, the RHT shard (holders), the RPC endpoint.
+    void setup_planes(PeerEntry& e);
+    void setup_rdma(PeerEntry& e);
     void setup_local_rht_shard(PeerEntry& e);
-    void setup_dct(PeerEntry& e);
     void setup_remote_op(PeerEntry& e);
-    void xrc_listener_loop();
-    void handle_client(int conn_fd);
 
-    // ---- remote-op control plane (remote_op_endpoint.cpp) ----
+    // ---- remote-op control plane (remote_op_service.cpp) ----
     std::unique_ptr<IRemoteOpServerTransport> rc_server_;
-    std::vector<std::thread> rc_threads_;   // one poller per lane
-    std::atomic<bool>    rc_running_{false};
+    uint64_t instance_id_ = 0;
+    std::unique_ptr<RemoteOpService> rc_service_;   // built by rc_spawn on svc_*
 
-    // build_remote_op callback body: create the authoritative transport, return its address material.
-    RemoteOpAddr rc_build_endpoint(uint32_t rot_auth, uint64_t dc_access_key,
-                                   RdmaContext& ctx);
+    // Start serving once svc_* exist; rc_stop stops serving, then drops the service.
     void     rc_spawn();
     void     rc_stop();
-    // Poller for `lane`: recv → validate → dispatch in place → send.
-    void     rc_loop(int lane);
-    // op handlers — return serialized wire bytes for rc_loop to send.
-    std::vector<char> handle_insert(const RemoteOpReqHeader& req,
-                                    const uint64_t* hashes);
-    // FINALIZE / INSERT_RELEASE / QUERY_RELEASE, branched on req.op.
-    std::vector<char> handle_finalize_like(const RemoteOpReqHeader& req,
-                                           const uint64_t* hashes);
-    std::vector<char> handle_query(const RemoteOpReqHeader& req,
-                                   const uint64_t* hashes);
 #endif
 };
 

@@ -5,19 +5,21 @@
 #include "radix_server.h"       // RadixClient(RadixServer&) ctor
 
 #include "local.h"
+#ifndef RADIXSHMEM_NO_RDMA
 #include "cluster_protocol.h"
 #include "cluster_manifest.h"
-#include "rht_endpoint.h"        // RhtConsumer / RhtTopology (+ rht_types.h)
+#include "bilateral_transport.h"
+#include "peer_index.h"
+#include "rht_endpoint.h"        // RdmaRht (+ rht_backend.h)
+#include "rht_redis.h"
 #include "rht_chain.h"
-#include "rdma_remote_walker.h"
-#include "rdma_transport.hpp"
-#include "rdma_transport_client.hpp"
+#include "peer_breaker.hpp"
 #include "peer_registry.hpp"
-#include "peer_connector.hpp"
-#include "xrc_connect.hpp"
+#include "remote_op_factory.hpp"
 #ifdef RADIXSHMEM_HAS_ETCD
 #include "etcd_client.hpp"
 #include "registry_client.hpp"
+#endif
 #endif
 
 #include <algorithm>
@@ -36,6 +38,7 @@
 
 namespace radixshmem {
 
+#ifndef RADIXSHMEM_NO_RDMA
 #ifdef RADIXSHMEM_HAS_ETCD
 struct RadixClient::Impl {
     std::unique_ptr<RegistryClient> reg;
@@ -48,20 +51,13 @@ struct RadixClient::Impl {};
 
 void RadixClient::teardown_cluster() {
     // Stop the /peers watcher first: its callback admits into the registry and
-    // resizes the connector's slots, so it must be joined before RDMA teardown.
+    // reaches the peer index and the RHT, so it must be joined before they go.
 #ifdef RADIXSHMEM_HAS_ETCD
     if (etcd_ && etcd_->reg) etcd_->reg->stop_watch();
 #endif
-    // Cached per-rank sessions hold DC AHs + reference the connector's shared
-    // DCI/DCT, so they must die before the connector.
     { std::lock_guard<std::mutex> g(peer_cache_mu_); peer_cache_.clear(); }
-    // Connector (data-plane endpoints + DC control stack) before the RHT plane,
-    // then the RHT plane, then the transport. DcReaders reference the shared DCI
-    // + AHs the transport frees in its dtor, so the transport must outlive them.
-    peer_conn_.reset();
-    rht_conn_.reset();
-    rht_holder_qps_.clear();
-    tx_.reset();
+    peer_index_.reset();
+    rht_.reset();
 }
 
 bool RadixClient::wait_for_ready() {
@@ -85,10 +81,12 @@ bool RadixClient::wait_for_ready() {
 
 void RadixClient::admit_peer(const PeerEntry& e) {
     if (!peer_reg_->admit(e) || e.rank == peer_reg_->my_rank()) return;
-    if (rht_conn_) rht_conn_->holder_changed(e);
-    if (!peer_conn_) return;
-    peer_conn_->peer_changed(e.rank);
-    if (!lazy_connect_ && !cfg_.rht_only && !peer_conn_->preconnect(e.rank))
+    drop_peer_session(e.rank);
+    rc_breaker_->retry_now(e.rank);
+    if (rht_) rht_->peer_changed(e);
+    if (!peer_index_) return;
+    peer_index_->peer_changed(e);
+    if (!lazy_connect_ && !peer_index_->preconnect(e.rank))
         fprintf(stderr, "[RadixClient rank %d] preconnect to peer rank %d failed\n",
                 peer_reg_->my_rank(), e.rank);
 }
@@ -96,12 +94,14 @@ void RadixClient::admit_peer(const PeerEntry& e) {
 void RadixClient::remove_peer(int rank) {
     if (rank == peer_reg_->my_rank()) return;
     peer_reg_->remove(rank);
-    if (rht_conn_) rht_conn_->holder_left(rank);
-    if (peer_conn_) peer_conn_->peer_left(rank);
+    drop_peer_session(rank);
+    rc_breaker_->left(rank, "left the cluster (etcd entry removed)");
+    if (rht_) rht_->peer_left(rank);
+    if (peer_index_) peer_index_->peer_left(rank);
 }
 
 void RadixClient::preconnect_peers() {
-    if (lazy_connect_ || cfg_.rht_only) return;
+    if (lazy_connect_ || !peer_index_) return;
     int me = peer_reg_->my_rank(), ws = peer_reg_->world_size();
     for (int r = 0; r < ws; r++) {
         if (r == me) continue;
@@ -109,104 +109,31 @@ void RadixClient::preconnect_peers() {
             std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
             if (peer_reg_->peers_locked()[r].rank != r) continue;   // node down
         }
-        if (!peer_conn_->preconnect(r))
+        if (!peer_index_->preconnect(r))
             fprintf(stderr, "[RadixClient rank %d] preconnect to peer rank %d failed\n",
                     me, r);
     }
 }
 
-void RadixClient::read_topology() {
+ShardMapMsg RadixClient::read_topology() {
 #ifdef RADIXSHMEM_HAS_ETCD
     ClusterTopology t = etcd_->reg->read_topology();
 
-    const ShardMapMsg& sm = t.sm;
-    rht_transport_        = sm.rht_transport;
-    peer_index_transport_ = sm.peer_index_transport;
-    dc_access_key_       = sm.dc_access_key;
-    remote_op_transport_ = sm.remote_op_transport;
-    rdma_sl_             = sm.rdma_sl;
-    rdma_tc_             = sm.rdma_tc;
-    cluster_cs_          = (int)sm.register_chunk_size;
-
-    num_shards_   = (int)sm.num_shards;
-    rht_capacity_ = sm.rht_capacity;
-    rht_slots_    = sm.rht_slots ? sm.rht_slots : 4;
-    holder_of_shard_.assign(num_shards_, 0);
-    for (int s = 0; s < num_shards_; s++)
-        holder_of_shard_[s] = (int)sm.holder_rank[s];
+    cluster_cs_ = (int)t.sm.register_chunk_size;
 
     if (t.my_rank < 0 && !cfg_.no_local_tree)
         throw std::runtime_error("RadixClient: own node '" + cfg_.node_name +
                                  "' not found in /peers");
     peer_reg_->seed(std::move(t.peers), t.world_size, t.my_rank);
     peers_snapshot_rev_  = t.peers_rev;
+    return t.sm;
 #else
     throw std::runtime_error("RadixClient: built without etcd");
 #endif
 }
 
-IRdmaEndpoint* RadixClient::connect_rht_holder(int holder) {
-    auto it = rht_holder_qps_.find(holder);
-    if (it != rht_holder_qps_.end()) return it->second.get();
-
-    // The watcher may reallocate the peer table; lock around reads and writes.
-    std::unique_lock<std::shared_mutex> lk(peer_reg_->mutex());
-    auto it2 = rht_holder_qps_.find(holder);
-    if (it2 != rht_holder_qps_.end()) return it2->second.get();
-
-    const PeerEntry& h = peer_reg_->peers_locked()[holder];
-    int my_rank = peer_reg_->my_rank();
-    std::unique_ptr<IRdmaEndpoint> ep;
-
-    if (rht_transport_ == CLUSTER_TRANSPORT_DC) {
-        DcInitiator* dci = tx_->shared_dci();
-        ibv_gid dgid;
-        memcpy(&dgid, h.gid_raw, 16);
-        int ws = peer_reg_->world_size();
-        ibv_ah* ah = tx_->ah_for(holder, dgid, h.lid, h.link_layer, ws);
-        if (!ah) {
-            fprintf(stderr,
-                    "[RadixClient rank %d] RHT-plane AH to holder rank %d failed\n",
-                    my_rank, holder);
-            return nullptr;
-        }
-        DcTargetInfo dst{ah, h.dct_num, dc_access_key_};
-        ep = std::make_unique<DcReader>(dci, dst);
-    } else {
-        // One try: a holder that does not answer is skipped and probed later
-        // by the RHT fault handling, at attach as on the query path.
-        ep = xrc_connect(tx_->ctx(), tx_->cq(), h.host, h.xrc_listen_port, my_rank,
-                         rht_conn_ ? 2 : 10);
-        if (!ep) return nullptr;
-    }
-
-    IRdmaEndpoint* raw = ep.get();
-    rht_holder_qps_.emplace(holder, std::move(ep));
-    return raw;
-}
-
-void RadixClient::setup_rht() {
-    RhtTopology topo;
-    topo.num_shards       = num_shards_;
-    topo.capacity         = rht_capacity_;
-    topo.slots_per_bucket = rht_slots_;
-    topo.my_rank          = peer_reg_->my_rank();
-    topo.holder_of_shard  = holder_of_shard_;
-    topo.peers            = &peer_reg_->peers_locked();
-    topo.faults           = peer_faults();
-
-    rht_conn_ = std::make_unique<RhtConsumer>(
-        topo, tx_->ctx().pd(),
-        [this](int holder) { return connect_rht_holder(holder); },
-        [this](int holder) {
-            std::unique_lock<std::shared_mutex> lk(peer_reg_->mutex());
-            rht_holder_qps_.erase(holder);
-        },
-        cfg_.bootstrap_timeout_sec);
-}
-
-// Build the etcd rendezvous + RDMA/RHT plane. Constructs peer_reg_/etcd_ then
-// runs the topology read + transport bring-up. Sets distributed_ on success;
+// Build the etcd rendezvous + peer index / RHT planes. Constructs peer_reg_/etcd_
+// then runs the topology read + plane bring-up. Sets distributed_ on success;
 // leaves it false (single-node local shm) or throws on failure.
 void RadixClient::bootstrap_cluster() {
     peer_reg_ = std::make_unique<PeerRegistry>();
@@ -236,76 +163,65 @@ void RadixClient::bootstrap_cluster() {
 #endif
     if (!wait_for_ready())
         throw std::runtime_error("RadixClient: cluster not ready (etcd timeout)");
-    read_topology();
+    const ShardMapMsg sm = read_topology();
 
     int my_rank = peer_reg_->my_rank();
+    rc_breaker_ = std::make_shared<PeerBreaker>(
+        "[RadixClient rank " + std::to_string(my_rank) + "] remote ops", peer_faults());
 
-    // Use the server-advertised index_dev / gid_idx unless caller overrode.
-    // Observers (rank < 0) have no /peers entry, so they rely on config only.
-    std::string dev_str = cfg_.index_dev;
-    int          gid_idx = cfg_.gid_idx;
-    if (my_rank >= 0) {
-        PeerEntry self;
-        {
-            std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
-            self = peer_reg_->peers_locked()[my_rank];
-        }
-        if (dev_str.empty() && self.index_dev[0] != '\0') dev_str = self.index_dev;
-        if (self.gid_index != gid_idx) gid_idx = self.gid_index;
-    }
-    const char* dev = dev_str.empty() ? nullptr : dev_str.c_str();
-    int ws = peer_reg_->world_size();
-    // QoS (rank 0's SL/TC) is adopted inside the transport before any QP connect.
-    tx_ = std::make_unique<RdmaTransportClient>(dev, gid_idx, rdma_sl_, rdma_tc_, ws);
-
-    // Peer plane: lazy data-plane endpoints + remote-op factory. Its slots track
-    // the peer table via the registry grow hook.
-    PeerConnectorConfig pcfg;
-    pcfg.transport            = peer_index_transport_;
-    pcfg.remote_op_transport  = remote_op_transport_;
-    pcfg.dc_access_key        = dc_access_key_;
-    pcfg.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
-    pcfg.faults               = peer_faults();
-    peer_conn_ = std::make_unique<PeerConnector>(*peer_reg_, *tx_, pcfg);
-    if (local_) {
-        peer_conn_->set_expected_component_config(
-            local_->tree().component_config());
-    } else {
-        // Observer: adopt the config only if every peer publishes the same
-        // self-valid tuple; otherwise component walks stay fail-closed.
-        std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
-        const auto& ps = peer_reg_->peers_locked();
-        const PeerEntry* ref = nullptr;
-        bool consensus = true;
-        for (size_t i = 0; consensus && i < ps.size(); i++) {
-            if (ps[i].rank < 0) continue;   // node down
-            if (!ref) ref = &ps[i];
-            consensus = peer_component_abi_valid(ps[i], ref->component_config);
-        }
-        consensus = consensus && ref;
-        if (consensus)
-            peer_conn_->set_expected_component_config(ref->component_config);
-        else
-            fprintf(stderr,
-                    "[RadixClient observer] no component-config consensus "
-                    "across %d peer(s); component queries disabled\n",
-                    (int)ps.size());
-    }
-    peer_conn_->resize(ws);
-    peer_reg_->set_grow_hook([this](int n) { peer_conn_->resize(n); });
-
-    if (rht_transport_ == CLUSTER_TRANSPORT_DC ||
-        (!cfg_.rht_only && peer_index_transport_ == CLUSTER_TRANSPORT_DC)) {
-        tx_->shared_dci();
-        fprintf(stderr, "[RadixClient rank %d] DC initiator up\n", my_rank);
-    }
     if (cfg_.rht_only) {
-        fprintf(stderr,
-                "[RadixClient rank %d] RHT-only mode (no data-plane QPs)\n",
-                my_rank);
+        fprintf(stderr, "[RadixClient rank %d] RHT-only mode (no peer index)\n", my_rank);
+    } else {
+        PeerIndexConfig pc;
+        pc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
+        pc.faults                = peer_faults();
+        if (local_) {
+            pc.has_expected = true;
+            pc.expected     = local_->tree().component_config();
+        } else {
+            // Observer: adopt the config only if every peer publishes the same
+            // self-valid tuple; otherwise component queries stay fail-closed.
+            std::shared_lock<std::shared_mutex> lk(peer_reg_->mutex());
+            const auto& ps = peer_reg_->peers_locked();
+            const PeerEntry* ref = nullptr;
+            bool consensus = true;
+            for (size_t i = 0; consensus && i < ps.size(); i++) {
+                if (ps[i].rank < 0) continue;   // node down
+                if (!ref) ref = &ps[i];
+                consensus = peer_component_abi_valid(ps[i], ref->component_config);
+            }
+            pc.has_expected = consensus && ref;
+            if (pc.has_expected)
+                pc.expected = ref->component_config;
+            else
+                fprintf(stderr,
+                        "[RadixClient observer] no component-config consensus "
+                        "across %d peer(s); component queries disabled\n",
+                        (int)ps.size());
+        }
+        peer_index_ = make_peer_index(sm, *peer_reg_, pc);
     }
 
-    setup_rht();
+    if (sm.rht_backend == CLUSTER_RHT_REDIS) {
+        RedisRhtConfig rc{std::string(sm.rht_redis_seeds,
+                                      strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds))),
+                          redis_rht_prefix(cfg_.cluster_id), (int)sm.rht_redis_timeout_ms, {}};
+        if (local_)
+            rc.live = [this](uint64_t first_hash, uint32_t tree_node_id) {
+                return local_->tree().node_head_matches(tree_node_id, first_hash);
+            };
+        if (local_ && cfg_.rht_only)   // the radix-server's client, one per rank
+            rc.routes = [this] {
+                const int32_t rank = peer_reg_->my_rank();
+                std::vector<RhtInsertEntry> out;
+                for (const NodeHead& h : local_->tree().node_heads())
+                    out.push_back({h.first_hash, rank, h.tree_node_id, h.num_blocks});
+                return out;
+            };
+        rht_ = make_redis_rht(rc, peer_reg_->my_rank(), peer_faults());
+    } else
+        rht_ = std::make_unique<RdmaRht>(sm, *peer_reg_, peer_faults(),
+                                         cfg_.bootstrap_timeout_sec);
     preconnect_peers();
 
     // Watch /peers for members that join, restart or leave. Anchor at the
@@ -319,7 +235,7 @@ void RadixClient::bootstrap_cluster() {
     // Evict/merge on the connector's own tree must clean RHT, else the recycled node id orphans a stale anchor.
     if (local_) {
         local_->tree().set_evict_callback(
-            [this](const std::vector<EvictedNode>& evicted) {
+            [this](const std::vector<NodeHead>& evicted) {
                 std::vector<EvictedKey> keys;
                 keys.reserve(evicted.size());
                 for (const auto& e : evicted)
@@ -339,6 +255,7 @@ void RadixClient::update_rht(const uint64_t* hashes, int n, const InsertResult& 
     int my_rank = peer_reg_->my_rank();
     if (my_rank < 0 || !local_) return;
     auto& tree = local_->tree();
+    tree.note_route_publish();
     auto boundaries = tree.get_node_boundaries(hashes, n);
     if (boundaries.empty()) return;
     std::vector<RhtInsertEntry> entries;
@@ -349,7 +266,7 @@ void RadixClient::update_rht(const uint64_t* hashes, int n, const InsertResult& 
     if (r.split_node_id != INVALID_NODE_ID)   // suffix split off the [0, n) path
         entries.push_back({r.split_first_hash, (int32_t)my_rank, r.split_node_id,
                            r.split_num_blocks});
-    rht_conn_->insert_batch(entries.data(), (int)entries.size());
+    rht_->insert_batch(entries.data(), (int)entries.size());
 }
 
 InsertResult RadixClient::dist_insert(const uint64_t* hashes, int n,
@@ -359,43 +276,47 @@ InsertResult RadixClient::dist_insert(const uint64_t* hashes, int n,
     // Node boundaries align to cs so peer RHT probes land on a node first_hash.
     InsertResult result = tree.insert(hashes, n, slots, num_slots,
                                       start, auto_recycle);
-
-    int my_rank = peer_reg_->my_rank();
     // Republish the whole root→leaf chain (idempotent), so merge/collision can't leave any node unrouted.
-    if (rht_conn_ && my_rank >= 0 && result.error == InsertError::OK) {
-        std::vector<NodeBoundary> chain = tree.get_node_boundaries(hashes, n);
-        if (!chain.empty()) {
-            std::vector<RhtInsertEntry> entries;
-            entries.reserve(chain.size() + 1);
-            for (const auto& b : chain)
-                entries.push_back({b.first_hash, (int32_t)my_rank,
-                                   b.tree_node_id, b.node_blocks});
-            if (result.split_node_id != INVALID_NODE_ID)   // suffix off the path
-                entries.push_back({result.split_first_hash, (int32_t)my_rank,
-                                   result.split_node_id, result.split_num_blocks});
-            rht_conn_->insert_batch(entries.data(), (int)entries.size());
-            if (debug_route_) {
-                fprintf(stderr, "[pub r%d] n=%d start=%d h0=%08llx chain:",
-                        my_rank, n, start, (unsigned long long)(hashes[0] & 0xffffffffu));
-                for (const auto& b : chain)
-                    fprintf(stderr, " %d+%d:%08llx:t%u/%u", b.offset, b.num_blocks,
-                            (unsigned long long)(b.first_hash & 0xffffffffu),
-                            b.tree_node_id, b.node_blocks);
-                fprintf(stderr, "\n");
-            }
-        }
-    }
+    if (result.error == InsertError::OK)
+        publish_chain(hashes, n, result, start);
     return result;
 }
 
-void RadixClient::dist_flush() { if (rht_conn_) rht_conn_->flush(); }
+void RadixClient::publish_chain(const uint64_t* hashes, int n, const InsertResult& r,
+                                int start) {
+    int my_rank = peer_reg_->my_rank();
+    if (!rht_ || my_rank < 0) return;
+    local_->tree().note_route_publish();
+    std::vector<NodeBoundary> chain = local_->tree().get_node_boundaries(hashes, n);
+    if (chain.empty()) return;
+    std::vector<RhtInsertEntry> entries;
+    entries.reserve(chain.size() + 1);
+    for (const auto& b : chain)
+        entries.push_back({b.first_hash, (int32_t)my_rank,
+                           b.tree_node_id, b.node_blocks});
+    if (r.split_node_id != INVALID_NODE_ID)   // suffix off the path
+        entries.push_back({r.split_first_hash, (int32_t)my_rank,
+                           r.split_node_id, r.split_num_blocks});
+    rht_->insert_batch(entries.data(), (int)entries.size());
+    if (debug_route_) {
+        fprintf(stderr, "[pub r%d] n=%d start=%d h0=%08llx chain:",
+                my_rank, n, start, (unsigned long long)(hashes[0] & 0xffffffffu));
+        for (const auto& b : chain)
+            fprintf(stderr, " %d+%d:%08llx:t%u/%u", b.offset, b.num_blocks,
+                    (unsigned long long)(b.first_hash & 0xffffffffu),
+                    b.tree_node_id, b.node_blocks);
+        fprintf(stderr, "\n");
+    }
+}
+
+void RadixClient::dist_flush() { if (rht_) rht_->flush(); }
 
 PeerFaultCounters* RadixClient::peer_faults() const {
     return local_ ? local_->tree().peer_faults() : nullptr;
 }
 
 void RadixClient::remove_evicted_from_rht(const EvictedKey* entries, int count) {
-    if (!rht_conn_ || count <= 0) return;
+    if (!rht_ || count <= 0) return;
     int my_rank = peer_reg_->my_rank();
     if (my_rank < 0) return;   // write half: observers publish nothing
     std::vector<RhtRemoveEntry> rem;
@@ -415,33 +336,46 @@ void RadixClient::remove_evicted_from_rht(const EvictedKey* entries, int count) 
                        entries[i].tree_node_id});
     }
     if (rem.empty()) return;
-    rht_conn_->remove_batch(rem.data(), (int)rem.size());
-    rht_conn_->flush();
-}
-
-void RadixClient::reset_owned_rht_shard() {
-    if (rht_conn_ && peer_reg_->my_rank() >= 0) rht_conn_->reset_owned_shard();
+    rht_->remove_batch(rem.data(), (int)rem.size());
 }
 
 // Lazily open (and cache) the per-rank session. Returns nullptr on any illegal
 // rank (single-node, self, out of range, remote ops disabled) — callers map that
 // to BAD_TARGET / REMOTE_FAILED, never a throw.
-RemotePeer* RadixClient::peer_for(int rank) {
-    if (!distributed_ || !peer_conn_) return nullptr;
+std::shared_ptr<RemotePeer> RadixClient::peer_for(int rank) {
+    if (!distributed_) return nullptr;
     std::lock_guard<std::mutex> g(peer_cache_mu_);
     auto it = peer_cache_.find(rank);
-    if (it != peer_cache_.end()) return it->second.get();
+    if (it != peer_cache_.end()) return it->second;
+    PeerEntry p;
+    if (rank == peer_reg_->my_rank() || !peer_reg_->entry(rank, p)) return nullptr;
     try {
-        auto rc = peer_conn_->open_remote(rank);
-        RemotePeer* raw = rc.get();
-        peer_cache_.emplace(rank, std::move(rc));
-        return raw;
+        std::string endpoint;
+        auto rc = std::make_shared<RemotePeer>(make_remote_op_client(p, endpoint),
+                                               std::move(endpoint));
+        rc->set_peer_rank(rank);
+        rc_breaker_->name(rank, p.host);
+        rc->set_breaker(rc_breaker_);
+        peer_cache_.emplace(rank, rc);
+        return rc;
     } catch (const std::exception&) {
-        return nullptr;   // self / oob / disabled peer
+        return nullptr;   // no remote-op endpoint
     }
 }
 
+// The rank re-registered with a new entry: the next op reopens from it; in-flight ops keep the old session alive.
+void RadixClient::drop_peer_session(int rank) {
+    std::lock_guard<std::mutex> g(peer_cache_mu_);
+    peer_cache_.erase(rank);
+}
 
+RemoteStatus RadixClient::missing_peer_status(int rank) const {
+    if (!distributed_ || !peer_reg_ || rank < 0 ||
+        rank >= peer_reg_->world_size() || rank == peer_reg_->my_rank())
+        return RemoteStatus::BAD_TARGET;
+    return RemoteStatus::UNAVAILABLE;
+}
+#endif
 
 // =====================================================================
 // RadixClient
@@ -451,14 +385,17 @@ RadixClient::RadixClient(const std::string& name, bool local_read_only)
     : local_(std::make_unique<LocalTreeConnector>(name)),
       local_read_only_(local_read_only) {
     if (local_read_only_) return;   // tree only; the cluster plane is never built
+    auto* hdr = static_cast<ShmHeader*>(local_->tree().shm_base());
 #ifndef RADIXSHMEM_NO_RDMA
     // The shm header carries the cluster identity; bootstrap_cluster reads
     // is_distributed and either sets distributed_ or returns single-node.
-    auto* hdr = static_cast<ShmHeader*>(local_->tree().shm_base());
     cfg_.registry   = hdr->registry;
     cfg_.cluster_id = hdr->cluster_id;
     cfg_.node_name  = hdr->node_name;
     bootstrap_cluster();
+#else
+    if (hdr->is_distributed)
+        throw std::runtime_error("RadixClient: writable cluster attach requires RDMA support");
 #endif
 }
 
@@ -487,7 +424,11 @@ std::string resolve_shm_name(const RadixClientConfig& cfg) {
 } // namespace
 
 RadixClient::RadixClient(const RadixClientConfig& cfg)
-#ifdef RADIXSHMEM_HAS_ETCD
+#ifdef RADIXSHMEM_NO_RDMA
+{
+    throw std::runtime_error("RadixClient: distributed config requires RDMA support");
+}
+#elif defined(RADIXSHMEM_HAS_ETCD)
     : cfg_(cfg)
 {
     // Observer (no local server): skip the shm attach, join the cluster as a
@@ -513,11 +454,24 @@ RadixClient::RadixClient(RadixServer& server)
 }
 
 RadixClient::RadixClient(const RadixClientConfig& cfg, LocalTreeConnector* borrowed)
+#ifndef RADIXSHMEM_NO_RDMA
     : local_(borrowed), owns_local_(false), cfg_(cfg) {
     // Borrow the caller's already-attached tree; build the RHT plane only.
     cfg_.rht_only = true;
-    bootstrap_cluster();
+    try {
+        bootstrap_cluster();
+    } catch (...) {
+        // The destructor does not run for a constructor that throws.
+        teardown_cluster();
+        (void)local_.release();
+        throw;
+    }
 }
+#else
+{
+    throw std::runtime_error("RadixClient: embedded cluster service requires RDMA support");
+}
+#endif
 
 RadixClient::~RadixClient() {
 #ifndef RADIXSHMEM_NO_RDMA
@@ -549,6 +503,7 @@ InsertResult RadixClient::insert(const uint64_t* hashes, int n,
     return result;
 }
 
+#ifndef RADIXSHMEM_NO_RDMA
 // Probes local node boundaries + cs-aligned positions (the latter flagged
 // for the gap early-stop); scored from the deepest probe not past incumbent,
 // then the winner's route chain is followed to its end (rht_chain.h).
@@ -610,8 +565,8 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
 
         // Each probe may return multiple candidates (W-way bucket chaining).
         std::vector<std::vector<RHTValue>> probe_results(probe_count);
-        rht_conn_->lookup_batch(probe_keys.data(), probe_count,
-                                probe_results.data());
+        rht_->lookup_batch(probe_keys.data(), probe_count,
+                           probe_results.data());
 
         // Collect remote candidates per position; tally positions hit per peer.
         struct FullHit { int pos; uint32_t tnid; int32_t remote; uint32_t len; };
@@ -672,6 +627,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                     remote_hits.push_back({h.pos, h.tnid});
                     known.emplace(hashes[h.pos], h);
                 }
+            std::unordered_set<uint64_t> probed(probe_keys.begin(), probe_keys.end());
             auto lookup = [&](uint64_t key, RhtHop& hop) {
                 auto it = known.find(key);
                 if (it != known.end()) {
@@ -679,8 +635,9 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                     hop.num_blocks = it->second.len;
                     return true;
                 }
+                if (probed.count(key)) return false;   // the batch found no route of this peer
                 std::vector<RHTValue> vals;
-                rht_conn_->lookup_batch(&key, 1, &vals);
+                rht_->lookup_batch(&key, 1, &vals);
                 for (auto& v : vals)
                     if (!v.empty() && v.node_id == best_remote_node &&
                         v.num_blocks > hop.num_blocks) {
@@ -709,12 +666,11 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
                             v.num_blocks);
                 fprintf(stderr, "]");
                 if (::getenv("RADIXSHMEM_DEBUG_ROUTE")[0] == '2') {
-                    std::vector<RhtRawCell> raw;
-                    rht_conn_->dump_bucket(probe_keys[i], raw);
+                    std::vector<std::string> raw;
+                    rht_->dump(probe_keys[i], raw);
                     fprintf(stderr, "{");
                     for (auto& c : raw)
-                        fprintf(stderr, "%016llx/%016llx ", (unsigned long long)c.head,
-                                (unsigned long long)c.ext);
+                        fprintf(stderr, "%s ", c.c_str());
                     fprintf(stderr, "}");
                 }
             }
@@ -726,6 +682,7 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
     hits_out = std::move(remote_hits);
     return best_remote_node;
 }
+#endif
 
 // Tree-level → public mapping; the Full run stays uncropped at [0, f) so a
 // remote fold can cut it at c — the component query exit crops to common_hit.
@@ -799,7 +756,7 @@ ComponentQueryResult RadixClient::query(const uint64_t* hashes, int n,
                 if (p.source_rank < 0)
                     self->dec_ref(hc.data(), hn, p);
                 else
-                    self->dec_ref_remote(p.source_rank, hc.data(), hn, p);
+                    self->dec_ref_remote(hc.data(), hn, p);
             }
         });
     }
@@ -839,21 +796,45 @@ ComponentQueryResult RadixClient::query_components_remote_from(
     const int f = result.full_fragments.empty()
                       ? 0
                       : (int)result.full_fragments[0].slot_ids.size();
-    if (!rht_conn_ || h >= n) {
+    if (!rht_ || !peer_index_ || h >= n) {
         return result;
     }
 
     std::vector<RemoteHit> remote_hits;
-    int best_remote_node = find_component_source(hashes, n, h, remote_hits);
+    const int remote = find_component_source(hashes, n, h, remote_hits);
+    if (remote < 0 || remote >= peer_reg_->world_size() || remote_hits.empty())
+        return result;
 
-    if (best_remote_node >= 0 &&
-        best_remote_node < peer_reg_->world_size() &&
-        !remote_hits.empty()) {
-        return peer_conn_->walk_components(best_remote_node, hashes, n,
-                                           component_mask, lock, h, f,
-                                           remote_hits, std::move(result),
-                                           pins);
+    RemoteQuery q;
+    q.mask   = component_mask;
+    q.lock   = lock;
+    q.window = {(uint32_t)h, (uint32_t)f};
+    QueryReply r = peer_index_->query(remote, hashes, n, q, remote_hits);
+    result.rdma_read_count   = r.rdma_read_count;
+    result.rdma_atomic_count = r.rdma_atomic_count;
+    if (r.status != RemoteStatus::OK || r.hit_length <= h) return result;
+
+    // Fold: Full = local [0,c) + remote [c,L); SWA/Mamba belong whole to the
+    // remote tail source.
+    const int L = r.hit_length;
+    const int c = std::min(f, L);
+    result.common_hit = L;
+    if ((component_mask & COMPONENT_MASK_FULL) != 0) {
+        if (c > 0 && !result.full_fragments.empty())
+            result.full_fragments[0].slot_ids.resize((size_t)c);
+        else
+            result.full_fragments.clear();
+        if (L > c)
+            result.full_fragments.push_back(
+                ComponentSlotFragment{(int32_t)remote, c, std::move(r.slots)});
     }
+    result.swa = ComponentSlotFragment{r.swa_slots.empty() ? -1 : (int32_t)remote,
+                                       (int)r.swa_start, std::move(r.swa_slots)};
+    if (r.mamba_slot != INVALID_COMPONENT_SLOT)
+        result.mamba = ComponentCheckpoint{(int32_t)remote, r.mamba_slot};
+    else
+        result.mamba.reset();
+    if (!r.pin.empty()) pins.push_back(std::move(r.pin));
     return result;
 }
 
@@ -879,9 +860,39 @@ void RadixClient::recycle_slots(const int32_t* slots, int num,
 
 void RadixClient::reset() {
     require_writable("reset");
-    if (local_) local_->reset();
+    std::lock_guard<std::mutex> g(reset_mu_);
+    int32_t rank = -1;
 #ifndef RADIXSHMEM_NO_RDMA
-    if (distributed_) reset_owned_rht_shard();
+    if (distributed_ && rht_) rank = peer_reg_->my_rank();
+    if (!local_ && rank >= 0) rht_->reset(nullptr, -1);
+#endif
+    if (!local_) return;
+    RadixShmemTree& tree = local_->tree();
+    const uint64_t gen = tree.reset_generation();
+    tree.lock_reset();
+    struct Unlock {
+        RadixShmemTree& t;
+        ~Unlock() { t.unlock_reset(); }
+    } unlock{tree};
+    if (tree.reset_generation() != gen) return;
+    if (rank < 0) {
+        tree.reset();
+        return;
+    }
+#ifndef RADIXSHMEM_NO_RDMA
+    // The routes go first, while the tree still lists them.
+    const uint64_t published = tree.route_publishes();
+    std::vector<RhtRemoveEntry> own;
+    for (const NodeHead& h : tree.node_heads()) own.push_back({h.first_hash, rank, h.tree_node_id});
+    rht_->reset(own.data(), (int)own.size());
+    std::vector<NodeHead> left;
+    tree.reset(&left, published);
+    own.clear();
+    for (const NodeHead& h : left) own.push_back({h.first_hash, rank, h.tree_node_id});
+    if (!own.empty()) {
+        rht_->remove_batch(own.data(), (int)own.size());
+        rht_->flush();
+    }
 #endif
 }
 
@@ -897,52 +908,99 @@ void RadixClient::flush() {
 #endif
 }
 
-void RadixClient::dec_ref_remote(int remote_node, const uint64_t* hashes,
-                                 int n, PinRecord pin) {
+void RadixClient::dec_ref_remote(const uint64_t* hashes, int n, PinRecord pin) {
 #ifndef RADIXSHMEM_NO_RDMA
-    if (distributed_ && peer_conn_)
-        (void)peer_conn_->dec_ref_components_remote(remote_node, hashes, n,
-                                                    std::move(pin));
+    if (distributed_ && peer_index_) peer_index_->unlock(hashes, n, std::move(pin));
 #endif
-    (void)remote_node; (void)hashes; (void)n;
+    (void)hashes; (void)n;
 }
 
 #ifndef RADIXSHMEM_NO_RDMA
 
-AllocateReply RadixClient::remote_allocate(int rank, int n) {
+template <typename Op>
+static RemoteStatus retry_unexecuted(Op op) {
+    RemoteStatus st = op();
+    for (int i = 0; i < 5 && st == RemoteStatus::RESOURCE_EXHAUSTED; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10 << i));
+        st = op();
+    }
+    return st;
+}
+
+static void release_remote_pin(RemotePeer& peer, const std::vector<uint64_t>& hashes,
+                               const PinRecord& pin) {
+    RemoteStatus st = retry_unexecuted([&] {
+        return peer.unlock(hashes.data(), (int)hashes.size(), pin);
+    });
+    if (st != RemoteStatus::OK && st != RemoteStatus::STALE_TARGET)
+        fprintf(stderr, "[RadixClient] remote unlock on rank %d failed: status %d\n",
+                peer.peer_rank(), (int)st);
+}
+
+AllocateReply RadixClient::remote_allocate(int rank, int n, ComponentType component) {
     AllocateReply out;
     if (n <= 0) return out;                       // nothing to allocate, status OK
-    RemotePeer* p = peer_for(rank);
-    if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
-    return p->allocate(n);            // serializes + caps internally
+    auto p = peer_for(rank);
+    if (!p) { out.status = missing_peer_status(rank); return out; }
+    return p->allocate(n, component); // serializes + caps internally
+}
+
+AllocateComponentsReply RadixClient::remote_allocate_components(
+        int rank, const std::vector<ComponentCount>& components) {
+    AllocateComponentsReply out;
+    if (components.empty()) return out;
+    auto p = peer_for(rank);
+    if (!p) { out.status = missing_peer_status(rank); return out; }
+    return p->allocate_components(components);
 }
 
 InsertResult RadixClient::remote_insert(int rank,
                                         const uint64_t* hashes, int n,
                                         int start, int length,
-                                        const int32_t* slots, bool auto_recycle) {
+                                        const int32_t* slots, bool auto_recycle,
+                                        ComponentType component) {
     InsertResult out;
-    RemotePeer* p = peer_for(rank);
-    if (!p) { out.error = InsertError::REMOTE_FAILED; return out; }
-    return p->insert(hashes, n, start, length, slots, auto_recycle);
+    auto p = peer_for(rank);
+    if (!p) {
+        out.error = InsertError::REMOTE_FAILED;
+        out.remote_status = missing_peer_status(rank);
+        return out;
+    }
+    return p->insert(hashes, n, start, length, slots, auto_recycle, component);
 }
 
-RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots) {
-    // slots discriminate RemotePeer::release; null would fall into QUERY_RELEASE.
+InsertPathResult RadixClient::remote_insert_path(int rank, const uint64_t* hashes, int n,
+                                                 int start, int length, const int32_t* full_slots,
+                                                 const std::vector<ComponentRun>& runs,
+                                                 bool auto_recycle) {
+    auto p = peer_for(rank);
+    if (p) return p->insert_path(hashes, n, start, length, full_slots, runs, auto_recycle);
+    InsertPathResult out;
+    out.remote_status = missing_peer_status(rank);
+    out.full.error = InsertError::REMOTE_FAILED;
+    out.full.remote_status = out.remote_status;
+    out.runs.assign(runs.size(), out.full);
+    return out;
+}
+
+RemoteStatus RadixClient::remote_recycle(int rank, const int32_t* slots, int num_slots,
+                                         ComponentType component) {
     if (!slots || num_slots <= 0) return RemoteStatus::BAD_REQUEST;
-    RemotePeer* p = peer_for(rank);
-    if (!p) return RemoteStatus::BAD_TARGET;
-    return p->release(/*hashes=*/nullptr, /*n=*/0, /*start=*/0,
-                      /*length=*/num_slots, slots);
+    auto p = peer_for(rank);
+    if (!p) return missing_peer_status(rank);
+    return retry_unexecuted([&] { return p->recycle(slots, num_slots, component); });
 }
 
 QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
                                       bool lock, bool update_meta) {
     QueryResult out;
     if (n <= 0) return out;                       // empty input, status OK
-    RemotePeer* p = peer_for(rank);
-    if (!p) { out.status = RemoteStatus::BAD_TARGET; return out; }
-    QueryReply rep = p->query(hashes, n, lock, update_meta);
+    auto p = peer_for(rank);
+    if (!p) { out.status = missing_peer_status(rank); return out; }
+    RemoteQuery q;
+    q.lock = lock;
+    q.update_meta = update_meta;
+    QueryReply rep = p->query(hashes, n, q);
 
     out.status            = rep.status;
     out.total_hit_length  = rep.hit_length;
@@ -950,22 +1008,59 @@ QueryResult RadixClient::remote_query(int rank, const uint64_t* hashes, int n,
     out.local_hit_length  = 0;
     out.remote_slots      = std::move(rep.slots);  // len == hit_length
     out.remote_node_id    = p->peer_rank();
-    if (lock && rep.status == RemoteStatus::OK && rep.hit_length > 0) {
+    if (lock && rep.status == RemoteStatus::OK && !rep.pin.empty()) {
         std::vector<uint64_t> hc(hashes, hashes + n);
-        int  len  = rep.hit_length;
-        auto* self = this;
-        out.finalize = FinalizeFn([self, rank, hc = std::move(hc), len]() {
-            self->remote_unlock(rank, hc.data(), (int)hc.size(), len);
+        out.finalize = FinalizeFn([p, hc = std::move(hc), pin = std::move(rep.pin)]() {
+            release_remote_pin(*p, hc, pin);
         });
     }
     return out;
 }
 
-RemoteStatus RadixClient::remote_unlock(int rank, const uint64_t* hashes, int n,
-                                int hit_length) {
-    RemotePeer* p = peer_for(rank);
-    if (!p) return RemoteStatus::BAD_TARGET;
-    return p->release(hashes, n, 0, hit_length, /*slots=*/nullptr);
+DedupReply RadixClient::remote_dedup_prefix(int rank, const uint64_t* hashes, int n,
+                                            const DedupRequest& req) {
+    DedupReply out;
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) out.unused[k] = req.landing[k];
+    if (n <= 0) return out;
+    auto p = peer_for(rank);
+    if (!p) { out.status = missing_peer_status(rank); return out; }
+    return p->dedup_prefix(hashes, n, req);
+}
+
+int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_cap,
+                            int branch_cap, const int landing[NUM_COMPONENT_TYPES]) {
+    if (n <= 0 || !local_ || !distributed_) return 0;
+    RadixShmemTree& tree = local_->tree();
+    // Our copy must outlive the source's: hold it until what moves has landed.
+    TreeComponentQueryResult held =
+        tree.query_components(hashes, n, COMPONENT_MASK_FULL, true, false);
+    if ((int)held.topology_match_length < n) {
+        (void)tree.dec_ref(hashes, n, std::move(held.pin));
+        return 0;
+    }
+    DedupRequest req;
+    req.rank = peer_reg_->my_rank();
+    req.tail_cap = tail_cap;
+    req.branch_cap = branch_cap;
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+        if (landing[k] > 0)
+            (void)tree.allocate_slots(landing[k], req.landing[k], (ComponentType)k, false);
+    DedupReply rep = remote_dedup_prefix(rank, hashes, n, req);
+    std::vector<int32_t> unused[NUM_COMPONENT_TYPES];
+    std::vector<uint64_t> path;
+    for (const MovedPath& m : rep.moved) {
+        path.assign(hashes, hashes + std::min(m.base, n));
+        path.insert(path.end(), m.hashes.begin(), m.hashes.end());
+        InsertResult r = tree.adopt(path.data(), (int)path.size(), m, unused);
+        publish_chain(path.data(), (int)path.size(), r, m.full_from);
+    }
+    for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
+        unused[k].insert(unused[k].end(), rep.unused[k].begin(), rep.unused[k].end());
+        if (!unused[k].empty())
+            tree.recycle_slots(unused[k].data(), (int)unused[k].size(), (ComponentType)k);
+    }
+    (void)tree.dec_ref(hashes, n, std::move(held.pin));
+    return rep.status == RemoteStatus::OK ? rep.freed : 0;
 }
 
 #endif  // !RADIXSHMEM_NO_RDMA
@@ -1027,6 +1122,10 @@ int RadixClient::check_health(HealthReport* report) const {
     else        r.flags = HEALTH_NOT_ATTACHED;
     if (report) *report = r;
     return (int)r.flags;
+}
+TreeDump RadixClient::dump_tree(uint32_t max_nodes, uint64_t max_blocks) const {
+    if (!local_) throw std::runtime_error("RadixClient::dump_tree: no local tree (observer client)");
+    return radixshmem::dump_tree(local_->tree(), max_nodes, max_blocks);
 }
 const std::string& RadixClient::name() const {
     static const std::string kNone;
