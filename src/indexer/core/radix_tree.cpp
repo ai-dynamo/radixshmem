@@ -19,6 +19,7 @@
 
 #ifdef __x86_64__
 #include <immintrin.h>
+#endif
 #include <cstdlib>
 #include <sys/time.h>
 
@@ -42,7 +43,6 @@ void lt_check_stuck(uint64_t prev, const char* where) {
             (unsigned long long)prev, (long long)(prev & ~(1ULL << 63)));
 }
 }
-#endif
 
 namespace radixshmem {
 
