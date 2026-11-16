@@ -11,7 +11,6 @@
 #include "radix_client.h"          // RadixClient (svc_client_)
 #include "cluster_protocol.h"      // MAX_REMOTE_OP_BLOCKS
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "remote_op_factory.hpp"   // make_remote_op_server
 
 #include <algorithm>
 #include <chrono>
@@ -111,8 +110,8 @@ AllocateComponentsReply RemoteOpService::allocate_components(
     return out;
 }
 
-QueryReply RemoteOpService::query(const uint64_t* hashes, int n, bool lock,
-                                  bool update_meta, Deadline deadline) {
+QueryReply RemoteOpService::query(const uint64_t* hashes, int n, const RemoteQuery& q,
+                                  Deadline deadline) {
     QueryReply out;
     if (!valid_count(n) || (n > 0 && !hashes)) {
         out.status = RemoteStatus::BAD_REQUEST;
@@ -120,13 +119,17 @@ QueryReply RemoteOpService::query(const uint64_t* hashes, int n, bool lock,
     }
     if (expired(deadline)) { out.status = RemoteStatus::TIMEOUT; return out; }
     TreeComponentQueryResult r = tree_.tree().query_components(
-        hashes, n, COMPONENT_MASK_FULL, lock, update_meta);
-    out.hit_length = (int)r.common_hit;
-    out.slots      = std::move(r.full_slots);   // len == hit_length
-    if (lock) {
-        out.pin_end  = (int)r.pin.full.end;
-        out.pin_tail = std::move(r.pin.tail);
-    }
+        hashes, n, q.mask, q.lock, q.update_meta, &q.window);
+    if (r.status != RemoteStatus::OK) { out.status = r.status; return out; }
+    const uint32_t hit = r.common_hit;
+    out.hit_length = (int)hit;
+    if (!r.full_slots.empty())
+        out.slots.assign(r.full_slots.begin() + std::min(q.window.full_from, hit),
+                         r.full_slots.begin() + hit);
+    out.swa_start  = r.swa_start;
+    out.swa_slots  = std::move(r.swa_slots);
+    out.mamba_slot = r.mamba_checkpoint_slot;
+    out.pin        = std::move(r.pin);
     return out;
 }
 
@@ -181,17 +184,11 @@ RemoteStatus RemoteOpService::recycle(const int32_t* slots, int num_slots,
     return RemoteStatus::OK;
 }
 
-RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, int start,
-                                     int length, int pin_end,
-                                     const uint64_t* pin_tail, int pin_tail_n) {
-    if (!valid_count(n) || !valid_range(start, length, n) ||
-        (n > 0 && !hashes) || !valid_count(pin_tail_n) ||
-        (pin_tail_n > 0 && !pin_tail) || pin_end < start + length)
+RemoteStatus RemoteOpService::unlock(const uint64_t* hashes, int n, PinRecord&& pin) {
+    if (!valid_count(n) || (n > 0 && !hashes) || !valid_count((int)pin.tail.size()) ||
+        pin.full.start > pin.full.end || pin.swa.start > pin.swa.end)
         return RemoteStatus::BAD_REQUEST;
-    if (length == 0) return RemoteStatus::OK;
-    PinRecord pin;
-    pin.full = {(uint32_t)start, (uint32_t)pin_end};
-    pin.tail.assign(pin_tail, pin_tail + pin_tail_n);
+    if (pin.empty()) return RemoteStatus::OK;
     return tree_.tree().dec_ref(hashes, n, std::move(pin)) ? RemoteStatus::OK
                                                            : RemoteStatus::BAD_REQUEST;
 }
@@ -258,13 +255,6 @@ DedupReply RemoteOpService::dedup_prefix(const uint64_t* hashes, int n,
 }
 
 // ==================== RadixServer remote-op endpoint ====================
-
-RemoteOpAddr RadixServer::rc_build_endpoint() {
-    // Body of the build_remote_op callback.
-    RemoteOpAddr addr{};
-    rc_server_ = make_remote_op_server(cfg_.remote_op_listen_port, instance_id_, addr);
-    return addr;
-}
 
 void RadixServer::rc_spawn() {
     if (!rc_server_) return;

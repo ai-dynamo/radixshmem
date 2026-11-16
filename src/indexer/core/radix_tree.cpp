@@ -1236,7 +1236,7 @@ void RadixShmemTree::post_evict_fixup(uint32_t check_id) {
 
 TreeComponentQueryResult RadixShmemTree::query_components(
         const uint64_t* hashes, int n, uint32_t mask, bool lock,
-        bool update_meta) {
+        bool update_meta, const PinWindow* window) {
     const ComponentConfig& config = header()->component_config;
 
     // mask must be a non-empty subset of the enabled components; invalid
@@ -1273,26 +1273,30 @@ TreeComponentQueryResult RadixShmemTree::query_components(
         touch_full(spans, mask, full_hit, m.last_node_id);
         aux_touch(spans, mask, detail.common_hit, detail.swa_start, ts);
     }
-    if (lock) {
-        if (detail.common_hit > 0 || full_hit > 0)
-            inc_ref(spans, mask, detail.common_hit, detail.swa_start, full_hit,
-                    detail.pin);
+    const uint32_t L = detail.common_hit;
+    if (lock && !window) {
+        if (L > 0 || full_hit > 0)
+            inc_ref(spans, mask, L, detail.swa_start, 0, full_hit, detail.pin);
+    } else if (lock && L > window->incumbent) {
+        // Full is the hit itself here: the folding rank uses no block past L.
+        inc_ref(spans, mask, L, detail.swa_start, std::min(window->full_from, L), L,
+                detail.pin);
     }
     read_unlock();
     return detail;
 }
 
 // Runs under the read lock; eviction needs the write lock, so no gap opens.
-// Full covers [0, full_hit); SWA/Mamba cover the aux boundary common_hit.
+// Full covers [full_lo, full_hi); SWA/Mamba cover the aux boundary common_hit.
 void RadixShmemTree::inc_ref(const std::vector<MatchedNodeSpanView>& spans,
                            uint32_t mask, uint32_t common_hit,
-                           uint32_t swa_start, uint32_t full_hit,
+                           uint32_t swa_start, uint32_t full_lo, uint32_t full_hi,
                            PinRecord& pin) {
     const uint32_t L = common_hit;
     // Index math plus, for a partial terminal, a copy of its tail hashes.
     PinCoverage cov = compute_pin_coverage(spans.data(), spans.size(), mask, L,
-                                           swa_start, 0, full_hit);
-    record_pin_tail(spans.data(), spans.size(), cov, full_hit, L, pin);
+                                           swa_start, full_lo, full_hi);
+    record_pin_tail(spans.data(), spans.size(), cov, full_hi, L, pin);
     if (cov.swa_from < spans.size())
         pin.swa = {spans[cov.swa_from].absolute_start, cov.aux_cover_end};
     // With MAMBA in the mask, acceptance at L implies L is spans[aux_k]'s

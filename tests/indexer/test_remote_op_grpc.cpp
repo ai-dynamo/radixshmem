@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// Loopback gRPC tests on a real tree: five ops, errors, deadlines, lifecycle and replies; no RDMA/etcd.
+// Loopback gRPC tests on a real tree: five ops, errors, deadlines, lifecycle and replies,
+// the peer index over them, and the XRC setup RPC; no RDMA/etcd.
 
 #include "test_utils.h"
 #include "grpc_remote_op.hpp"
+#include "grpc_peer_index.hpp"
 #include "remote_op_service.hpp"
 #include "remote_op_factory.hpp"
 #include "remote_ops.grpc.pb.h"
 #include "local.h"
 #include "peer_breaker.hpp"
+#include "peer_registry.hpp"
 
 #include <grpcpp/grpcpp.h>
 
@@ -43,6 +46,19 @@ std::vector<uint64_t> make_hashes(int64_t base, int n) {
     std::vector<int64_t> tok(n);
     std::iota(tok.begin(), tok.end(), base);
     return RadixClient::compute_hashes(tok.data(), n, 1);
+}
+
+RemoteQuery rq(bool lock, bool update_meta = false) {
+    RemoteQuery q;
+    q.lock = lock;
+    q.update_meta = update_meta;
+    return q;
+}
+
+PinRecord full_pin(int end) {
+    PinRecord p;
+    p.full = {0, (uint32_t)end};
+    return p;
 }
 
 // Single-node tree/service fixture; holding insert_mu parks allocate/insert handlers.
@@ -99,13 +115,13 @@ void test_transport_factory() {
     TEST_BEGIN("transport factory serves gRPC and rejects an entry without a port");
     Node node("factory");
     RemoteOpAddr address;
-    auto server = make_remote_op_server(0, kInstance, address);
+    auto server = make_remote_op_server(0, kInstance, {}, address);
     assert(address.port != 0);
     server->start(*node.svc);
     PeerEntry peer{};
     peer.rank = 1;
     std::strcpy(peer.host, "127.0.0.1");
-    peer.remote_op_listen_port = address.port;
+    peer.rpc_port = address.port;
     peer.instance_id = kInstance;
     std::string endpoint;
     auto client = make_remote_op_client(peer, endpoint);
@@ -114,12 +130,12 @@ void test_transport_factory() {
     assert(allocated.status == RemoteStatus::OK && allocated.slots.size() == 2);
     assert(client->recycle(allocated.slots.data(), 2) == RemoteStatus::OK);
     assert(node.used() == 0);
-    peer.remote_op_listen_port = 0;
+    peer.rpc_port = 0;
     bool rejected = false;
     try {
         make_remote_op_client(peer, endpoint);
     } catch (const std::runtime_error& error) {
-        rejected = std::string(error.what()).find("no remote-op port") != std::string::npos;
+        rejected = std::string(error.what()).find("no RPC port") != std::string::npos;
     }
     assert(rejected);
     server->stop();
@@ -150,9 +166,9 @@ void test_roundtrip() {
     InsertResult ins = cli.insert(h.data(), n, 0, n, a.slots.data(), true);
     assert(ins.error == InsertError::OK && ins.unused_slots.empty());
 
-    QueryReply q = cli.query(h.data(), n, /*lock=*/true, /*update_meta=*/true);
+    QueryReply q = cli.query(h.data(), n, rq(true, true));
     assert(q.status == RemoteStatus::OK && q.hit_length == n && q.slots == a.slots);
-    assert(cli.unlock(h.data(), n, 0, q.hit_length, q.pin_end, q.pin_tail) ==
+    assert(cli.unlock(h.data(), n, q.pin) ==
            RemoteStatus::OK);
 
     // Re-insert of the published prefix consumes nothing; surplus recycled.
@@ -193,9 +209,9 @@ void test_large_request() {
     assert(a.status == RemoteStatus::OK && (int)a.slots.size() == n);
     InsertResult ins = cli.insert(h.data(), n, 0, n, a.slots.data(), true);
     assert(ins.remote_status == RemoteStatus::OK && ins.error == InsertError::OK);
-    QueryReply q = cli.query(h.data(), n, true, false);
+    QueryReply q = cli.query(h.data(), n, rq(true));
     assert(q.status == RemoteStatus::OK && q.hit_length == n && q.slots == a.slots);
-    assert(cli.unlock(h.data(), n, 0, q.hit_length, q.pin_end, q.pin_tail) == RemoteStatus::OK);
+    assert(cli.unlock(h.data(), n, q.pin) == RemoteStatus::OK);
     assert(node.used() == (uint32_t)n);
     server.stop();
     expect_healthy(*node.client);
@@ -624,7 +640,7 @@ void test_deadline_no_replay() {
     // The handler is still parked; releasing it lands the insert anyway.
     park.unlock();
     assert(wait_until([&] {
-        return cli.query(h.data(), n, false, false).hit_length == n;
+        return cli.query(h.data(), n, rq(false)).hit_length == n;
     }));
     // Exactly the allocated slots are in use: nothing replayed or leaked.
     assert(node.used() == (uint32_t)n);
@@ -651,9 +667,9 @@ void test_no_admission_cap() {
     std::vector<std::thread> threads;
     for (auto& r : parked) threads.emplace_back([&cli, &r] { r = cli.allocate(1); });
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
-    QueryReply q = cli.query(h.data(), n, true, false);
+    QueryReply q = cli.query(h.data(), n, rq(true));
     assert(q.status == RemoteStatus::OK && q.hit_length == n);
-    assert(cli.unlock(h.data(), n, 0, q.hit_length, q.pin_end, q.pin_tail) ==
+    assert(cli.unlock(h.data(), n, q.pin) ==
            RemoteStatus::OK);
     assert(cli.recycle(spare.slots.data(), 2) == RemoteStatus::OK);
     park.unlock();
@@ -682,7 +698,7 @@ void test_deadline_skips_allocate_and_query() {
     auto h = make_hashes(550, n);
     AllocateReply a = cli.allocate(n);
     assert(cli.insert(h.data(), n, 0, n, a.slots.data(), true).error == InsertError::OK);
-    QueryReply late = node.svc->query(h.data(), n, true, false, past);
+    QueryReply late = node.svc->query(h.data(), n, rq(true), past);
     assert(late.status == RemoteStatus::TIMEOUT && late.hit_length == 0);
     expect_healthy(*node.client);
 
@@ -709,11 +725,11 @@ void test_unlock_partial_node() {
     AllocateReply a = cli.allocate(n);
     assert(cli.insert(h.data(), n, 0, n, a.slots.data(), true).error == InsertError::OK);
 
-    QueryReply q = cli.query(h.data(), 4, true, false);
+    QueryReply q = cli.query(h.data(), 4, rq(true));
     assert(q.status == RemoteStatus::OK && q.hit_length == 4);
-    assert(q.pin_end == n && q.pin_tail.size() == 4);
-    assert(std::equal(q.pin_tail.begin(), q.pin_tail.end(), h.begin() + 4));
-    assert(cli.unlock(h.data(), 4, 0, q.hit_length, q.pin_end, q.pin_tail) ==
+    assert(q.pin.full.end == (uint32_t)n && q.pin.tail.size() == 4);
+    assert(std::equal(q.pin.tail.begin(), q.pin.tail.end(), h.begin() + 4));
+    assert(cli.unlock(h.data(), 4, q.pin) ==
            RemoteStatus::OK);
     expect_healthy(*node.client);
     server.stop();
@@ -731,12 +747,12 @@ void test_stale_instance() {
     auto h = make_hashes(900, n);
     std::vector<int32_t> s(n, 0);
     assert(cli.allocate(n).status == RemoteStatus::STALE_TARGET);
-    assert(cli.query(h.data(), n, true, false).status == RemoteStatus::STALE_TARGET);
+    assert(cli.query(h.data(), n, rq(true)).status == RemoteStatus::STALE_TARGET);
     InsertResult ins = cli.insert(h.data(), n, 0, n, s.data(), true);
     assert(ins.error == InsertError::REMOTE_FAILED &&
            ins.remote_status == RemoteStatus::STALE_TARGET);
     assert(cli.recycle(s.data(), n) == RemoteStatus::STALE_TARGET);
-    assert(cli.unlock(h.data(), n, 0, n, n, {}) == RemoteStatus::STALE_TARGET);
+    assert(cli.unlock(h.data(), n, full_pin(n)) == RemoteStatus::STALE_TARGET);
     DedupRequest req;
     req.rank = 1;
     req.landing[0] = {7};
@@ -759,11 +775,11 @@ void test_local_limits() {
     assert(cli.allocate_components({{ComponentType::FULL, MAX_REMOTE_OP_BLOCKS},
                                     {ComponentType::SWA, 1}}).status == RemoteStatus::BAD_REQUEST);
     assert(cli.allocate_components({{ComponentType::SWA, -1}}).status == RemoteStatus::BAD_REQUEST);
-    assert(cli.query(h.data(), big, false, false).status == RemoteStatus::BAD_REQUEST);
+    assert(cli.query(h.data(), big, rq(false)).status == RemoteStatus::BAD_REQUEST);
     assert(cli.insert(h.data(), big, 0, big, s.data(), true).remote_status ==
            RemoteStatus::BAD_REQUEST);
     assert(cli.recycle(s.data(), big) == RemoteStatus::BAD_REQUEST);
-    assert(cli.unlock(h.data(), big, 0, 4, 4, {}) == RemoteStatus::BAD_REQUEST);
+    assert(cli.unlock(h.data(), big, full_pin(4)) == RemoteStatus::BAD_REQUEST);
     assert(cli.allocate(1).status == RemoteStatus::UNAVAILABLE && !cli.connected());
     TEST_PASS();
 }
@@ -785,7 +801,7 @@ struct FakeTransport final : IRemoteOpClientTransport {
         r.status = next;
         return r;
     }
-    QueryReply query(const uint64_t*, int, bool, bool) override {
+    QueryReply query(const uint64_t*, int, const RemoteQuery&) override {
         calls++;
         QueryReply r;
         r.status = next;
@@ -810,7 +826,7 @@ struct FakeTransport final : IRemoteOpClientTransport {
         calls++;
         return next;
     }
-    RemoteStatus unlock(const uint64_t*, int, int, int, int, const std::vector<uint64_t>&) override {
+    RemoteStatus unlock(const uint64_t*, int, const PinRecord&) override {
         calls++;
         return next;
     }
@@ -819,6 +835,10 @@ struct FakeTransport final : IRemoteOpClientTransport {
         DedupReply r;
         r.status = next;
         return r;
+    }
+    RemoteStatus xrc_connect(const XrcConnInfo&, XrcConnInfo&) override {
+        calls++;
+        return next;
     }
     bool connected() override { return up; }
 };
@@ -844,7 +864,7 @@ void test_breaker_gates_remote_ops() {
     const int calls = t.calls;
     assert(peer.allocate(1).status == RemoteStatus::UNAVAILABLE);
     assert(peer.allocate_components({{ComponentType::FULL, 1}}).status == RemoteStatus::UNAVAILABLE);
-    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE);
+    assert(peer.query(h.data(), 4, RemoteQuery{}).status == RemoteStatus::UNAVAILABLE);
     InsertResult ins = peer.insert(h.data(), 4, 0, 4, s.data());
     assert(ins.error == InsertError::REMOTE_FAILED && ins.remote_status == RemoteStatus::UNAVAILABLE);
     InsertPathResult path = peer.insert_path(h.data(), 4, 0, 4, s.data(), {{ComponentType::SWA, 4, {1}}});
@@ -852,7 +872,7 @@ void test_breaker_gates_remote_ops() {
            path.full.error == InsertError::REMOTE_FAILED &&
            path.runs[0].error == InsertError::REMOTE_FAILED);
     assert(peer.recycle(s.data(), 4) == RemoteStatus::UNAVAILABLE);
-    assert(peer.unlock(h.data(), 4, 0, 4, 4, {}) == RemoteStatus::UNAVAILABLE);
+    assert(peer.unlock(h.data(), 4, full_pin(4)) == RemoteStatus::UNAVAILABLE);
     assert(peer.dedup_prefix(h.data(), 4).status == RemoteStatus::UNAVAILABLE);
     DedupRequest landing;
     landing.landing[1] = {9};
@@ -861,13 +881,13 @@ void test_breaker_gates_remote_ops() {
     assert(t.calls == calls);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 1);
-    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 1);
+    assert(peer.query(h.data(), 4, RemoteQuery{}).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 1);
+    assert(peer.query(h.data(), 4, RemoteQuery{}).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 1);
     std::this_thread::sleep_for(std::chrono::milliseconds(250));
     t.next = RemoteStatus::OK;
     assert(peer.allocate_components({{ComponentType::SWA, 1}}).status == RemoteStatus::OK &&
            t.calls == calls + 2 && !breaker->is_down(1));
-    assert(peer.unlock(h.data(), 4, 0, 4, 4, {}) == RemoteStatus::OK && t.calls == calls + 3);
+    assert(peer.unlock(h.data(), 4, full_pin(4)) == RemoteStatus::OK && t.calls == calls + 3);
 
     t.next = RemoteStatus::UNAVAILABLE;
     assert(peer.allocate_components({{ComponentType::FULL, 1}}).status == RemoteStatus::UNAVAILABLE &&
@@ -875,12 +895,249 @@ void test_breaker_gates_remote_ops() {
     breaker->retry_now(1);
     t.next = RemoteStatus::TIMEOUT;
     t.up = false;
-    assert(peer.query(h.data(), 4).status == RemoteStatus::TIMEOUT && breaker->is_down(1));
-    assert(peer.query(h.data(), 4).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 5);
+    assert(peer.query(h.data(), 4, RemoteQuery{}).status == RemoteStatus::TIMEOUT && breaker->is_down(1));
+    assert(peer.query(h.data(), 4, RemoteQuery{}).status == RemoteStatus::UNAVAILABLE && t.calls == calls + 5);
     breaker->retry_now(1);
     t.next = RemoteStatus::OK;
     t.up = true;
-    assert(peer.query(h.data(), 4).status == RemoteStatus::OK && !breaker->is_down(1));
+    assert(peer.query(h.data(), 4, RemoteQuery{}).status == RemoteStatus::OK && !breaker->is_down(1));
+    TEST_PASS();
+}
+
+// ---- the peer index over gRPC: a one-peer cluster seen from rank 0 ----
+
+double secs_since(std::chrono::steady_clock::time_point t0) {
+    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+}
+
+PeerEntry entry_of(Node& node, uint16_t port, uint64_t instance) {
+    auto* hdr = static_cast<const ShmHeader*>(node.tree->tree().shm_base());
+    PeerEntry e{};
+    e.rank = 1;
+    std::strcpy(e.host, "127.0.0.1");
+    e.rpc_port = port;
+    e.instance_id = instance;
+    e.shm_size = node.tree->tree().shm_size();
+    e.node_pool_capacity = hdr->node_pool_capacity;
+    e.component_config = hdr->component_config;
+    e.component_state_offset = hdr->component_state_offset;
+    return e;
+}
+
+// Rank 1 is `node` behind `port`.
+struct OnePeer {
+    PeerRegistry reg;
+    std::unique_ptr<GrpcPeerIndex> index;
+
+    OnePeer(Node& node, uint16_t port, uint64_t instance, const ComponentConfig& expected) {
+        std::vector<PeerEntry> peers(2);
+        peers[0].rank = 0;
+        peers[1] = entry_of(node, port, instance);
+        reg.seed(std::move(peers), 2, 0);
+        PeerIndexConfig pc;
+        pc.has_expected = true;
+        pc.expected = expected;
+        index = std::make_unique<GrpcPeerIndex>(reg, pc);
+    }
+    OnePeer(Node& node, uint16_t port, uint64_t instance)
+        : OnePeer(node, port, instance, node.tree->tree().component_config()) {}
+};
+
+RemoteQuery locked_window(uint32_t mask, uint32_t incumbent, uint32_t full_from) {
+    RemoteQuery q;
+    q.mask = mask;
+    q.lock = true;
+    q.window = {incumbent, full_from};
+    return q;
+}
+
+bool refs_held(const Node& node) {
+    return (node.client->check_health() & HEALTH_REF_LEAK) != 0;
+}
+
+const std::vector<RemoteHit> kNoHints;
+
+void test_peer_index_components() {
+    TEST_BEGIN("peer index: Query returns the part past the incumbent with SWA and Mamba; Unlock drops it");
+    Node node("pi_cmp", kMaxBlocks, true);
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    const int n = 8;
+    auto h = make_hashes(1100, n);
+    auto full = reserve(cli, n, ComponentType::FULL);
+    InsertPathResult ins = cli.insert_path(h.data(), n, 0, n, full.data(), path_runs(cli), true);
+    assert(ins.remote_status == RemoteStatus::OK && ins.full.error == InsertError::OK);
+    auto want = node.tree->tree().query_components(h.data(), n, COMPONENT_MASK_ALL, false, false);
+    assert(want.common_hit == (uint32_t)n && want.mamba_checkpoint_slot != INVALID_COMPONENT_SLOT);
+
+    OnePeer c(node, server.port(), kInstance);
+    for (uint32_t inc : {0u, 3u, 6u, 8u}) {
+        QueryReply r = c.index->query(1, h.data(), n, locked_window(COMPONENT_MASK_ALL, inc, inc),
+                                      kNoHints);
+        assert(r.status == RemoteStatus::OK && r.hit_length == n);
+        assert(r.slots == std::vector<int32_t>(want.full_slots.begin() + inc,
+                                               want.full_slots.begin() + n));
+        assert(r.swa_start == want.swa_start && r.swa_slots == want.swa_slots);
+        assert(r.mamba_slot == want.mamba_checkpoint_slot);
+        assert(r.pin.source_rank == 1 && r.pin.source_instance == kInstance);
+        assert(r.pin.empty() == (inc == (uint32_t)n) && refs_held(node) == !r.pin.empty());
+        if (!r.pin.empty()) c.index->unlock(h.data(), n, std::move(r.pin));
+        expect_healthy(*node.client);
+    }
+
+    // A peer whose tree has another layout yields nothing, without a call.
+    ComponentConfig other = node.tree->tree().component_config();
+    other.swa_window_blocks += 1;
+    OnePeer mismatch(node, server.port(), kInstance, other);
+    QueryReply r = mismatch.index->query(1, h.data(), n, locked_window(COMPONENT_MASK_ALL, 0, 0),
+                                         kNoHints);
+    assert(r.status == RemoteStatus::BAD_REQUEST && r.pin.empty() && !refs_held(node));
+    server.stop();
+    TEST_PASS();
+}
+
+void test_peer_index_dead_peer() {
+    TEST_BEGIN("peer index: a dead peer fails fast and is skipped; its pin stays");
+    Node node("pi_dead");
+    auto server = std::make_unique<GrpcRemoteOpServer>(0, kInstance);
+    server->start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server->port()), 5000, kInstance);
+    const int n = 8;
+    auto h = make_hashes(1200, n);
+    AllocateReply a = cli.allocate(n);
+    assert(cli.insert(h.data(), n, 0, n, a.slots.data(), true).error == InsertError::OK);
+
+    OnePeer c(node, server->port(), kInstance);
+    QueryReply held = c.index->query(1, h.data(), n, rq(true), kNoHints);
+    assert(held.status == RemoteStatus::OK && !held.pin.empty());
+    PinRecord leaked = held.pin;
+
+    server->stop();
+    server.reset();
+    const auto t0 = std::chrono::steady_clock::now();
+    QueryReply r = c.index->query(1, h.data(), n, rq(true), kNoHints);
+    assert(r.status == RemoteStatus::UNAVAILABLE || r.status == RemoteStatus::TIMEOUT);
+    assert(c.index->query(1, h.data(), n, rq(true), kNoHints).status == RemoteStatus::UNAVAILABLE);
+    c.index->unlock(h.data(), n, std::move(held.pin));
+    assert(secs_since(t0) < 1.0);
+    assert(refs_held(node));   // nobody could release it: the leak a dead peer is allowed
+    assert(node.tree->tree().dec_ref(h.data(), n, std::move(leaked)));
+    expect_healthy(*node.client);
+    TEST_PASS();
+}
+
+void test_peer_index_hung_peer() {
+    TEST_BEGIN("peer index: a hung peer times out; it drops a pin taken after its caller left");
+    setenv("RADIXSHMEM_PEER_INDEX_TIMEOUT_MS", "300", 1);
+    Node node("pi_hung");
+    GrpcRemoteOpServer server(0, kInstance);
+    server.start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    const int n = 8;
+    auto h = make_hashes(1300, n);
+    AllocateReply a = cli.allocate(n);
+    assert(cli.insert(h.data(), n, 0, n, a.slots.data(), true).error == InsertError::OK);
+    OnePeer c(node, server.port(), kInstance);
+    assert(c.index->preconnect(1));
+
+    node.tree->tree().write_lock();   // every query on the peer waits behind it
+    auto t0 = std::chrono::steady_clock::now();
+    QueryReply r = c.index->query(1, h.data(), n, rq(true), kNoHints);
+    const double waited = secs_since(t0);
+    assert(r.status == RemoteStatus::TIMEOUT && waited >= 0.25 && waited < 1.0);
+    t0 = std::chrono::steady_clock::now();
+    assert(c.index->query(1, h.data(), n, rq(true), kNoHints).status == RemoteStatus::UNAVAILABLE);
+    assert(secs_since(t0) < 0.05);
+    node.tree->tree().write_unlock();
+    server.stop();   // returns once the parked handler is done
+    expect_healthy(*node.client);
+    unsetenv("RADIXSHMEM_PEER_INDEX_TIMEOUT_MS");
+    TEST_PASS();
+}
+
+void test_peer_index_restarted_peer() {
+    TEST_BEGIN("peer index: a restarted peer is stale until its new entry; old pins skip it");
+    Node node("pi_restart");
+    auto first = std::make_unique<GrpcRemoteOpServer>(0, kInstance);
+    const uint16_t port = first->port();
+    first->start(*node.svc);
+    GrpcRemoteOpClientTransport cli(target_of(port), 5000, kInstance);
+    const int n = 8;
+    auto h = make_hashes(1400, n);
+    AllocateReply a = cli.allocate(n);
+    assert(cli.insert(h.data(), n, 0, n, a.slots.data(), true).error == InsertError::OK);
+
+    OnePeer before(node, port, kInstance);
+    QueryReply held = before.index->query(1, h.data(), n, rq(true), kNoHints);
+    assert(held.status == RemoteStatus::OK && !held.pin.empty());
+    PinRecord old_pin = held.pin;
+    first->stop();
+    first.reset();
+    GrpcRemoteOpServer second(port, kInstance + 1);   // the same node, a new run
+    second.start(*node.svc);
+
+    // Its /peers entry has not reached this client yet.
+    OnePeer c(node, port, kInstance);
+    assert(c.index->query(1, h.data(), n, rq(false), kNoHints).status ==
+           RemoteStatus::STALE_TARGET);
+    assert(c.index->query(1, h.data(), n, rq(false), kNoHints).status ==
+           RemoteStatus::STALE_TARGET);
+    PeerEntry renewed = entry_of(node, port, kInstance + 1);
+    assert(c.reg.admit(renewed));
+    c.index->peer_changed(renewed);
+    QueryReply fresh = c.index->query(1, h.data(), n, rq(true), kNoHints);
+    assert(fresh.status == RemoteStatus::OK && fresh.pin.source_instance == kInstance + 1);
+    c.index->unlock(h.data(), n, std::move(fresh.pin));
+    // Here both runs share one tree, so the old pin shows; a real restart took it along.
+    c.index->unlock(h.data(), n, std::move(held.pin));
+    assert(refs_held(node));
+    assert(node.tree->tree().dec_ref(h.data(), n, std::move(old_pin)));
+    expect_healthy(*node.client);
+    second.stop();
+    TEST_PASS();
+}
+
+// ---- XRC setup: served before start(), for this instance, absent without RDMA ----
+void test_xrc_connect() {
+    TEST_BEGIN("XrcConnect before start(), instance-checked, UNKNOWN_OP without an RDMA side");
+    std::atomic<bool> fail{false};
+    // Answers with the caller's end shifted, so the reply shows both directions decoded.
+    GrpcRemoteOpServer server(0, kInstance, [&](const XrcConnInfo& c) {
+        if (fail.load()) throw std::runtime_error("no RECV QP");
+        XrcConnInfo t = c;
+        t.rank = c.rank + 1;
+        t.qp_num = c.qp_num + 1;
+        t.srq_num = 77;
+        t.lid = c.lid + 1;
+        t.gid[15] = (uint8_t)(c.gid[15] + 1);
+        return t;
+    });
+    GrpcRemoteOpClientTransport cli(target_of(server.port()), 5000, kInstance);
+    XrcConnInfo mine;
+    mine.rank = 2;
+    mine.qp_num = 0x4242;
+    mine.link_layer = 2;
+    mine.lid = 9;
+    mine.gid_index = 3;
+    for (int i = 0; i < 16; i++) mine.gid[i] = (uint8_t)(0xa0 + i);
+    XrcConnInfo theirs;
+    assert(cli.xrc_connect(mine, theirs) == RemoteStatus::OK);
+    assert(theirs.rank == 3 && theirs.qp_num == 0x4243 && theirs.srq_num == 77 &&
+           theirs.link_layer == 2 && theirs.lid == 10 && theirs.gid_index == 3);
+    assert(std::memcmp(theirs.gid, mine.gid, 15) == 0 && theirs.gid[15] == 0xb0);
+    assert(cli.allocate(1).status == RemoteStatus::UNAVAILABLE);   // the rest waits for start()
+
+    GrpcRemoteOpClientTransport other(target_of(server.port()), 5000, kInstance + 1);
+    assert(other.xrc_connect(mine, theirs) == RemoteStatus::STALE_TARGET);
+    fail = true;
+    assert(cli.xrc_connect(mine, theirs) == RemoteStatus::INTERNAL);
+    server.stop();
+
+    GrpcRemoteOpServer plain(0, kInstance);
+    GrpcRemoteOpClientTransport no_rdma(target_of(plain.port()), 5000, kInstance);
+    assert(no_rdma.xrc_connect(mine, theirs) == RemoteStatus::UNKNOWN_OP);
+    plain.stop();
     TEST_PASS();
 }
 
@@ -909,7 +1166,7 @@ void test_lifecycle() {
     op.join();
     assert(inflight.status == RemoteStatus::OK && inflight.slots.size() == 4);
 
-    assert(cli.query(h.data(), 4, false, false).status == RemoteStatus::UNAVAILABLE);
+    assert(cli.query(h.data(), 4, rq(false)).status == RemoteStatus::UNAVAILABLE);
     server->stop();
     server.reset();
     GrpcRemoteOpClientTransport gone(target_of(port), 5000, kInstance);
@@ -956,6 +1213,11 @@ struct BadService final : pb::RemoteOps::Service {
         rep->set_freed(3);   // a server without moves
         return grpc::Status::OK;
     }
+    grpc::Status XrcConnect(grpc::ServerContext*, const pb::XrcConnectRequest*,
+                            pb::XrcConnectResponse* rep) override {
+        rep->mutable_target()->set_gid("short");
+        return grpc::Status::OK;
+    }
 };
 
 void test_bad_reply() {
@@ -971,7 +1233,7 @@ void test_bad_reply() {
     auto h = make_hashes(700, 4);
     std::vector<int32_t> s(4, 0);
     assert(cli.allocate(4).status == RemoteStatus::BAD_REPLY);
-    assert(cli.query(h.data(), 4, false, false).status == RemoteStatus::BAD_REPLY);
+    assert(cli.query(h.data(), 4, rq(false)).status == RemoteStatus::BAD_REPLY);
     assert(cli.recycle(s.data(), 4) == RemoteStatus::UNKNOWN_OP);
     const std::vector<ComponentRun> runs = {{ComponentType::SWA, 4, {1, 2}}, {ComponentType::MAMBA, 4, {3}}};
     for (int mode : {1, 2, 3, 4}) {
@@ -990,6 +1252,8 @@ void test_bad_reply() {
     DedupReply d = cli.dedup_prefix(h.data(), 4, req);
     assert(d.status == RemoteStatus::OK && d.freed == 3 && d.moved.empty() &&
            d.unused[0] == (std::vector<int32_t>{5, 6}));
+    XrcConnInfo theirs;
+    assert(cli.xrc_connect(XrcConnInfo{}, theirs) == RemoteStatus::BAD_REPLY);
     server->Shutdown();
     TEST_PASS();
 }
@@ -1016,6 +1280,11 @@ int main() {
     test_stale_instance();
     test_local_limits();
     test_breaker_gates_remote_ops();
+    test_peer_index_components();
+    test_peer_index_dead_peer();
+    test_peer_index_hung_peer();
+    test_peer_index_restarted_peer();
+    test_xrc_connect();
     test_lifecycle();
     test_bad_reply();
     return tests_report();

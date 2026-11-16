@@ -67,8 +67,8 @@ python radix-monitor/demo.py --nodes 4 --monitor-port 9810
 # prints the /sd URL to add to Prometheus; Ctrl-C stops and cleans up
 ```
 
-It needs `etcd` on PATH and an RDMA device for the index plane (`--index-dev`,
-default `mlx5_bond_0`).
+It needs `etcd` on PATH; an index plane on RDMA uses the device of `--index-dev`
+(default `mlx5_bond_0`, passed to the servers as `RADIXSHMEM_INDEX_DEV`).
 
 ## Tests
 

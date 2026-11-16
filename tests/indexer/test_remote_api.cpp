@@ -38,8 +38,6 @@ constexpr int    kWorldSize      = 2;
 constexpr int    kBlockSize      = 1;
 constexpr int    kBootstrapTO    = 30;
 constexpr const char* kShmPrefix = "/test_remote_routing";
-std::string kRdmaDev = "mlx5_bond_0";   // default; resolved in main() (env override + SKIP)
-constexpr int    kGidIdx         = 3;
 constexpr int    kTargetRank     = 0;   // B: remote insert + query enabled
 constexpr int    kInitiatorRank  = 1;   // A: remote ops off
 
@@ -67,8 +65,6 @@ int run_server_process(const std::string& node, const std::string& registry,
     cfg.cluster_id  = cluster_id;
     cfg.node_name   = node;
     cfg.rpc_address = "127.0.0.1";   // single-host peers connect over loopback
-    cfg.index_dev    = kRdmaDev;
-    cfg.gid_idx     = kGidIdx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
 
     try {
@@ -577,16 +573,16 @@ int client_main(int argc, char** argv) {
 int main(int argc, char** argv) {
     // Re-exec'd server: --server <node> <registry> <cluster_id>.
     if (argc >= 5 && std::strcmp(argv[1], "--server") == 0) {
-        kRdmaDev = resolve_index_dev_or_skip(kRdmaDev.c_str());
+        resolve_index_dev_or_skip("mlx5_bond_0");
         return run_server_process(argv[2], argv[3], argv[4]);
     }
     // Re-exec'd client: --client <case> [<fd_to_parent> <fd_from_parent>].
     if (argc >= 3 && std::strcmp(argv[1], "--client") == 0) {
-        kRdmaDev = resolve_index_dev_or_skip(kRdmaDev.c_str());
+        resolve_index_dev_or_skip("mlx5_bond_0");
         return client_main(argc, argv);
     }
 
-    kRdmaDev = resolve_index_dev_or_skip(kRdmaDev.c_str());
+    resolve_index_dev_or_skip("mlx5_bond_0");
 
     // Private etcd — sole cluster bootstrap backend; no etcd binary → SKIP.
     radixshmem_test::EtcdHarness etcd;

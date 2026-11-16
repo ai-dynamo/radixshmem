@@ -170,8 +170,6 @@ int run_server_process(const std::string& base, int rank, int master_port,
     cfg.cluster_id     = "bench_query_dist";
     cfg.node_name      = "node" + std::to_string(rank);
     (void)master_port;
-    cfg.index_dev       = g_index_dev;
-    cfg.gid_idx        = g_gid_idx;
     cfg.bootstrap_timeout_sec = kBootstrapTO;
 
     RadixServer srv(cfg);
@@ -403,6 +401,9 @@ int main(int argc, char** argv) {
     }
     g_index_dev = argv[1];
     if (argc >= 3) g_gid_idx = std::atoi(argv[2]);
+    setenv("RADIXSHMEM_INDEX_DEV", g_index_dev.c_str(), 1);
+    setenv("RADIXSHMEM_INDEX_GID_IDX", std::to_string(g_gid_idx).c_str(), 1);
+    setenv("RADIXSHMEM_PEER_INDEX_BACKEND", "rdma", 0);   // the walk is what it measures
 
     printf("=== bench_query_dist (rank1 queries rank0 over RDMA; dev=%s gid=%d) ===\n",
            g_index_dev.c_str(), g_gid_idx);

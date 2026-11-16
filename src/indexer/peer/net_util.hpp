@@ -7,9 +7,13 @@
 
 #include <arpa/inet.h>
 #include <ifaddrs.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <string>
 
@@ -55,6 +59,25 @@ inline std::string resolve_bind_ip(const std::string& address,
         return ip;
     }
     return address;
+}
+
+// True if a TCP connect to host:port succeeds within timeout_sec.
+inline bool tcp_port_open(const char* host, uint16_t port, int timeout_sec) {
+    addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    const std::string port_str = std::to_string(port);
+    if (getaddrinfo(host, port_str.c_str(), &hints, &res) != 0) return false;
+    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    bool open = false;
+    if (fd >= 0) {
+        timeval tv{timeout_sec, 0};
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));   // bounds connect()
+        open = ::connect(fd, res->ai_addr, res->ai_addrlen) == 0;
+        ::close(fd);
+    }
+    freeaddrinfo(res);
+    return open;
 }
 
 } // namespace radixshmem

@@ -19,8 +19,7 @@
 
 #ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
-#include "cluster_protocol.h"      // ibv_cq, CLUSTER_TRANSPORT_*
-#include <unordered_map>
+#include "cluster_manifest.h"      // CLUSTER_TRANSPORT_*, CLUSTER_RHT_*, CLUSTER_PEER_INDEX_*
 #endif
 
 namespace radixshmem {
@@ -30,13 +29,8 @@ class RadixShmemTree;
 #ifndef RADIXSHMEM_NO_RDMA
 class LocalTreeConnector;
 class RadixClient;
-class RdmaContext;
-class RdmaXrcd;
-class XrcSrq;
-class RdmaMemoryRegion;
+class RdmaHost;    // src/indexer/transport/rdma/rdma_host.hpp
 class RhtHolder;   // src/indexer/rht/rht_endpoint.h
-class DcTarget;
-class XrcRecvQp;
 class EtcdRegistry;
 struct PeerEntry;
 struct ShardMapMsg;
@@ -56,8 +50,6 @@ struct RadixServerConfig {
     // rank: etcd-assigned dense rank, filled after bootstrap.
     int          rank        = 0;
     int          world_size  = 1;   // observed count(/peers) overrides at bootstrap
-    std::string  index_dev;          // empty = first available device
-    int          gid_idx     = 3;
     int          bootstrap_timeout_sec = 60;
     // TTL of this node's etcd lease and of the shared cluster lease: how long a
     // killed node's keys, or a fully stopped cluster's /config, outlive it.
@@ -65,15 +57,12 @@ struct RadixServerConfig {
 
     std::string  rpc_address;              // explicit IPv4, e.g. "192.168.1.11"
     std::string  rpc_interface;            // NIC name, e.g. "eth0"
-    uint16_t     rpc_port    = 0;          // 0 = OS-assigned bootstrap / XRC listen port
+    // gRPC endpoint peers reach: remote ops, peer queries, XRC setup; 0 = OS-assigned.
+    uint16_t     rpc_port    = 0;
     int          register_chunk_tokens = DEFAULT_REGISTER_CHUNK_TOKENS;   // copied onto shm at bootstrap
 
     int          expected_min_nodes = 0;   // > 1 = distributed
     int          settle_ms          = 500;
-
-    std::string       peer_index_transport = "xrc";
-
-    uint16_t          remote_op_listen_port = 0;
 
     // Cluster bootstrap registry: "etcd://host:port" (etcd dynamic discovery).
     std::string       registry   = "etcd://127.0.0.1:2379";
@@ -165,18 +154,14 @@ private:
     std::unique_ptr<EtcdRegistry> registry_;   // holds the lease for the server's lifetime
 #endif
 
-    std::unique_ptr<RdmaContext>      ctx_;
-    std::unique_ptr<RdmaXrcd>         xrcd_;
-    std::unique_ptr<XrcSrq>           srq_;
-    ibv_cq*                            cq_ = nullptr;
-    std::unique_ptr<RdmaMemoryRegion> shm_mr_;       // tree shm MR: READ|ATOMIC
+    // The RDMA side peers' one-sided QPs reach; only when a plane runs on RDMA.
+    std::unique_ptr<RdmaHost>          rdma_;
 
-    // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE).
+    // RHT shard (holders only): owns the shard shm + its MR (READ|WRITE) on rdma_.
     std::unique_ptr<RhtHolder>         rht_holder_;
 
-    // DC read target for the RHT and peer-index planes.
-    std::unique_ptr<DcTarget>          dct_;
     uint32_t                           rht_transport_ = CLUSTER_TRANSPORT_XRC;
+    uint32_t                           peer_index_backend_ = CLUSTER_PEER_INDEX_GRPC;
     uint32_t                           peer_index_transport_ = CLUSTER_TRANSPORT_XRC;
     uint64_t                           dc_access_key_ = 0;
 
@@ -193,6 +178,12 @@ private:
         } rdma;
     };
     RhtEnv rht_env_;
+    // RADIXSHMEM_PEER_INDEX_* of this node.
+    struct PeerIndexEnv {
+        uint32_t backend = CLUSTER_PEER_INDEX_GRPC;
+        uint32_t rdma_transport = CLUSTER_TRANSPORT_XRC;   // backend rdma only
+    };
+    PeerIndexEnv peer_index_env_;
     int rht_min_nodes() const {
         return rht_env_.backend == CLUSTER_RHT_RDMA ? rht_env_.rdma.shards : 0;
     }
@@ -209,29 +200,13 @@ private:
     int                  rdma_sl_ = 5;          // authoritative QoS (rank 0)
     int                  rdma_tc_ = 160;
 
-    // TCP XRC listener
-    int       xrc_listen_fd_ = -1;
-    uint16_t  actual_listen_port_ = 0;
-    std::thread listener_thread_;
-    std::atomic<bool> stopping_{false};
-
-    // Per-client XRC RECV QP table, keyed by an internal counter.
-    struct ClientSlot {
-        std::unique_ptr<XrcRecvQp> recv_qp;
-        int32_t  client_rank   = -1;
-        uint32_t client_send_qp_num = 0;
-        uint32_t recv_qp_num       = 0;
-    };
-    mutable std::mutex clients_mu_;
-    std::unordered_map<uint64_t, std::unique_ptr<ClientSlot>> clients_;
-    uint64_t next_client_id_ = 1;
-
-    // etcd rendezvous, install manifest, start XRC accept loop; true when all peers ready.
+    // etcd rendezvous, install manifest, bring up the planes; true when all peers ready.
     bool cluster_bootstrap();
 
     void fill_local_entry(PeerEntry& e) const;
     int  register_chunk_size() const;
     void read_rht_env();
+    void read_peer_index_env();
     void resolve_shard_map(int ranks);
     void adopt_shard_map(const ShardMapMsg& sm);
     // First field where `sm` disagrees with this node's own settings, "" if none.
@@ -241,18 +216,18 @@ private:
     // leader of a new cluster deletes all of them, a node rejoining a formed
     // cluster those of its rank. Redis only.
     void drop_stale_routes(bool whole_cluster);
+    // Round 2 of the rendezvous, once the shard map is known: the RDMA side if a
+    // plane needs it, the RHT shard (holders), the RPC endpoint.
+    void setup_planes(PeerEntry& e);
+    void setup_rdma(PeerEntry& e);
     void setup_local_rht_shard(PeerEntry& e);
-    void setup_dct(PeerEntry& e);
     void setup_remote_op(PeerEntry& e);
-    void xrc_listener_loop();
-    void handle_client(int conn_fd);
 
     // ---- remote-op control plane (remote_op_service.cpp) ----
     std::unique_ptr<IRemoteOpServerTransport> rc_server_;
     uint64_t instance_id_ = 0;
     std::unique_ptr<RemoteOpService> rc_service_;   // built by rc_spawn on svc_*
 
-    RemoteOpAddr rc_build_endpoint();
     // Start serving once svc_* exist; rc_stop stops serving, then drops the service.
     void     rc_spawn();
     void     rc_stop();

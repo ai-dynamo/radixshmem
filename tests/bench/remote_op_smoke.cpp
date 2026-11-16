@@ -34,9 +34,6 @@ constexpr const char* kShmPrefix = "/ro_smoke";
 constexpr int kWorldSize = 2;
 constexpr int kPlen      = 32;
 
-std::string g_index_dev = "mlx5_bond_0";
-int         g_gid_idx  = 3;
-
 volatile sig_atomic_t g_term = 0;
 void on_term(int) { g_term = 1; }
 
@@ -87,8 +84,6 @@ int run_server(int rank, int master_port) {
     cfg.cluster_id  = "remote_op_smoke";
     cfg.node_name   = "node" + std::to_string(rank);
     (void)master_port;
-    cfg.index_dev    = g_index_dev;
-    cfg.gid_idx     = g_gid_idx;
     cfg.bootstrap_timeout_sec = 30;
     try {
         RadixServer srv(cfg);
@@ -215,13 +210,10 @@ int run_grpc() {
 
 int main(int argc, char** argv) {
     for (int i = 1; i < argc; i++) {
-        if (!std::strcmp(argv[i], "--index-dev") && i + 1 < argc) g_index_dev = argv[++i];
-        else if (!std::strcmp(argv[i], "--gid-idx") && i + 1 < argc) g_gid_idx = std::atoi(argv[++i]);
-        else if (!std::strcmp(argv[i], "grpc")) continue;
-        else {
-            fprintf(stderr, "usage: remote_op_smoke [--index-dev DEV] [--gid-idx G] [grpc]\n");
-            return 2;
-        }
+        if (!std::strcmp(argv[i], "grpc")) continue;
+        fprintf(stderr, "usage: remote_op_smoke [grpc]   (an RDMA RHT's device: "
+                        "RADIXSHMEM_INDEX_DEV / RADIXSHMEM_INDEX_GID_IDX)\n");
+        return 2;
     }
     return run_grpc();
 }

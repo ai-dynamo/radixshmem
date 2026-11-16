@@ -223,7 +223,6 @@ def server_config(cfg: Config, rank: int) -> radixshmem.ServerConfig:
         cluster = radixshmem.ClusterConfig(
             expected_min_nodes=cfg.nodes, registry=f"etcd://127.0.0.1:{cfg.etcd_port}",
             cluster_id=f"agentic_{cfg.run_id}", node_name=f"node{rank}", rpc_address="0.0.0.0",
-            index_dev=dev[0] if dev else "", gid_idx=cfg.gid_idx,
             bootstrap_timeout_sec=cfg.bootstrap_timeout)
     monitor = ({"monitor_port": cfg.monitor_port, "monitor_interval_s": cfg.monitor_interval}
                if cfg.monitor_port else {})
@@ -331,6 +330,10 @@ def recv_msg(sock: socket.socket):
 def create_node(cfg: Config, rank: int):
     """The engine's bootstrap: start the node's server, build the client with
     the geometry (handed to the server at once), wait for the cluster."""
+    devs = rdma_devices(cfg)
+    if devs:   # the node's own HCA for the index planes that run on RDMA
+        os.environ.setdefault("RADIXSHMEM_INDEX_DEV", devs[rank % len(devs)])
+    os.environ.setdefault("RADIXSHMEM_INDEX_GID_IDX", str(cfg.gid_idx))
     sc = server_config(cfg, rank)
     delay = cfg.writeback_delay_ms
 

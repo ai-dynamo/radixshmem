@@ -10,8 +10,17 @@
 #include <cstddef>
 #include <cstdint>
 #include <infiniband/verbs.h>
+#include <string>
 
 namespace radixshmem {
+
+// The index planes' RDMA device and GID index: RADIXSHMEM_INDEX_DEV ("" = unset)
+// and RADIXSHMEM_INDEX_GID_IDX (-1 = unset). Only planes that run on RDMA read them.
+struct IndexDevice {
+    std::string dev;
+    int gid_idx = -1;
+};
+IndexDevice index_device_env();
 
 class RdmaContext {
 public:
@@ -23,6 +32,7 @@ public:
     RdmaContext& operator=(const RdmaContext&) = delete;
 
     ibv_context* ctx() const { return ctx_; }
+    const char* name() const { return ibv_get_device_name(ctx_->device); }
     ibv_pd* pd() const { return pd_; }
     ibv_cq* cq() const { return cq_; }
     int port() const { return port_; }

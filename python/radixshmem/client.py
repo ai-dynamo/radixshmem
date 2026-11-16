@@ -319,7 +319,7 @@ class RadixClient:
         self._completer: Optional[threading.Thread] = None
         self._settlers: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._auto_dedup = os.environ.get("RADIXSHMEM_DISABLE_AUTO_DEDUP", "0") != "1"
-        self._dedup_move = os.environ.get("RADIXSHMEM_DEDUP_MOVE", "1") != "0"
+        self._dedup_move = os.environ.get("RADIXSHMEM_DISABLE_DEDUP_TAIL_BRANCH_MIGRATION", "0") != "1"
         self._dedup_caps = (int(os.environ.get("RADIXSHMEM_DEDUP_TAIL_BLOCKS", "256")),
                             int(os.environ.get("RADIXSHMEM_DEDUP_BRANCH_BLOCKS", "16")))
         self._dedup_cv = threading.Condition()

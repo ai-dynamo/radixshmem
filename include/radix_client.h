@@ -25,11 +25,9 @@ struct RemoteHit;
 class LocalTreeConnector;
 class RadixServer;
 #ifndef RADIXSHMEM_NO_RDMA
-class RdmaTransportClient;
-class RdmaContext;
 class PeerRegistry;
-class PeerConnector;
-class RhtBackend;    // include/rht_backend.h
+class PeerIndexBackend;   // include/peer_index.h
+class RhtBackend;         // include/rht_backend.h
 struct PeerEntry;
 struct PeerFaultCounters;
 struct ShardMapMsg;
@@ -62,14 +60,12 @@ public:
                                  const int32_t* full_slots, const std::vector<ComponentRun>& runs,
                                  bool auto_recycle = true);
 
-    QueryReply query(const uint64_t* hashes, int n, bool lock = false,
-                     bool update_meta = true);
+    QueryReply query(const uint64_t* hashes, int n, const RemoteQuery& q);
 
     // Both return the target's comms status: OK on success, BAD_REQUEST/TIMEOUT/... on failure.
     RemoteStatus recycle(const int32_t* slots, int num_slots,
                          ComponentType component = ComponentType::FULL);
-    RemoteStatus unlock(const uint64_t* hashes, int n, int start, int length,
-                        int pin_end, const std::vector<uint64_t>& pin_tail);
+    RemoteStatus unlock(const uint64_t* hashes, int n, const PinRecord& pin);
     DedupReply dedup_prefix(const uint64_t* hashes, int n, const DedupRequest& req = {});
 
     const std::string& endpoint() const { return endpoint_; }
@@ -97,8 +93,6 @@ struct RadixClientConfig {
     std::string registry   = "etcd://127.0.0.1:2379";
     std::string cluster_id = "default";
     std::string node_name  = "";     // identity whose shm to attach (/shm/<node_name>)
-    std::string index_dev;            // empty = first available
-    int         gid_idx    = 3;
     int         bootstrap_timeout_sec = 60;
     bool        rht_only   = false;  // build only RHT-plane QPs (eviction client)
     bool        no_local_tree = false;  // observer: no local server, rank -1, remote-only
@@ -261,19 +255,18 @@ private:
     void require_writable(const char* op) const;
 
     // Pin release, reachable only through a query(lock=true) finalize:
-    // one PinRecord on the local tree / on peer `remote_node`.
+    // one PinRecord on the local tree / on peer pin.source_rank.
     void dec_ref(const uint64_t* hashes, int n, PinRecord pin);
-    void dec_ref_remote(int remote_node, const uint64_t* hashes, int n,
-                        PinRecord pin);
+    void dec_ref_remote(const uint64_t* hashes, int n, PinRecord pin);
 
 #ifndef RADIXSHMEM_NO_RDMA
     // ---- Cluster bring-up + teardown ----
     RadixClientConfig cfg_;            // set on the distributed ctors
     bool distributed_ = false;         // cluster machinery live
 
-    // Run the etcd rendezvous + RDMA/RHT bring-up. Throws on failure.
+    // Run the etcd rendezvous + peer index / RHT bring-up. Throws on failure.
     void bootstrap_cluster();
-    // Ordered teardown of the RDMA/RHT plane (watcher → peers → RHT → transport).
+    // Ordered teardown of the cluster planes (watcher → sessions → peer index → RHT).
     void teardown_cluster();
     bool wait_for_ready();
     ShardMapMsg read_topology();
@@ -292,8 +285,8 @@ private:
     void drop_peer_session(int rank);
     RemoteStatus missing_peer_status(int rank) const;
 
-    // RHT probe from the deepest position not past the incumbent, with the
-    // chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
+    // Step one, RHT probe from the deepest position not past the incumbent, with
+    // the chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
     int find_component_source(const uint64_t* hashes, int n, int incumbent,
                               std::vector<RemoteHit>& hits_out);
     // Authoritative local query/pin + RHT republish, then at most one remote
@@ -302,8 +295,8 @@ private:
                                                uint32_t component_mask,
                                                bool lock, bool update_meta,
                                                std::vector<PinRecord>& pins);
-    // Legacy shape: takes the local public result, returns it (folded) after
-    // at most one remote continuation.
+    // Takes the local public result, returns it after at most one remote
+    // continuation (step two, peer_index_), folded when it extends the hit.
     ComponentQueryResult query_components_remote_from(
         ComponentQueryResult result, const uint64_t* hashes, int n,
         uint32_t component_mask, bool lock, std::vector<PinRecord>& pins);
@@ -312,24 +305,21 @@ private:
     std::unique_ptr<Impl> etcd_;
 
     std::unique_ptr<PeerRegistry> peer_reg_;
-    int      rdma_sl_ = 5;
-    int      rdma_tc_ = 160;
     int      cluster_cs_ = 0;
 
-    std::unique_ptr<RdmaTransportClient> tx_;
-    std::unique_ptr<PeerConnector> peer_conn_;
+    // Step two of a query; none on an rht_only client.
+    std::unique_ptr<PeerIndexBackend> peer_index_;
 
     // Per-rank remote-op sessions, opened lazily by peer_for(), reused across
-    // allocate→insert / query→unlock. Cleared before peer_conn_ in teardown.
+    // allocate→insert / query→unlock.
     std::unordered_map<int, std::shared_ptr<RemotePeer>> peer_cache_;
     std::mutex peer_cache_mu_;
+    std::shared_ptr<PeerBreaker> rc_breaker_;
     bool debug_route_ = ::getenv("RADIXSHMEM_DEBUG_ROUTE") != nullptr;
     bool lazy_connect_ = ::getenv("RADIXSHMEM_LAZY_CONNECT") &&
                          ::getenv("RADIXSHMEM_LAZY_CONNECT")[0] == '1';
     void preconnect_peers();
 
-    uint32_t peer_index_transport_ = 0;  // ClusterTransport, remote walks
-    uint64_t dc_access_key_ = 0;
     int64_t  peers_snapshot_rev_ = 0;
 
     std::unique_ptr<RhtBackend> rht_;

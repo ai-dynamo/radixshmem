@@ -437,14 +437,6 @@ struct DedupReply {
     std::vector<int32_t> unused[NUM_COMPONENT_TYPES];
 };
 
-struct QueryReply {
-    RemoteStatus status = RemoteStatus::OK;
-    int hit_length       = 0;   // B local-tree total matched blocks
-    std::vector<int32_t> slots; // target-local physical slot ids (len == hit_length)
-    int pin_end = 0;
-    std::vector<uint64_t> pin_tail;
-};
-
 struct InsertResult {
     InsertError error = InsertError::OK;
     // remote_insert only: the comms status behind error == REMOTE_FAILED.

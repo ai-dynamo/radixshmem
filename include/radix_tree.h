@@ -145,9 +145,10 @@ public:
 
     // Component-aware peer of query(): mask selects enabled components, lock
     // pins whole-node ranges, and update_meta controls Full LRU metadata.
+    // A `window` limits the pin to the part another rank folds in.
     [[nodiscard]] TreeComponentQueryResult query_components(
         const uint64_t* hashes, int n, uint32_t mask, bool lock = false,
-        bool update_meta = true);
+        bool update_meta = true, const PinWindow* window = nullptr);
 
     // Positional SWA publish: the slots cover the trailing positions
     // [n - num_slots, n), 1 <= num_slots <= n. The window W only gates queries.
@@ -359,11 +360,11 @@ private:
     // Counter primitive: bounded decrement (floors at 0); true if decremented.
     static bool dec_ref(std::atomic<int64_t>& ref) noexcept;
 
-    // Caller holds the read lock. Whole-node coverage: Full over [0, full_hit),
+    // Caller holds the read lock. Whole-node coverage: Full over [full_lo, full_hi),
     // SWA/Mamba at common_hit; `pin` is filled before the first increment.
     void inc_ref(const std::vector<MatchedNodeSpanView>& spans,
                  uint32_t mask, uint32_t common_hit, uint32_t swa_start,
-                 uint32_t full_hit, PinRecord& pin);
+                 uint32_t full_lo, uint32_t full_hi, PinRecord& pin);
 
     // Leaf-list move for a Full hit (node timestamps come from query_internal).
     void touch_full(const std::vector<MatchedNodeSpanView>& spans, uint32_t mask,

@@ -11,7 +11,7 @@ the printed /sd URL. Ctrl-C stops everything.
 
     python radix-monitor/demo.py --nodes 4 --monitor-port 9810
 
-Needs etcd on PATH and an RDMA device for the index plane (--index-dev).
+Needs etcd on PATH; an index plane on RDMA uses the device of --index-dev.
 Writers are re-exec'd, never fork()'d (the etcd Go runtime does not survive a fork).
 """
 
@@ -127,7 +127,8 @@ def main() -> int:
 
     work = tempfile.mkdtemp(prefix="radix-monitor-demo-")
     procs = []
-    env = dict(os.environ, PYTHONUNBUFFERED="1")
+    env = dict(os.environ, PYTHONUNBUFFERED="1", RADIXSHMEM_INDEX_DEV=a.index_dev,
+               RADIXSHMEM_INDEX_GID_IDX=str(a.gid_idx))
 
     def launch(cmd, log):
         procs.append(subprocess.Popen(cmd, stdout=open(os.path.join(work, log), "ab"),
@@ -148,8 +149,7 @@ def main() -> int:
             launch([sys.executable, "-m", "radixshmem.cli", "--name", NAME, "--node-name", f"node{i}",
                     "--registry", f"etcd://127.0.0.1:{cport}", "--cluster-id", "rmdemo",
                     "--expected-min-nodes", str(a.nodes), "--rpc-address", "0.0.0.0",
-                    "--endpoint", ep(i), "--index-dev", a.index_dev, "--gid-idx", str(a.gid_idx),
-                    "--interval", "0", "--transfer-log", "", "--monitor-port", str(a.monitor_port),
+                    "--endpoint", ep(i), "--interval", "0", "--transfer-log", "", "--monitor-port", str(a.monitor_port),
                     "--monitor-interval", str(a.monitor_interval)]
                    + (["--decode"] if i == a.nodes - 1 else []), f"server{i}.log")
         for i in range(a.nodes):

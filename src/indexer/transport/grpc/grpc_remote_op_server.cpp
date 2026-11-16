@@ -8,6 +8,7 @@
 
 #include "remote_op_service.hpp"
 #include "remote_ops.grpc.pb.h"
+#include "remote_ops_codec.hpp"
 
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/resource_quota.h>
@@ -20,6 +21,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace radixshmem {
 
@@ -56,22 +58,47 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     int port = 0;
     std::string instance;
 
+    XrcAcceptor       xrc;
     RemoteOpService*  svc = nullptr;
     std::atomic<bool> ready{false};
     std::once_flag    stopped;
+
+    bool for_us(grpc::ServerContext* ctx) const {
+        const auto& md = ctx->client_metadata();
+        auto it = md.find(kGrpcRemoteOpInstanceKey);
+        return it != md.end() && it->second == grpc::string_ref(instance);
+    }
 
     template <typename Op>
     grpc::Status run(grpc::ServerContext* ctx, Op&& op) {
         if (!ready.load())
             return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                                 "remote-op: server not serving");
-        const auto& md = ctx->client_metadata();
-        auto it = md.find(kGrpcRemoteOpInstanceKey);
-        if (it == md.end() || it->second != grpc::string_ref(instance))
+        if (!for_us(ctx))
             return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
                                 "remote-op: request for another server instance");
         try {
             return op();
+        } catch (const std::exception& e) {
+            return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
+        }
+    }
+
+    // Not gated on start(): peers connect while this server's own bootstrap goes on.
+    grpc::Status XrcConnect(grpc::ServerContext* ctx, const pb::XrcConnectRequest* req,
+                            pb::XrcConnectResponse* rep) override {
+        if (!xrc)
+            return grpc::Status(grpc::StatusCode::UNIMPLEMENTED,
+                                "remote-op: no RDMA side on this server");
+        if (!for_us(ctx))
+            return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                                "remote-op: request for another server instance");
+        XrcConnInfo caller;
+        if (!xrc_from_pb(req->caller(), caller))
+            return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "remote-op: bad GID");
+        try {
+            xrc_to_pb(xrc(caller), rep->mutable_target());
+            return grpc::Status::OK;
         } catch (const std::exception& e) {
             return grpc::Status(grpc::StatusCode::INTERNAL, e.what());
         }
@@ -110,14 +137,28 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     grpc::Status Query(grpc::ServerContext* ctx, const pb::QueryRequest* req,
                        pb::QueryResponse* rep) override {
         return run(ctx, [&] {
-            QueryReply r = svc->query(req->hashes().data(), req->hashes_size(),
-                                      req->lock(), req->update_meta(),
+            RemoteQuery q;
+            q.mask = req->mask();
+            q.lock = req->lock();
+            q.update_meta = req->update_meta();
+            q.window = {req->incumbent(), req->full_from()};
+            QueryReply r = svc->query(req->hashes().data(), req->hashes_size(), q,
                                       ctx->deadline());
             if (r.status != RemoteStatus::OK) return to_grpc_status(r.status);
+            if (!r.pin.empty() && ctx->IsCancelled()) {
+                // The caller gave up and never learns of the pin: drop it here.
+                (void)svc->unlock(req->hashes().data(), req->hashes_size(),
+                                  std::move(r.pin));
+                return grpc::Status(grpc::StatusCode::CANCELLED,
+                                    "remote-op: caller gone, pin released");
+            }
             rep->set_hit_length(r.hit_length);
             rep->mutable_slots()->Add(r.slots.begin(), r.slots.end());
-            rep->set_pin_end(r.pin_end);
-            rep->mutable_pin_tail()->Add(r.pin_tail.begin(), r.pin_tail.end());
+            rep->set_swa_start(r.swa_start);
+            rep->mutable_swa_slots()->Add(r.swa_slots.begin(), r.swa_slots.end());
+            if (r.mamba_slot != INVALID_COMPONENT_SLOT)
+                rep->mutable_mamba()->set_slot(r.mamba_slot);
+            if (!r.pin.empty()) pin_to_pb(r.pin, rep->mutable_pin());
             return grpc::Status::OK;
         });
     }
@@ -177,11 +218,8 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     grpc::Status Unlock(grpc::ServerContext* ctx, const pb::UnlockRequest* req,
                         pb::UnlockResponse*) override {
         return run(ctx, [&] {
-            RemoteStatus st = svc->unlock(req->hashes().data(),
-                                          req->hashes_size(), req->start(),
-                                          req->length(), req->pin_end(),
-                                          req->pin_tail().data(),
-                                          req->pin_tail_size());
+            RemoteStatus st = svc->unlock(req->hashes().data(), req->hashes_size(),
+                                          pin_from_pb(req->pin()));
             return st == RemoteStatus::OK ? grpc::Status::OK
                                           : to_grpc_status(st);
         });
@@ -223,9 +261,11 @@ struct GrpcRemoteOpServer::Impl final : pb::RemoteOps::Service {
     }
 };
 
-GrpcRemoteOpServer::GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id)
+GrpcRemoteOpServer::GrpcRemoteOpServer(uint16_t listen_port, uint64_t instance_id,
+                                       XrcAcceptor xrc)
     : impl_(std::make_unique<Impl>()) {
     impl_->instance = std::to_string(instance_id);
+    impl_->xrc = std::move(xrc);
 
     grpc::ServerBuilder builder;
     builder.AddListeningPort("0.0.0.0:" + std::to_string(listen_port),

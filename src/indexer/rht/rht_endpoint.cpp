@@ -97,7 +97,7 @@ void RhtHolder::reset() { impl_->shard.reset(); }
 static constexpr size_t RDMA_RHT_SCRATCH_BYTES = 64 * 1024;
 
 struct RdmaRht::Impl {
-    RdmaTransportClient& tx;
+    std::unique_ptr<RdmaTransportClient> tx;   // first: outlives the endpoints below
     PeerRegistry&        peers;
     uint32_t             transport = CLUSTER_TRANSPORT_XRC;
     uint64_t             dc_access_key = 0;
@@ -124,7 +124,7 @@ struct RdmaRht::Impl {
     std::atomic<bool>                 has_changes{false};
     std::mutex                        op_mu;
 
-    Impl(RdmaTransportClient& t, PeerRegistry& p) : tx(t), peers(p) {}
+    explicit Impl(PeerRegistry& p) : peers(p) {}
 
     bool holds_shard(int rank) const {
         return rank != my_rank &&
@@ -142,9 +142,9 @@ struct RdmaRht::Impl {
     }
 };
 
-RdmaRht::RdmaRht(const ShardMapMsg& sm, RdmaTransportClient& tx, PeerRegistry& peers_reg,
-                 PeerFaultCounters* faults, int bootstrap_timeout_sec)
-    : impl_(std::make_unique<Impl>(tx, peers_reg)) {
+RdmaRht::RdmaRht(const ShardMapMsg& sm, PeerRegistry& peers_reg, PeerFaultCounters* faults,
+                 int bootstrap_timeout_sec)
+    : impl_(std::make_unique<Impl>(peers_reg)) {
     const int num_shards = (int)sm.num_shards;
     if (num_shards <= 0 || num_shards > (int)CLUSTER_MAX_SHARDS)
         throw std::runtime_error("RdmaRht: num_shards == " + std::to_string(num_shards));
@@ -158,6 +158,13 @@ RdmaRht::RdmaRht(const ShardMapMsg& sm, RdmaTransportClient& tx, PeerRegistry& p
         std::shared_lock<std::shared_mutex> lk(peers_reg.mutex());
         peers = peers_reg.peers_locked();
     }
+    // QoS (rank 0's SL/TC) is adopted inside the transport before any QP connect.
+    const int me = impl_->my_rank;
+    const bool has_self = me >= 0 && me < (int)peers.size() && peers[me].rank == me;
+    impl_->tx = std::make_unique<RdmaTransportClient>(has_self ? &peers[me] : nullptr,
+                                                      sm.rdma_sl, sm.rdma_tc,
+                                                      peers_reg.world_size(), 0);
+    RdmaTransportClient& tx = *impl_->tx;
 
     impl_->scratch = std::aligned_alloc(4096, RDMA_RHT_SCRATCH_BYTES);
     if (!impl_->scratch)
@@ -250,8 +257,7 @@ RdmaRht::RdmaRht(const ShardMapMsg& sm, RdmaTransportClient& tx, PeerRegistry& p
     impl_->attached = true;
 }
 
-// peers.mutex() guards the peer table and tx's DCI and AH cache, which the
-// peer plane shares.
+// peers.mutex() guards the peer table and tx's DCI and AH cache.
 IRdmaEndpoint* RdmaRht::Impl::connect(int holder) {
     auto it = holder_eps.find(holder);
     if (it != holder_eps.end()) return it->second.get();
@@ -260,10 +266,10 @@ IRdmaEndpoint* RdmaRht::Impl::connect(int holder) {
     const PeerEntry& h = peers.peers_locked()[holder];
     std::unique_ptr<IRdmaEndpoint> ep;
     if (transport == CLUSTER_TRANSPORT_DC) {
-        DcInitiator* dci = tx.shared_dci();
+        DcInitiator* dci = tx->shared_dci();
         ibv_gid dgid;
         memcpy(&dgid, h.gid_raw, 16);
-        ibv_ah* ah = tx.ah_for(holder, dgid, h.lid, h.link_layer, peers.world_size());
+        ibv_ah* ah = tx->ah_for(holder, dgid, h.lid, h.link_layer, peers.world_size());
         if (!ah) {
             fprintf(stderr, "[RadixClient rank %d] RHT-plane AH to holder rank %d failed\n",
                     my_rank, holder);
@@ -272,8 +278,7 @@ IRdmaEndpoint* RdmaRht::Impl::connect(int holder) {
         ep = std::make_unique<DcReader>(dci, DcTargetInfo{ah, h.dct_num, dc_access_key});
     } else {
         // One try; a holder that does not answer is probed again by the breaker.
-        ep = xrc_connect(tx.ctx(), tx.cq(), h.host, h.xrc_listen_port, my_rank,
-                         attached ? 2 : 10);
+        ep = xrc_connect(tx->ctx(), tx->cq(), h, my_rank, attached ? 2 : 10);
         if (!ep) return nullptr;
     }
     IRdmaEndpoint* raw = ep.get();
