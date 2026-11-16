@@ -318,7 +318,7 @@ XferState SlotTransfer::wait(BatchHandle h, int timeout_ms) {
 int SlotTransfer::release(BatchHandle h) {
     // A refused release keeps the hold.
     const int rc = backend_.release(h);
-    if (rc == XFER_EBUSY) return rc;
+    if (rc != XFER_OK) return rc;
 
     std::lock_guard<std::mutex> lk(mu_);
     auto it = batch_peer_.find(h);

@@ -84,8 +84,8 @@ public:
     int       release(BatchHandle) override { return release_rc_; }
     const char* backend_name() const override { return "stub"; }
 
-    // Stand in for a batch mooncake refuses to free: still running.
-    void refuse_release(bool on) { release_rc_ = on ? XFER_EBUSY : XFER_OK; }
+    // Stand in for a backend refusing release, including non-busy errors.
+    void release_result(int rc) { release_rc_ = rc; }
 
     void*    reg_addr() const { return reg_addr_; }
     uint64_t reg_len()  const { return reg_len_; }
@@ -381,11 +381,17 @@ static void test_detach_while_inflight() {
     assert(x.peer_geometry("peerK", g));
 
     // A release the backend refuses frees nothing and keeps the peer held.
-    be.refuse_release(true);
-    assert(x.release(h1) == XFER_EBUSY);
-    assert(x.detach_peer("peerK") == XFER_EBUSY);
-    assert(be.closes() == 0);
-    be.refuse_release(false);
+    for (int rc : {XFER_EBUSY, XFER_EBACKEND, XFER_ENOENT,
+                   XFER_EINVAL, XFER_EGEOMETRY}) {
+        be.release_result(rc);
+        for (int retry = 0; retry < 2; ++retry) {
+            assert(x.release(h1) == rc);
+            assert(x.detach_peer("peerK") == XFER_EBUSY);
+            assert(be.closes() == 0);
+            assert(x.peer_geometry("peerK", g));
+        }
+    }
+    be.release_result(XFER_OK);
 
     // Two batches: releasing one is not enough.
     const BatchHandle h2 = x.write("peerK", ls, rs, 2);

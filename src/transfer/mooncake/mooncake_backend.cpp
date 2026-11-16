@@ -485,9 +485,12 @@ int MooncakeBackend::release(BatchHandle h) {
         if (st.IsBatchBusy()) return XFER_EBUSY;
         fprintf(stderr, "[radixshmem] MooncakeBackend: freeBatchID failed: %.*s\n",
                 (int)st.message().size(), st.message().data());
+        // Keep the engine ID reachable for retry. A failed free is not an
+        // acknowledgement that the descriptor or its memory is no longer used.
+        return XFER_EBACKEND;
     }
     batches_.erase(it);
-    return st.ok() ? XFER_OK : XFER_EBACKEND;
+    return XFER_OK;
 }
 
 } // namespace

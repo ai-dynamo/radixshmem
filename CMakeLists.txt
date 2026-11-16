@@ -566,6 +566,23 @@ foreach(_t ${_dataplane_tests})
     add_test(NAME ${_t} COMMAND ${_t})
 endforeach()
 
+# Compile the real Mooncake backend against a fault-injecting engine surface.
+# Keep this target independent of radixshmem_data and the installed Mooncake
+# library so error-path coverage also runs in the default no-engine CI build.
+add_executable(test_mooncake_release
+    tests/dataplane/test_mooncake_release.cpp
+    src/transfer/mooncake/mooncake_backend.cpp
+    src/transfer/range_merge.cpp)
+target_include_directories(test_mooncake_release PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/dataplane/mooncake_stub
+    ${CMAKE_SOURCE_DIR}/tests/dataplane
+    ${CMAKE_SOURCE_DIR}/src/transfer/mooncake
+    ${CMAKE_SOURCE_DIR}/include)
+set_property(TARGET test_mooncake_release PROPERTY CXX_STANDARD 20)
+target_link_libraries(test_mooncake_release PRIVATE pthread)
+radixshmem_enable_asserts(test_mooncake_release)
+add_test(NAME test_mooncake_release COMMAND test_mooncake_release)
+
 # Data-plane benchmark (NOT in ctest). Links radixshmem_data only, like the tests.
 add_executable(bench_slot_transfer tests/bench/bench_slot_transfer.cpp)
 target_link_libraries(bench_slot_transfer PRIVATE radixshmem_data)

@@ -77,6 +77,11 @@ public:
 
     virtual XferState wait(BatchHandle h, int timeout_ms) = 0;
 
+    // XFER_OK acknowledges that the batch is retired and can no longer access
+    // its buffers. A refused release of a live batch must keep its handle
+    // available for retry, including on XFER_EBACKEND, not just XFER_EBUSY.
+    // Callers retain buffers, registrations and peer holds until success;
+    // an error is not evidence that the underlying transfer has stopped.
     virtual int  release(BatchHandle h) = 0;
 
     virtual const char* backend_name() const = 0;
