@@ -751,6 +751,8 @@ if(BUILD_PYTHON_MODULES)
             endif()
         endforeach()
         add_test(NAME py_test_cluster COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
+        # No RADIXSHMEM_INDEX_DEV: the servers discover the index device from the control address.
+        add_test(NAME py_test_cluster_auto_index COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py --auto-index)
         add_test(NAME py_test_p2p_pull COMMAND ${Python3_EXECUTABLE} tests/test_p2p_pull.py)
         add_test(NAME py_test_dedup_move COMMAND ${Python3_EXECUTABLE} tests/test_dedup_move.py)
         add_test(NAME py_test_writeback_pull COMMAND ${Python3_EXECUTABLE} tests/test_writeback_pull.py)
@@ -771,7 +773,7 @@ if(BUILD_PYTHON_MODULES)
                          --flush-after-insert)
         foreach(_t py_test_geometry py_test_server_rpc py_test_radixshmem py_test_geometry_registry
                    py_test_writeback py_test_monitor py_test_transfer_jobs py_test_slot_transfer
-                   py_test_cluster py_test_p2p_pull
+                   py_test_cluster py_test_cluster_auto_index py_test_p2p_pull
                    py_test_dedup_move
                    py_test_writeback_pull
                    py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)

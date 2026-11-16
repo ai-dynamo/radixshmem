@@ -459,7 +459,7 @@ static NetSelection select_index(const std::vector<NetDevice>& devices, const Ne
 NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectionInput& in, NetProbe* probe) {
     NetSelection sel = in.need_rdma ? select_index(devices, in, probe) : NetSelection{};
 
-    // Control IPv4: interface > address > index GID > registry route; only clients may leave it empty.
+    // Control IPv4: interface > address > registry route; only clients may leave it empty.
     if (!in.rpc_interface.empty()) {
         std::vector<std::string> v4;
         if (probe)
@@ -487,9 +487,6 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
     } else if (!in.rpc_address.empty()) {
         sel.control_ip = in.rpc_address;
         sel.control_source = "rpc_address";
-    } else if (!sel.index.address.empty()) {
-        sel.control_ip = sel.index.address;
-        sel.control_source = "index gid";
     } else {
         std::string src;
         if (probe && !in.registry_host.empty() && probe->route_to(in.registry_host, src) && !is_loopback(src)) {

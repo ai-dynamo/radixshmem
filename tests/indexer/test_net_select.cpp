@@ -124,7 +124,7 @@ void test_explicit() {
     auto s = select_net(devs, in, &p);
     assert(s.index.device == "mlx5_1" && s.index.gid_index == 3 && s.index.address == "172.18.32.23");
     assert(s.index.reason == "explicit device and gid");
-    assert(s.control_ip == "172.18.32.23" && s.control_source == "index gid");
+    assert(s.control_ip.empty() && has(s.notes.at(0), "set rpc_address"));   // the index GID is not a control address
 
     in.gid_idx = 7;   // not in the table
     assert(has(throws_with(devs, in, &p), "gid 7 is not set"));
@@ -195,7 +195,7 @@ void test_single_and_ambiguous() {
     std::vector<NetDevice> one = {eth("mlx5_bond_0", "10.6.131.12", "bond0")};
     auto s = select_net(one, in, &p);
     assert(s.index.device == "mlx5_bond_0" && s.index.gid_index == 3 && s.index.reason == "only candidate");
-    assert(s.control_ip == "10.6.131.12" && s.index.netdev == "bond0");
+    assert(s.index.address == "10.6.131.12" && s.index.netdev == "bond0" && s.control_ip.empty());
     assert(p.route_calls == 0);   // no hint needed
 
     // Two rails in different /27 nets: nothing guesses a common /24, both stay candidates.
@@ -242,10 +242,10 @@ void test_single_and_ambiguous() {
     p.route_ok = false;
     in = NetSelectionInput{};
 
-    // Interface not visible (container): the GID still qualifies and the control address comes from it.
+    // Interface not visible (container): the GID still qualifies.
     std::vector<NetDevice> hidden = {eth("mlx5_0", "172.18.0.23", "")};
     s = select_net(hidden, in, &p);
-    assert(s.index.netdev.empty() && s.control_ip == "172.18.0.23" && s.control_source == "index gid");
+    assert(s.index.netdev.empty() && s.index.address == "172.18.0.23" && s.control_ip.empty());
     printf("ok single/ambiguous\n");
 }
 
@@ -331,7 +331,7 @@ void test_gid_tiers() {
     NetDevice v1only = eth("mlx5_0", "172.18.0.23", "ens0");
     v1only.gids.pop_back();   // idx 3 (v2 IPv4) gone, idx 2 (v1 IPv4) stays
     auto s = select_net({v1only}, in, &p);
-    assert(s.index.gid_index == 2 && s.control_ip == "172.18.0.23");
+    assert(s.index.gid_index == 2 && s.index.address == "172.18.0.23");
 
     // RoCE v2 with a global IPv6: chosen; no IPv4 to publish, so the control address needs rpc_address.
     NetDevice v6 = eth("mlx5_1", "172.18.32.23", "ens1");
@@ -485,7 +485,7 @@ void test_sysfs() {
     in = NetSelectionInput{};
     in.index_dev = "mlx5_3";
     s = select_net(devs, in, &p);
-    assert(s.index.port == 2 && s.index.gid_index == 0 && s.control_ip == "10.9.1.5" && s.index.reason == "explicit device, only gid");
+    assert(s.index.port == 2 && s.index.gid_index == 0 && s.index.address == "10.9.1.5" && s.index.reason == "explicit device, only gid");
     in.index_port = 1;
     assert(has(throws_with(devs, in, &p), "mlx5_3 port 1: not ACTIVE"));
     in.index_port = 3;

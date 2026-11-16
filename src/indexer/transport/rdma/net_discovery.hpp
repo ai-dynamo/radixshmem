@@ -91,7 +91,7 @@ struct IndexPick {
 struct NetSelection {
     IndexPick   index;
     std::string control_ip;       // address published to peers; "" = none found (the server refuses)
-    std::string control_source;   // "rpc_interface" | "rpc_address" | "index gid" | "registry route"
+    std::string control_source;   // "rpc_interface" | "rpc_address" | "registry route"
     std::vector<std::string> notes;   // non-fatal diagnostics
     std::string summary() const;  // one line for the bootstrap log
 };
