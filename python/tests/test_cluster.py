@@ -15,6 +15,7 @@ Clients are re-exec'd, never fork()'d: the etcd Go wrapper starts its runtime
 at library load and a bare-forked child deadlocks on the first cgo call.
 
 Exit code 0 = pass.
+Redis + gRPC needs no RDMA device; RDMA index backends require the selected index device (exit 77 when missing).
 """
 
 import argparse
@@ -371,12 +372,33 @@ def check(cond, msg):
     print(f"  ok  {msg}")
 
 
+def prerequisite_error(index_dev, transfer_devices=None):
+    import radixshmem
+
+    if not shutil.which("etcd") or not hasattr(radixshmem._core, "EtcdKv"):
+        return "needs etcd and radixshmem built with etcd"
+    index_rdma = (os.environ.get("RADIXSHMEM_RHT_BACKEND", "redis") == "rdma" or
+                  os.environ.get("RADIXSHMEM_PEER_INDEX_BACKEND", "grpc").lower() == "rdma")
+    if not index_rdma and transfer_devices is None:
+        return ""
+    devices = {os.path.basename(path) for path in glob.glob("/sys/class/infiniband/*")}
+    if index_rdma and (index_dev not in devices if index_dev else not devices):
+        return f"needs RDMA index device {index_dev!r}" if index_dev else "needs an RDMA index device"
+    if transfer_devices is not None:
+        if "mooncake" not in getattr(getattr(radixshmem, "_data", None), "TRANSFER_BACKENDS", ()):
+            return "needs radixshmem built with Mooncake"
+        allowed = {device.strip() for value in transfer_devices for device in value.split(",") if device.strip()}
+        if not (devices & allowed if allowed else devices):
+            return f"needs an RDMA transfer device from {sorted(allowed) or 'all local devices'}"
+    return ""
+
+
 def orchestrate(args) -> int:
     import radixshmem
 
-    if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{args.index_dev}")
-            or not hasattr(radixshmem._core, "EtcdKv")):
-        print(f"SKIP: needs etcd, RDMA device {args.index_dev!r} and radixshmem built with etcd")
+    missing = prerequisite_error(args.index_dev)
+    if missing:
+        print(f"SKIP: {missing}")
         return 77
     workdir = tempfile.mkdtemp(prefix="radixshmem-cluster-")
     cluster_id = f"pytest{os.getpid()}"

@@ -21,7 +21,7 @@ each with a FULL path and an SWA window and a Mamba checkpoint at block MID and 
 
     python3 test_push.py [--index-dev mlx5_bond_0] [--transfer-dev mlx5_bond_0] [--gid-idx 3]
 
-Needs etcd, an RDMA device and the Mooncake backend; exits 77 when missing.
+Needs etcd and Mooncake with an RDMA transfer device; an RDMA index device is required only by RDMA index backends (exit 77 when missing).
 Clients are re-exec'd, never forked (etcd's Go runtime and ibverbs do not
 survive fork()).
 """
@@ -321,10 +321,9 @@ def test_writeback(eps, full_slots):
 def orchestrate(a) -> int:
     import radixshmem
 
-    if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{a.index_dev}")
-            or not hasattr(radixshmem, "_data") or "mooncake" not in radixshmem._data.TRANSFER_BACKENDS
-            or not hasattr(radixshmem._core, "EtcdKv")):
-        print(f"SKIP: needs etcd, RDMA device {a.index_dev!r} and radixshmem built with etcd + Mooncake")
+    missing = p2p.prerequisite_error(a.index_dev, a.transfer_dev)
+    if missing:
+        print(f"SKIP: {missing}")
         return 77
     workdir = tempfile.mkdtemp(prefix="radixshmem-push-")
     etcd_proc, servers, logs = None, [], []

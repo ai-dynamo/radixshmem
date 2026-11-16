@@ -9,7 +9,7 @@ long branch; node1 serves all of it with the writer's bytes.
 
     python3 test_dedup_move.py [--index-dev mlx5_bond_0] [--transfer-dev mlx5_bond_0] [--gid-idx 3]
 
-Needs etcd, an RDMA device and the Mooncake backend; exits 77 when missing.
+Needs etcd and Mooncake with an RDMA transfer device; an RDMA index device is required only by RDMA index backends (exit 77 when missing).
 """
 
 import argparse
@@ -128,10 +128,9 @@ def run_clients(roles_endpoints, timeout=240):
 def orchestrate(a) -> int:
     import radixshmem
 
-    if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{a.index_dev}")
-            or not hasattr(radixshmem, "_data") or "mooncake" not in radixshmem._data.TRANSFER_BACKENDS
-            or not hasattr(radixshmem._core, "EtcdKv")):
-        print(f"SKIP: needs etcd, RDMA device {a.index_dev!r} and radixshmem built with etcd + Mooncake")
+    missing = p2p.prerequisite_error(a.index_dev, a.transfer_dev)
+    if missing:
+        print(f"SKIP: {missing}")
         return 77
     workdir = tempfile.mkdtemp(prefix="radixshmem-dmove-")
     cluster_id = f"dmove{os.getpid()}"
