@@ -342,10 +342,12 @@ static void test_device_filter() {
 
     assert(run_loopback("rdma", "dev1", {devs[0]}));
 
-    // An entry the host does not have is an error: the list is explicit, and a
-    // misspelled name must not hand the data plane to the other entry.
+    // Missing allowlist entries do not prevent transfers through the remaining device.
+    assert(run_loopback("rdma", "dev_partial", {devs[0], "mlx5_no_such_device"}));
+
+    // No usable allowed device must fail rather than fall back to TCP.
     assert(child_succeeds([&] {
-        assert(!create_transfer_backend(mc_cfg(true, "rdma", 0, {devs[0], "mlx5_no_such_device"})));
+        assert(!create_transfer_backend(mc_cfg(true, "rdma", 0, {"mlx5_no_such_device"})));
     }));
 
     TEST_PASS();

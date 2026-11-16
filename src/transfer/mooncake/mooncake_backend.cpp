@@ -136,7 +136,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
     publish_ = cfg.publish;
 
     const bool auto_discover = cfg.protocol.empty() || cfg.protocol == "rdma";
-    std::vector<std::string> wanted = cfg.device_filter;   // what the engine must end up with
+    std::vector<std::string> wanted = cfg.device_filter;   // effective device allowlist
     // MC_TE_FILTERS intersects the allowlist: say what it drops, refuse only an empty result.
     if (auto_discover && !cfg.device_filter.empty()) {
         if (const char* env = ::getenv("MC_TE_FILTERS"); env && *env) {
@@ -191,7 +191,7 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
         }
     }
 
-    // Every explicitly named device must be in the engine's HCA list; reject an empty RDMA set to prevent TCP fallback.
+    // Allow partial device availability, but reject an empty RDMA set to prevent TCP fallback.
     if (auto_discover) {
         std::vector<std::string> hcas;
         if (auto topo = engine_->getLocalTopology()) hcas = topo->getHcaList();
@@ -205,11 +205,9 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
         for (const auto& d : wanted)
             if (std::find(hcas.begin(), hcas.end(), d) == hcas.end()) absent.push_back(d);
         if (!absent.empty()) {
-            fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices %s are not in the engine's HCA list (%s): "
-                            "misspelled, or the device has no usable port\n",
+            fprintf(stderr, "[radixshmem] MooncakeBackend: warning: allowed transfer devices %s are unavailable "
+                            "or filtered out; continuing with %s\n",
                     join(absent, "-").c_str(), join(hcas, "none").c_str());
-            engine_.reset();
-            return false;
         }
         fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices allowed=%s engine=%s active=unverified\n",
                 join(cfg.device_filter, "all").c_str(), join(hcas, "none").c_str());
