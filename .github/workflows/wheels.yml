@@ -1,0 +1,63 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Wheels
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      # The builder image's layers live in the Actions cache; only a cold cache compiles gRPC.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: packaging/manylinux
+          tags: radixshmem-manylinux:ci
+          load: true
+          build-args: JOBS=4
+          cache-from: type=gha,scope=radixshmem-manylinux
+          cache-to: type=gha,mode=max,scope=radixshmem-manylinux
+      # Pull requests build the cp312 wheel; a manual run builds all of them.
+      - uses: pypa/cibuildwheel@v4.3.5
+        env:
+          CIBW_MANYLINUX_X86_64_IMAGE: radixshmem-manylinux:ci
+        with:
+          only: ${{ github.event_name == 'pull_request' && 'cp312-manylinux_x86_64' || '' }}
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse/*.whl
+
+  test-clean-host:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "rockylinux:9"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse
+      - run: sh packaging/test_clean_host.sh 3.12 wheelhouse
+      - if: github.event_name != 'pull_request'
+        run: |
+          sh packaging/test_clean_host.sh 3.10 wheelhouse
+          sh packaging/test_clean_host.sh 3.14 wheelhouse
