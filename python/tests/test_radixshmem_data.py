@@ -350,7 +350,7 @@ def _publisher(backend, shm, protocol, fds, devices=()):
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
-    if x.register_store("cpu:0") != radixshmem._data.XFER_OK:
+    if x.register_store() != radixshmem._data.XFER_OK:
         return 3
 
     for i in range(SLOTS):
@@ -382,7 +382,7 @@ def _initiator(backend, shm, protocol, fds, devices=()):
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
-    if x.register_store("cpu:0") != radixshmem._data.XFER_OK:
+    if x.register_store() != radixshmem._data.XFER_OK:
         return 3
 
     peer = _read_str(name_r)
