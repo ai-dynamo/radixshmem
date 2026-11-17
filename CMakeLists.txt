@@ -25,19 +25,12 @@ set(RADIXSHMEM_TEST_REDIS "" CACHE STRING
 set(RADIXSHMEM_TEST_REDIS_BIN "" CACHE PATH
     "directory with redis-server and redis-cli for the Redis RHT fault tests; empty skips them")
 
-# The data plane's transfer backends are plugins (libradixshmem_<backend>.so) loaded on first use.
-# ENABLE_MOONCAKE / ENABLE_NIXL: AUTO builds the plugin when the engine is found, ON requires it, OFF skips it.
+# The Mooncake transfer backend is a plugin (libradixshmem_mooncake.so) loaded on first use; NIXL is reached
+# through its Python package. ENABLE_MOONCAKE: AUTO builds the plugin when Mooncake is found, ON requires it,
+# OFF skips it.
 set(ENABLE_MOONCAKE AUTO CACHE STRING "Build the Mooncake transfer plugin: AUTO, ON or OFF")
 set(MOONCAKE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mooncake" CACHE PATH
     "Mooncake source + build root")
-
-# NIXL (backend="UCX") backs the data plane's other transfer backend (src/transfer/nixl).
-# `scripts/build_nixl.sh` builds NIXL from source, pinned to the commit this
-# backend was written and end-to-end tested against, and installs it at
-# exactly this default path — run it once and NIXL_ROOT needs no override.
-set(ENABLE_NIXL AUTO CACHE STRING "Build the NIXL transfer plugin: AUTO, ON or OFF")
-set(NIXL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nixl-install" CACHE PATH
-    "NIXL install prefix (meson --prefix), holding include/nixl.h and lib*/libnixl.so")
 
 # ==================== radixshmem library ====================
 set(_radixshmem_sources
@@ -289,47 +282,6 @@ if(ENABLE_MOONCAKE)
     endif()
 else()
     message(STATUS "Mooncake disabled (ENABLE_MOONCAKE=OFF)")
-endif()
-
-# ==================== NIXL transfer engine (data plane) ====================
-# Probe only — the backend source lands with src/transfer. Same headers/lib
-# provenance rule as Mooncake above: both must come from the one NIXL_ROOT
-# install (meson --prefix=NIXL_ROOT install), never a stray /usr/local one —
-# run scripts/build_nixl.sh to produce one at the default NIXL_ROOT.
-set(RADIXSHMEM_NIXL_FOUND OFF)
-if(ENABLE_NIXL)
-    find_path(NIXL_INCLUDE_DIR nixl.h
-        HINTS ${NIXL_ROOT}/include NO_DEFAULT_PATH)
-    find_library(NIXL_LIBRARY NAMES nixl
-        HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu ${NIXL_ROOT}/lib64 ${NIXL_ROOT}/lib
-        NO_DEFAULT_PATH)
-    find_library(NIXL_BUILD_LIBRARY NAMES nixl_build
-        HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu ${NIXL_ROOT}/lib64 ${NIXL_ROOT}/lib
-        NO_DEFAULT_PATH)
-    find_library(NIXL_COMMON_LIBRARY NAMES nixl_common
-        HINTS ${NIXL_ROOT}/lib/x86_64-linux-gnu ${NIXL_ROOT}/lib64 ${NIXL_ROOT}/lib
-        NO_DEFAULT_PATH)
-    if(NIXL_INCLUDE_DIR AND NIXL_LIBRARY)
-        set(RADIXSHMEM_NIXL_FOUND ON)
-        # The UCX plugin (plugins/libplugin_UCX.so) is dlopen'd by libnixl at
-        # runtime via NIXL_PLUGIN_DIR / its compiled-in default — not linked here.
-        set(NIXL_LINK_LIBS ${NIXL_LIBRARY})
-        foreach(_lib NIXL_BUILD_LIBRARY NIXL_COMMON_LIBRARY)
-            if(${_lib})
-                list(APPEND NIXL_LINK_LIBS ${${_lib}})
-            endif()
-        endforeach()
-        get_filename_component(NIXL_LIBRARY_DIR ${NIXL_LIBRARY} DIRECTORY)
-        message(STATUS "NIXL found (${NIXL_LIBRARY}) — transfer plugin enabled")
-    elseif(NOT ENABLE_NIXL STREQUAL "AUTO")
-        message(FATAL_ERROR "NIXL not found under NIXL_ROOT=${NIXL_ROOT} "
-                            "(ENABLE_NIXL=${ENABLE_NIXL}; AUTO or OFF builds without it)")
-    else()
-        message(STATUS "NIXL not found (include=${NIXL_INCLUDE_DIR}, "
-                       "lib=${NIXL_LIBRARY}) — transfer plugin disabled")
-    endif()
-else()
-    message(STATUS "NIXL disabled (ENABLE_NIXL=OFF)")
 endif()
 
 # ==================== radix_server tool (launched by ServerLauncher) ====================
@@ -603,8 +555,8 @@ set(_radixshmem_data_sources
     # backend does it.
     src/transfer/range_merge.cpp
     src/transfer/backend_factory.cpp
-    # slot-granular convenience layer over the two above.
-    src/transfer/slot_transfer.cpp)
+    # slot ids -> address ranges, for radixshmem.transfer.SlotTransfer.
+    src/transfer/slot_plan.cpp)
 add_library(radixshmem_data STATIC ${_radixshmem_data_sources})
 target_include_directories(radixshmem_data PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(radixshmem_data PRIVATE
@@ -615,7 +567,7 @@ target_link_libraries(radixshmem_data PUBLIC rt pthread radixshmem_registry ${CM
 # The Python extension links this archive into a shared object.
 set_property(TARGET radixshmem_data PROPERTY POSITION_INDEPENDENT_CODE ON)
 
-# Transfer plugins: each engine and what it links stay in their own .so, which create_transfer_backend
+# Transfer plugins: the engine and what it links stay in their own .so, which create_transfer_backend
 # loads from the directory of _core (or RADIXSHMEM_TRANSFER_PLUGIN_DIR); only the entry point is exported.
 if(SKBUILD)
     set(_radixshmem_plugin_dir ${CMAKE_BINARY_DIR}/lib)
@@ -645,23 +597,10 @@ if(RADIXSHMEM_MOONCAKE_FOUND)
     radixshmem_transfer_plugin(mooncake src/transfer/mooncake/mooncake_backend.cpp
                                ${MOONCAKE_INCLUDE_DIR} ${MOONCAKE_LINK_LIBS})
 endif()
-if(RADIXSHMEM_NIXL_FOUND)
-    # libnixl.so, and next to it the plugins it dlopens, live in NIXL_LIBRARY_DIR.
-    radixshmem_transfer_plugin(nixl src/transfer/nixl/nixl_backend.cpp ${NIXL_INCLUDE_DIR} ${NIXL_LINK_LIBS})
-    set_target_properties(radixshmem_nixl PROPERTIES BUILD_RPATH ${NIXL_LIBRARY_DIR})
-endif()
 
-set(_dataplane_tests
-    test_slot_store
-    # Geometry contract against a stub backend — no engine, so it runs
-    # everywhere, Mooncake or not.
-    test_slot_geometry
-)
+set(_dataplane_tests test_slot_store)
 if(RADIXSHMEM_MOONCAKE_FOUND)
-    list(APPEND _dataplane_tests test_mooncake_loopback test_slot_transfer_e2e)
-endif()
-if(RADIXSHMEM_NIXL_FOUND)
-    list(APPEND _dataplane_tests test_nixl_loopback)
+    list(APPEND _dataplane_tests test_mooncake_loopback)
 endif()
 foreach(_t ${_dataplane_tests})
     add_executable(${_t} tests/dataplane/${_t}.cpp)
@@ -672,17 +611,6 @@ foreach(_t ${_dataplane_tests})
     set_tests_properties(${_t} PROPERTIES
         ENVIRONMENT "RADIXSHMEM_TRANSFER_PLUGIN_DIR=${_radixshmem_plugin_dir}")
 endforeach()
-
-# Data-plane benchmark (NOT in ctest). Links radixshmem_data only, like the tests.
-add_executable(bench_slot_transfer tests/bench/bench_slot_transfer.cpp)
-target_link_libraries(bench_slot_transfer PRIVATE radixshmem_data)
-
-# Manual real-hardware NIXL check (NOT in ctest — needs two hosts on one
-# fabric with the peer already running). See the file header for usage.
-if(RADIXSHMEM_NIXL_FOUND)
-    add_executable(test_nixl_two_node tests/dataplane/test_nixl_two_node.cpp)
-    target_link_libraries(test_nixl_two_node PRIVATE radixshmem_data)
-endif()
 
 # ---------- radixshmem._core: the pybind11 extension module (index and data plane) ----------
 option(BUILD_PYTHON_MODULES "Build the radixshmem._core pybind11 extension" ON)
@@ -741,7 +669,7 @@ if(BUILD_PYTHON_MODULES)
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
             RESULT_VARIABLE _pytest_rc OUTPUT_QUIET ERROR_QUIET)
         foreach(_t test_geometry test_server_rpc test_radixshmem test_geometry_registry test_writeback
-                   test_monitor test_transfer_jobs)
+                   test_monitor test_transfer_jobs test_slot_transfer)
             if(_pytest_rc EQUAL 0)
                 add_test(NAME py_${_t}
                          COMMAND ${Python3_EXECUTABLE} -m pytest -q tests/${_t}.py)
@@ -770,7 +698,8 @@ if(BUILD_PYTHON_MODULES)
                          --executors-per-worker 8 --rht-slots 4 --register-chunk-size 1
                          --flush-after-insert)
         foreach(_t py_test_geometry py_test_server_rpc py_test_radixshmem py_test_geometry_registry
-                   py_test_writeback py_test_monitor py_test_transfer_jobs py_test_cluster py_test_p2p_pull
+                   py_test_writeback py_test_monitor py_test_transfer_jobs py_test_slot_transfer
+                   py_test_cluster py_test_p2p_pull
                    py_test_dedup_move
                    py_test_writeback_pull
                    py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)

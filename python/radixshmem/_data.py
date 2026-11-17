@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The data plane's names in ``radixshmem._core``: SlotStore, geometry, transfer and the data-plane registry."""
+"""The data plane in one place: SlotStore, geometry, the data-plane registry (``radixshmem._core``) and the
+transfer backends with SlotTransfer (``radixshmem.transfer``)."""
 
 from radixshmem._core import (
     COMPONENT_MASK_FULL,
@@ -9,7 +10,6 @@ from radixshmem._core import (
     COMPONENT_MASK_SWA,
     INVALID_BATCH,
     PEER_SLOT_BYTES_UNCHECKED,
-    TRANSFER_BACKENDS,
     XFER_EBACKEND,
     XFER_EBUSY,
     XFER_EGEOMETRY,
@@ -20,18 +20,20 @@ from radixshmem._core import (
     DataPlaneEntry,
     DataPlaneRegistry,
     PoolGeometry,
+    SegmentInfo,
     SlotGeometry,
     SlotPoolConfig,
     SlotStore,
     SlotStoreConfig,
-    SlotTransfer,
     StoreGeometry,
-    TransferBackend,
     TransferConfig,
+    XferOp,
     XferState,
-    create_transfer_backend,
     make_data_plane_entry,
 )
+from radixshmem.transfer import SlotTransfer, TransferBackend, available_backends, create_transfer_backend
+
+TRANSFER_BACKENDS = available_backends()
 
 __all__ = [
     "COMPONENT_MASK_FULL",
@@ -50,6 +52,7 @@ __all__ = [
     "DataPlaneEntry",
     "DataPlaneRegistry",
     "PoolGeometry",
+    "SegmentInfo",
     "SlotGeometry",
     "SlotPoolConfig",
     "SlotStore",
@@ -58,6 +61,7 @@ __all__ = [
     "StoreGeometry",
     "TransferBackend",
     "TransferConfig",
+    "XferOp",
     "XferState",
     "create_transfer_backend",
     "make_data_plane_entry",

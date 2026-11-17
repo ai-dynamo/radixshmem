@@ -71,7 +71,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DENABLE_MOONCAKE=OFF \
-            -DENABLE_NIXL=OFF \
             -DPython3_EXECUTABLE="$(command -v python)"
       - name: Build
         run: cmake --build build -j "$(nproc)"

@@ -43,7 +43,9 @@ def build_info() -> dict:
     """Package, shm and cluster protocol versions, whether rdma-core loads, and the transfer backends."""
     from radixshmem import _core
 
-    backends = list(_core.TRANSFER_BACKENDS)
+    from radixshmem.transfer import available_backends
+
+    backends = available_backends()
     rdma_error = _core.rdma_error()
     info = {"version": __version__, "shm_version": _core.SHM_VERSION,
             "protocol_version": _core.CLUSTER_PROTOCOL_VERSION, "rdma": not rdma_error,

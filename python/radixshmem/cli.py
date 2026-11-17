@@ -115,7 +115,7 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="HCA allowlist of the transfer engine, repeatable or comma-separated (default: all)")
     g.add_argument("--transfer-ip", default=None, help="data-plane IP (default: the rpc address)")
     g.add_argument("--transfer-port", type=int, default=None,
-                   help="(default: 0 = engine picks; nixl backend requires a nonzero port)")
+                   help="(default: 0 = engine picks)")
     g.add_argument("--transfer-metadata", default=None, help="(default: P2PHANDSHAKE)")
     g.add_argument("--max-inflight", type=int, default=None,
                    help="batches in flight at the engine (default: 256)")

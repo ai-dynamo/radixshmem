@@ -1,21 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""radixshmem._data binding tests — the data plane from Python.
+"""radixshmem._data tests — the data plane from Python.
 
-The C++ suite (test_slot_store, test_slot_transfer_e2e) owns the functional
-coverage. These tests assert that the binding surface carries it faithfully:
    - geometry and lifetime come through as Python attributes,
    - slot views are windows onto the mapping, not copies,
-   - slot lists map to the right C++ parameters, and coalescing is observable
-     from Python (read/write's descriptor count) exactly as it is from C++,
-   - a real two-process transfer, driven entirely from Python, moves the same
-     bytes into the same slots as the C++ end-to-end test does.
+   - a real two-process transfer through SlotTransfer moves the right bytes into
+     the right slots, coalescing included, over each transfer backend,
+   - a transfer to the process's own segment is a local copy.
 
-Everything past the store tests needs a transfer backend, and the only backend
-is Mooncake, so those tests fork: an ibverbs context does not survive fork(), so
-every engine is built inside a child and the parent never touches one. They SKIP
-when no Mooncake engine can come up on this host.
+Everything past the store tests needs a transfer backend, so those tests fork:
+an ibverbs context does not survive fork(), so every engine is built inside a
+child and the parent never touches one. A backend that cannot come up on this
+host (no Mooncake plugin) is SKIPped.
 """
 
 import os
@@ -41,12 +38,12 @@ FULL, SWA, MAMBA = (radixshmem.ComponentType.FULL, radixshmem.ComponentType.SWA,
                     radixshmem.ComponentType.MAMBA)
 
 
-def mc_cfg(publish, protocol, devices=()):
+def xfer_cfg(backend, publish, protocol, devices=()):
     # rpc_port=0: the engine binds what it can and we read the name back off
     # local_segment. Naming the segment ourselves would hand Mooncake a host it
     # cannot resolve.
     return radixshmem._data.TransferConfig(
-        backend="mooncake", metadata="P2PHANDSHAKE", ip_or_host="127.0.0.1",
+        backend=backend, metadata="P2PHANDSHAKE", ip_or_host="127.0.0.1",
         rpc_port=0, protocol=protocol, device_filter=list(devices),
         publish=publish)
 
@@ -295,6 +292,8 @@ def _read_str(fd):
 
 
 def _spawn(fn):
+    sys.stdout.flush()
+    sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
         code = 1
@@ -322,26 +321,26 @@ def _reap(pid, who):
     return False
 
 
-def _mooncake_available():
+def _available(backend):
     """Probing costs a fork, but building an engine in this process would poison
     every later fork, which is worse."""
-    if _mooncake_available.cached is None:
+    if backend not in _available.cached:
         pid = _spawn(lambda: 0 if radixshmem._data.create_transfer_backend(
-            mc_cfg(True, "rdma")) is not None else 1)
+            xfer_cfg(backend, True, "rdma")) is not None else 1)
         _, status = os.waitpid(pid, 0)
-        _mooncake_available.cached = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-    return _mooncake_available.cached
+        _available.cached[backend] = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    return _available.cached[backend]
 
 
-_mooncake_available.cached = None
+_available.cached = {}
 
 
-def _publisher(shm, protocol, fds, devices=()):
+def _publisher(backend, shm, protocol, fds, devices=()):
     name_r, name_w, done_r, done_w = fds
     os.close(name_r)
     os.close(done_w)
     s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True, swa=SWA_POOL))
-    be = radixshmem._data.create_transfer_backend(mc_cfg(True, protocol, devices))
+    be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, True, protocol, devices))
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
@@ -368,12 +367,12 @@ def _publisher(shm, protocol, fds, devices=()):
     return 0
 
 
-def _initiator(shm, protocol, fds, devices=()):
+def _initiator(backend, shm, protocol, fds, devices=()):
     name_r, name_w, done_r, done_w = fds
     os.close(name_w)
     os.close(done_r)
     s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True, swa=SWA_POOL))
-    be = radixshmem._data.create_transfer_backend(mc_cfg(False, protocol, devices))
+    be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, False, protocol, devices))
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
@@ -467,7 +466,7 @@ def _initiator(shm, protocol, fds, devices=()):
     return 0
 
 
-def _run_e2e(protocol, tag, devices=()):
+def _run_e2e(protocol, tag, devices=(), backend="mooncake"):
     name_r, name_w = os.pipe()
     done_r, done_w = os.pipe()
     shm_a = "/py_ste_" + tag + "_a"
@@ -476,8 +475,8 @@ def _run_e2e(protocol, tag, devices=()):
     radixshmem._data.SlotStore.destroy(shm_b, "")
 
     fds = (name_r, name_w, done_r, done_w)
-    pa = _spawn(lambda: _publisher(shm_a, protocol, fds, devices))
-    pb = _spawn(lambda: _initiator(shm_b, protocol, fds, devices))
+    pa = _spawn(lambda: _publisher(backend, shm_a, protocol, fds, devices))
+    pb = _spawn(lambda: _initiator(backend, shm_b, protocol, fds, devices))
     for fd in fds:
         os.close(fd)
 
@@ -489,7 +488,7 @@ def _run_e2e(protocol, tag, devices=()):
 
 
 def test_e2e_rdma():
-    if not _mooncake_available():
+    if not _available("mooncake"):
         print("  SKIP: e2e_rdma (no Mooncake engine)")
         return
     assert _run_e2e("rdma", "rdma")
@@ -497,7 +496,7 @@ def test_e2e_rdma():
 
 
 def test_e2e_tcp():
-    if not _mooncake_available():
+    if not _available("mooncake"):
         print("  SKIP: e2e_tcp (no Mooncake engine)")
         return
     assert _run_e2e("tcp", "tcp")
@@ -508,7 +507,7 @@ def test_e2e_device_filter():
     """device_filter is how the data plane is kept off the management NIC.
     Pinning both endpoints to one named HCA is the deterministic case: they
     cannot end up on HCAs in different L3 planes, which never reach RTR."""
-    if not _mooncake_available():
+    if not _available("mooncake"):
         print("  SKIP: e2e_device_filter (no Mooncake engine)")
         return
     devs = rdma_devices()
@@ -520,6 +519,50 @@ def test_e2e_device_filter():
     # requirements, so a name that does not exist costs nothing.
     assert _run_e2e("rdma", "dev2", [devs[0], "mlx5_no_such_device"])
     print("  PASS: e2e_device_filter")
+
+
+def _self_copy(backend):
+    shm = "/py_ste_self_" + backend
+    radixshmem._data.SlotStore.destroy(shm, "")
+    s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True))
+    try:
+        be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, True, "tcp"))
+        if be is None:
+            return 2
+        x = radixshmem._data.SlotTransfer(s, be)
+        if x.register_store("cpu:0") != radixshmem._data.XFER_OK:
+            return 3
+        if x.attach_peer(x.local_segment, SLOT_BYTES)[0] != radixshmem._data.XFER_OK:
+            return 4
+        for i in range(4):
+            fill(s, i, pattern(i))
+            fill(s, 10 + i, 0)
+        h, n = x.write(x.local_segment, [0, 1, 2, 3], [10, 11, 12, 13])
+        if h == radixshmem._data.INVALID_BATCH or n != 1:
+            return 5
+        if x.wait(h, 5000) != radixshmem._data.XferState.COMPLETED or x.release(h) != radixshmem._data.XFER_OK:
+            return 6
+        if not all(holds(s, 10 + i, pattern(i)) for i in range(4)):
+            return 7
+        h, _ = x.read(x.local_segment, [12], [20])
+        x.wait(h, 5000)
+        x.release(h)
+        if not holds(s, 20, pattern(2)) or x.detach_peer(x.local_segment) != radixshmem._data.XFER_OK:
+            return 8
+        be.close()
+        return 0
+    finally:
+        radixshmem._data.SlotStore.destroy(shm, "")
+
+
+def test_self_segment():
+    """Single-node multi-DP: a peer that is this process is a memcpy, on every backend."""
+    ran = []
+    for backend in ("mooncake",):
+        if _available(backend):
+            assert _reap(_spawn(lambda: _self_copy(backend)), backend)
+            ran.append(backend)
+    print(f"  PASS: self_segment ({', '.join(ran) or 'no backend'})")
 
 
 # ==================================================================
@@ -536,4 +579,5 @@ if __name__ == "__main__":
     test_e2e_rdma()
     test_e2e_tcp()
     test_e2e_device_filter()
+    test_self_segment()
     print("\nAll tests passed.")

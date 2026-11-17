@@ -59,12 +59,12 @@ test-sources = ["packaging/smoke_test.py", "python/tests"]
 test-requires = ["pytest"]
 test-command = [
     "python packaging/smoke_test.py",
-    "python -m pytest -q -p no:cacheprovider python/tests/test_geometry.py python/tests/test_radixshmem.py python/tests/test_monitor.py python/tests/test_server_rpc.py python/tests/test_transfer_jobs.py python/tests/test_writeback.py",
+    "python -m pytest -q -p no:cacheprovider python/tests/test_geometry.py python/tests/test_radixshmem.py python/tests/test_monitor.py python/tests/test_server_rpc.py python/tests/test_transfer_jobs.py python/tests/test_writeback.py python/tests/test_slot_transfer.py",
     "python python/tests/test_radixshmem_data.py",
 ]
 
 [tool.cibuildwheel.linux]
-environment = { SKBUILD_CMAKE_DEFINE = "ENABLE_MOONCAKE=ON;ENABLE_NIXL=OFF;MOONCAKE_ROOT=/opt/mooncake" }
+environment = { SKBUILD_CMAKE_DEFINE = "ENABLE_MOONCAKE=ON;MOONCAKE_ROOT=/opt/mooncake" }
 # rdma-core and libnuma come from the host: rdma-core's providers must match the host's driver stack.
 repair-wheel-command = [
     "auditwheel repair --exclude libibverbs.so.1 --exclude libmlx5.so.1 --exclude libnuma.so.1 --exclude 'libnl-*' -w {dest_dir} {wheel}",

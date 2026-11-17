@@ -487,17 +487,14 @@ class RadixServer:
         from radixshmem import _data
 
         c = self.cfg
-        if c.transfer_backend == "nixl" and c.transfer_port <= 0:
-            raise ValueError("transfer_port must be set for the nixl transfer backend; "
-                             "it cannot pick a port")
         backend = _data.create_transfer_backend(_data.TransferConfig(
             backend=c.transfer_backend, metadata=c.transfer_metadata, ip_or_host=c.resolved_transfer_ip(),
             rpc_port=c.transfer_port, protocol=c.transfer_protocol,
             device_filter=list(c.transfer_devices), publish=True))
         if backend is None:
             raise RuntimeError(
-                f"transfer backend {c.transfer_backend!r} unavailable (its plugin is missing or "
-                f"failed to load, or no RDMA device; see the [radixshmem] transfer line on stderr)")
+                f"transfer backend {c.transfer_backend!r} unavailable (installed: {_data.TRANSFER_BACKENDS}; "
+                f"the reason is on stderr)")
         return backend
 
     def close(self) -> None:

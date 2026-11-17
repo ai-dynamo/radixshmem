@@ -13,7 +13,7 @@ namespace radixshmem {
 
 namespace {
 
-const char* const kBackends[] = {"mooncake", "nixl"};
+const char* const kBackends[] = {"mooncake"};
 
 std::string plugin_dir() {
     if (const char* dir = ::getenv("RADIXSHMEM_TRANSFER_PLUGIN_DIR")) return dir;
@@ -43,7 +43,7 @@ std::unique_ptr<ITransferBackend> create_transfer_backend(const TransferConfig& 
     bool known = false;
     for (const char* b : kBackends) known = known || cfg.backend == b;
     if (!known) {
-        fprintf(stderr, "[radixshmem] transfer: unknown backend '%s' (want 'mooncake' or 'nixl')\n",
+        fprintf(stderr, "[radixshmem] transfer: unknown backend '%s' (the C++ plugins: 'mooncake')\n",
                 cfg.backend.c_str());
         return nullptr;
     }

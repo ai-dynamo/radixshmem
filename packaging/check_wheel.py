@@ -19,8 +19,7 @@ HOST_LIBS = {"libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.s
 # What a transfer plugin may take from the host besides HOST_LIBS: rdma-core and libnuma.
 PLUGIN_HOST_LIBS = {"libibverbs.so.1", "libnuma.so.1"}
 EXPORTS = {"_core": {"PyInit__core"},
-           "libradixshmem_mooncake": {"radixshmem_create_transfer_backend"},
-           "libradixshmem_nixl": {"radixshmem_create_transfer_backend"}}
+           "libradixshmem_mooncake": {"radixshmem_create_transfer_backend"}}
 LICENSES = {"LICENSE", "ATTRIBUTIONS.md"}
 
 
