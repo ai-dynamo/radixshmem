@@ -172,6 +172,24 @@ PYBIND11_MODULE(_core, m) {
     m.attr("COMPONENT_MASK_SWA") = COMPONENT_MASK_SWA;
     m.attr("COMPONENT_MASK_MAMBA") = COMPONENT_MASK_MAMBA;
     m.attr("INVALID_COMPONENT_SLOT") = INVALID_COMPONENT_SLOT;
+    m.attr("SHM_VERSION") = SHM_VERSION;
+    m.attr("CLUSTER_PROTOCOL_VERSION") = CLUSTER_PROTOCOL_VERSION;
+
+    py::dict features;
+    for (const char* f : {"rdma", "grpc", "etcd", "redis"}) features[f] = false;
+#ifndef RADIXSHMEM_NO_RDMA
+    features["rdma"] = true;
+#endif
+#ifdef RADIXSHMEM_HAS_GRPC
+    features["grpc"] = true;
+#endif
+#ifdef RADIXSHMEM_HAS_ETCD
+    features["etcd"] = true;
+#endif
+#ifdef RADIXSHMEM_HAS_REDIS
+    features["redis"] = true;
+#endif
+    m.attr("BUILD_FEATURES") = features;
 
     // ==================== Config ====================
 

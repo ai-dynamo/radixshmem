@@ -36,10 +36,26 @@ except ImportError:
     pass
 
 from radixshmem._geometry import Geometry, check_pools_aligned
+from radixshmem._version import __version__
 from radixshmem.client import NodeInfo, PullJob, PullResult, PushJob, PushResult, RadixClient
 from radixshmem.rpc import DataPlaneUnavailable, GeometryMismatch, ServerBusy, ServerNotReady
 from radixshmem.server import ClusterConfig, RadixServer, ServerConfig
 from radixshmem.writeback import WritebackHandler, WritebackTask
+
+
+def build_info() -> dict:
+    """Package, shm and cluster protocol versions, compiled-in features and transfer backends."""
+    from radixshmem import _core
+
+    try:
+        from radixshmem import _data
+        backends = list(_data.TRANSFER_BACKENDS)
+    except ImportError:
+        backends = []
+    return {"version": __version__, "shm_version": _core.SHM_VERSION,
+            "protocol_version": _core.CLUSTER_PROTOCOL_VERSION,
+            "features": dict(_core.BUILD_FEATURES), "transfer_backends": backends}
+
 
 __all__ = [
     "COMPONENT_MASK_FULL",
@@ -73,6 +89,7 @@ __all__ = [
     "ServerNotReady",
     "WritebackHandler",
     "WritebackTask",
+    "build_info",
     "check_pools_aligned",
     "compute_hashes",
 ]

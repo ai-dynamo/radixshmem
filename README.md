@@ -20,7 +20,23 @@ an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV
 ### Build
 
 ```bash
-cd python && pip install -e .
+pip install .
+```
+
+For development, install the build requirements once and install in editable mode. With
+`editable.rebuild=true` the C++ modules are rebuilt on import after a change:
+
+```bash
+pip install scikit-build-core "pybind11==3.1.0"
+pip install --no-build-isolation -Ceditable.rebuild=true -e .
+```
+
+The C++ libraries, tools and tests build with CMake. The Python tests in ctest import the modules a plain
+CMake build puts in `python/radixshmem`, so run them in an environment without an editable install of
+radixshmem; an editable install takes precedence over `PYTHONPATH`.
+
+```bash
+cmake -S . -B build && cmake --build build -j && ctest --test-dir build
 ```
 
 Cross-node remote ops use gRPC exclusively and need the grpc++ and protobuf development packages
@@ -172,7 +188,7 @@ Build NIXL:
 
 ```bash
 scripts/build_nixl.sh
-cd python && pip install -e .
+pip install .
 ```
 
 Start the server with `--transfer-backend nixl`. NIXL cannot pick its own port, so `--transfer-port` is
@@ -192,7 +208,7 @@ Build Mooncake:
 
 ```bash
 scripts/build_mooncake.sh
-cd python && pip install -e .
+pip install .
 ```
 
 Start the server with `--transfer-backend mooncake`:

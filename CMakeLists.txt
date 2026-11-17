@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 cmake_minimum_required(VERSION 3.13)
-project(RadixShmem VERSION 0.1.0 LANGUAGES CXX)
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/python/radixshmem/_version.py _radixshmem_version
+     REGEX "^__version__")
+string(REGEX MATCH "[0-9]+(\\.[0-9]+)*" _radixshmem_version "${_radixshmem_version}")
+project(RadixShmem VERSION ${_radixshmem_version} LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
 
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
@@ -38,6 +43,9 @@ set(MOONCAKE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mooncake" CACHE PATH
 option(ENABLE_NIXL "Build the NIXL transfer backend (requires NIXL headers + lib)" ON)
 set(NIXL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nixl-install" CACHE PATH
     "NIXL install prefix (meson --prefix), holding include/nixl.h and lib*/libnixl.so")
+
+option(RADIXSHMEM_STRICT_DEPS
+    "Fail instead of disabling a backend when hiredis, Mooncake or NIXL is enabled but not found" OFF)
 
 # ==================== radixshmem library ====================
 set(_radixshmem_sources
@@ -122,7 +130,8 @@ target_include_directories(radixshmem PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/rht
 )
 
-set(_radixshmem_link_libs xxhash rt pthread)
+target_compile_definitions(radixshmem PUBLIC XXH_INLINE_ALL)
+set(_radixshmem_link_libs rt pthread)
 if(ENABLE_RDMA)
     list(APPEND _radixshmem_link_libs ibverbs mlx5)   # mlx5 for DC (Direct Verbs)
 else()
@@ -137,8 +146,10 @@ if(ENABLE_RDMA AND ENABLE_REDIS_RHT)
     if(HIREDIS_INCLUDE_DIR AND HIREDIS_LIBRARY)
         target_include_directories(radixshmem PRIVATE ${HIREDIS_INCLUDE_DIR})
         target_link_libraries(radixshmem PRIVATE ${HIREDIS_LIBRARY})
-        target_compile_definitions(radixshmem PRIVATE RADIXSHMEM_HAS_REDIS)
+        set(RADIXSHMEM_HAS_REDIS ON)
         message(STATUS "Redis RHT backend: ${HIREDIS_LIBRARY}")
+    elseif(RADIXSHMEM_STRICT_DEPS)
+        message(FATAL_ERROR "Redis RHT backend: hiredis not found (RADIXSHMEM_STRICT_DEPS=ON)")
     else()
         message(STATUS "Redis RHT backend: hiredis not found, disabled")
     endif()
@@ -217,20 +228,19 @@ if(ENABLE_ETCD AND ENABLE_RDMA)
     set(_etcd_go_lib  ${CMAKE_BINARY_DIR}/lib/libradix_etcd.so)
     set(_etcd_go_hdr  ${CMAKE_BINARY_DIR}/include/libradix_etcd.h)
     file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include)
-    # Build the wrapper into the build tree. GOPROXY carries a CN mirror fallback so
-    # `go mod tidy` resolves etcd modules on restricted networks (Mooncake's pattern).
+    # Build the wrapper into the build tree against the committed go.sum. GOPROXY carries
+    # a CN mirror fallback so the etcd modules download on restricted networks (Mooncake's pattern).
     add_custom_command(
         OUTPUT ${_etcd_go_lib} ${_etcd_go_hdr}
         COMMAND ${CMAKE_COMMAND} -E env
                 GOPROXY=https://proxy.golang.org,https://goproxy.cn,direct
-                ${GO_EXECUTABLE} mod tidy
-        COMMAND ${CMAKE_COMMAND} -E env
-                GOPROXY=https://proxy.golang.org,https://goproxy.cn,direct
-                ${GO_EXECUTABLE} build -buildmode=c-shared -o ${_etcd_go_lib} radix_etcd.go
+                ${GO_EXECUTABLE} build -mod=readonly -trimpath -buildmode=c-shared
+                "-ldflags=-s -w -extldflags=-Wl,-soname,libradix_etcd.so"
+                -o ${_etcd_go_lib} radix_etcd.go
         COMMAND ${CMAKE_COMMAND} -E copy
                 ${CMAKE_BINARY_DIR}/lib/libradix_etcd.h ${_etcd_go_hdr}
         WORKING_DIRECTORY ${_etcd_go_dir}
-        DEPENDS ${_etcd_go_dir}/radix_etcd.go ${_etcd_go_dir}/go.mod
+        DEPENDS ${_etcd_go_dir}/radix_etcd.go ${_etcd_go_dir}/go.mod ${_etcd_go_dir}/go.sum
         COMMENT "Building Go etcd client wrapper (libradix_etcd.so)"
         VERBATIM)
     add_custom_target(radix_etcd_wrapper DEPENDS ${_etcd_go_lib} ${_etcd_go_hdr})
@@ -300,6 +310,9 @@ if(ENABLE_MOONCAKE)
             ${MOONCAKE_ASIO_LIBRARY}
             glog gflags jsoncpp numa ibverbs curl pthread dl)
         message(STATUS "Mooncake found (${MOONCAKE_LIBRARY}) — transfer backend enabled")
+    elseif(RADIXSHMEM_STRICT_DEPS)
+        message(FATAL_ERROR "Mooncake not found under MOONCAKE_ROOT=${MOONCAKE_ROOT} "
+                            "(RADIXSHMEM_STRICT_DEPS=ON)")
     else()
         message(STATUS "Mooncake not found (include=${MOONCAKE_INCLUDE_DIR}, "
                        "lib=${MOONCAKE_LIBRARY}) — transfer backend disabled")
@@ -339,6 +352,8 @@ if(ENABLE_NIXL)
         endforeach()
         get_filename_component(NIXL_LIBRARY_DIR ${NIXL_LIBRARY} DIRECTORY)
         message(STATUS "NIXL found (${NIXL_LIBRARY}) — transfer backend enabled")
+    elseif(RADIXSHMEM_STRICT_DEPS)
+        message(FATAL_ERROR "NIXL not found under NIXL_ROOT=${NIXL_ROOT} (RADIXSHMEM_STRICT_DEPS=ON)")
     else()
         message(STATUS "NIXL not found (include=${NIXL_INCLUDE_DIR}, "
                        "lib=${NIXL_LIBRARY}) — transfer backend disabled")
@@ -725,8 +740,16 @@ if(BUILD_PYTHON_MODULES)
                 PATHS ${_pybind11_cmakedir} NO_DEFAULT_PATH)
         endif()
     endif()
+    if(SKBUILD AND NOT pybind11_FOUND)
+        message(FATAL_ERROR "pybind11 not found for ${Python3_EXECUTABLE}; a wheel needs both extension modules")
+    endif()
     if(pybind11_FOUND)
-        set(_radixshmem_py_dir ${CMAKE_SOURCE_DIR}/python/radixshmem)
+        # A pip build installs the modules into the wheel; a plain build puts them in the source tree.
+        if(SKBUILD)
+            set(_radixshmem_py_dir ${CMAKE_BINARY_DIR}/lib)
+        else()
+            set(_radixshmem_py_dir ${CMAKE_SOURCE_DIR}/python/radixshmem)
+        endif()
 
         pybind11_add_module(radixshmem_core_py python/bindings.cpp)
         set_target_properties(radixshmem_core_py PROPERTIES
@@ -748,6 +771,20 @@ if(BUILD_PYTHON_MODULES)
             LIBRARY_OUTPUT_DIRECTORY ${_radixshmem_py_dir}
             BUILD_RPATH "${_radixshmem_data_py_rpath}")
         target_link_libraries(radixshmem_data_py PRIVATE radixshmem_data)
+        # Only PyInit_* stays exported; installed modules find libradix_etcd.so beside them.
+        set(_radixshmem_py_map ${CMAKE_BINARY_DIR}/radixshmem_py.map)
+        file(WRITE ${_radixshmem_py_map} "{ global: PyInit_*; local: *; };\n")
+        foreach(_m radixshmem_core_py radixshmem_data_py)
+            target_link_options(${_m} PRIVATE "LINKER:--version-script=${_radixshmem_py_map}")
+            set_target_properties(${_m} PROPERTIES
+                INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH ON)
+        endforeach()
+        if(SKBUILD)
+            install(TARGETS radixshmem_core_py radixshmem_data_py LIBRARY DESTINATION radixshmem)
+            if(RADIXSHMEM_ETCD_FOUND)
+                install(FILES ${_etcd_go_lib} DESTINATION radixshmem)
+            endif()
+        endif()
         # In ctest, unlike test_radixshmem.py: this one needs no server and no
         # numpy, so it can be part of the gate rather than a manual step.
         add_test(NAME test_data_python
@@ -850,5 +887,15 @@ endif()
 # To build manually: g++ ... tests/legacy/{file}.cpp
 
 enable_testing()
+
+# A pip build, editable rebuilds included, builds the two modules and what they link, no tools or tests.
+if(SKBUILD)
+    get_property(_radixshmem_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(_t ${_radixshmem_targets})
+        if(NOT _t MATCHES "^radixshmem_(core|data)_py$")
+            set_target_properties(${_t} PROPERTIES EXCLUDE_FROM_ALL ON)
+        endif()
+    endforeach()
+endif()
 
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")

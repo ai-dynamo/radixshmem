@@ -64,7 +64,7 @@ jobs:
           go-version-file: src/registry/etcd_go/go.mod
           cache-dependency-path: src/registry/etcd_go/go.sum
       - name: Install Python build deps
-        run: pip install pybind11==3.1.0 numpy "grpcio>=1.60" setuptools pytest
+        run: pip install pybind11==3.1.0 numpy "grpcio>=1.60" pytest
       - name: Configure
         run: |
           cmake -S . -B build \
@@ -75,7 +75,18 @@ jobs:
             -DPython3_EXECUTABLE="$(command -v python)"
       - name: Build
         run: cmake --build build -j "$(nproc)"
-      - name: Install Python package
-        run: pip install --no-build-isolation -e python
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Wheel
+        run: |
+          pip wheel --no-deps -w dist .
+          python -m venv /tmp/wheel-venv
+          /tmp/wheel-venv/bin/pip install dist/radixshmem-*.whl
+          cd /tmp
+          /tmp/wheel-venv/bin/python -c "import radixshmem; print(radixshmem.build_info())"
+          /tmp/wheel-venv/bin/radix-server --help > /dev/null
+          for so in /tmp/wheel-venv/lib/python3*/site-packages/radixshmem/_*.so; do
+            extra=$(nm -D -g --defined-only "$so" | awk '{print $3}' |
+                    grep -vE '^PyInit__(core|data)$' || true)
+            if [ -n "$extra" ]; then echo "$so exports more than PyInit_*:"; echo "$extra" | head; exit 1; fi
+          done
