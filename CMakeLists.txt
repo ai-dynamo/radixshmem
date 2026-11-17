@@ -132,53 +132,63 @@ target_link_libraries(radixshmem PRIVATE ${HIREDIS_LIBRARY})
 message(STATUS "Redis RHT backend: ${HIREDIS_LIBRARY}")
 
 # ==================== gRPC (remote-op control plane) ====================
-# grpc++/protobuf via pkg-config plus protoc/grpc_cpp_plugin; the generated code is a static library only transport/grpc sees.
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND)
-    pkg_check_modules(GRPCPP QUIET grpc++)
-    pkg_check_modules(PROTOBUF QUIET protobuf)
-endif()
-find_program(PROTOC_EXECUTABLE protoc)
-find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin)
-if(GRPCPP_FOUND AND PROTOBUF_FOUND AND PROTOC_EXECUTABLE AND GRPC_CPP_PLUGIN)
-    set(_grpc_proto_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
-    set(_grpc_gen_dir   ${CMAKE_BINARY_DIR}/generated/grpc)
-    set(_grpc_gen_srcs
-        ${_grpc_gen_dir}/remote_ops.pb.cc
-        ${_grpc_gen_dir}/remote_ops.grpc.pb.cc)
-    file(MAKE_DIRECTORY ${_grpc_gen_dir})
-    add_custom_command(
-        OUTPUT ${_grpc_gen_srcs}
-               ${_grpc_gen_dir}/remote_ops.pb.h
-               ${_grpc_gen_dir}/remote_ops.grpc.pb.h
-        COMMAND ${PROTOC_EXECUTABLE}
-                --proto_path=${_grpc_proto_dir}
-                --cpp_out=${_grpc_gen_dir}
-                --grpc_out=${_grpc_gen_dir}
-                --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
-                ${_grpc_proto_dir}/remote_ops.proto
-        DEPENDS ${_grpc_proto_dir}/remote_ops.proto
-        COMMENT "Generating remote-op gRPC code (remote_ops.proto)"
-        VERBATIM)
-    add_library(radixshmem_grpc_proto STATIC ${_grpc_gen_srcs})
-    set_property(TARGET radixshmem_grpc_proto PROPERTY POSITION_INDEPENDENT_CODE ON)
-    target_include_directories(radixshmem_grpc_proto PUBLIC
-        ${_grpc_gen_dir} ${GRPCPP_INCLUDE_DIRS} ${PROTOBUF_INCLUDE_DIRS})
-    target_link_directories(radixshmem_grpc_proto PUBLIC
-        ${GRPCPP_LIBRARY_DIRS} ${PROTOBUF_LIBRARY_DIRS})
-    target_link_libraries(radixshmem_grpc_proto PUBLIC
-        ${GRPCPP_LIBRARIES} ${PROTOBUF_LIBRARIES})
-
-    target_sources(radixshmem PRIVATE
-        src/indexer/transport/grpc/grpc_remote_op_client.cpp
-        src/indexer/transport/grpc/grpc_remote_op_server.cpp)
-    target_include_directories(radixshmem PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
-    target_link_libraries(radixshmem PRIVATE radixshmem_grpc_proto)
-    message(STATUS "gRPC found (grpc++ ${GRPCPP_VERSION}, protobuf ${PROTOBUF_VERSION}) — grpc remote-op backend enabled")
+# A gRPC CMake package on CMAKE_PREFIX_PATH (the static build in the wheel image) wins over
+# grpc++/protobuf via pkg-config (distro packages); the generated code is a static library only transport/grpc sees.
+# gRPC's package does not look up the protobuf it was built with, so find that first.
+find_package(protobuf CONFIG QUIET NO_CMAKE_SYSTEM_PATH NO_SYSTEM_ENVIRONMENT_PATH)
+find_package(gRPC CONFIG QUIET NO_CMAKE_SYSTEM_PATH NO_SYSTEM_ENVIRONMENT_PATH)
+if(gRPC_FOUND)
+    set(PROTOC_EXECUTABLE $<TARGET_FILE:protobuf::protoc>)
+    set(GRPC_CPP_PLUGIN $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
+    set(GRPCPP_LIBRARIES gRPC::grpc++ protobuf::libprotobuf)
+    message(STATUS "gRPC found (CMake package ${gRPC_VERSION}, ${gRPC_DIR})")
 else()
-    message(FATAL_ERROR "Remote ops need gRPC: grpc++ and protobuf via pkg-config, protoc and grpc_cpp_plugin (Ubuntu: apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc).")
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(GRPCPP QUIET grpc++)
+        pkg_check_modules(PROTOBUF QUIET protobuf)
+    endif()
+    find_program(PROTOC_EXECUTABLE protoc)
+    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin)
+    if(NOT (GRPCPP_FOUND AND PROTOBUF_FOUND AND PROTOC_EXECUTABLE AND GRPC_CPP_PLUGIN))
+        message(FATAL_ERROR "Remote ops need gRPC: grpc++ and protobuf via pkg-config, protoc and grpc_cpp_plugin (Ubuntu: apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc).")
+    endif()
+    message(STATUS "gRPC found (grpc++ ${GRPCPP_VERSION}, protobuf ${PROTOBUF_VERSION})")
 endif()
+set(_grpc_proto_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+set(_grpc_gen_dir   ${CMAKE_BINARY_DIR}/generated/grpc)
+set(_grpc_gen_srcs
+    ${_grpc_gen_dir}/remote_ops.pb.cc
+    ${_grpc_gen_dir}/remote_ops.grpc.pb.cc)
+file(MAKE_DIRECTORY ${_grpc_gen_dir})
+add_custom_command(
+    OUTPUT ${_grpc_gen_srcs}
+           ${_grpc_gen_dir}/remote_ops.pb.h
+           ${_grpc_gen_dir}/remote_ops.grpc.pb.h
+    COMMAND ${PROTOC_EXECUTABLE}
+            --proto_path=${_grpc_proto_dir}
+            --cpp_out=${_grpc_gen_dir}
+            --grpc_out=${_grpc_gen_dir}
+            --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
+            ${_grpc_proto_dir}/remote_ops.proto
+    DEPENDS ${_grpc_proto_dir}/remote_ops.proto
+    COMMENT "Generating remote-op gRPC code (remote_ops.proto)"
+    VERBATIM)
+add_library(radixshmem_grpc_proto STATIC ${_grpc_gen_srcs})
+set_property(TARGET radixshmem_grpc_proto PROPERTY POSITION_INDEPENDENT_CODE ON)
+target_include_directories(radixshmem_grpc_proto PUBLIC
+    ${_grpc_gen_dir} ${GRPCPP_INCLUDE_DIRS} ${PROTOBUF_INCLUDE_DIRS})
+target_link_directories(radixshmem_grpc_proto PUBLIC
+    ${GRPCPP_LIBRARY_DIRS} ${PROTOBUF_LIBRARY_DIRS})
+target_link_libraries(radixshmem_grpc_proto PUBLIC
+    ${GRPCPP_LIBRARIES} ${PROTOBUF_LIBRARIES})
+
+target_sources(radixshmem PRIVATE
+    src/indexer/transport/grpc/grpc_remote_op_client.cpp
+    src/indexer/transport/grpc/grpc_remote_op_server.cpp)
+target_include_directories(radixshmem PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+target_link_libraries(radixshmem PRIVATE radixshmem_grpc_proto)
 
 # ==================== radixshmem_registry: the etcd plane (Go client wrapper) ====================
 # The official Go etcd client compiled to a c-shared lib via `go build -buildmode=c-shared`,
@@ -263,7 +273,12 @@ if(ENABLE_MOONCAKE)
             ${MOONCAKE_BASE_LIBRARY}
             ${MOONCAKE_COMMON_LIBRARY}
             ${MOONCAKE_ASIO_LIBRARY}
-            glog gflags jsoncpp numa ibverbs curl pthread dl)
+            glog gflags jsoncpp numa ibverbs pthread dl)
+        # libcurl only backs Mooncake's HTTP metadata server (USE_HTTP).
+        file(STRINGS ${MOONCAKE_BUILD_DIR}/CMakeCache.txt _mooncake_http REGEX "^USE_HTTP:BOOL=ON")
+        if(_mooncake_http)
+            list(APPEND MOONCAKE_LINK_LIBS curl)
+        endif()
         message(STATUS "Mooncake found (${MOONCAKE_LIBRARY}) — transfer plugin enabled")
     elseif(NOT ENABLE_MOONCAKE STREQUAL "AUTO")
         message(FATAL_ERROR "Mooncake not found under MOONCAKE_ROOT=${MOONCAKE_ROOT} "
