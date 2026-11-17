@@ -12,7 +12,7 @@
 Everything past the store tests needs a transfer backend, so those tests fork:
 an ibverbs context does not survive fork(), so every engine is built inside a
 child and the parent never touches one. A backend that cannot come up on this
-host (no Mooncake plugin) is SKIPped.
+host (no Mooncake plugin, no NIXL package) is SKIPped.
 """
 
 import os
@@ -521,6 +521,14 @@ def test_e2e_device_filter():
     print("  PASS: e2e_device_filter")
 
 
+def test_e2e_nixl():
+    if not _available("nixl"):
+        print("  SKIP: e2e_nixl (no NIXL package or UCX agent)")
+        return
+    assert _run_e2e("rdma", "nixl", backend="nixl")
+    print("  PASS: e2e_nixl")
+
+
 def _self_copy(backend):
     shm = "/py_ste_self_" + backend
     radixshmem._data.SlotStore.destroy(shm, "")
@@ -558,7 +566,7 @@ def _self_copy(backend):
 def test_self_segment():
     """Single-node multi-DP: a peer that is this process is a memcpy, on every backend."""
     ran = []
-    for backend in ("mooncake",):
+    for backend in ("mooncake", "nixl"):
         if _available(backend):
             assert _reap(_spawn(lambda: _self_copy(backend)), backend)
             ran.append(backend)
@@ -579,5 +587,6 @@ if __name__ == "__main__":
     test_e2e_rdma()
     test_e2e_tcp()
     test_e2e_device_filter()
+    test_e2e_nixl()
     test_self_segment()
     print("\nAll tests passed.")

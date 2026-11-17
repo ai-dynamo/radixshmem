@@ -26,6 +26,10 @@ classifiers = [
 ]
 dependencies = ["numpy", "grpcio>=1.60"]
 
+[project.optional-dependencies]
+# The nixl transfer backend; NIXL publishes no Python 3.14 wheels yet.
+nixl = ['nixl-cu13>=1.4.1,<2; python_version < "3.14"']
+
 [project.urls]
 Homepage = "https://github.com/ai-dynamo/radixshmem"
 Documentation = "https://github.com/ai-dynamo/radixshmem/blob/main/docs/api.md"
