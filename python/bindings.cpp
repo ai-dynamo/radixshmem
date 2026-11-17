@@ -12,6 +12,7 @@
 #include "types.h"
 
 #include "cluster_protocol.h"
+#include "verbs_loader.hpp"
 
 #include "etcd_client.hpp"   // src/registry: the Go-wrapper etcd client, bound as _core.EtcdKv
 
@@ -172,6 +173,8 @@ PYBIND11_MODULE(_core, m) {
     m.attr("INVALID_COMPONENT_SLOT") = INVALID_COMPONENT_SLOT;
     m.attr("SHM_VERSION") = SHM_VERSION;
     m.attr("CLUSTER_PROTOCOL_VERSION") = CLUSTER_PROTOCOL_VERSION;
+    m.def("rdma_error", &verbs::ibverbs_error,
+          "Why rdma-core cannot be loaded for the RDMA planes, or an empty string when it can.");
 
     // ==================== Config ====================
 

@@ -44,7 +44,7 @@ from radixshmem.writeback import WritebackHandler, WritebackTask
 
 
 def build_info() -> dict:
-    """Package, shm and cluster protocol versions and the transfer backends."""
+    """Package, shm and cluster protocol versions, whether rdma-core loads, and the transfer backends."""
     from radixshmem import _core
 
     try:
@@ -52,8 +52,13 @@ def build_info() -> dict:
         backends = list(_data.TRANSFER_BACKENDS)
     except ImportError:
         backends = []
-    return {"version": __version__, "shm_version": _core.SHM_VERSION,
-            "protocol_version": _core.CLUSTER_PROTOCOL_VERSION, "transfer_backends": backends}
+    rdma_error = _core.rdma_error()
+    info = {"version": __version__, "shm_version": _core.SHM_VERSION,
+            "protocol_version": _core.CLUSTER_PROTOCOL_VERSION, "rdma": not rdma_error,
+            "transfer_backends": backends}
+    if rdma_error:
+        info["rdma_error"] = rdma_error
+    return info
 
 
 __all__ = [

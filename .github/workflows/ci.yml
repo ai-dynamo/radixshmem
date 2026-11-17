@@ -90,3 +90,5 @@ jobs:
                     grep -vE '^PyInit__(core|data)$' || true)
             if [ -n "$extra" ]; then echo "$so exports more than PyInit_*:"; echo "$extra" | head; exit 1; fi
           done
+          if nm -D --undefined-only /tmp/wheel-venv/lib/python3*/site-packages/radixshmem/_core*.so |
+               grep -E ' (ibv|mlx5dv)_'; then echo "_core links rdma-core"; exit 1; fi

@@ -4,6 +4,7 @@
 #include "dc_oneside.hpp"
 
 #include "detail.hpp"
+#include "verbs_loader.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -26,6 +27,7 @@ struct DciQp {
 };
 static DciQp dc_create_dci_qp(RdmaContext& ctx, ibv_cq* cq,
                               uint64_t send_ops_flags, const char* who) {
+    verbs::require_mlx5();
     ibv_qp_init_attr_ex attr{};
     attr.qp_type   = IBV_QPT_DRIVER;
     attr.send_cq   = cq;
@@ -113,6 +115,7 @@ static void dc_dci_to_rts(ibv_qp* qp, RdmaContext& ctx,
 static ibv_qp* dc_create_dct_qp(RdmaContext& ctx, ibv_cq* cq, ibv_srq* srq,
                                 uint64_t dct_access_key, unsigned access_flags,
                                 const char* who) {
+    verbs::require_mlx5();
     ibv_qp_init_attr_ex attr{};
     attr.qp_type   = IBV_QPT_DRIVER;
     attr.send_cq   = cq;

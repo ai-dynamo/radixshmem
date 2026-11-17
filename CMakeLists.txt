@@ -79,6 +79,7 @@ set(_radixshmem_sources
     src/indexer/transport/rdma/rc_endpoint.cpp
     src/indexer/transport/rdma/xrc.cpp
     src/indexer/transport/rdma/dc_oneside.cpp
+    src/indexer/transport/rdma/verbs_loader.cpp
     # XRC SEND-QP setup through the peer's XrcConnect RPC.
     src/indexer/transport/rdma/xrc_connect.cpp
     # The RDMA side of a radix-server (device, XRC SRQ, DCT, tree MR).
@@ -120,7 +121,7 @@ target_include_directories(radixshmem PRIVATE
 )
 
 target_compile_definitions(radixshmem PUBLIC XXH_INLINE_ALL)
-target_link_libraries(radixshmem PUBLIC rt pthread ibverbs mlx5)   # mlx5 for DC (Direct Verbs)
+target_link_libraries(radixshmem PUBLIC rt pthread ${CMAKE_DL_LIBS})
 
 # Redis RHT backend: static hiredis when available, so nothing extra is needed at runtime.
 find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
@@ -723,6 +724,10 @@ if(BUILD_PYTHON_MODULES)
             install(TARGETS radixshmem_core_py radixshmem_data_py LIBRARY DESTINATION radixshmem)
             install(FILES ${_etcd_go_lib} DESTINATION radixshmem)
         endif()
+        # rdma-core is loaded at run time, so neither the module nor radix_server may link it.
+        add_test(NAME test_verbs_not_linked
+                 COMMAND sh -c "for f in \"$@\"; do nm -D --undefined-only \"$f\"; readelf -d \"$f\"; done | grep -E ' (ibv|mlx5dv)_|lib(ibverbs|mlx5)' && exit 1 || exit 0"
+                         sh $<TARGET_FILE:radixshmem_core_py> $<TARGET_FILE:radix_server>)
         # In ctest, unlike test_radixshmem.py: this one needs no server and no
         # numpy, so it can be part of the gate rather than a manual step.
         add_test(NAME test_data_python
