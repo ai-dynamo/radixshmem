@@ -426,17 +426,19 @@ def test_peer_writeback_is_active_while_a_decode_node_is_ready(capfd):
     assert not d.active() and d._targets == []
 
 
-def test_peer_writeback_counts_tasks_and_skips_long_paths():
+def test_peer_writeback_counts_tasks_and_skips_long_paths(monkeypatch):
+    monkeypatch.setattr(writeback, "MAX_REMOTE_OP_BLOCKS", 64)   # the real cap is ~1e8 blocks of np.arange
+    cap = writeback.MAX_REMOTE_OP_BLOCKS
     h = peer_writeback("prefill")
     done = []
-    h.write([task(1, 8), task(2, 8, first=2), task(3, radixshmem.MAX_REMOTE_OP_BLOCKS + 1)], done.extend)
+    h.write([task(1, 8), task(2, 8, first=2), task(3, cap + 1)], done.extend)
     assert done == [1, 2, 3]
     assert sorted(h.client.pushes) == [(1, 8), (2, 8)]
     assert h.stats() == {"pushed": 2, "incomplete": 0, "no_space": 0, "no_target": 0, "too_long": 1}
 
     h = peer_writeback("prefill", complete=False)
-    h.write([task(1, radixshmem.MAX_REMOTE_OP_BLOCKS)], done.extend)
-    assert h.client.pushes == [(2, radixshmem.MAX_REMOTE_OP_BLOCKS)]
+    h.write([task(1, cap)], done.extend)
+    assert h.client.pushes == [(2, cap)]
     assert h.stats() == {"pushed": 0, "incomplete": 1, "no_space": 0, "no_target": 0, "too_long": 0}
 
     h = peer_writeback("prefill", complete=False, no_space=True)
