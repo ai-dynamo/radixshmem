@@ -469,8 +469,6 @@ class RadixServer:
             return
         if not (c.cluster.rpc_address or c.cluster.rpc_interface):
             raise ValueError("distributed mode requires cluster.rpc_address or cluster.rpc_interface")
-        if not hasattr(_core, "EtcdKv"):
-            raise RuntimeError("radixshmem was built without etcd; a cluster needs it")
         self._greg = _ServerRegistry(c.cluster.registry, c.cluster.cluster_id)
         if not c.index_only:
             self._backend = self._make_backend()

@@ -5,7 +5,6 @@
 #include "radix_server.h"       // RadixClient(RadixServer&) ctor
 
 #include "local.h"
-#ifndef RADIXSHMEM_NO_RDMA
 #include "cluster_protocol.h"
 #include "cluster_manifest.h"
 #include "bilateral_transport.h"
@@ -16,11 +15,8 @@
 #include "peer_breaker.hpp"
 #include "peer_registry.hpp"
 #include "remote_op_factory.hpp"
-#ifdef RADIXSHMEM_HAS_ETCD
 #include "etcd_client.hpp"
 #include "registry_client.hpp"
-#endif
-#endif
 
 #include <algorithm>
 #include <cassert>
@@ -38,30 +34,22 @@
 
 namespace radixshmem {
 
-#ifndef RADIXSHMEM_NO_RDMA
-#ifdef RADIXSHMEM_HAS_ETCD
 struct RadixClient::Impl {
     std::unique_ptr<RegistryClient> reg;
 };
-#else
-struct RadixClient::Impl {};
-#endif
 
 // ==================== Cluster plane ====================
 
 void RadixClient::teardown_cluster() {
     // Stop the /peers watcher first: its callback admits into the registry and
     // reaches the peer index and the RHT, so it must be joined before they go.
-#ifdef RADIXSHMEM_HAS_ETCD
     if (etcd_ && etcd_->reg) etcd_->reg->stop_watch();
-#endif
     { std::lock_guard<std::mutex> g(peer_cache_mu_); peer_cache_.clear(); }
     peer_index_.reset();
     rht_.reset();
 }
 
 bool RadixClient::wait_for_ready() {
-#ifdef RADIXSHMEM_HAS_ETCD
     // Same-host fast path: spin the local ready flag briefly, then defer to etcd.
     // Observers have no local shm, so they go straight to etcd.
     if (local_) {
@@ -74,9 +62,6 @@ bool RadixClient::wait_for_ready() {
         }
     }
     return etcd_->reg->wait_for_ready();
-#else
-    return false;
-#endif
 }
 
 void RadixClient::admit_peer(const PeerEntry& e) {
@@ -116,7 +101,6 @@ void RadixClient::preconnect_peers() {
 }
 
 ShardMapMsg RadixClient::read_topology() {
-#ifdef RADIXSHMEM_HAS_ETCD
     ClusterTopology t = etcd_->reg->read_topology();
 
     cluster_cs_ = (int)t.sm.register_chunk_size;
@@ -127,9 +111,6 @@ ShardMapMsg RadixClient::read_topology() {
     peer_reg_->seed(std::move(t.peers), t.world_size, t.my_rank);
     peers_snapshot_rev_  = t.peers_rev;
     return t.sm;
-#else
-    throw std::runtime_error("RadixClient: built without etcd");
-#endif
 }
 
 // Build the etcd rendezvous + peer index / RHT planes. Constructs peer_reg_/etcd_
@@ -148,7 +129,6 @@ void RadixClient::bootstrap_cluster() {
             return;   // single-node: distributed_ stays false
         }
     }
-#ifdef RADIXSHMEM_HAS_ETCD
     RegistryClientConfig rc;
     rc.registry             = cfg_.registry;
     rc.cluster_id           = cfg_.cluster_id;
@@ -157,10 +137,6 @@ void RadixClient::bootstrap_cluster() {
     rc.bootstrap_timeout_sec = cfg_.bootstrap_timeout_sec;
     etcd_->reg = std::make_unique<RegistryClient>(rc);
     etcd_->reg->connect();
-#else
-    throw std::runtime_error(
-        "RadixClient: distributed shm but built without etcd");
-#endif
     if (!wait_for_ready())
         throw std::runtime_error("RadixClient: cluster not ready (etcd timeout)");
     const ShardMapMsg sm = read_topology();
@@ -226,11 +202,9 @@ void RadixClient::bootstrap_cluster() {
 
     // Watch /peers for members that join, restart or leave. Anchor at the
     // snapshot rev so a PUT before establishment isn't lost.
-#ifdef RADIXSHMEM_HAS_ETCD
     etcd_->reg->start_watch(peers_snapshot_rev_ + 1,
                             [this](const PeerEntry& e) { admit_peer(e); },
                             [this](int rank) { remove_peer(rank); });
-#endif
 
     // Evict/merge on the connector's own tree must clean RHT, else the recycled node id orphans a stale anchor.
     if (local_) {
@@ -375,7 +349,6 @@ RemoteStatus RadixClient::missing_peer_status(int rank) const {
         return RemoteStatus::BAD_TARGET;
     return RemoteStatus::UNAVAILABLE;
 }
-#endif
 
 // =====================================================================
 // RadixClient
@@ -386,17 +359,12 @@ RadixClient::RadixClient(const std::string& name, bool local_read_only)
       local_read_only_(local_read_only) {
     if (local_read_only_) return;   // tree only; the cluster plane is never built
     auto* hdr = static_cast<ShmHeader*>(local_->tree().shm_base());
-#ifndef RADIXSHMEM_NO_RDMA
     // The shm header carries the cluster identity; bootstrap_cluster reads
     // is_distributed and either sets distributed_ or returns single-node.
     cfg_.registry   = hdr->registry;
     cfg_.cluster_id = hdr->cluster_id;
     cfg_.node_name  = hdr->node_name;
     bootstrap_cluster();
-#else
-    if (hdr->is_distributed)
-        throw std::runtime_error("RadixClient: writable cluster attach requires RDMA support");
-#endif
 }
 
 void RadixClient::require_writable(const char* op) const {
@@ -406,7 +374,6 @@ void RadixClient::require_writable(const char* op) const {
 }
 
 namespace {
-#ifdef RADIXSHMEM_HAS_ETCD
 // Resolve /shm/<node_name> → local shm name via etcd.
 std::string resolve_shm_name(const RadixClientConfig& cfg) {
     etcd::Client cli;
@@ -420,33 +387,19 @@ std::string resolve_shm_name(const RadixClientConfig& cfg) {
             "RadixClient: /shm/" + cfg.node_name + " not published");
     return shm;
 }
-#endif
 } // namespace
 
 RadixClient::RadixClient(const RadixClientConfig& cfg)
-#ifdef RADIXSHMEM_NO_RDMA
-{
-    throw std::runtime_error("RadixClient: distributed config requires RDMA support");
-}
-#elif defined(RADIXSHMEM_HAS_ETCD)
     : cfg_(cfg)
 {
     // Observer (no local server): skip the shm attach, join the cluster as a
     // remote-only reader with rank -1.
     if (!cfg_.no_local_tree)
         local_ = std::make_unique<LocalTreeConnector>(resolve_shm_name(cfg_));
-#ifndef RADIXSHMEM_NO_RDMA
     // Observers are always distributed; a local server may be single-node.
     // bootstrap_cluster resolves is_distributed off the attached header.
     bootstrap_cluster();
-#endif
 }
-#else
-{
-    throw std::runtime_error(
-        "RadixClient: etcd-config ctor requires an etcd-enabled build");
-}
-#endif
 
 RadixClient::RadixClient(RadixServer& server)
     : RadixClient(server.shm_name()) {
@@ -454,7 +407,6 @@ RadixClient::RadixClient(RadixServer& server)
 }
 
 RadixClient::RadixClient(const RadixClientConfig& cfg, LocalTreeConnector* borrowed)
-#ifndef RADIXSHMEM_NO_RDMA
     : local_(borrowed), owns_local_(false), cfg_(cfg) {
     // Borrow the caller's already-attached tree; build the RHT plane only.
     cfg_.rht_only = true;
@@ -467,16 +419,9 @@ RadixClient::RadixClient(const RadixClientConfig& cfg, LocalTreeConnector* borro
         throw;
     }
 }
-#else
-{
-    throw std::runtime_error("RadixClient: embedded cluster service requires RDMA support");
-}
-#endif
 
 RadixClient::~RadixClient() {
-#ifndef RADIXSHMEM_NO_RDMA
     teardown_cluster();
-#endif
     // Borrowed local tree is owned by the caller — don't free it.
     if (!owns_local_) (void)local_.release();
 }
@@ -489,21 +434,16 @@ InsertResult RadixClient::insert(const uint64_t* hashes, int n,
         throw std::runtime_error(
             "RadixClient::insert: no local tree (observer client is read-only)");
     require_writable("insert");
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_ && component == ComponentType::FULL)
         return dist_insert(hashes, n, slots, num_slots, start, auto_recycle);
-#endif
     InsertResult result = local_->insert(hashes, n, slots, num_slots, start,
                                          auto_recycle, component);
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_ && component != ComponentType::FULL &&
         result.topology_changed)
         update_rht(hashes, n, result);
-#endif
     return result;
 }
 
-#ifndef RADIXSHMEM_NO_RDMA
 // Probes local node boundaries + cs-aligned positions (the latter flagged
 // for the gap early-stop); scored from the deepest probe not past incumbent,
 // then the winner's route chain is followed to its end (rht_chain.h).
@@ -682,7 +622,6 @@ int RadixClient::find_component_source(const uint64_t* hashes, int n,
     hits_out = std::move(remote_hits);
     return best_remote_node;
 }
-#endif
 
 // Tree-level → public mapping; the Full run stays uncropped at [0, f) so a
 // remote fold can cut it at c — the component query exit crops to common_hit.
@@ -717,12 +656,10 @@ ComponentQueryResult RadixClient::query(const uint64_t* hashes, int n,
         result.status = RemoteStatus::BAD_REQUEST;
         return result;
     }
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_ && !local_only) {
         result = dist_query_components(hashes, n, component_mask, lock,
                                        update_meta, pins);
     } else
-#endif
     {
         if (!local_) {
             // local-only query needs a local tree (observer client is
@@ -763,7 +700,6 @@ ComponentQueryResult RadixClient::query(const uint64_t* hashes, int n,
     return result;
 }
 
-#ifndef RADIXSHMEM_NO_RDMA
 
 ComponentQueryResult RadixClient::dist_query_components(
         const uint64_t* hashes, int n, uint32_t component_mask, bool lock,
@@ -838,7 +774,6 @@ ComponentQueryResult RadixClient::query_components_remote_from(
     return result;
 }
 
-#endif  // !RADIXSHMEM_NO_RDMA
 
 int RadixClient::allocate_slots(int num_slots, std::vector<int32_t>& out,
                                 ComponentType component) {
@@ -862,10 +797,8 @@ void RadixClient::reset() {
     require_writable("reset");
     std::lock_guard<std::mutex> g(reset_mu_);
     int32_t rank = -1;
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_ && rht_) rank = peer_reg_->my_rank();
     if (!local_ && rank >= 0) rht_->reset(nullptr, -1);
-#endif
     if (!local_) return;
     RadixShmemTree& tree = local_->tree();
     const uint64_t gen = tree.reset_generation();
@@ -879,7 +812,6 @@ void RadixClient::reset() {
         tree.reset();
         return;
     }
-#ifndef RADIXSHMEM_NO_RDMA
     // The routes go first, while the tree still lists them.
     const uint64_t published = tree.route_publishes();
     std::vector<RhtRemoveEntry> own;
@@ -893,7 +825,6 @@ void RadixClient::reset() {
         rht_->remove_batch(own.data(), (int)own.size());
         rht_->flush();
     }
-#endif
 }
 
 
@@ -903,19 +834,14 @@ void RadixClient::dec_ref(const uint64_t* hashes, int n, PinRecord pin) {
 }
 
 void RadixClient::flush() {
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_) dist_flush();
-#endif
 }
 
 void RadixClient::dec_ref_remote(const uint64_t* hashes, int n, PinRecord pin) {
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_ && peer_index_) peer_index_->unlock(hashes, n, std::move(pin));
-#endif
     (void)hashes; (void)n;
 }
 
-#ifndef RADIXSHMEM_NO_RDMA
 
 template <typename Op>
 static RemoteStatus retry_unexecuted(Op op) {
@@ -1063,20 +989,13 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
     return rep.status == RemoteStatus::OK ? rep.freed : 0;
 }
 
-#endif  // !RADIXSHMEM_NO_RDMA
 
 bool RadixClient::is_distributed() const {
-#ifndef RADIXSHMEM_NO_RDMA
     return distributed_;
-#else
-    return false;
-#endif
 }
 
 int RadixClient::rank() const {
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_) return peer_reg_->my_rank();
-#endif
     // Without a cluster plane the tree's own stamp is the answer: 0 for a
     // standalone region, the owner's etcd rank for a local_read_only attach.
     if (local_)
@@ -1085,9 +1004,7 @@ int RadixClient::rank() const {
 }
 
 int RadixClient::world_size() const {
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed_) return peer_reg_->world_size();
-#endif
     return 1;
 }
 

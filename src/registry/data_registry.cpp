@@ -3,7 +3,6 @@
 
 #include "data_registry.h"
 
-#ifdef RADIXSHMEM_HAS_ETCD
 
 #include "etcd_client.hpp"
 
@@ -194,4 +193,3 @@ bool DataPlaneRegistry::validate_uniform(const DataPlaneEntry& local,
 
 } // namespace radixshmem
 
-#endif // RADIXSHMEM_HAS_ETCD

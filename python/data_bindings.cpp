@@ -460,7 +460,6 @@ PYBIND11_MODULE(_data, m) {
              py::call_guard<py::gil_scoped_release>(),
              "XFER_OK, or XFER_EBUSY while the batch is still running.");
 
-#ifdef RADIXSHMEM_HAS_ETCD
     // ==================== data-plane registry (etcd) ====================
     py::class_<DataPlaneEntry>(m, "DataPlaneEntry")
         .def_readonly("pool_mask", &DataPlaneEntry::pool_mask)
@@ -517,5 +516,4 @@ PYBIND11_MODULE(_data, m) {
                  return py::make_tuple(ok, who, why);
              },
              py::arg("local"), "Returns (ok, offending node, reason).");
-#endif
 }

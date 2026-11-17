@@ -4,7 +4,6 @@
 // Local-tree remote ops and endpoint lifecycle; transport creation stays in the factory.
 #include "radix_server.h"
 
-#ifndef RADIXSHMEM_NO_RDMA
 
 #include "remote_op_service.hpp"
 #include "local.h"                 // LocalTreeConnector (svc_tree_)
@@ -277,4 +276,3 @@ void RadixServer::rc_stop() {
 
 }  // namespace radixshmem
 
-#endif  // !RADIXSHMEM_NO_RDMA

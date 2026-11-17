@@ -44,7 +44,7 @@ from radixshmem.writeback import WritebackHandler, WritebackTask
 
 
 def build_info() -> dict:
-    """Package, shm and cluster protocol versions, compiled-in features and transfer backends."""
+    """Package, shm and cluster protocol versions and the transfer backends."""
     from radixshmem import _core
 
     try:
@@ -53,8 +53,7 @@ def build_info() -> dict:
     except ImportError:
         backends = []
     return {"version": __version__, "shm_version": _core.SHM_VERSION,
-            "protocol_version": _core.CLUSTER_PROTOCOL_VERSION,
-            "features": dict(_core.BUILD_FEATURES), "transfer_backends": backends}
+            "protocol_version": _core.CLUSTER_PROTOCOL_VERSION, "transfer_backends": backends}
 
 
 __all__ = [

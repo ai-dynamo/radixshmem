@@ -9,9 +9,7 @@
 #include "test_utils.h"
 #include "radix_client.h"
 #include "radix_tree.h"
-#ifndef RADIXSHMEM_NO_RDMA
 #include "rht_core.hpp"   // private module header: this test pokes RhtShard directly
-#endif
 
 #include <cassert>
 #include <chrono>
@@ -169,7 +167,6 @@ static void test_reset_then_fill_and_reset_slots_recycled() {
     TEST_PASS();
 }
 
-#ifndef RADIXSHMEM_NO_RDMA
 // ==================================================================
 static void test_reset_keeps_peer_fault_counts() {
     TEST_BEGIN("reset keeps the peer fault counts, which describe the cluster");
@@ -184,7 +181,6 @@ static void test_reset_keeps_peer_fault_counts() {
 
     TEST_PASS();
 }
-#endif
 
 // ==================================================================
 static void test_overlapping_resets_run_once() {
@@ -236,7 +232,6 @@ static void test_reset_lists_nodes_after_a_publish() {
     TEST_PASS();
 }
 
-#ifndef RADIXSHMEM_NO_RDMA
 // ==================================================================
 // RhtShard::reset() (run by RdmaRht::reset): every slot zeroed, header kept.
 static void test_rht_shard_reset() {
@@ -314,7 +309,6 @@ static void test_rht_shard_capacity_normalized() {
 
     TEST_PASS();
 }
-#endif
 
 // ==================================================================
 int main() {
@@ -325,10 +319,8 @@ int main() {
     test_reset_then_fill_and_reset_slots_recycled();
     test_overlapping_resets_run_once();
     test_reset_lists_nodes_after_a_publish();
-#ifndef RADIXSHMEM_NO_RDMA
     test_reset_keeps_peer_fault_counts();
     test_rht_shard_reset();
     test_rht_shard_capacity_normalized();
-#endif
     return tests_report();
 }

@@ -3,7 +3,6 @@
 
 #include "etcd_registry.hpp"
 
-#ifdef RADIXSHMEM_HAS_ETCD
 
 #include "radix_server.h"
 #include "cluster_manifest.h"
@@ -437,4 +436,3 @@ bool EtcdRegistry::join_existing(std::vector<PeerEntry>& out) {
 
 } // namespace radixshmem
 
-#endif // RADIXSHMEM_HAS_ETCD

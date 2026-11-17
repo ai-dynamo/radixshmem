@@ -5,7 +5,6 @@
 
 #include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 
-#ifndef RADIXSHMEM_NO_RDMA
 
 #include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
 
@@ -28,4 +27,3 @@ std::unique_ptr<IRemoteOpClientTransport> make_remote_op_client(
 
 }  // namespace radixshmem
 
-#endif  // !RADIXSHMEM_NO_RDMA

@@ -39,16 +39,14 @@ radixshmem; an editable install takes precedence over `PYTHONPATH`.
 cmake -S . -B build && cmake --build build -j && ctest --test-dir build
 ```
 
-Cross-node remote ops use gRPC exclusively and need the grpc++ and protobuf development packages
-(Ubuntu: `apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc`).
-An RDMA build fails configuration if these dependencies are missing. There is no ZMQ/DC remote-op fallback.
+A source build needs the grpc++ and protobuf development packages for the remote ops, hiredis for the
+Redis RHT, the rdma-core headers and a Go toolchain for the etcd client (Ubuntu: `apt-get install
+libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc libhiredis-dev libibverbs-dev
+libxxhash-dev golang`); configuration fails if one is missing. Cross-node remote ops use gRPC exclusively.
 The RHT and the peer index each run on one-sided RDMA (XRC or DC) or without it: the RHT on Redis
 (`RADIXSHMEM_RHT_BACKEND=redis`), the peer index on the peers' gRPC remote ops
 (`RADIXSHMEM_PEER_INDEX_BACKEND=grpc`). Both are the defaults, so by default the index opens no RDMA
 device on any node.
-
-C++ local-only builds (`-DENABLE_RDMA=OFF`) retain `RadixClient`, the standalone
-`radix_server`, and local tests; distributed client/server entry points are rejected.
 
 The optional data-plane backends are built separately; see [Transfer backends](#transfer-backends).
 

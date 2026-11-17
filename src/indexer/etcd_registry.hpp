@@ -5,15 +5,11 @@
 // and orders bringup through etcd (lease / create-if-absent / prefix-get): the
 // leader assigns dense ranks by sorted /peers order, resolves the shard map from
 // the observed node count, and every node publishes its final PeerEntry + shm name.
-//
-// Guarded on RADIXSHMEM_HAS_ETCD: when etcd is not built in, this TU is empty and
-// there is no cluster bootstrap (CMake FATAL_ERRORs before that in RDMA builds).
 
 #pragma once
 
 #include "radixshmem_config.h"
 
-#ifdef RADIXSHMEM_HAS_ETCD
 
 #include "cluster_registry.h"
 
@@ -82,4 +78,3 @@ private:
 
 } // namespace radixshmem
 
-#endif // RADIXSHMEM_HAS_ETCD

@@ -13,7 +13,6 @@
 #include "radix_tree.h"
 #include "net_util.hpp"
 
-#ifndef RADIXSHMEM_NO_RDMA
 #include "radix_client.h"
 #include "cluster_manifest.h"
 #include "cluster_protocol.h"
@@ -23,8 +22,7 @@
 #include "rht_redis.h"
 #include "remote_op_service.hpp"
 #include "remote_op_factory.hpp"
-#include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path; self-guards on RADIXSHMEM_HAS_ETCD)
-#endif
+#include "etcd_registry.hpp"   // EtcdRegistry (sole bootstrap path)
 
 #include <algorithm>
 #include <chrono>
@@ -53,11 +51,7 @@ const RadixShmemTree& RadixServer::tree() const { return *tree_; }
 const std::string& RadixServer::shm_name() const { return shm_name_; }
 
 int64_t RadixServer::lease_id() const {
-#if !defined(RADIXSHMEM_NO_RDMA) && defined(RADIXSHMEM_HAS_ETCD)
     return registry_ ? registry_->lease_id() : 0;
-#else
-    return 0;
-#endif
 }
 
 uint32_t RadixServer::total_radix_nodes() const  { return tree_->total_radix_nodes(); }
@@ -159,7 +153,6 @@ void RadixServer::evictor_loop() {
     }
 }
 
-#ifndef RADIXSHMEM_NO_RDMA
 
 // =====================================================================
 // cluster bring-up — shard-map helpers
@@ -331,11 +324,6 @@ void RadixServer::resolve_shard_map(int ranks) {
 void RadixServer::adopt_shard_map(const ShardMapMsg& sm) {
     // Follower path: install the leader's authoritative shard map + QoS. Mirrors
     // what resolve_shard_map() computes on the leader, but from the wire message.
-#ifndef RADIXSHMEM_HAS_REDIS
-    if (sm.rht_backend == CLUSTER_RHT_REDIS)
-        throw std::runtime_error("RadixServer: the cluster keeps its RHT in Redis, and this "
-                                 "radixshmem was built without hiredis");
-#endif
     rht_backend_  = sm.rht_backend;
     rht_redis_.assign(sm.rht_redis_seeds, strnlen(sm.rht_redis_seeds, sizeof(sm.rht_redis_seeds)));
     rht_redis_timeout_ms_ = sm.rht_redis_timeout_ms;
@@ -481,7 +469,6 @@ bool RadixServer::cluster_bootstrap() {
 
     // etcd rendezvous: discover peers + order bringup via etcd (sole path); the
     // planes come up in its round 2, once the shard map says which ones run.
-#ifdef RADIXSHMEM_HAS_ETCD
     // registry uri = "etcd://host:port" → strip scheme to "host:port".
     std::string ep = cfg_.registry;
     auto pos = ep.find("://");
@@ -496,16 +483,8 @@ bool RadixServer::cluster_bootstrap() {
     if (registry_->run_rendezvous(entries)) return true;
     registry_.reset();
     return false;
-#else
-    // No etcd built in → no cluster bootstrap. CMake FATAL_ERRORs before this in
-    // RDMA builds; this guard only covers a hand-forced ENABLE_ETCD=OFF RDMA build.
-    fprintf(stderr, "[RadixServer] built without etcd — no cluster bootstrap "
-                    "available\n");
-    return false;
-#endif
 }
 
-#endif  // !RADIXSHMEM_NO_RDMA
 
 // =====================================================================
 // RadixServer lifecycle
@@ -520,12 +499,6 @@ bool want_cluster(const RadixServerConfig& c) {
 } // namespace
 
 RadixServer::RadixServer(const RadixServerConfig& cfg) : cfg_(cfg) {
-#ifdef RADIXSHMEM_NO_RDMA
-    if (want_cluster(cfg_))
-        throw std::runtime_error(
-            "RadixServer: built without RDMA — distributed deployments "
-            "require libibverbs.");
-#endif
 }
 
 RadixServer::RadixServer(const std::string& name, const ShmConfig& shm) {
@@ -537,23 +510,17 @@ RadixServer::RadixServer(const std::string& name, const ShmConfig& shm) {
 
 RadixServer::~RadixServer() {
     dedup_writes_->set_active(false);
-#ifndef RADIXSHMEM_NO_RDMA
     // Stop remote-op serving before tearing down svc_*.
     rc_stop();
-#endif
     // Stop the evictor before anything that touches tree_ is torn down.
     stop_evictor();
     writeback_.reset();
-#ifndef RADIXSHMEM_NO_RDMA
     // Release the eviction-service client (its evict callback touches tree_).
     svc_client_.reset();   // releases (not frees) the borrowed svc_tree_
     svc_tree_.reset();
-#ifdef RADIXSHMEM_HAS_ETCD
     registry_.reset();     // revokes the lease: peers see this node leave at once
-#endif
     rht_holder_.reset();   // its MR lives on rdma_'s PD
     rdma_.reset();
-#endif
     // Finally drop the tree shm region.
     if (tree_) { tree_->destroy(); tree_.reset(); }
 }
@@ -563,12 +530,10 @@ bool RadixServer::bootstrap() {
     const float held_ratio = cfg_.writeback_max_held_ratio;
     if (cfg_.writeback_enabled && !(held_ratio > 0.0f && held_ratio <= 1.0f))
         throw std::runtime_error("RadixServer: writeback_max_held_ratio must be in (0, 1]");
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed) {
         read_rht_env();
         read_peer_index_env();
     }
-#endif
 
     ShmConfig shm = cfg_.shm;
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;
@@ -600,7 +565,6 @@ bool RadixServer::bootstrap() {
         writeback_ = std::make_unique<WritebackQueue>(*tree_);
     start_evictor();
 
-#ifndef RADIXSHMEM_NO_RDMA
     if (distributed) {
         bind_ip_ = bind_ip;   // published as PeerEntry.host
 
@@ -672,10 +636,7 @@ bool RadixServer::bootstrap() {
                 ec->remove_evicted_from_rht(keys.data(), (int)keys.size());
             });
     }
-#endif
-#ifndef RADIXSHMEM_NO_RDMA
     rc_spawn();
-#endif
     return true;
 }
 

@@ -20,12 +20,6 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
-# RDMA support (libibverbs) is optional; disable on hosts without IB headers.
-option(ENABLE_RDMA "Build RDMA-dependent sources (requires libibverbs)" ON)
-
-option(ENABLE_ETCD "Build the etcd cluster-bootstrap registry (requires Go toolchain)" ON)
-
-option(ENABLE_REDIS_RHT "Build the Redis Cluster RHT backend (requires hiredis)" ON)
 set(RADIXSHMEM_TEST_REDIS "" CACHE STRING
     "host:port of a Redis Cluster for the Redis RHT tests; empty skips them")
 set(RADIXSHMEM_TEST_REDIS_BIN "" CACHE PATH
@@ -45,7 +39,7 @@ set(NIXL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nixl-install" CACHE PATH
     "NIXL install prefix (meson --prefix), holding include/nixl.h and lib*/libnixl.so")
 
 option(RADIXSHMEM_STRICT_DEPS
-    "Fail instead of disabling a backend when hiredis, Mooncake or NIXL is enabled but not found" OFF)
+    "Fail instead of disabling a backend when Mooncake or NIXL is enabled but not found" OFF)
 
 # ==================== radixshmem library ====================
 set(_radixshmem_sources
@@ -64,8 +58,7 @@ set(_radixshmem_sources
     src/indexer/component/mamba_component.cpp
     # aux chain primitives + per-node retire + touch (eviction lifecycle hooks)
     src/indexer/component/aux_list.cpp
-    # RadixServer: shm region + evictor + (distributed) cluster bring-up. Self-guards
-    # RDMA use; must compile in both RDMA and non-RDMA builds.
+    # RadixServer: shm region + evictor + (distributed) cluster bring-up.
     src/indexer/server.cpp
     # Write-back queue between the background evictor and the write-back side.
     src/indexer/writeback.cpp
@@ -75,37 +68,33 @@ set(_radixshmem_sources
     # Lock-free leak audit (check_health); friend of RadixShmemTree, no other coupling.
     src/indexer/health_check.cpp
     # Lock-free tree copy for radix-monitor (dump_tree); same coupling as check_health.
-    src/indexer/tree_dump.cpp)
-if(ENABLE_RDMA)
-    list(APPEND _radixshmem_sources
-        # RHT (Radix Hash Table): shard shm + routing engine (core), holder +
-        # RdmaRht endpoints.
-        src/indexer/rht/rht_core.cpp
-        src/indexer/rht/rht_endpoint.cpp
-        src/indexer/rht/redis_rht.cpp
-        # RDMA transport plane: verbs primitives split by connection model.
-        src/indexer/transport/rdma/context.cpp
-        src/indexer/transport/rdma/rc_endpoint.cpp
-        src/indexer/transport/rdma/xrc.cpp
-        src/indexer/transport/rdma/dc_oneside.cpp
-        # XRC SEND-QP setup through the peer's XrcConnect RPC.
-        src/indexer/transport/rdma/xrc_connect.cpp
-        # The RDMA side of a radix-server (device, XRC SRQ, DCT, tree MR).
-        src/indexer/transport/rdma/rdma_host.cpp
-        # Peer-facing plane: the peer index backends (RDMA walks, gRPC remote ops)
-        # + remote-walk executor + client-side remote-op protocol (RemotePeer).
-        src/indexer/peer/peer_index.cpp
-        src/indexer/peer/rdma_peer_index.cpp
-        src/indexer/peer/grpc_peer_index.cpp
-        src/indexer/peer/peer_breaker.cpp
-        src/indexer/peer/rdma_remote_walker.cpp
-        src/indexer/peer/remote_op.cpp
-        # etcd cluster rendezvous; indexer-side (holds a RadixServer&).
-        src/indexer/etcd_registry.cpp
-        src/indexer/remote_op_service.cpp
-        src/indexer/transport/remote_op_factory.cpp
-    )
-endif()
+    src/indexer/tree_dump.cpp
+    # RHT (Radix Hash Table): shard shm + routing engine (core), holder +
+    # RdmaRht endpoints.
+    src/indexer/rht/rht_core.cpp
+    src/indexer/rht/rht_endpoint.cpp
+    src/indexer/rht/redis_rht.cpp
+    # RDMA transport plane: verbs primitives split by connection model.
+    src/indexer/transport/rdma/context.cpp
+    src/indexer/transport/rdma/rc_endpoint.cpp
+    src/indexer/transport/rdma/xrc.cpp
+    src/indexer/transport/rdma/dc_oneside.cpp
+    # XRC SEND-QP setup through the peer's XrcConnect RPC.
+    src/indexer/transport/rdma/xrc_connect.cpp
+    # The RDMA side of a radix-server (device, XRC SRQ, DCT, tree MR).
+    src/indexer/transport/rdma/rdma_host.cpp
+    # Peer-facing plane: the peer index backends (RDMA walks, gRPC remote ops)
+    # + remote-walk executor + client-side remote-op protocol (RemotePeer).
+    src/indexer/peer/peer_index.cpp
+    src/indexer/peer/rdma_peer_index.cpp
+    src/indexer/peer/grpc_peer_index.cpp
+    src/indexer/peer/peer_breaker.cpp
+    src/indexer/peer/rdma_remote_walker.cpp
+    src/indexer/peer/remote_op.cpp
+    # etcd cluster rendezvous; indexer-side (holds a RadixServer&).
+    src/indexer/etcd_registry.cpp
+    src/indexer/remote_op_service.cpp
+    src/indexer/transport/remote_op_factory.cpp)
 add_library(radixshmem STATIC ${_radixshmem_sources})
 set_property(TARGET radixshmem PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -131,129 +120,99 @@ target_include_directories(radixshmem PRIVATE
 )
 
 target_compile_definitions(radixshmem PUBLIC XXH_INLINE_ALL)
-set(_radixshmem_link_libs rt pthread)
-if(ENABLE_RDMA)
-    list(APPEND _radixshmem_link_libs ibverbs mlx5)   # mlx5 for DC (Direct Verbs)
-else()
-    set(RADIXSHMEM_NO_RDMA ON)
-endif()
-target_link_libraries(radixshmem PUBLIC ${_radixshmem_link_libs})
+target_link_libraries(radixshmem PUBLIC rt pthread ibverbs mlx5)   # mlx5 for DC (Direct Verbs)
 
 # Redis RHT backend: static hiredis when available, so nothing extra is needed at runtime.
-if(ENABLE_RDMA AND ENABLE_REDIS_RHT)
-    find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
-    find_library(HIREDIS_LIBRARY NAMES libhiredis.a hiredis)
-    if(HIREDIS_INCLUDE_DIR AND HIREDIS_LIBRARY)
-        target_include_directories(radixshmem PRIVATE ${HIREDIS_INCLUDE_DIR})
-        target_link_libraries(radixshmem PRIVATE ${HIREDIS_LIBRARY})
-        set(RADIXSHMEM_HAS_REDIS ON)
-        message(STATUS "Redis RHT backend: ${HIREDIS_LIBRARY}")
-    elseif(RADIXSHMEM_STRICT_DEPS)
-        message(FATAL_ERROR "Redis RHT backend: hiredis not found (RADIXSHMEM_STRICT_DEPS=ON)")
-    else()
-        message(STATUS "Redis RHT backend: hiredis not found, disabled")
-    endif()
+find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
+find_library(HIREDIS_LIBRARY NAMES libhiredis.a hiredis)
+if(NOT HIREDIS_INCLUDE_DIR OR NOT HIREDIS_LIBRARY)
+    message(FATAL_ERROR "The Redis RHT backend needs hiredis (Ubuntu: apt-get install libhiredis-dev).")
 endif()
+target_include_directories(radixshmem PRIVATE ${HIREDIS_INCLUDE_DIR})
+target_link_libraries(radixshmem PRIVATE ${HIREDIS_LIBRARY})
+message(STATUS "Redis RHT backend: ${HIREDIS_LIBRARY}")
 
 # ==================== gRPC (remote-op control plane) ====================
 # grpc++/protobuf via pkg-config plus protoc/grpc_cpp_plugin; the generated code is a static library only transport/grpc sees.
-set(RADIXSHMEM_GRPC_FOUND OFF)
-if(ENABLE_RDMA)
-    find_package(PkgConfig QUIET)
-    if(PkgConfig_FOUND)
-        pkg_check_modules(GRPCPP QUIET grpc++)
-        pkg_check_modules(PROTOBUF QUIET protobuf)
-    endif()
-    find_program(PROTOC_EXECUTABLE protoc)
-    find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin)
-    if(GRPCPP_FOUND AND PROTOBUF_FOUND AND PROTOC_EXECUTABLE AND GRPC_CPP_PLUGIN)
-        set(_grpc_proto_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
-        set(_grpc_gen_dir   ${CMAKE_BINARY_DIR}/generated/grpc)
-        set(_grpc_gen_srcs
-            ${_grpc_gen_dir}/remote_ops.pb.cc
-            ${_grpc_gen_dir}/remote_ops.grpc.pb.cc)
-        file(MAKE_DIRECTORY ${_grpc_gen_dir})
-        add_custom_command(
-            OUTPUT ${_grpc_gen_srcs}
-                   ${_grpc_gen_dir}/remote_ops.pb.h
-                   ${_grpc_gen_dir}/remote_ops.grpc.pb.h
-            COMMAND ${PROTOC_EXECUTABLE}
-                    --proto_path=${_grpc_proto_dir}
-                    --cpp_out=${_grpc_gen_dir}
-                    --grpc_out=${_grpc_gen_dir}
-                    --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
-                    ${_grpc_proto_dir}/remote_ops.proto
-            DEPENDS ${_grpc_proto_dir}/remote_ops.proto
-            COMMENT "Generating remote-op gRPC code (remote_ops.proto)"
-            VERBATIM)
-        add_library(radixshmem_grpc_proto STATIC ${_grpc_gen_srcs})
-        set_property(TARGET radixshmem_grpc_proto PROPERTY POSITION_INDEPENDENT_CODE ON)
-        target_include_directories(radixshmem_grpc_proto PUBLIC
-            ${_grpc_gen_dir} ${GRPCPP_INCLUDE_DIRS} ${PROTOBUF_INCLUDE_DIRS})
-        target_link_directories(radixshmem_grpc_proto PUBLIC
-            ${GRPCPP_LIBRARY_DIRS} ${PROTOBUF_LIBRARY_DIRS})
-        target_link_libraries(radixshmem_grpc_proto PUBLIC
-            ${GRPCPP_LIBRARIES} ${PROTOBUF_LIBRARIES})
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(GRPCPP QUIET grpc++)
+    pkg_check_modules(PROTOBUF QUIET protobuf)
+endif()
+find_program(PROTOC_EXECUTABLE protoc)
+find_program(GRPC_CPP_PLUGIN grpc_cpp_plugin)
+if(GRPCPP_FOUND AND PROTOBUF_FOUND AND PROTOC_EXECUTABLE AND GRPC_CPP_PLUGIN)
+    set(_grpc_proto_dir ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+    set(_grpc_gen_dir   ${CMAKE_BINARY_DIR}/generated/grpc)
+    set(_grpc_gen_srcs
+        ${_grpc_gen_dir}/remote_ops.pb.cc
+        ${_grpc_gen_dir}/remote_ops.grpc.pb.cc)
+    file(MAKE_DIRECTORY ${_grpc_gen_dir})
+    add_custom_command(
+        OUTPUT ${_grpc_gen_srcs}
+               ${_grpc_gen_dir}/remote_ops.pb.h
+               ${_grpc_gen_dir}/remote_ops.grpc.pb.h
+        COMMAND ${PROTOC_EXECUTABLE}
+                --proto_path=${_grpc_proto_dir}
+                --cpp_out=${_grpc_gen_dir}
+                --grpc_out=${_grpc_gen_dir}
+                --plugin=protoc-gen-grpc=${GRPC_CPP_PLUGIN}
+                ${_grpc_proto_dir}/remote_ops.proto
+        DEPENDS ${_grpc_proto_dir}/remote_ops.proto
+        COMMENT "Generating remote-op gRPC code (remote_ops.proto)"
+        VERBATIM)
+    add_library(radixshmem_grpc_proto STATIC ${_grpc_gen_srcs})
+    set_property(TARGET radixshmem_grpc_proto PROPERTY POSITION_INDEPENDENT_CODE ON)
+    target_include_directories(radixshmem_grpc_proto PUBLIC
+        ${_grpc_gen_dir} ${GRPCPP_INCLUDE_DIRS} ${PROTOBUF_INCLUDE_DIRS})
+    target_link_directories(radixshmem_grpc_proto PUBLIC
+        ${GRPCPP_LIBRARY_DIRS} ${PROTOBUF_LIBRARY_DIRS})
+    target_link_libraries(radixshmem_grpc_proto PUBLIC
+        ${GRPCPP_LIBRARIES} ${PROTOBUF_LIBRARIES})
 
-        target_sources(radixshmem PRIVATE
-            src/indexer/transport/grpc/grpc_remote_op_client.cpp
-            src/indexer/transport/grpc/grpc_remote_op_server.cpp)
-        target_include_directories(radixshmem PUBLIC
-            ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
-        target_link_libraries(radixshmem PRIVATE radixshmem_grpc_proto)
-        set(RADIXSHMEM_GRPC_FOUND ON)
-        set(RADIXSHMEM_HAS_GRPC ON)
-        message(STATUS "gRPC found (grpc++ ${GRPCPP_VERSION}, protobuf ${PROTOBUF_VERSION}) — grpc remote-op backend enabled")
-    else()
-        message(FATAL_ERROR "RDMA builds need gRPC for remote ops: grpc++ and protobuf via pkg-config, protoc and grpc_cpp_plugin (Ubuntu: apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc).")
-    endif()
+    target_sources(radixshmem PRIVATE
+        src/indexer/transport/grpc/grpc_remote_op_client.cpp
+        src/indexer/transport/grpc/grpc_remote_op_server.cpp)
+    target_include_directories(radixshmem PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/indexer/transport/grpc)
+    target_link_libraries(radixshmem PRIVATE radixshmem_grpc_proto)
+    message(STATUS "gRPC found (grpc++ ${GRPCPP_VERSION}, protobuf ${PROTOBUF_VERSION}) — grpc remote-op backend enabled")
 else()
-    message(STATUS "gRPC not needed (ENABLE_RDMA=${ENABLE_RDMA})")
+    message(FATAL_ERROR "Remote ops need gRPC: grpc++ and protobuf via pkg-config, protoc and grpc_cpp_plugin (Ubuntu: apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc).")
 endif()
 
 # ==================== radixshmem_registry: the etcd plane (Go client wrapper) ====================
 # The official Go etcd client compiled to a c-shared lib via `go build -buildmode=c-shared`,
 # which also emits libradix_etcd.h (the C surface). grpc/protobuf are statically bundled into
-# the .so, so the C++ side gains no heavy deps. RDMA is a prerequisite (no cluster without it).
-set(RADIXSHMEM_ETCD_FOUND OFF)
-if(ENABLE_ETCD AND ENABLE_RDMA)
-    find_program(GO_EXECUTABLE go)
-    if(NOT GO_EXECUTABLE)
-        message(FATAL_ERROR
-            "ENABLE_ETCD=ON but no `go` toolchain found. The cluster bootstrap "
-            "registry requires the Go etcd client. Install Go, or reconfigure with "
-            "-DENABLE_ETCD=OFF to build without cluster support.")
-    endif()
-    set(_etcd_go_dir  ${CMAKE_CURRENT_SOURCE_DIR}/src/registry/etcd_go)
-    set(_etcd_go_lib  ${CMAKE_BINARY_DIR}/lib/libradix_etcd.so)
-    set(_etcd_go_hdr  ${CMAKE_BINARY_DIR}/include/libradix_etcd.h)
-    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include)
-    # Build the wrapper into the build tree against the committed go.sum. GOPROXY carries
-    # a CN mirror fallback so the etcd modules download on restricted networks (Mooncake's pattern).
-    add_custom_command(
-        OUTPUT ${_etcd_go_lib} ${_etcd_go_hdr}
-        COMMAND ${CMAKE_COMMAND} -E env
-                GOPROXY=https://proxy.golang.org,https://goproxy.cn,direct
-                ${GO_EXECUTABLE} build -mod=readonly -trimpath -buildmode=c-shared
-                "-ldflags=-s -w -extldflags=-Wl,-soname,libradix_etcd.so"
-                -o ${_etcd_go_lib} radix_etcd.go
-        COMMAND ${CMAKE_COMMAND} -E copy
-                ${CMAKE_BINARY_DIR}/lib/libradix_etcd.h ${_etcd_go_hdr}
-        WORKING_DIRECTORY ${_etcd_go_dir}
-        DEPENDS ${_etcd_go_dir}/radix_etcd.go ${_etcd_go_dir}/go.mod ${_etcd_go_dir}/go.sum
-        COMMENT "Building Go etcd client wrapper (libradix_etcd.so)"
-        VERBATIM)
-    add_custom_target(radix_etcd_wrapper DEPENDS ${_etcd_go_lib} ${_etcd_go_hdr})
-    set(RADIXSHMEM_ETCD_FOUND ON)
-    set(RADIXSHMEM_HAS_ETCD ON)
-    message(STATUS "etcd registry enabled (Go wrapper via ${GO_EXECUTABLE})")
-else()
-    message(STATUS "etcd registry disabled (ENABLE_ETCD=${ENABLE_ETCD}, ENABLE_RDMA=${ENABLE_RDMA}) — no cluster bootstrap")
+# the .so, so the C++ side gains no heavy deps.
+find_program(GO_EXECUTABLE go)
+if(NOT GO_EXECUTABLE)
+    message(FATAL_ERROR "No `go` toolchain found; the cluster bootstrap registry is the Go etcd client.")
 endif()
+set(_etcd_go_dir  ${CMAKE_CURRENT_SOURCE_DIR}/src/registry/etcd_go)
+set(_etcd_go_lib  ${CMAKE_BINARY_DIR}/lib/libradix_etcd.so)
+set(_etcd_go_hdr  ${CMAKE_BINARY_DIR}/include/libradix_etcd.h)
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/include)
+# Build the wrapper into the build tree against the committed go.sum. GOPROXY carries
+# a CN mirror fallback so the etcd modules download on restricted networks (Mooncake's pattern).
+add_custom_command(
+    OUTPUT ${_etcd_go_lib} ${_etcd_go_hdr}
+    COMMAND ${CMAKE_COMMAND} -E env
+            GOPROXY=https://proxy.golang.org,https://goproxy.cn,direct
+            ${GO_EXECUTABLE} build -mod=readonly -trimpath -buildmode=c-shared
+            "-ldflags=-s -w -extldflags=-Wl,-soname,libradix_etcd.so"
+            -o ${_etcd_go_lib} radix_etcd.go
+    COMMAND ${CMAKE_COMMAND} -E copy
+            ${CMAKE_BINARY_DIR}/lib/libradix_etcd.h ${_etcd_go_hdr}
+    WORKING_DIRECTORY ${_etcd_go_dir}
+    DEPENDS ${_etcd_go_dir}/radix_etcd.go ${_etcd_go_dir}/go.mod ${_etcd_go_dir}/go.sum
+    COMMENT "Building Go etcd client wrapper (libradix_etcd.so)"
+    VERBATIM)
+add_custom_target(radix_etcd_wrapper DEPENDS ${_etcd_go_lib} ${_etcd_go_hdr})
+message(STATUS "etcd registry enabled (Go wrapper via ${GO_EXECUTABLE})")
 
 # Its own plane, not the indexer's: both planes key off the same etcd, so both
-# may link this. Defined unconditionally — every TU under src/registry guards on
-# RADIXSHMEM_HAS_ETCD, so an etcd-less build just yields an empty archive.
+# may link this.
 add_library(radixshmem_registry STATIC src/registry/data_registry.cpp)
 target_include_directories(radixshmem_registry PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -262,10 +221,8 @@ target_include_directories(radixshmem_registry PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/src/registry)
 target_link_libraries(radixshmem_registry PUBLIC rt pthread)
 set_property(TARGET radixshmem_registry PROPERTY POSITION_INDEPENDENT_CODE ON)
-if(RADIXSHMEM_ETCD_FOUND)
-    add_dependencies(radixshmem_registry radix_etcd_wrapper)
-    target_link_libraries(radixshmem_registry PUBLIC ${_etcd_go_lib})
-endif()
+add_dependencies(radixshmem_registry radix_etcd_wrapper)
+target_link_libraries(radixshmem_registry PUBLIC ${_etcd_go_lib})
 
 target_link_libraries(radixshmem PUBLIC radixshmem_registry)
 
@@ -392,8 +349,7 @@ set(_core_unit_tests
     test_tree_reset
     test_client_concurrency
     test_alloc
-    # Consolidated query_components coverage (match/pin/facade; the remote
-    # sections self-gate on RADIXSHMEM_NO_RDMA inside the file).
+    # Consolidated query_components coverage (match/pin/facade and the remote sections).
     test_component_query
     # Aux chain lifecycle (EV1): publish/touch/split/merge/cascade/reuse.
     test_component_evict
@@ -402,7 +358,7 @@ set(_core_unit_tests
     test_tree_dedup
     test_dedup_move
     # RhtEngine over a fake one-sided endpoint: scratch-bounded lookup rounds,
-    # remote insert/remove plumbing (self-gates on RADIXSHMEM_NO_RDMA).
+    # remote insert/remove plumbing.
     test_rht_engine
     # PeerBreaker: skip/probe/backoff of an unreachable peer.
     test_peer_breaker
@@ -417,150 +373,138 @@ foreach(_t ${_core_unit_tests})
     add_test(NAME ${_t} COMMAND ${_t})
 endforeach()
 
-if(ENABLE_RDMA)
-    # XRC shared-state cross-process primitive test (no radixshmem needed).
-    add_executable(test_xrc_state tests/indexer/test_xrc_state.cpp)
-    target_link_libraries(test_xrc_state PRIVATE radixshmem)
-    radixshmem_enable_asserts(test_xrc_state)
-    add_test(NAME test_xrc_state COMMAND test_xrc_state)
+# XRC shared-state cross-process primitive test (no radixshmem needed).
+add_executable(test_xrc_state tests/indexer/test_xrc_state.cpp)
+target_link_libraries(test_xrc_state PRIVATE radixshmem)
+radixshmem_enable_asserts(test_xrc_state)
+add_test(NAME test_xrc_state COMMAND test_xrc_state)
 
 
-    # Cross-process distributed integration test (writer/reader/lockdec/...).
-    add_executable(test_cluster tests/indexer/test_cluster.cpp)
-    target_link_libraries(test_cluster PRIVATE radixshmem)
-    radixshmem_enable_asserts(test_cluster)
-    add_test(NAME test_cluster COMMAND test_cluster)
+# Cross-process distributed integration test (writer/reader/lockdec/...).
+add_executable(test_cluster tests/indexer/test_cluster.cpp)
+target_link_libraries(test_cluster PRIVATE radixshmem)
+radixshmem_enable_asserts(test_cluster)
+add_test(NAME test_cluster COMMAND test_cluster)
 
-    # Phase-3 node-join: 2-node cluster + a late data-peer joiner (join_existing),
-    # existing reader senses it via /peers watcher and remote-walks it lazily.
-    add_executable(test_cluster_node_join tests/indexer/test_cluster_node_join.cpp)
-    target_link_libraries(test_cluster_node_join PRIVATE radixshmem)
-    radixshmem_enable_asserts(test_cluster_node_join)
-    add_test(NAME test_cluster_node_join COMMAND test_cluster_node_join)
+# Phase-3 node-join: 2-node cluster + a late data-peer joiner (join_existing),
+# existing reader senses it via /peers watcher and remote-walks it lazily.
+add_executable(test_cluster_node_join tests/indexer/test_cluster_node_join.cpp)
+target_link_libraries(test_cluster_node_join PRIVATE radixshmem)
+radixshmem_enable_asserts(test_cluster_node_join)
+add_test(NAME test_cluster_node_join COMMAND test_cluster_node_join)
 
-    # Observer (no local tree, rank -1): pure client discovers the cluster from
-    # etcd, remote-walks a writer's prefix, and rejects every local-tree op.
-    add_executable(test_client_no_server tests/indexer/test_client_no_server.cpp)
-    target_link_libraries(test_client_no_server PRIVATE radixshmem)
-    radixshmem_enable_asserts(test_client_no_server)
-    add_test(NAME test_client_no_server COMMAND test_client_no_server)
-    add_test(NAME test_client_no_server_dc COMMAND test_client_no_server)
-    set_tests_properties(test_client_no_server_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
+# Observer (no local tree, rank -1): pure client discovers the cluster from
+# etcd, remote-walks a writer's prefix, and rejects every local-tree op.
+add_executable(test_client_no_server tests/indexer/test_client_no_server.cpp)
+target_link_libraries(test_client_no_server PRIVATE radixshmem)
+radixshmem_enable_asserts(test_client_no_server)
+add_test(NAME test_client_no_server COMMAND test_client_no_server)
+add_test(NAME test_client_no_server_dc COMMAND test_client_no_server)
+set_tests_properties(test_client_no_server_dc PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
 
-    # A client borrowing a tree (radix-server's RHT client) that fails to
-    # bootstrap leaves the tree to its owner.
-    add_executable(test_client_borrowed_tree tests/indexer/test_client_borrowed_tree.cpp)
-    target_link_libraries(test_client_borrowed_tree PRIVATE radixshmem)
-    radixshmem_enable_asserts(test_client_borrowed_tree)
-    add_test(NAME test_client_borrowed_tree COMMAND test_client_borrowed_tree)
+# A client borrowing a tree (radix-server's RHT client) that fails to
+# bootstrap leaves the tree to its owner.
+add_executable(test_client_borrowed_tree tests/indexer/test_client_borrowed_tree.cpp)
+target_link_libraries(test_client_borrowed_tree PRIVATE radixshmem)
+radixshmem_enable_asserts(test_client_borrowed_tree)
+add_test(NAME test_client_borrowed_tree COMMAND test_client_borrowed_tree)
 
-    # M < N RHT-shard decoupling test (N=3, M=2, holders={0,1}).
-    add_executable(test_cluster_shards tests/indexer/test_cluster_shards.cpp)
-    target_link_libraries(test_cluster_shards PRIVATE radixshmem)
-    radixshmem_enable_asserts(test_cluster_shards)
-    add_test(NAME test_cluster_shards COMMAND test_cluster_shards)
+# M < N RHT-shard decoupling test (N=3, M=2, holders={0,1}).
+add_executable(test_cluster_shards tests/indexer/test_cluster_shards.cpp)
+target_link_libraries(test_cluster_shards PRIVATE radixshmem)
+radixshmem_enable_asserts(test_cluster_shards)
+add_test(NAME test_cluster_shards COMMAND test_cluster_shards)
 
-    # Same binaries re-run over the DC data-plane transport (incl. fetch-add atomics).
-    add_test(NAME test_cluster_dc COMMAND test_cluster)
-    set_tests_properties(test_cluster_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
-    # The two planes pick their transport independently: one DC, the other XRC.
-    add_test(NAME test_cluster_rht_dc_peer_xrc COMMAND test_cluster)
-    set_tests_properties(test_cluster_rht_dc_peer_xrc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc")
-    add_test(NAME test_cluster_rht_xrc_peer_dc COMMAND test_cluster)
-    set_tests_properties(test_cluster_rht_xrc_peer_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
-    add_test(NAME test_cluster_shards_dc COMMAND test_cluster_shards)
-    set_tests_properties(test_cluster_shards_dc PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
+# Same binaries re-run over the DC data-plane transport (incl. fetch-add atomics).
+add_test(NAME test_cluster_dc COMMAND test_cluster)
+set_tests_properties(test_cluster_dc PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
+# The two planes pick their transport independently: one DC, the other XRC.
+add_test(NAME test_cluster_rht_dc_peer_xrc COMMAND test_cluster)
+set_tests_properties(test_cluster_rht_dc_peer_xrc PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc")
+add_test(NAME test_cluster_rht_xrc_peer_dc COMMAND test_cluster)
+set_tests_properties(test_cluster_rht_xrc_peer_dc PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
+add_test(NAME test_cluster_shards_dc COMMAND test_cluster_shards)
+set_tests_properties(test_cluster_shards_dc PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
 
-    # DC + peer-shard RDMA: a rank only attaches its own shard, so every peer
-    # shard's RHT access hits the DC one-sided WRITE path (write_async_inline +
-    # flush) on the wire — no env needed, distinct node_name per rank already
-    # forces it. W=4 also covers read-modify-write over the collision chain.
-    add_test(NAME test_cluster_dc_rht_nic COMMAND test_cluster)
-    set_tests_properties(test_cluster_dc_rht_nic PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
-    add_test(NAME test_cluster_shards_dc_rht_nic_w4 COMMAND test_cluster_shards)
-    set_tests_properties(test_cluster_shards_dc_rht_nic_w4 PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc;RADIXSHMEM_RHT_SLOTS=4")
+# DC + peer-shard RDMA: a rank only attaches its own shard, so every peer
+# shard's RHT access hits the DC one-sided WRITE path (write_async_inline +
+# flush) on the wire — no env needed, distinct node_name per rank already
+# forces it. W=4 also covers read-modify-write over the collision chain.
+add_test(NAME test_cluster_dc_rht_nic COMMAND test_cluster)
+set_tests_properties(test_cluster_dc_rht_nic PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
+add_test(NAME test_cluster_shards_dc_rht_nic_w4 COMMAND test_cluster_shards)
+set_tests_properties(test_cluster_shards_dc_rht_nic_w4 PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc;RADIXSHMEM_RHT_SLOTS=4")
 
-    # The peer index over the peers' gRPC Query/Unlock instead of RDMA walks.
-    foreach(_t test_cluster test_cluster_node_join test_client_no_server)
-        add_test(NAME ${_t}_grpc_peer COMMAND ${_t})
-        set_tests_properties(${_t}_grpc_peer PROPERTIES
-            ENVIRONMENT "RADIXSHMEM_PEER_INDEX_BACKEND=grpc")
-    endforeach()
+# The peer index over the peers' gRPC Query/Unlock instead of RDMA walks.
+foreach(_t test_cluster test_cluster_node_join test_client_no_server)
+    add_test(NAME ${_t}_grpc_peer COMMAND ${_t})
+    set_tests_properties(${_t}_grpc_peer PROPERTIES
+        ENVIRONMENT "RADIXSHMEM_PEER_INDEX_BACKEND=grpc")
+endforeach()
 
-    # Multi-slot RHT re-run with W=4 to exercise collision chaining.
-    add_test(NAME test_cluster_w4 COMMAND test_cluster)
-    set_tests_properties(test_cluster_w4 PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_SLOTS=4")
-    add_test(NAME test_cluster_shards_w4 COMMAND test_cluster_shards)
-    set_tests_properties(test_cluster_shards_w4 PROPERTIES
-        ENVIRONMENT "RADIXSHMEM_RHT_SLOTS=4")
+# Multi-slot RHT re-run with W=4 to exercise collision chaining.
+add_test(NAME test_cluster_w4 COMMAND test_cluster)
+set_tests_properties(test_cluster_w4 PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_SLOTS=4")
+add_test(NAME test_cluster_shards_w4 COMMAND test_cluster_shards)
+set_tests_properties(test_cluster_shards_w4 PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_SLOTS=4")
 
-    # Redis RHT against a live cluster at RADIXSHMEM_TEST_REDIS; skips without one.
-    add_executable(test_rht_redis tests/indexer/core/test_rht_redis.cpp)
-    target_link_libraries(test_rht_redis PRIVATE radixshmem)
-    target_include_directories(test_rht_redis PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
-    radixshmem_enable_asserts(test_rht_redis)
-    add_test(NAME test_rht_redis COMMAND test_rht_redis)
-    set_tests_properties(test_rht_redis PROPERTIES SKIP_RETURN_CODE 77
-        ENVIRONMENT "RADIXSHMEM_TEST_REDIS=${RADIXSHMEM_TEST_REDIS}")
+# Redis RHT against a live cluster at RADIXSHMEM_TEST_REDIS; skips without one.
+add_executable(test_rht_redis tests/indexer/core/test_rht_redis.cpp)
+target_link_libraries(test_rht_redis PRIVATE radixshmem)
+target_include_directories(test_rht_redis PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
+radixshmem_enable_asserts(test_rht_redis)
+add_test(NAME test_rht_redis COMMAND test_rht_redis)
+set_tests_properties(test_rht_redis PROPERTIES SKIP_RETURN_CODE 77
+    ENVIRONMENT "RADIXSHMEM_TEST_REDIS=${RADIXSHMEM_TEST_REDIS}")
 
-    # Starts its own 6-node cluster on free ports; skips without RADIXSHMEM_TEST_REDIS_BIN.
-    add_executable(test_rht_redis_faults tests/indexer/core/test_rht_redis_faults.cpp)
-    target_link_libraries(test_rht_redis_faults PRIVATE radixshmem)
-    target_include_directories(test_rht_redis_faults PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
-    radixshmem_enable_asserts(test_rht_redis_faults)
-    add_test(NAME test_rht_redis_faults COMMAND test_rht_redis_faults)
-    set_tests_properties(test_rht_redis_faults PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
-        ENVIRONMENT "RADIXSHMEM_TEST_REDIS_BIN=${RADIXSHMEM_TEST_REDIS_BIN}")
-endif()
+# Starts its own 6-node cluster on free ports; skips without RADIXSHMEM_TEST_REDIS_BIN.
+add_executable(test_rht_redis_faults tests/indexer/core/test_rht_redis_faults.cpp)
+target_link_libraries(test_rht_redis_faults PRIVATE radixshmem)
+target_include_directories(test_rht_redis_faults PRIVATE ${CMAKE_SOURCE_DIR}/tests/indexer)
+radixshmem_enable_asserts(test_rht_redis_faults)
+add_test(NAME test_rht_redis_faults COMMAND test_rht_redis_faults)
+set_tests_properties(test_rht_redis_faults PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
+    ENVIRONMENT "RADIXSHMEM_TEST_REDIS_BIN=${RADIXSHMEM_TEST_REDIS_BIN}")
 
 # ==================== Remote-op e2e gate ====================
-# Explicit remote routing API on RadixClient; built whenever ENABLE_RDMA
-# (remote-op is always compiled in RDMA builds), self-SKIPs (exit 77) without a device.
-if(ENABLE_RDMA)
-    add_executable(test_remote_api tests/indexer/test_remote_api.cpp)
-    target_link_libraries(test_remote_api PRIVATE radixshmem)
-
-    if(RADIXSHMEM_GRPC_FOUND)
-        add_test(NAME test_remote_api_grpc COMMAND test_remote_api)
-        add_test(NAME test_remote_api_grpc_dcd COMMAND test_remote_api)
-        set_tests_properties(test_remote_api_grpc_dcd PROPERTIES
-            ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
-    endif()
-endif()
+# Explicit remote routing API on RadixClient; self-SKIPs (exit 77) without a device.
+add_executable(test_remote_api tests/indexer/test_remote_api.cpp)
+target_link_libraries(test_remote_api PRIVATE radixshmem)
+add_test(NAME test_remote_api_grpc COMMAND test_remote_api)
+add_test(NAME test_remote_api_grpc_dcd COMMAND test_remote_api)
+set_tests_properties(test_remote_api_grpc_dcd PROPERTIES
+    ENVIRONMENT "RADIXSHMEM_RHT_TRANSPORT=dc;RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc")
 
 # Loopback gRPC tests use a real single-node tree without RDMA or etcd.
-if(RADIXSHMEM_GRPC_FOUND)
-    add_executable(test_remote_op_grpc tests/indexer/test_remote_op_grpc.cpp)
-    target_link_libraries(test_remote_op_grpc PRIVATE radixshmem radixshmem_grpc_proto)
-    target_include_directories(test_remote_op_grpc PRIVATE
-        ${CMAKE_SOURCE_DIR}/tests/indexer ${CMAKE_SOURCE_DIR}/src/indexer
-        ${CMAKE_SOURCE_DIR}/src/indexer/transport)
-    radixshmem_enable_asserts(test_remote_op_grpc)
-    add_test(NAME test_remote_op_grpc COMMAND test_remote_op_grpc)
-endif()
+add_executable(test_remote_op_grpc tests/indexer/test_remote_op_grpc.cpp)
+target_link_libraries(test_remote_op_grpc PRIVATE radixshmem radixshmem_grpc_proto)
+target_include_directories(test_remote_op_grpc PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/indexer ${CMAKE_SOURCE_DIR}/src/indexer
+    ${CMAKE_SOURCE_DIR}/src/indexer/transport)
+radixshmem_enable_asserts(test_remote_op_grpc)
+add_test(NAME test_remote_op_grpc COMMAND test_remote_op_grpc)
 
 # Data-plane geometry in the shared etcd registry. Needs an etcd binary but no
 # RDMA device, and stays single-process (the Go wrapper deadlocks on a bare
-# fork), so it is gated on the registry alone. Links radixshmem_registry ALONE —
-# neither plane's library — which keeps the registry plane-neutral.
-if(RADIXSHMEM_HAS_ETCD)
-    add_executable(test_data_registry tests/registry/test_data_registry.cpp)
-    target_link_libraries(test_data_registry PRIVATE radixshmem_registry)
-    # etcd fixture from tests/indexer; runner from tests/dataplane (no indexer headers).
-    target_include_directories(test_data_registry PRIVATE
-        ${CMAKE_SOURCE_DIR}/tests/indexer
-        ${CMAKE_SOURCE_DIR}/tests/dataplane)
-    radixshmem_enable_asserts(test_data_registry)
-    add_test(NAME test_data_registry COMMAND test_data_registry)
-endif()
+# fork). Links radixshmem_registry ALONE — neither plane's library — which keeps
+# the registry plane-neutral.
+add_executable(test_data_registry tests/registry/test_data_registry.cpp)
+target_link_libraries(test_data_registry PRIVATE radixshmem_registry)
+# etcd fixture from tests/indexer; runner from tests/dataplane (no indexer headers).
+target_include_directories(test_data_registry PRIVATE
+    ${CMAKE_SOURCE_DIR}/tests/indexer
+    ${CMAKE_SOURCE_DIR}/tests/dataplane)
+radixshmem_enable_asserts(test_data_registry)
+add_test(NAME test_data_registry COMMAND test_data_registry)
 
 # Tests that self-SKIP (exit 77) without RDMA device / python ext / etcd binary;
 # register code so ctest shows "Skipped". The cluster tests fork a private etcd
@@ -625,10 +569,8 @@ set(_benches
     bench_query_dist
     bench_cluster
     stress_test_llm
+    bench_peer_query
 )
-if(RADIXSHMEM_HAS_ETCD)
-    list(APPEND _benches bench_peer_query)
-endif()
 foreach(_b ${_benches})
     add_executable(${_b} tests/bench/${_b}.cpp)
     target_link_libraries(${_b} PRIVATE radixshmem)
@@ -638,10 +580,8 @@ foreach(_b ${_benches})
 endforeach()
 
 # Remote-op correctness smoke on a 2-rank cluster; manual quick check (needs RDMA device, not in ctest).
-if(ENABLE_RDMA)
-    add_executable(remote_op_smoke tests/bench/remote_op_smoke.cpp)
-    target_link_libraries(remote_op_smoke PRIVATE radixshmem)
-endif()
+add_executable(remote_op_smoke tests/bench/remote_op_smoke.cpp)
+target_link_libraries(remote_op_smoke PRIVATE radixshmem)
 
 # ==================== Data plane: radixshmem_data (storage + transfer) ====================
 # Deliberately independent of libradixshmem. The ONLY coupling between the control
@@ -781,9 +721,7 @@ if(BUILD_PYTHON_MODULES)
         endforeach()
         if(SKBUILD)
             install(TARGETS radixshmem_core_py radixshmem_data_py LIBRARY DESTINATION radixshmem)
-            if(RADIXSHMEM_ETCD_FOUND)
-                install(FILES ${_etcd_go_lib} DESTINATION radixshmem)
-            endif()
+            install(FILES ${_etcd_go_lib} DESTINATION radixshmem)
         endif()
         # In ctest, unlike test_radixshmem.py: this one needs no server and no
         # numpy, so it can be part of the gate rather than a manual step.
