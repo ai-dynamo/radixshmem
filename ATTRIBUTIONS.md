@@ -22,7 +22,7 @@ The Python wheels bundle the third-party code listed below, at the versions the 
 | zlib | 1.3.1.1 (f1f503da) | Zlib | `_core` (static) | https://github.com/madler/zlib |
 | hiredis | 1.5.0 | BSD-3-Clause | `_core` (static) | https://github.com/redis/hiredis |
 | xxHash | 0.8.2 (headers) | BSD-2-Clause | `_core` | https://github.com/Cyan4973/xxHash |
-| pybind11 | 3.1.0 (headers) | BSD-3-Clause | `_core`, `_data` | https://github.com/pybind/pybind11 |
+| pybind11 | 3.1.0 (headers) | BSD-3-Clause | `_core` | https://github.com/pybind/pybind11 |
 | Go standard library and runtime | go1.27.4 | BSD-3-Clause | `libradix_etcd.so` | https://go.dev |
 | github.com/coreos/go-semver | v0.3.1 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-semver@v0.3.1 |
 | github.com/coreos/go-systemd/v22 | v22.5.0 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-systemd/v22@v22.5.0 |

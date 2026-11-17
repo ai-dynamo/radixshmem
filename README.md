@@ -182,52 +182,50 @@ The full API (methods, parameters, result fields, error codes) is in [`docs/api.
 
 ## Transfer backends
 
-### 1. NIXL
+The data plane moves slots through a transfer backend, chosen with `--transfer-backend`. Both backends implement
+`radixshmem.transfer.TransferBackend`; `radixshmem.transfer.SlotTransfer` turns slot ids into address ranges for
+whichever one is in use.
 
-Build NIXL:
+### 1. Mooncake (default)
 
-```bash
-scripts/build_nixl.sh
-pip install .
-```
-
-Start the server with `--transfer-backend nixl`. NIXL cannot pick its own port, so `--transfer-port` is
-required:
-
-```bash
-radix-server --name /my_kv_cache --data-bytes 1024G \
-    --transfer-backend nixl --transfer-port 17000 \
-    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 \
-    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
-```
-
-### 2. Mooncake
-
-Build Mooncake:
+The Mooncake backend is C++, built as the plugin `libradixshmem_mooncake.so` next to `radixshmem._core`, which
+loads it when a server first needs it. The PyPI wheels include it. From source, build Mooncake first:
 
 ```bash
 scripts/build_mooncake.sh
 pip install .
 ```
 
-Start the server with `--transfer-backend mooncake`:
+`ENABLE_MOONCAKE` takes `AUTO` (default: build the plugin when Mooncake is found), `ON` (fail without it) or
+`OFF`. C++ programs outside the package find the plugin through `RADIXSHMEM_TRANSFER_PLUGIN_DIR`.
 
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G \
-    --transfer-backend mooncake \
     --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
     --rpc-address 10.0.0.10 \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
-Each backend is a plugin, `libradixshmem_mooncake.so` or `libradixshmem_nixl.so`, installed next to
-`radixshmem._data` and loaded when a server first needs it; C++ programs outside the package find the plugins
-through `RADIXSHMEM_TRANSFER_PLUGIN_DIR`. `ENABLE_MOONCAKE` and `ENABLE_NIXL` take `AUTO` (default: build the
-plugin when the engine is found), `ON` (fail without it) or `OFF`. To check which plugins are installed:
+### 2. NIXL
+
+The NIXL backend uses NIXL's Python package (UCX backend). Install it with the `nixl` extra, which brings
+`nixl-cu13` (and with it torch; no wheels for Python 3.14 yet), or put an existing NIXL installation's Python
+package on the path:
 
 ```bash
-python -c "import radixshmem; print(radixshmem._data.TRANSFER_BACKENDS)"
+pip install "radixshmem[nixl]"
+radix-server --name /my_kv_cache --data-bytes 1024G \
+    --transfer-backend nixl \
+    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
+    --rpc-address 10.0.0.10 \
+    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
+```
+
+`--transfer-port` sets NIXL's metadata port; without it a free port is picked. To check which backends are
+available:
+
+```bash
+python -c "import radixshmem; print(radixshmem.build_info()['transfer_backends'])"
 ```
 
 ## License
