@@ -24,23 +24,23 @@ The Python wheels bundle the third-party code listed below, at the versions the 
 | xxHash | 0.8.2 (headers) | BSD-2-Clause | `_core` | https://github.com/Cyan4973/xxHash |
 | pybind11 | 3.1.0 (headers) | BSD-3-Clause | `_core`, `_data` | https://github.com/pybind/pybind11 |
 | Go standard library and runtime | go1.27.4 | BSD-3-Clause | `libradix_etcd.so` | https://go.dev |
-| github.com/coreos/go-semver | v0.3.0 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-semver@v0.3.0 |
-| github.com/coreos/go-systemd/v22 | v22.3.2 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-systemd/v22@v22.3.2 |
+| github.com/coreos/go-semver | v0.3.1 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-semver@v0.3.1 |
+| github.com/coreos/go-systemd/v22 | v22.5.0 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-systemd/v22@v22.5.0 |
 | github.com/gogo/protobuf | v1.3.2 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/gogo/protobuf@v1.3.2 |
 | github.com/golang/protobuf | v1.5.4 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/golang/protobuf@v1.5.4 |
-| go.etcd.io/etcd/api/v3 | v3.5.21 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/api/v3@v3.5.21 |
-| go.etcd.io/etcd/client/pkg/v3 | v3.5.21 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/client/pkg/v3@v3.5.21 |
-| go.etcd.io/etcd/client/v3 | v3.5.21 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/client/v3@v3.5.21 |
-| go.uber.org/atomic | v1.7.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/atomic@v1.7.0 |
-| go.uber.org/multierr | v1.6.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/multierr@v1.6.0 |
-| go.uber.org/zap | v1.17.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/zap@v1.17.0 |
-| golang.org/x/net | v0.38.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/net@v0.38.0 |
-| golang.org/x/sys | v0.31.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/sys@v0.31.0 |
-| golang.org/x/text | v0.23.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/text@v0.23.0 |
-| google.golang.org/genproto/googleapis/api | v0.0.0-20230822172742-b8732ec3820d | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/genproto/googleapis/api@v0.0.0-20230822172742-b8732ec3820d |
-| google.golang.org/genproto/googleapis/rpc | v0.0.0-20230822172742-b8732ec3820d | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/genproto/googleapis/rpc@v0.0.0-20230822172742-b8732ec3820d |
-| google.golang.org/grpc | v1.59.0 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/grpc@v1.59.0 |
-| google.golang.org/protobuf | v1.33.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/protobuf@v1.33.0 |
+| github.com/grpc-ecosystem/grpc-gateway/v2 | v2.29.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/grpc-ecosystem/grpc-gateway/v2@v2.29.0 |
+| go.etcd.io/etcd/api/v3 | v3.6.16 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/api/v3@v3.6.16 |
+| go.etcd.io/etcd/client/pkg/v3 | v3.6.16 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/client/pkg/v3@v3.6.16 |
+| go.etcd.io/etcd/client/v3 | v3.6.16 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/client/v3@v3.6.16 |
+| go.uber.org/multierr | v1.11.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/multierr@v1.11.0 |
+| go.uber.org/zap | v1.27.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/zap@v1.27.0 |
+| golang.org/x/net | v0.62.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/net@v0.62.0 |
+| golang.org/x/sys | v0.49.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/sys@v0.49.0 |
+| golang.org/x/text | v0.43.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/text@v0.43.0 |
+| google.golang.org/genproto/googleapis/api | v0.0.0-20260817212433-ac3dfec99bb1 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/genproto/googleapis/api@v0.0.0-20260817212433-ac3dfec99bb1 |
+| google.golang.org/genproto/googleapis/rpc | v0.0.0-20260817212433-ac3dfec99bb1 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/genproto/googleapis/rpc@v0.0.0-20260817212433-ac3dfec99bb1 |
+| google.golang.org/grpc | v1.85.0 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/grpc@v1.85.0 |
+| google.golang.org/protobuf | v1.36.12 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/protobuf@v1.36.12 |
 | Mooncake Transfer Engine | e5598b09 | Apache-2.0 | `libradixshmem_mooncake.so` (static) | https://github.com/kvcache-ai/Mooncake |
 | yaLanTingLibs | 7801bc9a (headers) | Apache-2.0 | `libradixshmem_mooncake.so` | https://github.com/alibaba/yalantinglibs |
 | Asio (standalone, from yaLanTingLibs) | 1.24.0 | BSL-1.0 | `radixshmem.libs/libasio-*.so` | https://github.com/chriskohlhoff/asio |
@@ -234,28 +234,36 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## go.uber.org/atomic
+## github.com/grpc-ecosystem/grpc-gateway/v2
 
 ```
-Copyright (c) 2016 Uber Technologies, Inc.
+Copyright (c) 2015, Gengo, Inc.
+All rights reserved.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Redistribution and use in source and binary forms, with or without modification,
+are permitted provided that the following conditions are met:
 
-The above copyright notice and this permission notice shall be included in
-all copies or substantial portions of the Software.
+    * Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
-THE SOFTWARE.
+    * Redistributions in binary form must reproduce the above copyright notice,
+      this list of conditions and the following disclaimer in the documentation
+      and/or other materials provided with the distribution.
+
+    * Neither the name of Gengo, Inc. nor the names of its
+      contributors may be used to endorse or promote products derived from this
+      software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
 ## go.uber.org/multierr
