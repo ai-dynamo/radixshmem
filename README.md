@@ -23,6 +23,8 @@ an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV
 pip install .
 ```
 
+The wheels published to PyPI are built as described in [packaging/README.md](packaging/README.md).
+
 For development, install the build requirements once and install in editable mode. With
 `editable.rebuild=true` the C++ modules are rebuilt on import after a change:
 

@@ -9,7 +9,7 @@ build-backend = "scikit_build_core.build"
 name = "radixshmem"
 dynamic = ["version"]
 description = "Shared-memory radix index and slot store for KV cache sharing"
-readme = "README.md"
+readme = "python/README.pypi.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE", "ATTRIBUTIONS.md"]

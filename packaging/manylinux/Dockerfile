@@ -5,7 +5,7 @@
 # gRPC and hiredis are static in /opt/deps; Mooncake is built at the commit scripts/build_mooncake.sh pins,
 # without its HTTP metadata server (radixshmem uses P2PHANDSHAKE), in /opt/mooncake.
 #
-#   docker build --network host -t radixshmem-manylinux packaging/manylinux
+#   docker build -t radixshmem-manylinux packaging/manylinux     (see packaging/README.md)
 
 FROM quay.io/pypa/manylinux_2_28_x86_64@sha256:d086f64cddcace250ef0f0073583c51b8298159303290a730c9f59bd91edfd2c
 

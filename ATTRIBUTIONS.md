@@ -6,34 +6,51 @@ SPDX-License-Identifier: Apache-2.0
 # Third-Party Attributions
 
 RadixShmem source is NVIDIA-authored and licensed under Apache-2.0. No third-party source is copied into this repository.
-The Python wheels bundle the third-party binaries and statically linked code listed below, and this file carries their notices.
+The Python wheels bundle the third-party code listed below, at the versions the wheel build uses
+(`packaging/manylinux/Dockerfile`), and this file carries their notices.
 
-| Component | Version | License | Ships in | Source |
+| Component | Version | License | In the wheel | Source |
 |---|---|---|---|---|
-| xxHash (`libxxhash`) | system package at build time | BSD-2-Clause | `+cpu` and `+rdma` wheels | https://github.com/Cyan4973/xxHash |
-| pybind11 | >= 2.12 (build-time headers compiled into `_core`) | BSD-3-Clause | `+cpu` and `+rdma` wheels | https://github.com/pybind/pybind11 |
-| libzmq | 4.3.5+ (when built with ZMQ) | MPL-2.0 | `+rdma` wheel | https://github.com/zeromq/libzmq |
-| Go standard library and runtime | toolchain used to build `libradix_etcd.so` | BSD-3-Clause | `+rdma` wheel | https://go.dev |
-| github.com/coreos/go-semver | v0.3.0 | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/github.com/coreos/go-semver@v0.3.0 |
-| github.com/coreos/go-systemd/v22 | v22.3.2 | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/github.com/coreos/go-systemd/v22@v22.3.2 |
-| github.com/gogo/protobuf | v1.3.2 | BSD-3-Clause | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/github.com/gogo/protobuf@v1.3.2 |
-| github.com/golang/protobuf | v1.5.4 | BSD-3-Clause | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/github.com/golang/protobuf@v1.5.4 |
-| go.etcd.io/etcd/api/v3 | v3.5.21 | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/go.etcd.io/etcd/api/v3@v3.5.21 |
-| go.etcd.io/etcd/client/pkg/v3 | v3.5.21 | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/go.etcd.io/etcd/client/pkg/v3@v3.5.21 |
-| go.etcd.io/etcd/client/v3 | v3.5.21 | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/go.etcd.io/etcd/client/v3@v3.5.21 |
-| go.uber.org/atomic | v1.7.0 | MIT | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/go.uber.org/atomic@v1.7.0 |
-| go.uber.org/multierr | v1.6.0 | MIT | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/go.uber.org/multierr@v1.6.0 |
-| go.uber.org/zap | v1.17.0 | MIT | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/go.uber.org/zap@v1.17.0 |
-| golang.org/x/net | v0.38.0 | BSD-3-Clause | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/golang.org/x/net@v0.38.0 |
-| golang.org/x/sys | v0.31.0 | BSD-3-Clause | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/golang.org/x/sys@v0.31.0 |
-| golang.org/x/text | v0.23.0 | BSD-3-Clause | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/golang.org/x/text@v0.23.0 |
-| google.golang.org/genproto/googleapis/api | v0.0.0-20230822172742-b8732ec3820d | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/google.golang.org/genproto/googleapis/api@v0.0.0-20230822172742-b8732ec3820d |
-| google.golang.org/genproto/googleapis/rpc | v0.0.0-20230822172742-b8732ec3820d | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/google.golang.org/genproto/googleapis/rpc@v0.0.0-20230822172742-b8732ec3820d |
-| google.golang.org/grpc | v1.59.0 | Apache-2.0 | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/google.golang.org/grpc@v1.59.0 |
-| google.golang.org/protobuf | v1.33.0 | BSD-3-Clause | `+rdma` wheel (statically linked into `libradix_etcd.so`) | https://pkg.go.dev/google.golang.org/protobuf@v1.33.0 |
+| gRPC (C++) | 1.85.2 | Apache-2.0, with BSD-3-Clause and MPL-2.0 parts | `_core` (static) | https://github.com/grpc/grpc |
+| address_sorting (in gRPC) | gRPC 1.85.2 | BSD-3-Clause | `_core` (static) | https://github.com/grpc/grpc/tree/v1.85.2/third_party/address_sorting |
+| Protocol Buffers, with upb | 35.1.0 (35cd01f9) | BSD-3-Clause | `_core` (static) | https://github.com/protocolbuffers/protobuf |
+| utf8_range (in Protocol Buffers) | Protocol Buffers 35.1.0 | MIT | `_core` (static) | https://github.com/protocolbuffers/protobuf/tree/35cd01f9fe9afbeea38cc7b979a3b6bfcde82c03/third_party/utf8_range |
+| Abseil | 20260526 (5650e9cf) | Apache-2.0 | `_core` (static) | https://github.com/abseil/abseil-cpp |
+| BoringSSL | 3adc3d1a | Apache-2.0, support code BSD-3-Clause | `_core` (static) | https://github.com/google/boringssl |
+| c-ares | 1.34.5 (d3a507e9) | MIT | `_core` (static) | https://github.com/c-ares/c-ares |
+| RE2 | 0c5616df | BSD-3-Clause | `_core` (static) | https://github.com/google/re2 |
+| zlib | 1.3.1.1 (f1f503da) | Zlib | `_core` (static) | https://github.com/madler/zlib |
+| hiredis | 1.5.0 | BSD-3-Clause | `_core` (static) | https://github.com/redis/hiredis |
+| xxHash | 0.8.2 (headers) | BSD-2-Clause | `_core` | https://github.com/Cyan4973/xxHash |
+| pybind11 | 3.1.0 (headers) | BSD-3-Clause | `_core`, `_data` | https://github.com/pybind/pybind11 |
+| Go standard library and runtime | go1.27.4 | BSD-3-Clause | `libradix_etcd.so` | https://go.dev |
+| github.com/coreos/go-semver | v0.3.0 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-semver@v0.3.0 |
+| github.com/coreos/go-systemd/v22 | v22.3.2 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/coreos/go-systemd/v22@v22.3.2 |
+| github.com/gogo/protobuf | v1.3.2 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/gogo/protobuf@v1.3.2 |
+| github.com/golang/protobuf | v1.5.4 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/github.com/golang/protobuf@v1.5.4 |
+| go.etcd.io/etcd/api/v3 | v3.5.21 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/api/v3@v3.5.21 |
+| go.etcd.io/etcd/client/pkg/v3 | v3.5.21 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/client/pkg/v3@v3.5.21 |
+| go.etcd.io/etcd/client/v3 | v3.5.21 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/go.etcd.io/etcd/client/v3@v3.5.21 |
+| go.uber.org/atomic | v1.7.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/atomic@v1.7.0 |
+| go.uber.org/multierr | v1.6.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/multierr@v1.6.0 |
+| go.uber.org/zap | v1.17.0 | MIT | `libradix_etcd.so` (static) | https://pkg.go.dev/go.uber.org/zap@v1.17.0 |
+| golang.org/x/net | v0.38.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/net@v0.38.0 |
+| golang.org/x/sys | v0.31.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/sys@v0.31.0 |
+| golang.org/x/text | v0.23.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/golang.org/x/text@v0.23.0 |
+| google.golang.org/genproto/googleapis/api | v0.0.0-20230822172742-b8732ec3820d | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/genproto/googleapis/api@v0.0.0-20230822172742-b8732ec3820d |
+| google.golang.org/genproto/googleapis/rpc | v0.0.0-20230822172742-b8732ec3820d | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/genproto/googleapis/rpc@v0.0.0-20230822172742-b8732ec3820d |
+| google.golang.org/grpc | v1.59.0 | Apache-2.0 | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/grpc@v1.59.0 |
+| google.golang.org/protobuf | v1.33.0 | BSD-3-Clause | `libradix_etcd.so` (static) | https://pkg.go.dev/google.golang.org/protobuf@v1.33.0 |
+| Mooncake Transfer Engine | e5598b09 | Apache-2.0 | `libradixshmem_mooncake.so` (static) | https://github.com/kvcache-ai/Mooncake |
+| yaLanTingLibs | 7801bc9a (headers) | Apache-2.0 | `libradixshmem_mooncake.so` | https://github.com/alibaba/yalantinglibs |
+| Asio (standalone, from yaLanTingLibs) | 1.24.0 | BSL-1.0 | `radixshmem.libs/libasio-*.so` | https://github.com/chriskohlhoff/asio |
+| glog | 0.3.5 (EPEL 8 build) | BSD-3-Clause | `radixshmem.libs/libglog-*.so` | https://github.com/google/glog |
+| gflags | 2.1.2 (EPEL 8 build) | BSD-3-Clause | `radixshmem.libs/libgflags-*.so` | https://github.com/gflags/gflags |
+| JsonCpp | 1.8.4 (EPEL 8 build) | MIT or public domain | `radixshmem.libs/libjsoncpp-*.so` | https://github.com/open-source-parsers/jsoncpp |
 
-Runtime dependencies installed separately by pip and not bundled: numpy (BSD-3-Clause), grpcio (Apache-2.0).
-System libraries excluded from the `+rdma` wheel and supplied by the host: rdma-core (`libibverbs`, `libmlx5`; GPL-2.0 OR BSD-2-Clause), libnl (LGPL-2.1).
+Runtime dependencies installed by pip and not bundled: numpy (BSD-3-Clause), grpcio (Apache-2.0).
+Host libraries the wheels do not bundle: rdma-core (`libibverbs`, `libmlx5`; GPL-2.0 OR BSD-2-Clause), libnuma
+(LGPL-2.1) and libnl (LGPL-2.1). Only the RDMA planes and the Mooncake plugin load them.
 
 The Apache-2.0 components are covered by the license text in [LICENSE](LICENSE). Apache-2.0 components that ship an upstream NOTICE file carry it below, followed by the notices for the remaining components.
 
@@ -321,11 +338,74 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
 
-## libzmq
-
-libzmq is distributed under the Mozilla Public License 2.0. Its source is available at https://github.com/zeromq/libzmq. The full license text follows.
+## gRPC
 
 ```
+Copyright 2014 gRPC authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+```
+
+## gRPC: parts of its LICENSE besides Apache-2.0
+
+```
+-----------------------------------------------------------
+
+Following applies to:
+./src/objective-c/!ProtoCompiler-gRPCCppPlugin.podspec
+./src/objective-c/!ProtoCompiler-gRPCPlugin.podspec
+./src/objective-c/!ProtoCompiler.podspec
+./src/objective-c/BoringSSL-GRPC.podspec
+./templates/src/objective-c/!ProtoCompiler-gRPCCppPlugin.podspec.inja
+./templates/src/objective-c/!ProtoCompiler-gRPCPlugin.podspec.inja
+./templates/src/objective-c/!ProtoCompiler.podspec.inja
+./templates/src/objective-c/BoringSSL-GRPC.podspec.template
+
+BSD 3-Clause License
+
+Copyright 2016, Google Inc.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+this list of conditions and the following disclaimer in the documentation
+and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from this
+software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+THE POSSIBILITY OF SUCH DAMAGE.
+
+-----------------------------------------------------------
+
+Following applies to:
+./etc/roots.pem
+
 Mozilla Public License Version 2.0
 ==================================
 
@@ -363,7 +443,7 @@ Mozilla Public License Version 2.0
     means any form of the work other than Source Code Form.
 
 1.7. "Larger Work"
-    means a work that combines Covered Software with other material, in
+    means a work that combines Covered Software with other material, in 
     a separate file or files, that is not Covered Software.
 
 1.8. "License"
@@ -699,4 +779,488 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 
   This Source Code Form is "Incompatible With Secondary Licenses", as
   defined by the Mozilla Public License, v. 2.0.
+```
+
+## address_sorting
+
+```
+Copyright (C) 1995, 1996, 1997, and 1998 WIDE Project.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. Neither the name of the project nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE PROJECT AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE PROJECT OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
+```
+
+## Protocol Buffers
+
+```
+Copyright 2008 Google Inc.  All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+    * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+Code generated by the Protocol Buffer compiler is owned by the owner
+of the input file used when generating it.  This code is not
+standalone and requires a support library to be linked with it.  This
+support library is itself covered by the above license.
+```
+
+## utf8_range
+
+```
+MIT License
+
+Copyright (c) 2019 Yibo Cai
+Copyright 2022 Google LLC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## BoringSSL: support code
+
+```
+Licenses for support code
+-------------------------
+
+Parts of the TLS test suite are under the Go license. This code is not included
+in BoringSSL (i.e. libcrypto and libssl) when compiled, however, so
+distributing code linked against BoringSSL does not trigger this license:
+
+Copyright (c) 2009 The Go Authors. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## c-ares
+
+```
+MIT License
+
+Copyright (c) 1998 Massachusetts Institute of Technology  
+Copyright (c) 2007 - 2023 Daniel Stenberg with many contributors, see AUTHORS
+file.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice (including the next
+paragraph) shall be included in all copies or substantial portions of the
+Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## RE2
+
+```
+// Copyright (c) 2009 The RE2 Authors. All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//    * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//    * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//    * Neither the name of Google Inc. nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## zlib
+
+```
+Copyright notice:
+
+ (C) 1995-2024 Jean-loup Gailly and Mark Adler
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Jean-loup Gailly        Mark Adler
+  jloup@gzip.org          madler@alumni.caltech.edu
+```
+
+## hiredis
+
+```
+Copyright (c) 2009-2011, Salvatore Sanfilippo <antirez at gmail dot com>
+Copyright (c) 2010-2011, Pieter Noordhuis <pcnoordhuis at gmail dot com>
+
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+* Redistributions of source code must retain the above copyright notice,
+  this list of conditions and the following disclaimer.
+
+* Redistributions in binary form must reproduce the above copyright notice,
+  this list of conditions and the following disclaimer in the documentation
+  and/or other materials provided with the distribution.
+
+* Neither the name of Redis nor the names of its contributors may be used
+  to endorse or promote products derived from this software without specific
+  prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## yaLanTingLibs
+
+```
+========================================================
+yaLanTingLibs
+Copyright (c) 2019-2022, Alibaba Group Holding Limited
+Licensed under the Apache License, Version 2.0
+===================================================================
+
+This product contains various third-party components under other open source licenses
+This section summarizes those components and their licenses.
+Apache Software Foundation License 2.0
+--------------------------------------
+
+ylt/struct_pack/texpr.hpp
+
+BSD 3-Clause "New" or "Revised" License
+--------------------------------------
+
+util/expected.hpp
+
+Creative Commons Zero v1.0 Universal License
+
+--------------------------------------
+
+test/doctest.h
+
+include/ylt/struct_pack/pp
+
+Distributed under the Boost Software License, Version 1.0. (See accompanying
+file LICENSE_1_0.txt or copy at <http://www.boost.org/LICENSE_1_0.txt>)
+
+===================================================================
+The reflection of a struct and data format borrow various ideas from zpp_bits, reflect-cpp and msgpack.
+coro_rpc borrow various ideas from rest_rpc.
+```
+
+## Asio
+
+```
+Boost Software License - Version 1.0 - August 17th, 2003
+
+Permission is hereby granted, free of charge, to any person or organization
+obtaining a copy of the software and accompanying documentation covered by
+this license (the "Software") to use, reproduce, display, distribute,
+execute, and transmit the Software, and to prepare derivative works of the
+Software, and to permit third-parties to whom the Software is furnished to
+do so, all subject to the following:
+
+The copyright notices in the Software and this entire statement, including
+the above license grant, this restriction and the following disclaimer,
+must be included in all copies of the Software, in whole or in part, and
+all derivative works of the Software, unless such copies or derivative
+works are solely in the form of machine-executable object code generated by
+a source language processor.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDERS OR ANYONE DISTRIBUTING THE SOFTWARE BE LIABLE
+FOR ANY DAMAGES OR OTHER LIABILITY, WHETHER IN CONTRACT, TORT OR OTHERWISE,
+ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+```
+
+## glog
+
+```
+Copyright (c) 2008, Google Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+    * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+A function gettimeofday in utilities.cc is based on
+
+http://www.google.com/codesearch/p?hl=en#dR3YEbitojA/COPYING&q=GetSystemTimeAsFileTime%20license:bsd
+
+The license of this code is:
+
+Copyright (c) 2003-2008, Jouni Malinen <j@w1.fi> and contributors
+All Rights Reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+
+3. Neither the name(s) of the above-listed copyright holder(s) nor the
+   names of its contributors may be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## gflags
+
+```
+Copyright (c) 2006, Google Inc.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+    * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+    * Neither the name of Google Inc. nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+```
+
+## JsonCpp
+
+```
+The JsonCpp library's source code, including accompanying documentation, 
+tests and demonstration applications, are licensed under the following
+conditions...
+
+Baptiste Lepilleur and The JsonCpp Authors explicitly disclaim copyright in all 
+jurisdictions which recognize such a disclaimer. In such jurisdictions, 
+this software is released into the Public Domain.
+
+In jurisdictions which do not recognize Public Domain property (e.g. Germany as of
+2010), this software is Copyright (c) 2007-2010 by Baptiste Lepilleur and
+The JsonCpp Authors, and is released under the terms of the MIT License (see below).
+
+In jurisdictions which recognize Public Domain property, the user of this 
+software may choose to accept it either as 1) Public Domain, 2) under the 
+conditions of the MIT License (see below), or 3) under the terms of dual 
+Public Domain/MIT License conditions described here, as they choose.
+
+The MIT License is about as close to Public Domain as a license can get, and is
+described in clear, concise terms at:
+
+   http://en.wikipedia.org/wiki/MIT_License
+   
+The full text of the MIT License follows:
+
+========================================================================
+Copyright (c) 2007-2010 Baptiste Lepilleur and The JsonCpp Authors
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use, copy,
+modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+========================================================================
+(END LICENSE TEXT)
+
+The MIT license is compatible with both the GPL and commercial
+software, affording one all of the rights of Public Domain with the
+minor nuisance of being required to keep the above copyright notice
+and license text in the source code. Note also that by accepting the
+Public Domain "license" you can re-license your copy using whatever
+license you like.
 ```
