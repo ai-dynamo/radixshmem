@@ -5,7 +5,6 @@
 // semantics, joint
 // common_hit, trust-model pin/release, the client facade, and the remote walk.
 
-#include "radixshmem_config.h"
 #include "radix_client.h"
 #include "local.h"
 #include "radix_tree.h"

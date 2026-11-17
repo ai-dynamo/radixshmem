@@ -507,3 +507,8 @@ std::unique_ptr<ITransferBackend> create_mooncake_backend(const TransferConfig& 
 }
 
 } // namespace radixshmem
+
+extern "C" __attribute__((visibility("default"))) radixshmem::ITransferBackend*
+radixshmem_create_transfer_backend(const radixshmem::TransferConfig* cfg) {
+    return radixshmem::create_mooncake_backend(*cfg).release();
+}

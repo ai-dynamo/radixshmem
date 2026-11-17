@@ -7,9 +7,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"
-
-
 #include "cluster_manifest.h"
 #include "cluster_protocol.h"
 

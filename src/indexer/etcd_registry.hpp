@@ -8,9 +8,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"
-
-
 #include "cluster_registry.h"
 
 #include <memory>

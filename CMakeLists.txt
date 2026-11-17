@@ -25,8 +25,9 @@ set(RADIXSHMEM_TEST_REDIS "" CACHE STRING
 set(RADIXSHMEM_TEST_REDIS_BIN "" CACHE PATH
     "directory with redis-server and redis-cli for the Redis RHT fault tests; empty skips them")
 
-# Mooncake TransferEngine backs the data plane's transfer backend (src/transfer).
-option(ENABLE_MOONCAKE "Build the Mooncake transfer backend (requires Mooncake headers + lib)" ON)
+# The data plane's transfer backends are plugins (libradixshmem_<backend>.so) loaded on first use.
+# ENABLE_MOONCAKE / ENABLE_NIXL: AUTO builds the plugin when the engine is found, ON requires it, OFF skips it.
+set(ENABLE_MOONCAKE AUTO CACHE STRING "Build the Mooncake transfer plugin: AUTO, ON or OFF")
 set(MOONCAKE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mooncake" CACHE PATH
     "Mooncake source + build root")
 
@@ -34,12 +35,9 @@ set(MOONCAKE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mooncake" CACHE PATH
 # `scripts/build_nixl.sh` builds NIXL from source, pinned to the commit this
 # backend was written and end-to-end tested against, and installs it at
 # exactly this default path — run it once and NIXL_ROOT needs no override.
-option(ENABLE_NIXL "Build the NIXL transfer backend (requires NIXL headers + lib)" ON)
+set(ENABLE_NIXL AUTO CACHE STRING "Build the NIXL transfer plugin: AUTO, ON or OFF")
 set(NIXL_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/nixl-install" CACHE PATH
     "NIXL install prefix (meson --prefix), holding include/nixl.h and lib*/libnixl.so")
-
-option(RADIXSHMEM_STRICT_DEPS
-    "Fail instead of disabling a backend when Mooncake or NIXL is enabled but not found" OFF)
 
 # ==================== radixshmem library ====================
 set(_radixshmem_sources
@@ -217,7 +215,7 @@ message(STATUS "etcd registry enabled (Go wrapper via ${GO_EXECUTABLE})")
 add_library(radixshmem_registry STATIC src/registry/data_registry.cpp)
 target_include_directories(radixshmem_registry PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_BINARY_DIR}/include                      # radixshmem_config.h + libradix_etcd.h
+    ${CMAKE_BINARY_DIR}/include                      # libradix_etcd.h
     # etcd_client.hpp / registry_client.hpp — private, included by bare name.
     ${CMAKE_CURRENT_SOURCE_DIR}/src/registry)
 target_link_libraries(radixshmem_registry PUBLIC rt pthread)
@@ -260,20 +258,19 @@ if(ENABLE_MOONCAKE)
         HINTS ${MOONCAKE_BUILD_DIR}/mooncake-common NO_DEFAULT_PATH)
     if(MOONCAKE_INCLUDE_DIR AND MOONCAKE_LIBRARY)
         set(RADIXSHMEM_MOONCAKE_FOUND ON)
-        set(RADIXSHMEM_HAS_MOONCAKE ON)
         set(MOONCAKE_LINK_LIBS
             ${MOONCAKE_LIBRARY}
             ${MOONCAKE_BASE_LIBRARY}
             ${MOONCAKE_COMMON_LIBRARY}
             ${MOONCAKE_ASIO_LIBRARY}
             glog gflags jsoncpp numa ibverbs curl pthread dl)
-        message(STATUS "Mooncake found (${MOONCAKE_LIBRARY}) — transfer backend enabled")
-    elseif(RADIXSHMEM_STRICT_DEPS)
+        message(STATUS "Mooncake found (${MOONCAKE_LIBRARY}) — transfer plugin enabled")
+    elseif(NOT ENABLE_MOONCAKE STREQUAL "AUTO")
         message(FATAL_ERROR "Mooncake not found under MOONCAKE_ROOT=${MOONCAKE_ROOT} "
-                            "(RADIXSHMEM_STRICT_DEPS=ON)")
+                            "(ENABLE_MOONCAKE=${ENABLE_MOONCAKE}; AUTO or OFF builds without it)")
     else()
         message(STATUS "Mooncake not found (include=${MOONCAKE_INCLUDE_DIR}, "
-                       "lib=${MOONCAKE_LIBRARY}) — transfer backend disabled")
+                       "lib=${MOONCAKE_LIBRARY}) — transfer plugin disabled")
     endif()
 else()
     message(STATUS "Mooncake disabled (ENABLE_MOONCAKE=OFF)")
@@ -299,7 +296,6 @@ if(ENABLE_NIXL)
         NO_DEFAULT_PATH)
     if(NIXL_INCLUDE_DIR AND NIXL_LIBRARY)
         set(RADIXSHMEM_NIXL_FOUND ON)
-        set(RADIXSHMEM_HAS_NIXL ON)
         # The UCX plugin (plugins/libplugin_UCX.so) is dlopen'd by libnixl at
         # runtime via NIXL_PLUGIN_DIR / its compiled-in default — not linked here.
         set(NIXL_LINK_LIBS ${NIXL_LIBRARY})
@@ -309,23 +305,17 @@ if(ENABLE_NIXL)
             endif()
         endforeach()
         get_filename_component(NIXL_LIBRARY_DIR ${NIXL_LIBRARY} DIRECTORY)
-        message(STATUS "NIXL found (${NIXL_LIBRARY}) — transfer backend enabled")
-    elseif(RADIXSHMEM_STRICT_DEPS)
-        message(FATAL_ERROR "NIXL not found under NIXL_ROOT=${NIXL_ROOT} (RADIXSHMEM_STRICT_DEPS=ON)")
+        message(STATUS "NIXL found (${NIXL_LIBRARY}) — transfer plugin enabled")
+    elseif(NOT ENABLE_NIXL STREQUAL "AUTO")
+        message(FATAL_ERROR "NIXL not found under NIXL_ROOT=${NIXL_ROOT} "
+                            "(ENABLE_NIXL=${ENABLE_NIXL}; AUTO or OFF builds without it)")
     else()
         message(STATUS "NIXL not found (include=${NIXL_INCLUDE_DIR}, "
-                       "lib=${NIXL_LIBRARY}) — transfer backend disabled")
+                       "lib=${NIXL_LIBRARY}) — transfer plugin disabled")
     endif()
 else()
     message(STATUS "NIXL disabled (ENABLE_NIXL=OFF)")
 endif()
-
-# ==================== Generated feature-config header ====================
-# Feature macros baked into one generated header every consumer includes.
-# Generated into the BUILD tree so parallel build dirs keep separate configs.
-configure_file(include/radixshmem_config.h.in
-               ${CMAKE_BINARY_DIR}/include/radixshmem_config.h)
-target_include_directories(radixshmem PUBLIC ${CMAKE_BINARY_DIR}/include)
 
 # ==================== radix_server tool (launched by ServerLauncher) ====================
 add_executable(radix_server tools/server_main.cpp)
@@ -600,39 +590,51 @@ set(_radixshmem_data_sources
     src/transfer/backend_factory.cpp
     # slot-granular convenience layer over the two above.
     src/transfer/slot_transfer.cpp)
-if(RADIXSHMEM_MOONCAKE_FOUND)
-    list(APPEND _radixshmem_data_sources src/transfer/mooncake/mooncake_backend.cpp)
-endif()
-if(RADIXSHMEM_NIXL_FOUND)
-    list(APPEND _radixshmem_data_sources src/transfer/nixl/nixl_backend.cpp)
-endif()
 add_library(radixshmem_data STATIC ${_radixshmem_data_sources})
-if(RADIXSHMEM_MOONCAKE_FOUND)
-    # Mooncake's headers require C++20 (<span>) while this project is C++17.
-    # Only this one translation unit is raised, and no Mooncake type crosses its
-    # boundary — the backend is reached solely through create_mooncake_backend.
-    set_source_files_properties(src/transfer/mooncake/mooncake_backend.cpp
-        PROPERTIES COMPILE_OPTIONS "-std=c++20")
-    target_include_directories(radixshmem_data PRIVATE ${MOONCAKE_INCLUDE_DIR})
-    target_link_libraries(radixshmem_data PUBLIC ${MOONCAKE_LINK_LIBS})
-endif()
-if(RADIXSHMEM_NIXL_FOUND)
-    # NIXL's headers require C++20 (<span>) too — same treatment as Mooncake's TU.
-    set_source_files_properties(src/transfer/nixl/nixl_backend.cpp
-        PROPERTIES COMPILE_OPTIONS "-std=c++20")
-    target_include_directories(radixshmem_data PRIVATE ${NIXL_INCLUDE_DIR})
-    target_link_libraries(radixshmem_data PUBLIC ${NIXL_LINK_LIBS})
-endif()
-target_include_directories(radixshmem_data PUBLIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_BINARY_DIR}/include)                       # generated radixshmem_config.h
+target_include_directories(radixshmem_data PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(radixshmem_data PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src/storage
     ${CMAKE_CURRENT_SOURCE_DIR}/src/transfer)
 # radixshmem_registry, not radixshmem: its own geometry under /data/, no indexer.
-target_link_libraries(radixshmem_data PUBLIC rt pthread radixshmem_registry)
+target_link_libraries(radixshmem_data PUBLIC rt pthread radixshmem_registry ${CMAKE_DL_LIBS})
 # The Python extension links this archive into a shared object.
 set_property(TARGET radixshmem_data PROPERTY POSITION_INDEPENDENT_CODE ON)
+
+# Transfer plugins: each engine and what it links stay in their own .so, which create_transfer_backend
+# loads from the directory of _data (or RADIXSHMEM_TRANSFER_PLUGIN_DIR); only the entry point is exported.
+if(SKBUILD)
+    set(_radixshmem_plugin_dir ${CMAKE_BINARY_DIR}/lib)
+else()
+    set(_radixshmem_plugin_dir ${CMAKE_SOURCE_DIR}/python/radixshmem)
+endif()
+set(_radixshmem_plugin_map ${CMAKE_BINARY_DIR}/radixshmem_plugin.map)
+file(WRITE ${_radixshmem_plugin_map} "{ global: radixshmem_create_transfer_backend; local: *; };\n")
+function(radixshmem_transfer_plugin name source include_dir)
+    add_library(radixshmem_${name} MODULE ${source} src/transfer/range_merge.cpp)
+    # The engines' headers require C++20 (<span>) while this project is C++17.
+    set_source_files_properties(${source} PROPERTIES COMPILE_OPTIONS "-std=c++20")
+    target_include_directories(radixshmem_${name} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/src/transfer ${include_dir})
+    target_link_libraries(radixshmem_${name} PRIVATE ${ARGN})
+    target_link_options(radixshmem_${name} PRIVATE "LINKER:--version-script=${_radixshmem_plugin_map}")
+    set_target_properties(radixshmem_${name} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${_radixshmem_plugin_dir}
+        INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH ON)
+    # Built with anything that links radixshmem_data, so the data plane always finds it.
+    add_dependencies(radixshmem_data radixshmem_${name})
+    if(SKBUILD)
+        install(TARGETS radixshmem_${name} LIBRARY DESTINATION radixshmem)
+    endif()
+endfunction()
+if(RADIXSHMEM_MOONCAKE_FOUND)
+    radixshmem_transfer_plugin(mooncake src/transfer/mooncake/mooncake_backend.cpp
+                               ${MOONCAKE_INCLUDE_DIR} ${MOONCAKE_LINK_LIBS})
+endif()
+if(RADIXSHMEM_NIXL_FOUND)
+    # libnixl.so, and next to it the plugins it dlopens, live in NIXL_LIBRARY_DIR.
+    radixshmem_transfer_plugin(nixl src/transfer/nixl/nixl_backend.cpp ${NIXL_INCLUDE_DIR} ${NIXL_LINK_LIBS})
+    set_target_properties(radixshmem_nixl PROPERTIES BUILD_RPATH ${NIXL_LIBRARY_DIR})
+endif()
 
 set(_dataplane_tests
     test_slot_store
@@ -652,6 +654,8 @@ foreach(_t ${_dataplane_tests})
     target_include_directories(${_t} PRIVATE ${CMAKE_SOURCE_DIR}/tests/dataplane)
     radixshmem_enable_asserts(${_t})
     add_test(NAME ${_t} COMMAND ${_t})
+    set_tests_properties(${_t} PROPERTIES
+        ENVIRONMENT "RADIXSHMEM_TRANSFER_PLUGIN_DIR=${_radixshmem_plugin_dir}")
 endforeach()
 
 # Data-plane benchmark (NOT in ctest). Links radixshmem_data only, like the tests.
@@ -700,17 +704,12 @@ if(BUILD_PYTHON_MODULES)
             BUILD_RPATH ${CMAKE_BINARY_DIR}/lib)
         target_link_libraries(radixshmem_core_py PRIVATE radixshmem)
 
-        # libradix_etcd.so lives in the build tree; libnixl.so, and next to it the
-        # plugins it dlopens, in NIXL_LIBRARY_DIR.
-        set(_radixshmem_data_py_rpath ${CMAKE_BINARY_DIR}/lib)
-        if(RADIXSHMEM_NIXL_FOUND)
-            list(APPEND _radixshmem_data_py_rpath ${NIXL_LIBRARY_DIR})
-        endif()
         pybind11_add_module(radixshmem_data_py python/data_bindings.cpp)
         set_target_properties(radixshmem_data_py PROPERTIES
             OUTPUT_NAME _data
             LIBRARY_OUTPUT_DIRECTORY ${_radixshmem_py_dir}
-            BUILD_RPATH "${_radixshmem_data_py_rpath}")
+            # libradix_etcd.so lives in the build tree.
+            BUILD_RPATH ${CMAKE_BINARY_DIR}/lib)
         target_link_libraries(radixshmem_data_py PRIVATE radixshmem_data)
         # Only PyInit_* stays exported; installed modules find libradix_etcd.so beside them.
         set(_radixshmem_py_map ${CMAKE_BINARY_DIR}/radixshmem_py.map)

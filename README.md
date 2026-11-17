@@ -219,7 +219,10 @@ radix-server --name /my_kv_cache --data-bytes 1024G \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
-To check which backends were built in:
+Each backend is a plugin, `libradixshmem_mooncake.so` or `libradixshmem_nixl.so`, installed next to
+`radixshmem._data` and loaded when a server first needs it; C++ programs outside the package find the plugins
+through `RADIXSHMEM_TRANSFER_PLUGIN_DIR`. `ENABLE_MOONCAKE` and `ENABLE_NIXL` take `AUTO` (default: build the
+plugin when the engine is found), `ON` (fail without it) or `OFF`. To check which plugins are installed:
 
 ```bash
 python -c "import radixshmem; print(radixshmem._data.TRANSFER_BACKENDS)"

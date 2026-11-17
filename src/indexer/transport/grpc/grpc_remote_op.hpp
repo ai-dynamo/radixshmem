@@ -3,9 +3,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
-
-
 #include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
 #include "cluster_protocol.h"
 

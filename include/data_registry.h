@@ -3,9 +3,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"
-
-
 #include "component_kind.h"
 #include "slot_geometry.h"
 

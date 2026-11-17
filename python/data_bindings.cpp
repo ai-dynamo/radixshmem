@@ -89,15 +89,8 @@ PYBIND11_MODULE(_data, m) {
     m.attr("XFER_EBUSY")     = XFER_EBUSY;
     m.attr("INVALID_BATCH")  = INVALID_BATCH;
     m.attr("PEER_SLOT_BYTES_UNCHECKED") = PEER_SLOT_BYTES_UNCHECKED;
-    // Transfer backends compiled in (tests SKIP on a missing one).
-    py::list backends;
-#ifdef RADIXSHMEM_HAS_MOONCAKE
-    backends.append("mooncake");
-#endif
-#ifdef RADIXSHMEM_HAS_NIXL
-    backends.append("nixl");
-#endif
-    m.attr("TRANSFER_BACKENDS") = backends;
+    // Transfer backends whose plugin is installed (tests SKIP on a missing one).
+    m.attr("TRANSFER_BACKENDS") = available_transfer_backends();
     m.attr("COMPONENT_MASK_FULL")  = COMPONENT_MASK_FULL;
     m.attr("COMPONENT_MASK_SWA")   = COMPONENT_MASK_SWA;
     m.attr("COMPONENT_MASK_MAMBA") = COMPONENT_MASK_MAMBA;

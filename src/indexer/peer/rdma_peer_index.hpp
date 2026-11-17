@@ -6,7 +6,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"
 #include "cluster_manifest.h"
 #include "peer_index.h"
 #include "rdma_remote_walker.h"

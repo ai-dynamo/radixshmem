@@ -5,7 +5,6 @@
 // read API by design, so the validator reads the shm structures directly.
 
 #include "cluster_manifest.h"
-#include "radixshmem_config.h"
 #include "radix_tree.h"
 #include "test_utils.h"
 

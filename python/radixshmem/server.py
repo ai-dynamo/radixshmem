@@ -496,8 +496,8 @@ class RadixServer:
             device_filter=list(c.transfer_devices), publish=True))
         if backend is None:
             raise RuntimeError(
-                f"transfer backend {c.transfer_backend!r} unavailable (no RDMA "
-                f"device, or that backend not built — see ENABLE_MOONCAKE/ENABLE_NIXL)")
+                f"transfer backend {c.transfer_backend!r} unavailable (its plugin is missing or "
+                f"failed to load, or no RDMA device; see the [radixshmem] transfer line on stderr)")
         return backend
 
     def close(self) -> None:

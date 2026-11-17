@@ -18,9 +18,6 @@
 #include "data_test_utils.h"
 #include "etcd_test_harness.hpp"
 
-#include "radixshmem_config.h"
-
-
 #include "data_registry.h"
 #include "etcd_client.hpp"
 

@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "component_types.h"
 #include "health_check.h"
 #include "tree_dump.h"

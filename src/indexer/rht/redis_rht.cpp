@@ -3,8 +3,6 @@
 
 #include "rht_redis.h"
 
-#include "radixshmem_config.h"
-
 #include <stdexcept>
 
 
