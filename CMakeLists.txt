@@ -616,7 +616,7 @@ target_link_libraries(radixshmem_data PUBLIC rt pthread radixshmem_registry ${CM
 set_property(TARGET radixshmem_data PROPERTY POSITION_INDEPENDENT_CODE ON)
 
 # Transfer plugins: each engine and what it links stay in their own .so, which create_transfer_backend
-# loads from the directory of _data (or RADIXSHMEM_TRANSFER_PLUGIN_DIR); only the entry point is exported.
+# loads from the directory of _core (or RADIXSHMEM_TRANSFER_PLUGIN_DIR); only the entry point is exported.
 if(SKBUILD)
     set(_radixshmem_plugin_dir ${CMAKE_BINARY_DIR}/lib)
 else()
@@ -684,11 +684,8 @@ if(RADIXSHMEM_NIXL_FOUND)
     target_link_libraries(test_nixl_two_node PRIVATE radixshmem_data)
 endif()
 
-# ---------- radixshmem._core + radixshmem._data: pybind11 extension modules ----------
-# Both from one pybind11 and one Python: pybind11 shares types across modules
-# only when they were built alike, and _data reuses _core's ComponentType.
-# _data stays its own module so the data plane never links the indexer.
-option(BUILD_PYTHON_MODULES "Build the radixshmem._core and radixshmem._data pybind11 extensions" ON)
+# ---------- radixshmem._core: the pybind11 extension module (index and data plane) ----------
+option(BUILD_PYTHON_MODULES "Build the radixshmem._core pybind11 extension" ON)
 if(BUILD_PYTHON_MODULES)
     find_package(Python3 COMPONENTS Interpreter Development.Module QUIET)
     if(Python3_FOUND)
@@ -701,41 +698,31 @@ if(BUILD_PYTHON_MODULES)
         endif()
     endif()
     if(SKBUILD AND NOT pybind11_FOUND)
-        message(FATAL_ERROR "pybind11 not found for ${Python3_EXECUTABLE}; a wheel needs both extension modules")
+        message(FATAL_ERROR "pybind11 not found for ${Python3_EXECUTABLE}; a wheel needs the extension module")
     endif()
     if(pybind11_FOUND)
-        # A pip build installs the modules into the wheel; a plain build puts them in the source tree.
+        # A pip build installs the module into the wheel; a plain build puts it in the source tree.
         if(SKBUILD)
             set(_radixshmem_py_dir ${CMAKE_BINARY_DIR}/lib)
         else()
             set(_radixshmem_py_dir ${CMAKE_SOURCE_DIR}/python/radixshmem)
         endif()
 
-        pybind11_add_module(radixshmem_core_py python/bindings.cpp)
+        pybind11_add_module(radixshmem_core_py python/bindings.cpp python/data_bindings.cpp)
         set_target_properties(radixshmem_core_py PROPERTIES
             OUTPUT_NAME _core
             LIBRARY_OUTPUT_DIRECTORY ${_radixshmem_py_dir}
             # libradix_etcd.so lives in the build tree.
             BUILD_RPATH ${CMAKE_BINARY_DIR}/lib)
-        target_link_libraries(radixshmem_core_py PRIVATE radixshmem)
-
-        pybind11_add_module(radixshmem_data_py python/data_bindings.cpp)
-        set_target_properties(radixshmem_data_py PROPERTIES
-            OUTPUT_NAME _data
-            LIBRARY_OUTPUT_DIRECTORY ${_radixshmem_py_dir}
-            # libradix_etcd.so lives in the build tree.
-            BUILD_RPATH ${CMAKE_BINARY_DIR}/lib)
-        target_link_libraries(radixshmem_data_py PRIVATE radixshmem_data)
-        # Only PyInit_* stays exported; installed modules find libradix_etcd.so beside them.
+        target_link_libraries(radixshmem_core_py PRIVATE radixshmem radixshmem_data)
+        # Only PyInit__core stays exported; the installed module finds libradix_etcd.so beside it.
         set(_radixshmem_py_map ${CMAKE_BINARY_DIR}/radixshmem_py.map)
         file(WRITE ${_radixshmem_py_map} "{ global: PyInit_*; local: *; };\n")
-        foreach(_m radixshmem_core_py radixshmem_data_py)
-            target_link_options(${_m} PRIVATE "LINKER:--version-script=${_radixshmem_py_map}")
-            set_target_properties(${_m} PROPERTIES
-                INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH ON)
-        endforeach()
+        target_link_options(radixshmem_core_py PRIVATE "LINKER:--version-script=${_radixshmem_py_map}")
+        set_target_properties(radixshmem_core_py PROPERTIES
+            INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH ON)
         if(SKBUILD)
-            install(TARGETS radixshmem_core_py radixshmem_data_py LIBRARY DESTINATION radixshmem)
+            install(TARGETS radixshmem_core_py LIBRARY DESTINATION radixshmem)
             install(FILES ${_etcd_go_lib} DESTINATION radixshmem)
         endif()
         # rdma-core is loaded at run time, so neither the module nor radix_server may link it.
@@ -748,7 +735,7 @@ if(BUILD_PYTHON_MODULES)
                  COMMAND ${Python3_EXECUTABLE} tests/test_radixshmem_data.py
                  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}/python)
         set_tests_properties(test_data_python PROPERTIES
-            DEPENDS radixshmem_data_py TIMEOUT 300
+            DEPENDS radixshmem_core_py TIMEOUT 300
             ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python")
 
         execute_process(COMMAND ${Python3_EXECUTABLE} -c "import pytest"
@@ -833,10 +820,9 @@ if(BUILD_PYTHON_MODULES)
                 ENVIRONMENT "PYTHONPATH=${CMAKE_SOURCE_DIR}/python;${_redis_rht_env};RADIXSHMEM_INDEX_DEV=no_rdma_device"
                 SKIP_RETURN_CODE 77 TIMEOUT 600)
         endif()
-        message(STATUS "radixshmem._core + radixshmem._data: building "
-                       "(pybind11 ${pybind11_VERSION}, ${Python3_EXECUTABLE})")
+        message(STATUS "radixshmem._core: building (pybind11 ${pybind11_VERSION}, ${Python3_EXECUTABLE})")
     else()
-        message(STATUS "radixshmem._core + radixshmem._data: skipped (no pybind11 for this Python)")
+        message(STATUS "radixshmem._core: skipped (no pybind11 for this Python)")
     endif()
 endif()
 
@@ -845,11 +831,11 @@ endif()
 
 enable_testing()
 
-# A pip build, editable rebuilds included, builds the two modules and what they link, no tools or tests.
+# A pip build, editable rebuilds included, builds the module and what it links, no tools or tests.
 if(SKBUILD)
     get_property(_radixshmem_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
     foreach(_t ${_radixshmem_targets})
-        if(NOT _t MATCHES "^radixshmem_(core|data)_py$")
+        if(NOT _t STREQUAL "radixshmem_core_py")
             set_target_properties(${_t} PROPERTIES EXCLUDE_FROM_ALL ON)
         endif()
     endforeach()

@@ -41,7 +41,7 @@ input = "python/radixshmem/_version.py"
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
-build.targets = ["radixshmem_core_py", "radixshmem_data_py"]
+build.targets = ["radixshmem_core_py"]
 wheel.packages = ["python/radixshmem"]
 sdist.exclude = ["zfl/", ".claude/", "radix-monitor/"]
 

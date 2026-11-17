@@ -1,9 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// radixshmem._data — Python bindings for the data plane (SlotStore + transfer
-// backend + SlotTransfer). A separate extension from radixshmem._core: the data
-// plane does not link the indexer.
+// Data-plane bindings (SlotStore, transfer backend, SlotTransfer), part of radixshmem._core.
 //
 // Lifetime: SlotTransfer borrows its store and backend; keep_alive pins both.
 // Slot payloads are memoryviews over the shared mapping (windows, not copies).
@@ -77,9 +75,7 @@ std::string pool_repr(const PoolGeometry& g) {
 
 } // namespace
 
-PYBIND11_MODULE(_data, m) {
-    m.doc() = "radixshmem data plane: shared-memory slot pools and slot-granular transfers";
-
+void bind_data(py::module_& m) {
     // ==================== return codes / enums ====================
     m.attr("XFER_OK")        = XFER_OK;
     m.attr("XFER_EINVAL")    = XFER_EINVAL;
@@ -91,20 +87,6 @@ PYBIND11_MODULE(_data, m) {
     m.attr("PEER_SLOT_BYTES_UNCHECKED") = PEER_SLOT_BYTES_UNCHECKED;
     // Transfer backends whose plugin is installed (tests SKIP on a missing one).
     m.attr("TRANSFER_BACKENDS") = available_transfer_backends();
-    m.attr("COMPONENT_MASK_FULL")  = COMPONENT_MASK_FULL;
-    m.attr("COMPONENT_MASK_SWA")   = COMPONENT_MASK_SWA;
-    m.attr("COMPONENT_MASK_MAMBA") = COMPONENT_MASK_MAMBA;
-
-    // ComponentType is shared with _core: reuse its registration when _core is
-    // already loaded (pybind11 refuses to bind one C++ type twice).
-    if (py::detail::get_type_info(typeid(ComponentType)) == nullptr) {
-        py::enum_<ComponentType>(m, "ComponentType")
-            .value("FULL", ComponentType::FULL)
-            .value("SWA", ComponentType::SWA)
-            .value("MAMBA", ComponentType::MAMBA);
-    } else {
-        m.attr("ComponentType") = py::detail::get_type_handle(typeid(ComponentType), true);
-    }
 
     py::enum_<XferState>(m, "XferState")
         .value("PENDING", XferState::PENDING)

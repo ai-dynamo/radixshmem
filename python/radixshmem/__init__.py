@@ -7,8 +7,8 @@ Public surface: ``RadixServer`` (one per node: index, SlotStore, P2P transfer;
 started from a ``ServerConfig`` and configured by a client's ``Geometry``) and
 ``RadixClient`` (hands the server its geometry, ``status`` / ``wait_ready``,
 index ops plus ``pull_async`` / ``push_async``). ``WritebackHandler`` / ``WritebackTask``:
-the write-back side of background eviction (``radixshmem.writeback``). The pybind modules ``_core`` (index) and
-``_data`` (SlotStore, transfer) stay importable for tests and advanced users.
+the write-back side of background eviction (``radixshmem.writeback``). The pybind module ``_core`` and
+``_data``, its data-plane names (SlotStore, transfer), stay importable for tests and advanced users.
 """
 
 from radixshmem._core import (
@@ -30,11 +30,7 @@ from radixshmem._core import (
     compute_hashes,
 )
 
-try:
-    from radixshmem import _data  # noqa: F401
-except ImportError:
-    pass
-
+from radixshmem import _data  # noqa: F401
 from radixshmem._geometry import Geometry, check_pools_aligned
 from radixshmem._version import __version__
 from radixshmem.client import NodeInfo, PullJob, PullResult, PushJob, PushResult, RadixClient
@@ -47,11 +43,7 @@ def build_info() -> dict:
     """Package, shm and cluster protocol versions, whether rdma-core loads, and the transfer backends."""
     from radixshmem import _core
 
-    try:
-        from radixshmem import _data
-        backends = list(_data.TRANSFER_BACKENDS)
-    except ImportError:
-        backends = []
+    backends = list(_core.TRANSFER_BACKENDS)
     rdma_error = _core.rdma_error()
     info = {"version": __version__, "shm_version": _core.SHM_VERSION,
             "protocol_version": _core.CLUSTER_PROTOCOL_VERSION, "rdma": not rdma_error,
