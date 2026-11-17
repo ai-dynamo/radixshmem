@@ -143,7 +143,7 @@ struct RdmaRht::Impl {
 };
 
 RdmaRht::RdmaRht(const ShardMapMsg& sm, PeerRegistry& peers_reg, PeerFaultCounters* faults,
-                 int bootstrap_timeout_sec)
+                 int bootstrap_timeout_sec, const std::string& registry)
     : impl_(std::make_unique<Impl>(peers_reg)) {
     const int num_shards = (int)sm.num_shards;
     if (num_shards <= 0 || num_shards > (int)CLUSTER_MAX_SHARDS)
@@ -163,7 +163,8 @@ RdmaRht::RdmaRht(const ShardMapMsg& sm, PeerRegistry& peers_reg, PeerFaultCounte
     const bool has_self = me >= 0 && me < (int)peers.size() && peers[me].rank == me;
     impl_->tx = std::make_unique<RdmaTransportClient>(has_self ? &peers[me] : nullptr,
                                                       sm.rdma_sl, sm.rdma_tc,
-                                                      peers_reg.world_size(), 0);
+                                                      peers_reg.world_size(), 0,
+                                                      sm.rht_transport == CLUSTER_TRANSPORT_DC, registry);
     RdmaTransportClient& tx = *impl_->tx;
 
     impl_->scratch = std::aligned_alloc(4096, RDMA_RHT_SCRATCH_BYTES);

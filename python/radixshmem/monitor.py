@@ -323,11 +323,16 @@ class Monitor:
             self._add_rows(t, view_rows(ti.view(0, self.tree_nodes), merged=False), "node")
         heads = treeview.pack(treeview.node_heads(d, ti, _HEADS_PER_TREE))
         with self._mu:
-            self._dump, self._summary, self._tree_text = d, summary, t
+            self._dump, self._summary = d, summary
             self._anchor_cache, self._heads = {}, heads
-        cluster = self._merge(labels) if self._is_leader() else None
-        with self._mu:
-            self._cluster_text = cluster
+        cluster = None
+        if self._is_leader():
+            try:
+                cluster = self._merge(labels)
+            except Exception as e:  # noqa: BLE001 - a failed merge must not hold back this node's rows
+                print(f"radixshmem monitor: merge: {type(e).__name__}: {e}", file=sys.stderr)
+        with self._mu:   # one step: a reader never sees the new tree rows without the cluster rows
+            self._tree_text, self._cluster_text = t, cluster
 
     @staticmethod
     def _add_rows(t: _Text, rows: List[Dict], view: str) -> None:

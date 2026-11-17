@@ -236,16 +236,156 @@ def test_remote_op_options():
                     ["--enable-remote-query"], ["--zmq-listen-port", "31001"],
                     ["--rht-transport", "dc"], ["--rht-slots", "4"], ["--num-rht-shards", "2"],
                     ["--rht-shard-holders", "0,1"], ["--peer-index-backend", "rdma"],
-                    ["--peer-index-transport", "dc"], ["--index-dev", "mlx5_0"], ["--gid-idx", "3"]):
+                    ["--peer-index-transport", "dc"], ["--index-dev", "mlx5_0"], ["--gid-idx", "3"],
+                    ["--index-port", "2"]):
         with pytest.raises(SystemExit):
             cli.parse_args(removed)
     for name in ("remote_op_listen_port", "remote_op_transport", "enable_remote_insert",
                  "enable_remote_query", "peer_index_backend", "peer_index_transport", "index_dev",
-                 "gid_idx"):
+                 "index_port", "gid_idx"):
         with pytest.raises(TypeError):
             ClusterConfig(**{name: True})
         assert not hasattr(radixshmem._core.RadixServerConfig(), name)
     assert not hasattr(radixshmem._core.RadixServerConfig(), "zmq_listen_port")
+
+
+def test_control_address_resolution():
+    """Transfer handshakes use the settled control address unless explicitly overridden."""
+    config = ServerConfig(transfer_ip="10.9.9.9")
+    assert config.resolved_transfer_ip() == "10.9.9.9"
+    config = ServerConfig()
+    config.cluster.rpc_address = "0.0.0.0"
+    assert config.resolved_transfer_ip() == "127.0.0.1"
+    config.cluster.rpc_address = "10.6.131.12"
+    assert config.resolved_transfer_ip() == "10.6.131.12"
+    config.cluster.rpc_address = ""
+    with pytest.raises(ValueError):
+        config.resolved_transfer_ip()
+
+
+def test_net_preflight_copies_normalized_cluster_settings(monkeypatch):
+    normalized = dict(registry="etcd://192.0.2.1:2379", cluster_id="normalized", node_name="node-test",
+                      rpc_address="192.0.2.2")
+
+    def resolve(config):
+        for name, value in normalized.items():
+            setattr(config, name, value)
+        return "normalized test settings"
+
+    monkeypatch.setattr(radixshmem._core, "resolve_cluster_net", resolve, raising=False)
+    config = ServerConfig()
+    RadixServer(config)._resolve_net()
+    for name, value in normalized.items():
+        assert getattr(config.cluster, name) == value
+
+
+def test_core_net_resolver_applies_environment_without_rdma(monkeypatch):
+    if not hasattr(radixshmem._core, "resolve_cluster_net"):
+        pytest.skip("built without distributed support")
+    overrides = dict(REGISTRY=("registry", "etcd://192.0.2.1:2379"),
+                     CLUSTER_ID=("cluster_id", "normalized"), NODE_NAME=("node_name", "node-test"))
+    for name, (_, value) in overrides.items():
+        monkeypatch.setenv(f"RADIXSHMEM_{name}", str(value))
+    monkeypatch.setenv("RADIXSHMEM_INDEX_DEV", "radixshmem_missing_test_device")
+    monkeypatch.setenv("RADIXSHMEM_INDEX_PORT", "invalid")
+    monkeypatch.setenv("RADIXSHMEM_INDEX_GID_IDX", "invalid")
+    config = radixshmem._core.RadixServerConfig()
+    config.rpc_address = "192.0.2.2"
+    summary = radixshmem._core.resolve_cluster_net(config)
+    assert summary == "control 192.0.2.2 (rpc_address)"
+    for name, value in overrides.values():
+        assert getattr(config, name) == value
+
+
+def test_wildcard_control_address_needs_a_node_name(cfg, monkeypatch):
+    """Reject unnamed wildcard publication before creating shm, without requiring an RDMA NIC."""
+    if not hasattr(radixshmem._core, "resolve_cluster_net"):
+        pytest.skip("built without distributed support")
+    monkeypatch.delenv("RADIXSHMEM_NODE_NAME", raising=False)
+
+    def config(**settings):
+        result = radixshmem._core.RadixServerConfig()
+        result.rpc_address = "0.0.0.0"
+        for name, value in settings.items():
+            setattr(result, name, value)
+        return result
+
+    with pytest.raises(RuntimeError, match="node_name"):
+        radixshmem._core.resolve_cluster_net(config())
+    resolved = config(node_name="a")
+    radixshmem._core.resolve_cluster_net(resolved)
+    assert resolved.rpc_address == "0.0.0.0"
+    monkeypatch.setenv("RADIXSHMEM_NODE_NAME", "b")
+    resolved = config()
+    radixshmem._core.resolve_cluster_net(resolved)
+    assert (resolved.node_name, resolved.rpc_address) == ("b", "0.0.0.0")
+    monkeypatch.delenv("RADIXSHMEM_NODE_NAME")
+    resolved = config(rpc_interface="lo")
+    radixshmem._core.resolve_cluster_net(resolved)
+    assert resolved.rpc_address == "127.0.0.1"
+
+    server_config = cfg()
+    server_config.cluster.expected_min_nodes = 2
+    server_config.cluster.rpc_address = "0.0.0.0"
+    with pytest.raises(RuntimeError, match="node_name"):
+        RadixServer(server_config).start()
+    assert not os.path.exists(f"/dev/shm{server_config.name}_node0.0.0.0")
+
+
+@pytest.mark.parametrize("rht,peer,index_dev,transfer_devices,devices,expected", [
+    (None, None, "missing", None, None, ""),
+    ("redis", "grpc", "missing", None, None, ""),
+    ("rdma", "grpc", "missing", None, [], "RDMA index device"),
+    ("redis", "RDMA", "missing", None, ["transfer0"], "RDMA index device"),
+    ("rdma", "rdma", "index0", None, ["index0"], ""),
+    ("rdma", "grpc", "", None, ["index0"], ""),
+    ("rdma", "grpc", "", None, [], "RDMA index device"),
+    ("redis", "grpc", "missing", ["transfer0"], ["transfer0"], ""),
+    ("redis", "grpc", "missing", ["missing, transfer0"], ["transfer0"], ""),
+    ("redis", "grpc", "index0", ["missing"], ["index0"], "RDMA transfer device"),
+    ("redis", "grpc", "missing", [], ["transfer0"], ""),
+    ("redis", "grpc", "missing", [], [], "RDMA transfer device"),
+    ("rdma", "grpc", "index0", ["transfer0"], ["index0", "transfer0"], ""),
+])
+def test_cluster_prerequisites_separate_index_and_transfer(monkeypatch, rht, peer, index_dev,
+                                                          transfer_devices, devices, expected):
+    from types import SimpleNamespace
+    import test_cluster as cluster_test
+
+    for name, value in (("RADIXSHMEM_RHT_BACKEND", rht), ("RADIXSHMEM_PEER_INDEX_BACKEND", peer)):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
+    monkeypatch.setattr(cluster_test.shutil, "which", lambda name: "/test/etcd")
+    monkeypatch.setattr(radixshmem._core, "EtcdKv", object(), raising=False)
+    monkeypatch.setattr(radixshmem, "_data", SimpleNamespace(TRANSFER_BACKENDS=["mooncake"]))
+
+    def hardware(pattern):
+        assert devices is not None, "Redis + gRPC index-only must not inspect RDMA hardware"
+        assert pattern == "/sys/class/infiniband/*"
+        return [f"/sys/class/infiniband/{device}" for device in devices]
+
+    monkeypatch.setattr(cluster_test.glob, "glob", hardware)
+    result = cluster_test.prerequisite_error(index_dev, transfer_devices)
+    assert expected in result if expected else result == ""
+
+
+@pytest.mark.parametrize("missing", ["etcd", "EtcdKv", "mooncake"])
+def test_cluster_prerequisites_keep_dependency_checks(monkeypatch, missing):
+    from types import SimpleNamespace
+    import test_cluster as cluster_test
+
+    monkeypatch.setenv("RADIXSHMEM_RHT_BACKEND", "redis")
+    monkeypatch.setenv("RADIXSHMEM_PEER_INDEX_BACKEND", "grpc")
+    monkeypatch.setattr(cluster_test.shutil, "which", lambda name: None if missing == "etcd" else "/test/etcd")
+    monkeypatch.setattr(radixshmem._core, "EtcdKv", object(), raising=False)
+    if missing == "EtcdKv":
+        monkeypatch.delattr(radixshmem._core, "EtcdKv")
+    monkeypatch.setattr(radixshmem, "_data", SimpleNamespace(TRANSFER_BACKENDS=[]))
+    monkeypatch.setattr(cluster_test.glob, "glob", lambda pattern: ["/sys/class/infiniband/transfer0"])
+    result = cluster_test.prerequisite_error("missing", ["transfer0"])
+    assert ("Mooncake" if missing == "mooncake" else "etcd") in result
 
 
 def test_local_read_only_client_reads_index_and_store_but_never_writes(cfg):

@@ -21,9 +21,12 @@
 #include "../range_merge.hpp"
 
 #include "transfer_engine.h"
+#include "topology.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <mutex>
@@ -128,13 +131,21 @@ MooncakeBackend::~MooncakeBackend() {
     }
 }
 
+namespace {
+
+std::string join(const std::vector<std::string>& v, const char* empty) {
+    if (v.empty()) return empty;
+    std::string s;
+    for (const auto& x : v) s += (s.empty() ? "" : ",") + x;
+    return s;
+}
+
+}  // namespace
+
 bool MooncakeBackend::init(const TransferConfig& cfg) {
     publish_ = cfg.publish;
 
     const bool auto_discover = cfg.protocol.empty() || cfg.protocol == "rdma";
-    // The engine intersects this allowlist with its own MC_TE_FILTERS env
-    // allowlist, so an empty filter here is "whatever the environment says",
-    // not "everything".
     if (!cfg.device_filter.empty()) {
         engine_.reset(new mooncake::TransferEngine(auto_discover, cfg.device_filter));
     } else {
@@ -164,6 +175,31 @@ bool MooncakeBackend::init(const TransferConfig& cfg) {
             engine_.reset();
             return false;
         }
+    }
+
+    // Allow partial device availability, but reject an empty RDMA set to prevent TCP fallback.
+    if (auto_discover) {
+        std::vector<std::string> hcas;
+        if (auto topo = engine_->getLocalTopology()) hcas = topo->getHcaList();
+        if (hcas.empty()) {
+            fprintf(stderr, "[radixshmem] MooncakeBackend: protocol rdma but the engine topology has no HCA "
+                            "(allowed=%s); refusing to fall back to TCP\n", join(cfg.device_filter, "all").c_str());
+            engine_.reset();
+            return false;
+        }
+        std::vector<std::string> absent;
+        for (const auto& d : cfg.device_filter)
+            if (std::find(hcas.begin(), hcas.end(), d) == hcas.end()) absent.push_back(d);
+        if (!absent.empty()) {
+            fprintf(stderr, "[radixshmem] MooncakeBackend: warning: allowed transfer devices %s are unavailable "
+                            "or filtered out; continuing with %s\n",
+                    join(absent, "-").c_str(), join(hcas, "none").c_str());
+        }
+        fprintf(stderr, "[radixshmem] MooncakeBackend: transfer devices allowed=%s engine=%s active=unverified\n",
+                join(cfg.device_filter, "all").c_str(), join(hcas, "none").c_str());
+    } else {
+        fprintf(stderr, "[radixshmem] MooncakeBackend: protocol %s; RDMA device constraints not applied\n",
+                cfg.protocol.c_str());
     }
 
     local_segment_ = engine_->getLocalIpAndPort();

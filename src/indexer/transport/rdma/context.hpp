@@ -14,18 +14,9 @@
 
 namespace radixshmem {
 
-// The index planes' RDMA device and GID index: RADIXSHMEM_INDEX_DEV ("" = unset)
-// and RADIXSHMEM_INDEX_GID_IDX (-1 = unset). Only planes that run on RDMA read them.
-struct IndexDevice {
-    std::string dev;
-    int gid_idx = -1;
-};
-IndexDevice index_device_env();
-
 class RdmaContext {
 public:
-    explicit RdmaContext(const char* dev_name = nullptr,
-                         int port = 1, int gid_idx = 3);
+    explicit RdmaContext(const char* dev_name, int port, int gid_idx);
     ~RdmaContext();
 
     RdmaContext(const RdmaContext&) = delete;
@@ -49,7 +40,7 @@ private:
     ibv_pd* pd_ = nullptr;
     ibv_cq* cq_ = nullptr;
     int port_ = 1;
-    int gid_idx_ = 3;
+    int gid_idx_ = -1;
     int sl_ = 5;
     int tc_ = 160;
     union ibv_gid gid_ = {};

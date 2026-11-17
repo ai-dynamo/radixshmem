@@ -27,6 +27,8 @@ import sys
 import tempfile
 import time
 
+from test_cluster import prerequisite_error
+
 NAME = "/py_p2p"
 PREFIXES = 8
 PREFIX_LEN = 32
@@ -155,10 +157,9 @@ def check(cond, msg):
 def orchestrate(a) -> int:
     import radixshmem
 
-    if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{a.index_dev}")
-            or not hasattr(radixshmem, "_data") or "mooncake" not in radixshmem._data.TRANSFER_BACKENDS
-            or not hasattr(radixshmem._core, "EtcdKv")):
-        print(f"SKIP: needs etcd, RDMA device {a.index_dev!r} and radixshmem built with etcd + Mooncake")
+    missing = prerequisite_error(a.index_dev, a.transfer_dev)
+    if missing:
+        print(f"SKIP: {missing}")
         return 77
     workdir = tempfile.mkdtemp(prefix="radixshmem-p2p-")
     cluster_id = f"p2p{os.getpid()}"

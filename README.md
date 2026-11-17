@@ -40,7 +40,7 @@ The optional data-plane backends are built separately; see [Transfer backends](#
 
 Each node runs one `radix-server`, which manages `--data-bytes` of host memory; the slot size is configured
 by the client. In a distributed setup, `--transfer-dev` selects the devices of the data plane. The index uses
-no RDMA by default; an index plane switched to RDMA opens `RADIXSHMEM_INDEX_DEV` (first device if unset).
+no RDMA by default; an index plane switched to RDMA discovers a usable local device, port and GID.
 
 Single node:
 
@@ -52,9 +52,14 @@ radix-server --name /my_kv_cache --data-bytes 1024G
 [`docs/redis_deployment.md`](docs/redis_deployment.md) shows how to set one up);
 `RADIXSHMEM_RHT_BACKEND=rdma` keeps it in shards on the nodes instead. A query continues on a peer's tree
 with gRPC remote ops by default; `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` walks it with one-sided RDMA instead.
-These variables and the RDMA device of such planes (`RADIXSHMEM_INDEX_DEV`, `RADIXSHMEM_INDEX_GID_IDX`) are
+These variables and the RDMA constraints (`RADIXSHMEM_INDEX_DEV`, `RADIXSHMEM_INDEX_PORT`, `RADIXSHMEM_INDEX_GID_IDX`) are
 listed in [`docs/api.md`](docs/api.md). Peers reach a node on one TCP port, `--rpc-port` (default: picked by
 the OS and published in etcd).
+
+Control addresses are resolved before bootstrap: `--rpc-interface`, then `--rpc-address`, then the
+non-loopback source IP of the route to the registry. RDMA index discovery runs only after the cluster
+selects an RDMA backend; the default Redis + gRPC index ignores all `RADIXSHMEM_INDEX_*` settings.
+RDMA settings are environment-only; data-plane selection stays separate (`--transfer-dev`).
 
 ```bash
 # Same command on every node except --rpc-address

@@ -56,7 +56,7 @@ class RdmaRht final : public RhtBackend {
 public:
     // Opens the index device (RdmaTransportClient) and connects to the holders `sm` names.
     RdmaRht(const ShardMapMsg& sm, PeerRegistry& peers, PeerFaultCounters* faults,
-            int bootstrap_timeout_sec);
+            int bootstrap_timeout_sec, const std::string& registry = "");
     ~RdmaRht() override;
 
     RdmaRht(const RdmaRht&) = delete;
