@@ -282,7 +282,7 @@ class RadixClient:
     ``info`` still carries the server's rank and world size."""
 
     def __init__(self, name: str, geometry=None, *, endpoint: Optional[str] = None,
-                 max_outstanding: int = 256, local_read_only: bool = False):
+                 max_outstanding: int = 1024, local_read_only: bool = False):
         self._init(name, _Rpc(endpoint or rpc.endpoint_for(name)), max_outstanding, local_read_only)
         try:
             self.info = (self._t.configure(_geometry.as_spec(geometry)) if geometry is not None
@@ -292,7 +292,7 @@ class RadixClient:
             raise
 
     @classmethod
-    def _in_process(cls, server, max_outstanding: int = 256) -> "RadixClient":
+    def _in_process(cls, server, max_outstanding: int = 1024) -> "RadixClient":
         self = cls.__new__(cls)
         self._init(server.cfg.name, _LocalTransport(server), max_outstanding, False)
         self.info = self._t.describe()

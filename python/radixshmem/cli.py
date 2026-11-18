@@ -118,11 +118,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="(default: 0 = engine picks)")
     g.add_argument("--transfer-metadata", default=None, help="(default: P2PHANDSHAKE)")
     g.add_argument("--max-inflight", type=int, default=None,
-                   help="batches in flight at the engine (default: 256)")
+                   help="batches in flight at the engine (default: 1024)")
     g.add_argument("--max-pending-jobs", type=int, default=None,
                    help="queued + running + uncollected jobs before Submit is refused (default: 4096)")
     g.add_argument("--job-ttl", type=float, default=None,
-                   help="seconds an uncollected job is kept (default: 60)")
+                   help="seconds an uncollected job is kept (default: 300)")
 
     g = p.add_argument_group("server")
     g.add_argument("--endpoint", default="",

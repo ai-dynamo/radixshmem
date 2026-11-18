@@ -103,9 +103,9 @@ class ServerConfig:
     transfer_port: int = 0
     transfer_metadata: str = "P2PHANDSHAKE"
     # jobs
-    max_inflight: int = 256          # batches in flight at the engine
+    max_inflight: int = 1024         # batches in flight at the engine
     max_pending_jobs: int = 4096     # queued + running + uncollected jobs before Submit is refused
-    job_ttl_s: float = 60.0          # seconds an uncollected job is kept
+    job_ttl_s: float = 300.0         # seconds an uncollected job is kept
     transfer_log: str = ""           # one line per transfer with bytes > 0: "-" = stdout, a path appends, "" = off
     # index tuning
     max_nodes: int = 0               # radix node pool, 0 = auto
