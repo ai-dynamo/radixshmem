@@ -42,9 +42,13 @@ cmake -S . -B build && cmake --build build -j && ctest --test-dir build
 ```
 
 A source build needs the grpc++ and protobuf development packages for the remote ops, hiredis for the
-Redis RHT, the rdma-core headers and a Go toolchain for the etcd client (Ubuntu: `apt-get install
-libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc libhiredis-dev libibverbs-dev
-libxxhash-dev golang`); configuration fails if one is missing. Cross-node remote ops use gRPC exclusively.
+Redis RHT, the rdma-core headers and a Go toolchain for the etcd client, and, for the Mooncake transfer
+backend, git and the glog, gflags, jsoncpp, yaml-cpp and libnuma development packages (Ubuntu: `apt-get
+install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc libhiredis-dev libibverbs-dev
+libxxhash-dev golang git libgoogle-glog-dev libgflags-dev libjsoncpp-dev libyaml-cpp-dev libnuma-dev`);
+configuration fails if one is missing. The first build fetches Mooncake at the commit `MOONCAKE_COMMIT` pins
+into `third_party/mooncake` and builds it there (a few minutes, once); an index-only build skips it with
+`pip install . -Ccmake.define.ENABLE_MOONCAKE=OFF`. Cross-node remote ops use gRPC exclusively.
 The RHT and the peer index each run on one-sided RDMA (XRC or DC) or without it: the RHT on Redis
 (`RADIXSHMEM_RHT_BACKEND=redis`), the peer index on the peers' gRPC remote ops
 (`RADIXSHMEM_PEER_INDEX_BACKEND=grpc`). Both are the defaults, so by default the index opens no RDMA
@@ -189,15 +193,10 @@ whichever one is in use.
 ### 1. Mooncake (default)
 
 The Mooncake backend is C++, built as the plugin `libradixshmem_mooncake.so` next to `radixshmem._core`, which
-loads it when a server first needs it. The PyPI wheels include it. From source, build Mooncake first:
-
-```bash
-scripts/build_mooncake.sh
-pip install .
-```
-
-`ENABLE_MOONCAKE` takes `AUTO` (default: build the plugin when Mooncake is found), `ON` (fail without it) or
-`OFF`. C++ programs outside the package find the plugin through `RADIXSHMEM_TRANSFER_PLUGIN_DIR`.
+loads it when a server first needs it. The PyPI wheels include it, and `pip install .` builds it (see Build).
+`ENABLE_MOONCAKE` takes `ON` (default: fetch and build Mooncake into `MOONCAKE_ROOT` unless a build is already
+there), `AUTO` (use an existing build under `MOONCAKE_ROOT`, never fetch) or `OFF`. C++ programs outside the
+package find the plugin through `RADIXSHMEM_TRANSFER_PLUGIN_DIR`.
 
 ```bash
 radix-server --name /my_kv_cache --data-bytes 1024G \

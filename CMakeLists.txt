@@ -26,11 +26,14 @@ set(RADIXSHMEM_TEST_REDIS_BIN "" CACHE PATH
     "directory with redis-server and redis-cli for the Redis RHT fault tests; empty skips them")
 
 # The Mooncake transfer backend is a plugin (libradixshmem_mooncake.so) loaded on first use; NIXL is reached
-# through its Python package. ENABLE_MOONCAKE: AUTO builds the plugin when Mooncake is found, ON requires it,
-# OFF skips it.
-set(ENABLE_MOONCAKE AUTO CACHE STRING "Build the Mooncake transfer plugin: AUTO, ON or OFF")
+# through its Python package. ENABLE_MOONCAKE: ON (default) builds the plugin, and when MOONCAKE_ROOT holds no
+# Mooncake build, fetches Mooncake at MOONCAKE_COMMIT and builds it there first; AUTO builds the plugin only
+# from an existing Mooncake build; OFF skips it (an index-only build).
+set(ENABLE_MOONCAKE ON CACHE STRING "Build the Mooncake transfer plugin: ON, AUTO or OFF")
 set(MOONCAKE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/mooncake" CACHE PATH
     "Mooncake source + build root")
+set(MOONCAKE_COMMIT e5598b0992cc258b06d22f24d875480e8931a28e CACHE STRING
+    "The Mooncake commit fetched when MOONCAKE_ROOT holds no build (packaging/manylinux/Dockerfile pins the same)")
 
 # ==================== radixshmem library ====================
 set(_radixshmem_sources
@@ -229,36 +232,88 @@ target_link_libraries(radixshmem_registry PUBLIC ${_etcd_go_lib})
 target_link_libraries(radixshmem PUBLIC radixshmem_registry)
 
 # ==================== Mooncake transfer engine (data plane) ====================
-# Probe only — the backend source lands with src/transfer.
-#
-# Headers and library MUST come from the same Mooncake checkout: TransferMetadata
-# 's descriptor structs change shape between revisions, and a stale archive
-# against fresh headers links cleanly and then hands back garbage (empty buffer
-# lists, in practice). So the library is looked up under MOONCAKE_BUILD_DIR,
-# which lives inside MOONCAKE_ROOT, and the headers come from that same tree --
-# never from a /usr/local install of unknown vintage.
-#
-# Build Mooncake's transfer engine alone with:
-#   cmake -S <root> -B <root>/build-te -DCMAKE_BUILD_TYPE=Release -DWITH_TE=ON \
-#         -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_P2P_STORE=OFF \
-#         -DBUILD_UNIT_TESTS=OFF -DUSE_ETCD=OFF && cmake --build <root>/build-te \
-#         --target transfer_engine
+# Headers and library MUST come from the same Mooncake checkout: TransferMetadata's descriptor structs change
+# shape between revisions, and a stale archive against fresh headers links cleanly and then hands back
+# garbage (empty buffer lists, in practice). So the library is looked up under MOONCAKE_BUILD_DIR, inside
+# MOONCAKE_ROOT, and the headers come from that same tree -- never from a /usr/local install.
 set(MOONCAKE_BUILD_DIR "${MOONCAKE_ROOT}/build-te" CACHE PATH
     "Mooncake build tree holding libtransfer_engine (must match MOONCAKE_ROOT's sources)")
-set(RADIXSHMEM_MOONCAKE_FOUND OFF)
-if(ENABLE_MOONCAKE)
+set(_mooncake_vars MOONCAKE_INCLUDE_DIR MOONCAKE_LIBRARY MOONCAKE_BASE_LIBRARY MOONCAKE_COMMON_LIBRARY
+    MOONCAKE_ASIO_LIBRARY)
+
+macro(radixshmem_find_mooncake)
     find_path(MOONCAKE_INCLUDE_DIR transfer_engine.h
         HINTS ${MOONCAKE_ROOT}/mooncake-transfer-engine/include NO_DEFAULT_PATH)
     find_library(MOONCAKE_LIBRARY NAMES transfer_engine
         HINTS ${MOONCAKE_BUILD_DIR}/mooncake-transfer-engine/src NO_DEFAULT_PATH)
-    # The static build splits into several archives and needs its transitive deps
-    # spelled out; a shared build (-DBUILD_SHARED_LIBS=ON) would carry its own.
+    # The static build splits into several archives and needs its transitive deps spelled out.
     find_library(MOONCAKE_BASE_LIBRARY NAMES base
         HINTS ${MOONCAKE_BUILD_DIR}/mooncake-transfer-engine/src/common/base NO_DEFAULT_PATH)
     find_library(MOONCAKE_COMMON_LIBRARY NAMES mooncake_common
         HINTS ${MOONCAKE_BUILD_DIR}/mooncake-common/src NO_DEFAULT_PATH)
     find_library(MOONCAKE_ASIO_LIBRARY NAMES asio
         HINTS ${MOONCAKE_BUILD_DIR}/mooncake-common NO_DEFAULT_PATH)
+endmacro()
+
+function(radixshmem_run what)
+    execute_process(COMMAND ${ARGN} RESULT_VARIABLE _rc)
+    if(NOT _rc EQUAL 0)
+        message(FATAL_ERROR "Mooncake: ${what} failed. It needs git, network access to GitHub and the "
+            "development packages of glog, gflags, jsoncpp, yaml-cpp, libnuma and rdma-core (Ubuntu: apt-get "
+            "install libgoogle-glog-dev libgflags-dev libjsoncpp-dev libyaml-cpp-dev libnuma-dev "
+            "libibverbs-dev). ENABLE_MOONCAKE=OFF builds without the Mooncake transfer backend.")
+    endif()
+endfunction()
+
+# Fetch Mooncake at MOONCAKE_COMMIT into MOONCAKE_ROOT and build its transfer engine there, as the wheel
+# image does: static, without its HTTP metadata server (radixshmem uses P2PHANDSHAKE) and without CUDA.
+function(radixshmem_build_mooncake)
+    find_package(Git REQUIRED)
+    include(ProcessorCount)
+    ProcessorCount(_jobs)
+    if(_jobs EQUAL 0)
+        set(_jobs 8)
+    endif()
+    message(STATUS "Mooncake: fetching ${MOONCAKE_COMMIT} into ${MOONCAKE_ROOT} and building its transfer engine")
+    file(MAKE_DIRECTORY ${MOONCAKE_ROOT})
+    if(NOT EXISTS ${MOONCAKE_ROOT}/.git)
+        radixshmem_run("git init" ${GIT_EXECUTABLE} init --quiet ${MOONCAKE_ROOT})
+    endif()
+    radixshmem_run("git fetch" ${GIT_EXECUTABLE} -C ${MOONCAKE_ROOT} fetch --quiet --depth 1
+        https://github.com/kvcache-ai/Mooncake ${MOONCAKE_COMMIT})
+    radixshmem_run("git checkout" ${GIT_EXECUTABLE} -C ${MOONCAKE_ROOT} checkout --quiet --force FETCH_HEAD)
+    radixshmem_run("git submodule update" ${GIT_EXECUTABLE} -C ${MOONCAKE_ROOT} submodule update --quiet
+        --init --depth 1 extern/pybind11)
+    file(REMOVE_RECURSE ${MOONCAKE_BUILD_DIR})
+    radixshmem_run("configure" ${CMAKE_COMMAND} -S ${MOONCAKE_ROOT} -B ${MOONCAKE_BUILD_DIR}
+        -G ${CMAKE_GENERATOR} -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_P2P_STORE=OFF
+        -DUSE_ETCD=OFF -DUSE_HTTP=OFF -DUSE_CUDA=OFF
+        -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF)
+    radixshmem_run("build" ${CMAKE_COMMAND} --build ${MOONCAKE_BUILD_DIR} --target transfer_engine
+        --parallel ${_jobs})
+    file(WRITE ${MOONCAKE_BUILD_DIR}/radixshmem_commit ${MOONCAKE_COMMIT})
+endfunction()
+
+set(RADIXSHMEM_MOONCAKE_FOUND OFF)
+if(ENABLE_MOONCAKE)
+    radixshmem_find_mooncake()
+    # A build this file made at another commit is rebuilt; one made elsewhere (no stamp) is taken as is.
+    set(_mooncake_stale OFF)
+    if(EXISTS ${MOONCAKE_BUILD_DIR}/radixshmem_commit)
+        file(READ ${MOONCAKE_BUILD_DIR}/radixshmem_commit _mooncake_built)
+        if(NOT _mooncake_built STREQUAL MOONCAKE_COMMIT)
+            set(_mooncake_stale ON)
+        endif()
+    endif()
+    if(ENABLE_MOONCAKE STREQUAL "ON" AND (NOT (MOONCAKE_INCLUDE_DIR AND MOONCAKE_LIBRARY) OR _mooncake_stale))
+        radixshmem_build_mooncake()
+        foreach(_v ${_mooncake_vars})
+            unset(${_v} CACHE)
+        endforeach()
+        radixshmem_find_mooncake()
+    endif()
     if(MOONCAKE_INCLUDE_DIR AND MOONCAKE_LIBRARY)
         set(RADIXSHMEM_MOONCAKE_FOUND ON)
         set(MOONCAKE_LINK_LIBS
@@ -273,12 +328,12 @@ if(ENABLE_MOONCAKE)
             list(APPEND MOONCAKE_LINK_LIBS curl)
         endif()
         message(STATUS "Mooncake found (${MOONCAKE_LIBRARY}) — transfer plugin enabled")
-    elseif(NOT ENABLE_MOONCAKE STREQUAL "AUTO")
-        message(FATAL_ERROR "Mooncake not found under MOONCAKE_ROOT=${MOONCAKE_ROOT} "
-                            "(ENABLE_MOONCAKE=${ENABLE_MOONCAKE}; AUTO or OFF builds without it)")
+    elseif(ENABLE_MOONCAKE STREQUAL "ON")
+        message(FATAL_ERROR "Mooncake built under MOONCAKE_ROOT=${MOONCAKE_ROOT} but its transfer engine "
+                            "is missing (include=${MOONCAKE_INCLUDE_DIR}, lib=${MOONCAKE_LIBRARY})")
     else()
-        message(STATUS "Mooncake not found (include=${MOONCAKE_INCLUDE_DIR}, "
-                       "lib=${MOONCAKE_LIBRARY}) — transfer plugin disabled")
+        message(STATUS "Mooncake not found under MOONCAKE_ROOT=${MOONCAKE_ROOT} — transfer plugin disabled "
+                       "(ENABLE_MOONCAKE=AUTO)")
     endif()
 else()
     message(STATUS "Mooncake disabled (ENABLE_MOONCAKE=OFF)")
