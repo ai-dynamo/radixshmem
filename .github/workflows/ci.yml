@@ -77,6 +77,8 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Wheel
+        env:
+          SKBUILD_CMAKE_DEFINE: ENABLE_MOONCAKE=OFF   # as configured above; wheels.yml builds the Mooncake wheels
         run: |
           pip wheel --no-deps -w dist .
           python -m venv /tmp/wheel-venv
