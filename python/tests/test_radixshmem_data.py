@@ -7,7 +7,9 @@
    - slot views are windows onto the mapping, not copies,
    - a real two-process transfer through SlotTransfer moves the right bytes into
      the right slots, coalescing included, over each transfer backend,
-   - a transfer to the process's own segment is a local copy.
+   - a transfer to the process's own segment is a local copy,
+   - release() of a batch in flight is XFER_EBUSY and keeps the handle,
+   - NIXL: opening a peer that starts late retries, a closed segment reopens.
 
 Everything past the store tests needs a transfer backend, so those tests fork:
 an ibverbs context does not survive fork(), so every engine is built inside a
@@ -16,8 +18,12 @@ host (no Mooncake plugin, no NIXL package) is SKIPped.
 """
 
 import os
+import socket
 import struct
 import sys
+import time
+
+import numpy as np
 
 import radixshmem
 
@@ -557,6 +563,23 @@ def _self_copy(backend):
         x.release(h)
         if not holds(s, 20, pattern(2)) or x.detach_peer(x.local_segment) != radixshmem._data.XFER_OK:
             return 8
+        # The closed segment takes no batch; reopened, it is the same memory again.
+        rc, seg = be.open_segment(be.local_segment)
+        if rc != radixshmem._data.XFER_OK or seg.base != s.data_addr:
+            return 9
+        be.close_segment(seg.id)
+        one = np.array([s.data_addr + s.slot_offset(30)], dtype=np.uint64)
+        size = np.array([SLOT_BYTES], dtype=np.uint64)
+        if be.submit(radixshmem._data.XferOp.READ, seg.id, one, np.array([seg.base], dtype=np.uint64), size) \
+                != radixshmem._data.INVALID_BATCH:
+            return 10
+        if x.attach_peer(x.local_segment, SLOT_BYTES)[0] != radixshmem._data.XFER_OK:
+            return 11
+        h, _ = x.read(x.local_segment, [1], [31])
+        if x.wait(h, 5000) != radixshmem._data.XferState.COMPLETED or x.release(h) != radixshmem._data.XFER_OK:
+            return 12
+        if not holds(s, 31, pattern(1)):
+            return 13
         be.close()
         be.close()   # idempotent
         return 0
@@ -572,6 +595,172 @@ def test_self_segment():
             assert _reap(_spawn(lambda: _self_copy(backend)), backend)
             ran.append(backend)
     print(f"  PASS: self_segment ({', '.join(ran) or 'no backend'})")
+
+
+BIG_SLOTS, BIG_SLOT_BYTES = 64, 4 << 20   # one 256 MiB read: long enough to be in flight at release()
+
+
+def _big_store(shm):
+    radixshmem._data.SlotStore.destroy(shm, "")
+    s = radixshmem._data.SlotStore.create(store_cfg(shm, slots=BIG_SLOTS, slot_bytes=BIG_SLOT_BYTES,
+                                                    prefault=True))
+    return s
+
+
+def _release_publisher(backend, shm, fds):
+    name_r, name_w, done_r, done_w = fds
+    os.close(name_r)
+    os.close(done_w)
+    s = _big_store(shm)
+    be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, True, "rdma"))
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != radixshmem._data.XFER_OK:
+        return 2
+    for i in range(BIG_SLOTS):
+        s.slot_view(i)[:] = bytes([pattern(i)]) * BIG_SLOT_BYTES
+    _write_str(name_w, be.local_segment)
+    ok = os.read(done_r, 1) == b"k"
+    be.close()
+    return 0 if ok else 3
+
+
+def _release_initiator(backend, shm, fds):
+    """release() on a batch in flight is XFER_EBUSY and keeps the handle; once done it frees it, after
+    which poll() is INVALID and release() ENOENT. Exits 0 if EBUSY was seen, 100 if the batch finished
+    before the first release()."""
+    d = radixshmem._data
+    name_r, name_w, done_r, done_w = fds
+    os.close(name_w)
+    os.close(done_r)
+    s = _big_store(shm)
+    be = d.create_transfer_backend(xfer_cfg(backend, False, "rdma"))
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != d.XFER_OK:
+        return 2
+    rc, seg = be.open_segment(_read_str(name_r))
+    if rc != d.XFER_OK:
+        return 4
+    n = BIG_SLOTS * BIG_SLOT_BYTES
+    u64 = lambda v: np.array([v], dtype=np.uint64)  # noqa: E731
+    h = be.submit(d.XferOp.READ, seg.id, u64(s.data_addr), u64(seg.base), u64(n))
+    if h == d.INVALID_BATCH:
+        return 5
+    busy = be.release(h) == d.XFER_EBUSY
+    if busy:
+        if be.poll(h)[0] not in (d.XferState.PENDING, d.XferState.COMPLETED):
+            return 6
+        if be.wait(h, 30000) != d.XferState.COMPLETED or be.release(h) != d.XFER_OK:
+            return 7
+    if be.poll(h)[0] != d.XferState.INVALID or be.release(h) != d.XFER_ENOENT:
+        return 8
+    for i in (0, BIG_SLOTS // 2, BIG_SLOTS - 1):
+        if s.read_slot(i)[:4096] != bytes([pattern(i)]) * 4096:
+            return 9
+    be.close_segment(seg.id)
+    os.write(done_w, b"k")
+    be.close()
+    return 0 if busy else 100
+
+
+def test_release_contract():
+    for backend in ("mooncake", "nixl"):
+        if not _available(backend):
+            print(f"  SKIP: release_contract ({backend} unavailable)")
+            continue
+        name_r, name_w = os.pipe()
+        done_r, done_w = os.pipe()
+        fds = (name_r, name_w, done_r, done_w)
+        a, b = f"/py_rel_{backend}_a", f"/py_rel_{backend}_b"
+        pa = _spawn(lambda: _release_publisher(backend, a, fds))
+        pb = _spawn(lambda: _release_initiator(backend, b, fds))
+        for fd in fds:
+            os.close(fd)
+        _, status = os.waitpid(pb, 0)
+        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+        ok_a = _reap(pa, "publisher")
+        for name in (a, b):
+            radixshmem._data.SlotStore.destroy(name, "")
+        assert code in (0, 100) and ok_a, f"{backend}: initiator exited {code}"
+        print(f"  PASS: release_contract ({backend}, "
+              f"{'EBUSY seen' if code == 0 else 'no EBUSY: the batch finished before release'})")
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _late_publisher(shm, port, done_r):
+    time.sleep(1.5)   # the initiator is already opening this segment
+    s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True))
+    cfg = xfer_cfg("nixl", True, "rdma")
+    cfg.rpc_port = port
+    be = radixshmem._data.create_transfer_backend(cfg)
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != radixshmem._data.XFER_OK:
+        return 2
+    for i in range(SLOTS):
+        fill(s, i, pattern(i))
+    ok = os.read(done_r, 1) == b"k"
+    be.close()
+    return 0 if ok else 3
+
+
+def _late_initiator(shm, port, done_w):
+    d = radixshmem._data
+    s = d.SlotStore.create(store_cfg(shm, prefault=True))
+    be = d.create_transfer_backend(xfer_cfg("nixl", False, "rdma"))
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != d.XFER_OK:
+        return 2
+    u64 = lambda v: np.array([v], dtype=np.uint64)  # noqa: E731
+
+    def pull(seg, slot, code):
+        local = s.data_addr + s.slot_offset(slot)
+        h = be.submit(d.XferOp.READ, seg.id, u64(local), u64(seg.base + s.slot_offset(slot)), u64(SLOT_BYTES))
+        if h == d.INVALID_BATCH or be.wait(h, 30000) != d.XferState.COMPLETED or be.release(h) != d.XFER_OK:
+            return code
+        return 0 if holds(s, slot, pattern(slot)) else code + 1
+
+    peer = f"127.0.0.1:{port}"
+    t0 = time.monotonic()
+    rc, seg = be.open_segment(peer)   # nobody listens yet: the exchange is retried
+    if rc != d.XFER_OK or time.monotonic() - t0 < 1.0:
+        return 4
+    err = pull(seg, 5, 10)
+    if err:
+        return err
+    be.close_segment(seg.id)
+    h = be.submit(d.XferOp.READ, seg.id, u64(s.data_addr), u64(seg.base), u64(SLOT_BYTES))
+    if h != d.INVALID_BATCH:
+        return 20
+    rc, again = be.open_segment(peer)   # reopened: the metadata is fetched afresh
+    if rc != d.XFER_OK or again.base != seg.base or again.id == seg.id:
+        return 21
+    err = pull(again, 9, 30)
+    if err:
+        return err
+    os.write(done_w, b"k")
+    be.close()
+    return 0
+
+
+def test_nixl_late_peer_and_reopen():
+    if not _available("nixl"):
+        print("  SKIP: nixl_late_peer_and_reopen (no NIXL package or UCX agent)")
+        return
+    port = _free_port()
+    done_r, done_w = os.pipe()
+    a, b = "/py_late_a", "/py_late_b"
+    for name in (a, b):
+        radixshmem._data.SlotStore.destroy(name, "")
+    pb = _spawn(lambda: _late_initiator(b, port, done_w))
+    pa = _spawn(lambda: _late_publisher(a, port, done_r))
+    os.close(done_r)
+    os.close(done_w)
+    ok_b = _reap(pb, "initiator")
+    ok_a = _reap(pa, "publisher")
+    for name in (a, b):
+        radixshmem._data.SlotStore.destroy(name, "")
+    assert ok_a and ok_b
+    print("  PASS: nixl_late_peer_and_reopen")
 
 
 # ==================================================================
@@ -590,4 +779,6 @@ if __name__ == "__main__":
     test_e2e_device_filter()
     test_e2e_nixl()
     test_self_segment()
+    test_release_contract()
+    test_nixl_late_peer_and_reopen()
     print("\nAll tests passed.")
