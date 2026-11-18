@@ -136,6 +136,8 @@ class NixlBackend(TransferBackend):
     def register_memory(self, addr: int, length: int, location: str = "") -> int:
         if not addr or not length:
             return XFER_EINVAL
+        if self._agent is None:
+            return XFER_EBACKEND
         with self._mu:
             if addr in self._registered:
                 return XFER_EINVAL
@@ -151,6 +153,8 @@ class NixlBackend(TransferBackend):
 
     def unregister_memory(self, addr: int) -> int:
         with self._mu:
+            if self._agent is None:
+                return XFER_EBACKEND
             entry = self._registered.get(addr)
             if entry is None:
                 return XFER_ENOENT
@@ -172,6 +176,8 @@ class NixlBackend(TransferBackend):
     def open_segment(self, name: str) -> Tuple[int, Optional[SegmentInfo]]:
         if not name:
             return XFER_EINVAL, None
+        if self._agent is None:
+            return XFER_EBACKEND, None
         with self._mu:
             sid = self._by_name.get(name)
             if sid is not None:
@@ -281,7 +287,7 @@ class NixlBackend(TransferBackend):
             return INVALID_BATCH
         with self._mu:
             seg = self._segments.get(seg_id)
-        if seg is None:
+        if seg is None or self._agent is None:
             _warn(f"batch targets unknown segment {seg_id}")
             return INVALID_BATCH
         if not lengths.all() or not local.all():
@@ -330,22 +336,23 @@ class NixlBackend(TransferBackend):
             return h
 
     def poll(self, handle: int) -> Tuple[XferState, int]:
+        # Under the lock through the state read: a release() of the same handle frees the request.
         with self._mu:
             b = self._batches.get(handle)
-        if b is None:
-            return XferState.INVALID, 0
-        if b.failed:
+            if b is None:
+                return XferState.INVALID, 0
+            if b.failed:
+                return XferState.FAILED, 0
+            if b.done:
+                return XferState.COMPLETED, b.nbytes
+            state = self._agent.check_xfer_state(b.handle)
+            if state == "DONE":
+                b.done = True
+                return XferState.COMPLETED, b.nbytes
+            if state == "PROC":
+                return XferState.PENDING, 0
+            b.failed = True
             return XferState.FAILED, 0
-        if b.done:
-            return XferState.COMPLETED, b.nbytes
-        state = self._agent.check_xfer_state(b.handle)
-        if state == "DONE":
-            b.done = True
-            return XferState.COMPLETED, b.nbytes
-        if state == "PROC":
-            return XferState.PENDING, 0
-        b.failed = True
-        return XferState.FAILED, 0
 
     def release(self, handle: int) -> int:
         with self._mu:
@@ -364,9 +371,13 @@ class NixlBackend(TransferBackend):
         return XFER_OK
 
     def close(self) -> None:
+        """Stop the notification thread, release every batch and registration, and drop the agent, which
+        closes its listener port. The backend refuses work afterwards."""
         self._stop.set()
         self._notif_thread.join(1)
         with self._mu:
+            if self._agent is None:
+                return
             for h, b in list(self._batches.items()):
                 if b.handle is not None:
                     try:
@@ -381,6 +392,9 @@ class NixlBackend(TransferBackend):
                     pass
             self._registered.clear()
             self._merged = []
+            self._segments.clear()
+            self._by_name.clear()
+            self._agent = None
 
 
 def create(cfg: TransferConfig) -> Optional[NixlBackend]:

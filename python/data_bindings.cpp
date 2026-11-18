@@ -18,6 +18,7 @@
 
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -75,11 +76,18 @@ py::array_t<uint64_t> to_array(const std::vector<uint64_t>& v) {
     return a;
 }
 
+// Calls take a reference before they release the GIL; close() drops ours, and the engine goes with the last one.
 struct NativeBackend {
-    std::unique_ptr<ITransferBackend> be;
-    ITransferBackend& get() {
+    std::mutex mu;
+    std::shared_ptr<ITransferBackend> be;
+    std::shared_ptr<ITransferBackend> get() {
+        std::lock_guard<std::mutex> lk(mu);
         if (!be) throw std::runtime_error("transfer backend is closed");
-        return *be;
+        return be;
+    }
+    std::shared_ptr<ITransferBackend> take() {
+        std::lock_guard<std::mutex> lk(mu);
+        return std::move(be);
     }
 };
 
@@ -346,35 +354,39 @@ void bind_data(py::module_& m) {
 
     // A plugin's ITransferBackend behind radixshmem.transfer.TransferBackend.
     py::class_<NativeBackend>(m, "NativeTransferBackend")
-        .def_property_readonly("name", [](NativeBackend& b) { return std::string(b.get().backend_name()); })
-        .def_property_readonly("local_segment", [](NativeBackend& b) { return b.get().local_segment(); })
+        .def_property_readonly("name", [](NativeBackend& b) { return std::string(b.get()->backend_name()); })
+        .def_property_readonly("local_segment", [](NativeBackend& b) { return b.get()->local_segment(); })
         .def("register_memory",
              [](NativeBackend& b, uint64_t addr, uint64_t length, const std::string& location) {
+                 auto be = b.get();
                  py::gil_scoped_release nogil;
-                 return b.get().register_memory(reinterpret_cast<void*>(addr), length, location);
+                 return be->register_memory(reinterpret_cast<void*>(addr), length, location);
              },
              py::arg("addr"), py::arg("length"), py::arg("location") = "")
         .def("unregister_memory",
              [](NativeBackend& b, uint64_t addr) {
+                 auto be = b.get();
                  py::gil_scoped_release nogil;
-                 return b.get().unregister_memory(reinterpret_cast<void*>(addr));
+                 return be->unregister_memory(reinterpret_cast<void*>(addr));
              },
              py::arg("addr"))
         .def("open_segment",
              [](NativeBackend& b, const std::string& name) -> py::tuple {
+                 auto be = b.get();
                  SegmentInfo info;
                  int rc;
                  {
                      py::gil_scoped_release nogil;
-                     rc = b.get().open_segment(name, info);
+                     rc = be->open_segment(name, info);
                  }
                  return py::make_tuple(rc, rc == XFER_OK ? py::cast(info) : py::none());
              },
              py::arg("name"), "Returns (rc, SegmentInfo or None).")
         .def("close_segment",
              [](NativeBackend& b, int32_t id) {
+                 auto be = b.get();
                  py::gil_scoped_release nogil;
-                 b.get().close_segment(id);
+                 be->close_segment(id);
              },
              py::arg("seg_id"))
         .def("submit",
@@ -384,46 +396,56 @@ void bind_data(py::module_& m) {
                  const uint64_t* l = local.data();
                  const uint64_t* r = remote.data();
                  const uint64_t* len = lengths.data();
+                 auto be = b.get();
                  py::gil_scoped_release nogil;
                  std::vector<TransferDesc> descs((size_t)n);
                  for (py::ssize_t i = 0; i < n; ++i)
                      descs[i] = TransferDesc{op, reinterpret_cast<void*>(l[i]), seg, r[i], len[i]};
-                 return b.get().submit(descs.data(), (int)n);
+                 return be->submit(descs.data(), (int)n);
              },
              py::arg("op"), py::arg("seg_id"), py::arg("local"), py::arg("remote"), py::arg("lengths"),
              "Batch handle, INVALID_BATCH on rejection.")
         .def("poll",
              [](NativeBackend& b, BatchHandle h) {
+                 auto be = b.get();
                  uint64_t done = 0;
                  XferState s;
                  {
                      py::gil_scoped_release nogil;
-                     s = b.get().poll(h, &done);
+                     s = be->poll(h, &done);
                  }
                  return py::make_tuple(s, done);
              },
              py::arg("handle"), "Returns (XferState, bytes_done).")
         .def("wait",
              [](NativeBackend& b, BatchHandle h, int timeout_ms) {
+                 auto be = b.get();
                  py::gil_scoped_release nogil;
-                 return b.get().wait(h, timeout_ms);
+                 return be->wait(h, timeout_ms);
              },
              py::arg("handle"), py::arg("timeout_ms"))
         .def("release",
              [](NativeBackend& b, BatchHandle h) {
+                 auto be = b.get();
                  py::gil_scoped_release nogil;
-                 return b.get().release(h);
+                 return be->release(h);
              },
              py::arg("handle"), "XFER_OK, or XFER_EBUSY while the batch is still running.")
         .def("close",
              [](NativeBackend& b) {
+                 auto be = b.take();
                  py::gil_scoped_release nogil;
-                 b.be.reset();
+                 be.reset();
              })
         .def("__repr__", [](NativeBackend& b) {
-            if (!b.be) return std::string("<NativeTransferBackend closed>");
-            return std::string("<NativeTransferBackend '") + b.be->backend_name() + "' segment='" +
-                   b.be->local_segment() + "'>";
+            std::shared_ptr<ITransferBackend> be;
+            {
+                std::lock_guard<std::mutex> lk(b.mu);
+                be = b.be;
+            }
+            if (!be) return std::string("<NativeTransferBackend closed>");
+            return std::string("<NativeTransferBackend '") + be->backend_name() + "' segment='" +
+                   be->local_segment() + "'>";
         });
 
     m.def("create_native_backend",
@@ -434,7 +456,9 @@ void bind_data(py::module_& m) {
                   be = create_transfer_backend(cfg);
               }
               if (!be) return nullptr;
-              return std::unique_ptr<NativeBackend>(new NativeBackend{std::move(be)});
+              auto nb = std::unique_ptr<NativeBackend>(new NativeBackend());
+              nb->be = std::move(be);
+              return nb;
           },
           py::arg("config"), "The plugin backend named by config.backend, or None if it is unavailable.");
 

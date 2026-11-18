@@ -528,6 +528,8 @@ class RadixServer:
             except Exception:  # noqa: BLE001
                 pass
             self._greg.close()
+        if self._backend is not None:
+            self._backend.close()   # before the store is unmapped: it deregisters the memory
         self._teardown_regions()
         self._backend = self._greg = None
         with self._cv:

@@ -558,6 +558,7 @@ def _self_copy(backend):
         if not holds(s, 20, pattern(2)) or x.detach_peer(x.local_segment) != radixshmem._data.XFER_OK:
             return 8
         be.close()
+        be.close()   # idempotent
         return 0
     finally:
         radixshmem._data.SlotStore.destroy(shm, "")
