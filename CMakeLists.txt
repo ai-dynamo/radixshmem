@@ -284,10 +284,20 @@ function(radixshmem_build_mooncake)
     radixshmem_run("git checkout" ${GIT_EXECUTABLE} -C ${MOONCAKE_ROOT} checkout --quiet --force FETCH_HEAD)
     radixshmem_run("git submodule update" ${GIT_EXECUTABLE} -C ${MOONCAKE_ROOT} submodule update --quiet
         --init --depth 1 extern/pybind11)
+    # The same toolchain as this build: a pip build's ninja is on no PATH, and radixshmem itself enables no C.
+    include(CheckLanguage)
+    check_language(C)
+    set(_toolchain -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER})
+    if(CMAKE_C_COMPILER)
+        list(APPEND _toolchain -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER})
+    endif()
+    if(CMAKE_MAKE_PROGRAM)
+        list(APPEND _toolchain -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
+    endif()
     file(REMOVE_RECURSE ${MOONCAKE_BUILD_DIR})
     radixshmem_run("configure" ${CMAKE_COMMAND} -S ${MOONCAKE_ROOT} -B ${MOONCAKE_BUILD_DIR}
         -G ${CMAKE_GENERATOR} -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON
-        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ${_toolchain}
         -DWITH_TE=ON -DWITH_STORE=OFF -DWITH_STORE_RUST=OFF -DWITH_P2P_STORE=OFF
         -DUSE_ETCD=OFF -DUSE_HTTP=OFF -DUSE_CUDA=OFF
         -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF)
