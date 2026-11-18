@@ -597,7 +597,7 @@ def test_self_segment():
     print(f"  PASS: self_segment ({', '.join(ran) or 'no backend'})")
 
 
-BIG_SLOTS, BIG_SLOT_BYTES = 64, 4 << 20   # one 256 MiB read: long enough to be in flight at release()
+BIG_SLOTS, BIG_SLOT_BYTES = 8, 2 << 20   # one 16 MiB read, in flight at release(); two stores fit a 64 MB /dev/shm
 
 
 def _big_store(shm):
