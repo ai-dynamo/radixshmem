@@ -33,7 +33,7 @@ struct SlotPlan {
 // local_slots[i] <-> remote_slots[i] in pool `c`, runs contiguous on both sides fused into one range.
 // All or nothing: false with `why` if any slot is out of range on its side or a pool is missing.
 bool plan_slots(const SlotStore& store, const StoreGeometry& peer, ComponentType c,
-                const int32_t* local_slots, const int32_t* remote_slots, int n, SlotPlan& out,
+                const int64_t* local_slots, const int64_t* remote_slots, int n, SlotPlan& out,
                 std::string& why);
 
 } // namespace radixshmem

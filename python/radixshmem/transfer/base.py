@@ -19,8 +19,6 @@ import numpy as np
 
 from radixshmem._core import SegmentInfo, XferOp, XferState
 
-INT32 = np.iinfo(np.int32)
-
 
 def integer_array(values, what: str) -> np.ndarray:
     """``values`` as an integer array, without numpy's silent truncation of floats; TypeError otherwise."""

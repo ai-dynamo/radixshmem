@@ -16,13 +16,11 @@ import threading
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple, Union
 
-import numpy as np
-
 from radixshmem import _core
 from radixshmem._core import (COMPONENT_MASK_FULL, COMPONENT_MASK_MAMBA, COMPONENT_MASK_SWA, INVALID_BATCH,
                               PEER_SLOT_BYTES_UNCHECKED, XFER_EBUSY, XFER_EGEOMETRY, XFER_EINVAL, XFER_OK,
                               ComponentType, StoreGeometry, XferOp, XferState)
-from radixshmem.transfer.base import INT32, TransferBackend, integer_array
+from radixshmem.transfer.base import TransferBackend
 
 COMPONENT_MASK_ALL = COMPONENT_MASK_FULL | COMPONENT_MASK_SWA | COMPONENT_MASK_MAMBA
 
@@ -149,18 +147,12 @@ class SlotTransfer:
         return self._submit(XferOp.WRITE, peer, kind, local_slots, remote_slots)
 
     def _submit(self, op: XferOp, peer: str, kind, local_slots, remote_slots) -> Tuple[int, int]:
-        local_slots = integer_array(local_slots, "local slots")
-        remote_slots = integer_array(remote_slots, "remote slots")
         with self._mu:
             p = self._peers.get(peer)
         if p is None:
             _warn(f"peer '{peer}' is not attached")
             return INVALID_BATCH, 0
-        if any(a.size and (a.min() < INT32.min or a.max() > INT32.max) for a in (local_slots, remote_slots)):
-            _warn(f"a slot id is out of range (peer '{peer}')")
-            return INVALID_BATCH, 0
-        local, remote, lengths, why = _core.plan_slots(self._store, p.geo, kind, local_slots.astype(np.int32),
-                                                       remote_slots.astype(np.int32))
+        local, remote, lengths, why = _core.plan_slots(self._store, p.geo, kind, local_slots, remote_slots)
         if local is None:
             _warn(f"{why} (peer '{peer}')")
             return INVALID_BATCH, 0

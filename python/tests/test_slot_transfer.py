@@ -200,10 +200,11 @@ def test_native_arrays_are_not_cast_unsafely(make_store):
     s = make_store()
     peer = StoreGeometry()
     peer[F] = PoolGeometry(BASE, 8, SLOT_BYTES)
-    with pytest.raises(TypeError):
-        _core.plan_slots(s, peer, F, np.array([2**32 + 3], dtype=np.int64), np.array([0], dtype=np.int32))
-    with pytest.raises(TypeError):
-        _core.plan_slots(s, peer, F, np.array([1.7]), np.array([0], dtype=np.int32))
+    for big in (np.array([2**32 + 3], dtype=np.int64), np.array([2**63], dtype=np.uint64), [2**64 + 3]):
+        assert _core.plan_slots(s, peer, F, big, np.array([0], dtype=np.int32))[0] is None
+    for bad in (np.array([1.7]), [1.7], [True], "0"):
+        with pytest.raises(TypeError):
+            _core.plan_slots(s, peer, F, bad, [0])
     one = np.array([1], dtype=np.uint64)
     with pytest.raises(TypeError):
         _core.copy_ranges(XferOp.READ, np.array([-1], dtype=np.int64), one, one)
@@ -360,6 +361,7 @@ def test_plan_slots_direct(make_store):
     assert why == "" and local.dtype == np.uint64
     assert list(lengths) == [3 * SLOT_BYTES, SLOT_BYTES]
     assert _core.plan_slots(s, peer, F, [0], [8])[0] is None
+    assert list(_core.plan_slots(s, peer, F, range(2), (3, 4))[2]) == [2 * SLOT_BYTES]
 
 
 def test_copy_ranges(make_store):

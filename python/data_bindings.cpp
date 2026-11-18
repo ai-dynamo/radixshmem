@@ -16,6 +16,7 @@
 #include "slot_plan.h"
 #include "transfer.h"
 
+#include <climits>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -60,9 +61,47 @@ void* slot_or_throw(SlotStore& s, ComponentType c, uint64_t slot_id) {
     return p;
 }
 
-// No forcecast: numpy's safe casting only, so a value that does not fit is a TypeError, not a wrapped slot or address.
+// No forcecast: numpy's safe casting only, so a value that does not fit is a TypeError, not a wrapped address.
 using U64Array = py::array_t<uint64_t, py::array::c_style>;
-using I32Array = py::array_t<int32_t, py::array::c_style>;
+
+// Slot ids from a sequence of ints or a 1-d integer array, read exactly: anything else is a TypeError (numpy's
+// casts would truncate 1.7 to 1). Ids past int64 become -1, so plan_slots refuses them as out of range.
+std::vector<int64_t> slot_ids(py::handle h, const char* what) {
+    std::vector<int64_t> out;
+    if (py::isinstance<py::array>(h)) {
+        auto a = py::reinterpret_borrow<py::array>(h);
+        const char k = a.dtype().kind();
+        if ((k != 'i' && k != 'u') || a.ndim() != 1)
+            throw py::type_error(std::string(what) + " must be a 1-d integer array");
+        // uint64 ids past int64 wrap negative: out of range like any other.
+        auto v = py::array_t<int64_t, py::array::c_style | py::array::forcecast>::ensure(a);
+        if (!v) throw std::runtime_error(std::string("cannot read ") + what);
+        out.assign(v.data(), v.data() + v.size());
+        return out;
+    }
+    if (!PySequence_Check(h.ptr()) || PyUnicode_Check(h.ptr()) || PyBytes_Check(h.ptr()))
+        throw py::type_error(std::string(what) + " must be a sequence of integers or an integer array");
+    const Py_ssize_t n = PyObject_Size(h.ptr());
+    if (n < 0) throw py::error_already_set();
+    out.reserve((size_t)n);
+    for (py::handle item : h) {
+        PyObject* o = item.ptr();
+        int overflow = 0;
+        long long v;
+        if (PyLong_CheckExact(o)) {
+            v = PyLong_AsLongLongAndOverflow(o, &overflow);
+        } else {
+            if (PyBool_Check(o) || PyFloat_Check(o) || !PyIndex_Check(o))
+                throw py::type_error(std::string(what) + " must be integers");
+            py::object i = py::reinterpret_steal<py::object>(PyNumber_Index(o));
+            if (!i) throw py::error_already_set();
+            v = PyLong_AsLongLongAndOverflow(i.ptr(), &overflow);
+        }
+        if (v == -1 && PyErr_Occurred()) throw py::error_already_set();
+        out.push_back(overflow ? -1 : (int64_t)v);
+    }
+    return out;
+}
 
 py::ssize_t check_ranges(const U64Array& local, const U64Array& remote, const U64Array& lengths) {
     if (local.ndim() != 1 || remote.ndim() != 1 || lengths.ndim() != 1 || local.shape(0) != remote.shape(0) ||
@@ -480,27 +519,28 @@ void bind_data(py::module_& m) {
           "Returns (ok, the peer's StoreGeometry with absolute bases or None, why).");
 
     m.def("plan_slots",
-          [](const SlotStore& store, const StoreGeometry& peer, py::object k, const I32Array& local_slots,
-             const I32Array& remote_slots) -> py::tuple {
+          [](const SlotStore& store, const StoreGeometry& peer, py::object k, py::handle local_slots,
+             py::handle remote_slots) -> py::tuple {
               const ComponentType c = kind_of(k);
-              if (local_slots.ndim() != 1 || remote_slots.ndim() != 1 ||
-                  local_slots.shape(0) != remote_slots.shape(0))
-                  throw std::invalid_argument("slot lists must be 1-d and the same length");
-              if (local_slots.shape(0) == 0)
-                  throw std::invalid_argument("slot lists must not be empty");
+              const std::vector<int64_t> local = slot_ids(local_slots, "local slots");
+              const std::vector<int64_t> remote = slot_ids(remote_slots, "remote slots");
+              if (local.size() != remote.size())
+                  throw std::invalid_argument("slot lists must be the same length");
+              if (local.empty() || local.size() > (size_t)INT_MAX)
+                  throw std::invalid_argument("slot lists must not be empty or longer than INT_MAX");
               SlotPlan plan;
               std::string why;
               bool ok;
               {
                   py::gil_scoped_release nogil;
-                  ok = plan_slots(store, peer, c, local_slots.data(), remote_slots.data(),
-                                  (int)local_slots.shape(0), plan, why);
+                  ok = plan_slots(store, peer, c, local.data(), remote.data(), (int)local.size(), plan, why);
               }
               if (!ok) return py::make_tuple(py::none(), py::none(), py::none(), why);
               return py::make_tuple(to_array(plan.local), to_array(plan.remote), to_array(plan.length), "");
           },
           py::arg("store"), py::arg("peer"), py::arg("kind"), py::arg("local_slots"), py::arg("remote_slots"),
-          "Returns (local, remote, lengths, \"\") as uint64 arrays, runs fused, or (None, None, None, why).");
+          "Slot ids: sequences of ints or integer arrays. Returns (local, remote, lengths, \"\") as uint64 arrays, runs "
+          "fused, or (None, None, None, why).");
 
     m.def("copy_ranges",
           [](XferOp op, const U64Array& local, const U64Array& remote, const U64Array& lengths) {

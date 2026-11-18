@@ -70,7 +70,7 @@ bool resolve_peer_geometry(const StoreGeometry& mine, const StoreGeometry* publi
 }
 
 bool plan_slots(const SlotStore& store, const StoreGeometry& peer, ComponentType c,
-                const int32_t* local_slots, const int32_t* remote_slots, int n, SlotPlan& out,
+                const int64_t* local_slots, const int64_t* remote_slots, int n, SlotPlan& out,
                 std::string& why) {
     out = SlotPlan{};
     if (n <= 0 || local_slots == nullptr || remote_slots == nullptr) {
