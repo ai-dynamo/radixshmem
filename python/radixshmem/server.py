@@ -528,9 +528,9 @@ class RadixServer:
             except Exception:  # noqa: BLE001
                 pass
             self._greg.close()
-        if self._backend is not None:
-            self._backend.close()   # before the store is unmapped: it deregisters the memory
         self._teardown_regions()
+        if self._backend is not None:
+            self._backend.close()
         self._backend = self._greg = None
         with self._cv:
             self._mode = MODE_CLOSED
@@ -619,7 +619,7 @@ class RadixServer:
         self._stop_writeback()
         self._stop_dedup_writes()
         with self._cv:
-            index, store, dreg = self._index, self._store, self._dreg
+            index, store, dreg, xfer = self._index, self._store, self._dreg, self._xfer
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
             self._peers = {}
         if dreg is not None and index is not None:
@@ -627,7 +627,15 @@ class RadixServer:
                 dreg.unpublish(index.node_name())
             except Exception:  # noqa: BLE001
                 pass
-        self._reap()
+        if xfer is not None:
+            from radixshmem import _data
+
+            self._zombies = [h for h in self._zombies if xfer.release(h) == _data.XFER_EBUSY]
+            if store is not None:
+                # The next store registers anew; a stale range would split the segment peers open.
+                rc = xfer.backend.unregister_memory(store.data_addr)
+                if rc != _data.XFER_OK:
+                    print(f"radixshmem: unregistering the old store failed rc={rc}", file=sys.stderr)
         if store is not None:
             from radixshmem import _data
 
