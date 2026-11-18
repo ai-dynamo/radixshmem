@@ -244,16 +244,22 @@ class NixlBackend(TransferBackend):
                 continue
             for peer, msgs in notifs.items():
                 for msg in msgs:
-                    if msg == BUFREQ:
-                        own = self._own_region()
-                        if own is not None and self._publish:
-                            self._agent.send_notif(peer, BUFRESP + f"{own[0]}:{own[1]}".encode())
-                    elif msg.startswith(BUFRESP):
-                        base, _, length = msg[len(BUFRESP):].partition(b":")
-                        if base.isdigit() and length.isdigit():
-                            with self._notif_cv:
-                                self._peer_buf[peer] = (int(base), int(length))
-                                self._notif_cv.notify_all()
+                    try:
+                        self._on_notif(peer, msg)
+                    except Exception as e:  # noqa: BLE001 - e.g. a BUFREQ before the peer's metadata: it resends
+                        _warn(f"notification from {peer!r}: {e}")
+
+    def _on_notif(self, peer: str, msg: bytes) -> None:
+        if msg == BUFREQ:
+            own = self._own_region()
+            if own is not None and self._publish:
+                self._agent.send_notif(peer, BUFRESP + f"{own[0]}:{own[1]}".encode())
+        elif msg.startswith(BUFRESP):
+            base, _, length = msg[len(BUFRESP):].partition(b":")
+            if base.isdigit() and length.isdigit():
+                with self._notif_cv:
+                    self._peer_buf[peer] = (int(base), int(length))
+                    self._notif_cv.notify_all()
 
     # ---------------------------------------------------------------- transfers
 
