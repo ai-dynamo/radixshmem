@@ -180,6 +180,35 @@ def test_slot_range_checks(make_store):
         x.read("peerI", [], [])
 
 
+def test_slot_ids_are_not_cast_unsafely(make_store):
+    s = make_store()
+    be, x = attached(s, "peerU")
+    assert x.attach_peer("peerU", SLOT_BYTES)[0] == XFER_OK
+    # Values that an unsafe cast would wrap into valid slots (2**32 + 3 -> 3, 2**63 -> 0) are out of range.
+    assert x.read("peerU", np.array([2**32 + 3], dtype=np.int64), [0])[0] == INVALID_BATCH
+    assert x.read("peerU", [0], np.array([2**63], dtype=np.uint64))[0] == INVALID_BATCH
+    assert x.read("peerU", [2**40], [0])[0] == INVALID_BATCH
+    with pytest.raises(TypeError):
+        x.read("peerU", [1.7], [0])
+    with pytest.raises(TypeError):
+        x.write("peerU", np.array([1.0]), [0])
+    assert be.last is None
+
+
+def test_native_arrays_are_not_cast_unsafely(make_store):
+    from radixshmem import _core
+    s = make_store()
+    peer = StoreGeometry()
+    peer[F] = PoolGeometry(BASE, 8, SLOT_BYTES)
+    with pytest.raises(TypeError):
+        _core.plan_slots(s, peer, F, np.array([2**32 + 3], dtype=np.int64), np.array([0], dtype=np.int32))
+    with pytest.raises(TypeError):
+        _core.plan_slots(s, peer, F, np.array([1.7]), np.array([0], dtype=np.int32))
+    one = np.array([1], dtype=np.uint64)
+    with pytest.raises(TypeError):
+        _core.copy_ranges(XferOp.READ, np.array([-1], dtype=np.int64), one, one)
+
+
 def test_numpy_slots(make_store):
     s = make_store()
     be, x = attached(s, "peerN")

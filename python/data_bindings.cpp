@@ -60,8 +60,9 @@ void* slot_or_throw(SlotStore& s, ComponentType c, uint64_t slot_id) {
     return p;
 }
 
-using U64Array = py::array_t<uint64_t, py::array::c_style | py::array::forcecast>;
-using I32Array = py::array_t<int32_t, py::array::c_style | py::array::forcecast>;
+// No forcecast: numpy's safe casting only, so a value that does not fit is a TypeError, not a wrapped slot or address.
+using U64Array = py::array_t<uint64_t, py::array::c_style>;
+using I32Array = py::array_t<int32_t, py::array::c_style>;
 
 py::ssize_t check_ranges(const U64Array& local, const U64Array& remote, const U64Array& lengths) {
     if (local.ndim() != 1 || remote.ndim() != 1 || lengths.ndim() != 1 || local.shape(0) != remote.shape(0) ||

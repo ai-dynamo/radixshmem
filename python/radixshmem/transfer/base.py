@@ -19,6 +19,26 @@ import numpy as np
 
 from radixshmem._core import SegmentInfo, XferOp, XferState
 
+INT32 = np.iinfo(np.int32)
+
+
+def integer_array(values, what: str) -> np.ndarray:
+    """``values`` as an integer array, without numpy's silent truncation of floats; TypeError otherwise."""
+    a = np.asarray(values)
+    if a.size == 0:
+        return a.astype(np.int64)
+    if a.dtype.kind not in "iu":
+        raise TypeError(f"{what} must be integers, not {a.dtype}")
+    return a
+
+
+def as_u64(values, what: str) -> Optional[np.ndarray]:
+    """Non-negative integers as a uint64 array, or None if any is negative."""
+    a = integer_array(values, what)
+    if a.size and a.dtype.kind == "i" and a.min() < 0:
+        return None
+    return np.ascontiguousarray(a, dtype=np.uint64)
+
 
 class TransferBackend(abc.ABC):
     @property

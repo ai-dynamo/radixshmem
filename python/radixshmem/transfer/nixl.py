@@ -25,7 +25,7 @@ import numpy as np
 from radixshmem import _core
 from radixshmem._core import (INVALID_BATCH, XFER_EBACKEND, XFER_EBUSY, XFER_EGEOMETRY, XFER_EINVAL, XFER_ENOENT,
                               XFER_OK, SegmentInfo, TransferConfig, XferOp, XferState)
-from radixshmem.transfer.base import TransferBackend
+from radixshmem.transfer.base import TransferBackend, as_u64
 
 # nixl-cu13 / nixl-cu12 install nixl_cu13 / nixl_cu12; the nixl meta package forwards to one of them.
 _MODULES = ("nixl_cu13", "nixl_cu12", "nixl")
@@ -279,9 +279,11 @@ class NixlBackend(TransferBackend):
         return bool(ok.all())
 
     def submit(self, op: XferOp, seg_id: int, local, remote, lengths) -> int:
-        local = np.ascontiguousarray(local, dtype=np.uint64)
-        remote = np.ascontiguousarray(remote, dtype=np.uint64)
-        lengths = np.ascontiguousarray(lengths, dtype=np.uint64)
+        local, remote, lengths = (as_u64(local, "addresses"), as_u64(remote, "addresses"),
+                                  as_u64(lengths, "lengths"))
+        if local is None or remote is None or lengths is None:
+            _warn("a negative address or length")
+            return INVALID_BATCH
         n = len(local)
         if n == 0 or len(remote) != n or len(lengths) != n:
             return INVALID_BATCH
