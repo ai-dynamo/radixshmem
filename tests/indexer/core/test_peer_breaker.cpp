@@ -8,7 +8,6 @@
 
 #include "test_utils.h"
 
-#ifndef RADIXSHMEM_NO_RDMA
 #include "peer_breaker.hpp"
 
 #include <cassert>
@@ -103,11 +102,3 @@ int main() {
     return tests_report();
 }
 
-#else // RADIXSHMEM_NO_RDMA
-
-int main() {
-    printf("=== test_peer_breaker ===\n\n  (skipped: built without RDMA)\n");
-    return 0;
-}
-
-#endif

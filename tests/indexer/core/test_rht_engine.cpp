@@ -19,7 +19,6 @@
 
 #include "test_utils.h"
 
-#ifndef RADIXSHMEM_NO_RDMA
 #include "rht_core.hpp"   // private module header: this test drives RhtEngine directly
 #include "rht_chain.h"
 
@@ -695,11 +694,3 @@ int main() {
     return tests_report();
 }
 
-#else // RADIXSHMEM_NO_RDMA
-
-int main() {
-    printf("=== test_rht_engine ===\n\n  (skipped: built without RDMA)\n");
-    return 0;
-}
-
-#endif

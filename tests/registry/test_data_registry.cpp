@@ -18,12 +18,6 @@
 #include "data_test_utils.h"
 #include "etcd_test_harness.hpp"
 
-#include "radixshmem_config.h"
-
-#ifndef RADIXSHMEM_HAS_ETCD
-int main() { printf("built without etcd — SKIP\n"); return 77; }
-#else
-
 #include "data_registry.h"
 #include "etcd_client.hpp"
 
@@ -357,4 +351,3 @@ int main() {
     return tests_report();
 }
 
-#endif // RADIXSHMEM_HAS_ETCD

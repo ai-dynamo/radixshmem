@@ -4,7 +4,6 @@
 // gRPC client: encode arguments, issue unary calls, validate replies and map statuses to RemoteStatus.
 #include "grpc_remote_op.hpp"
 
-#ifdef RADIXSHMEM_HAS_GRPC
 
 #include "cluster_protocol.h"
 #include "remote_ops.grpc.pb.h"
@@ -383,4 +382,3 @@ void GrpcRemoteOpClientTransport::connect() {
 
 }  // namespace radixshmem
 
-#endif  // RADIXSHMEM_HAS_GRPC

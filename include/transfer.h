@@ -82,7 +82,12 @@ public:
     virtual const char* backend_name() const = 0;
 };
 
-// Returns nullptr when the backend name is unknown or when the requested
+// Loads libradixshmem_<backend>.so from RADIXSHMEM_TRANSFER_PLUGIN_DIR, else from the directory of
+// the library holding this function. Returns nullptr when the backend name is unknown, the plugin
+// is missing or fails to load, or the backend fails to start.
 std::unique_ptr<ITransferBackend> create_transfer_backend(const TransferConfig& cfg);
+
+// The backends whose plugin is present in that directory.
+std::vector<std::string> available_transfer_backends();
 
 } // namespace radixshmem

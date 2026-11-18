@@ -3,10 +3,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"
-
-#ifdef RADIXSHMEM_HAS_ETCD
-
 #include "component_kind.h"
 #include "slot_geometry.h"
 
@@ -89,4 +85,3 @@ private:
 
 } // namespace radixshmem
 
-#endif // RADIXSHMEM_HAS_ETCD

@@ -7,10 +7,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"
-
-#ifdef RADIXSHMEM_HAS_ETCD
-
 #include "cluster_manifest.h"
 #include "cluster_protocol.h"
 
@@ -181,4 +177,3 @@ private:
 
 } // namespace radixshmem
 
-#endif // RADIXSHMEM_HAS_ETCD

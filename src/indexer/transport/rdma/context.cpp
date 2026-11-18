@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "context.hpp"
+#include "verbs_loader.hpp"
 
 #include <cstdio>
 #include <cstdlib>
@@ -26,6 +27,7 @@ IndexDevice index_device_env() {
 
 RdmaContext::RdmaContext(const char* dev_name, int port, int gid_idx)
     : port_(port), gid_idx_(gid_idx) {
+    verbs::require_ibverbs();
     // QoS defaults from env; set_qos() may override before QPs connect.
     if (const char* s = ::getenv("RADIXSHMEM_RDMA_SL")) sl_ = atoi(s);
     if (const char* t = ::getenv("RADIXSHMEM_RDMA_TC")) tc_ = atoi(t);

@@ -20,19 +20,35 @@ an existing transfer engine, such as NIXL or Mooncake, to enable peer-to-peer KV
 ### Build
 
 ```bash
-cd python && pip install -e .
+pip install .
 ```
 
-Cross-node remote ops use gRPC exclusively and need the grpc++ and protobuf development packages
-(Ubuntu: `apt-get install libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc`).
-An RDMA build fails configuration if these dependencies are missing. There is no ZMQ/DC remote-op fallback.
+The wheels published to PyPI are built as described in [packaging/README.md](packaging/README.md).
+
+For development, install the build requirements once and install in editable mode. With
+`editable.rebuild=true` the C++ modules are rebuilt on import after a change:
+
+```bash
+pip install scikit-build-core "pybind11==3.1.0"
+pip install --no-build-isolation -Ceditable.rebuild=true -e .
+```
+
+The C++ libraries, tools and tests build with CMake. The Python tests in ctest import the modules a plain
+CMake build puts in `python/radixshmem`, so run them in an environment without an editable install of
+radixshmem; an editable install takes precedence over `PYTHONPATH`.
+
+```bash
+cmake -S . -B build && cmake --build build -j && ctest --test-dir build
+```
+
+A source build needs the grpc++ and protobuf development packages for the remote ops, hiredis for the
+Redis RHT, the rdma-core headers and a Go toolchain for the etcd client (Ubuntu: `apt-get install
+libgrpc++-dev libprotobuf-dev protobuf-compiler protobuf-compiler-grpc libhiredis-dev libibverbs-dev
+libxxhash-dev golang`); configuration fails if one is missing. Cross-node remote ops use gRPC exclusively.
 The RHT and the peer index each run on one-sided RDMA (XRC or DC) or without it: the RHT on Redis
 (`RADIXSHMEM_RHT_BACKEND=redis`), the peer index on the peers' gRPC remote ops
 (`RADIXSHMEM_PEER_INDEX_BACKEND=grpc`). Both are the defaults, so by default the index opens no RDMA
 device on any node.
-
-C++ local-only builds (`-DENABLE_RDMA=OFF`) retain `RadixClient`, the standalone
-`radix_server`, and local tests; distributed client/server entry points are rejected.
 
 The optional data-plane backends are built separately; see [Transfer backends](#transfer-backends).
 
@@ -172,7 +188,7 @@ Build NIXL:
 
 ```bash
 scripts/build_nixl.sh
-cd python && pip install -e .
+pip install .
 ```
 
 Start the server with `--transfer-backend nixl`. NIXL cannot pick its own port, so `--transfer-port` is
@@ -192,7 +208,7 @@ Build Mooncake:
 
 ```bash
 scripts/build_mooncake.sh
-cd python && pip install -e .
+pip install .
 ```
 
 Start the server with `--transfer-backend mooncake`:
@@ -205,7 +221,10 @@ radix-server --name /my_kv_cache --data-bytes 1024G \
     --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
-To check which backends were built in:
+Each backend is a plugin, `libradixshmem_mooncake.so` or `libradixshmem_nixl.so`, installed next to
+`radixshmem._data` and loaded when a server first needs it; C++ programs outside the package find the plugins
+through `RADIXSHMEM_TRANSFER_PLUGIN_DIR`. `ENABLE_MOONCAKE` and `ENABLE_NIXL` take `AUTO` (default: build the
+plugin when the engine is found), `ON` (fail without it) or `OFF`. To check which plugins are installed:
 
 ```bash
 python -c "import radixshmem; print(radixshmem._data.TRANSFER_BACKENDS)"

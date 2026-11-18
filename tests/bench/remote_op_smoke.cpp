@@ -19,12 +19,6 @@
 #include <unistd.h>
 #include <vector>
 
-#ifdef RADIXSHMEM_NO_RDMA
-int main() {
-    fprintf(stderr, "remote_op_smoke: built without RDMA (no remote-op) — skipped\n");
-    return 0;
-}
-#else
 
 using namespace radixshmem;
 
@@ -218,4 +212,3 @@ int main(int argc, char** argv) {
     return run_grpc();
 }
 
-#endif  // RADIXSHMEM_NO_RDMA

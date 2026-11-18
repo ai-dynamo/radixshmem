@@ -211,10 +211,11 @@ def test_server_monitor_endpoint(tmp_path):
             m = int(core.query(h, update_meta=False).common_hit)
             core.insert(h, core.allocate_slots(len(h) - m), start=m)
         deadline = time.time() + 30
-        while True:                                        # the process' next round sees the inserts
+        while True:                     # a round publishes the node view first, the cluster merge after it
             text = get(f"http://127.0.0.1:{port}/metrics").decode()
             if 'radixshmem_tree_blocks{' in text and text.split("radixshmem_tree_blocks{")[1].split("\n")[0] \
-                    .endswith(" 10.0") or time.time() > deadline:
+                    .endswith(" 10.0") and 'view="cluster"' in text \
+                    and 'radixshmem_cluster_dup_factor{cluster="default"} 1.0' in text or time.time() > deadline:
                 break
             time.sleep(0.5)
         assert 'radixshmem_tree_blocks{' in text and text.count("radixshmem_tree_blocks{") == 1

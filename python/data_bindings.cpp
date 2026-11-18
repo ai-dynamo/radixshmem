@@ -89,15 +89,8 @@ PYBIND11_MODULE(_data, m) {
     m.attr("XFER_EBUSY")     = XFER_EBUSY;
     m.attr("INVALID_BATCH")  = INVALID_BATCH;
     m.attr("PEER_SLOT_BYTES_UNCHECKED") = PEER_SLOT_BYTES_UNCHECKED;
-    // Transfer backends compiled in (tests SKIP on a missing one).
-    py::list backends;
-#ifdef RADIXSHMEM_HAS_MOONCAKE
-    backends.append("mooncake");
-#endif
-#ifdef RADIXSHMEM_HAS_NIXL
-    backends.append("nixl");
-#endif
-    m.attr("TRANSFER_BACKENDS") = backends;
+    // Transfer backends whose plugin is installed (tests SKIP on a missing one).
+    m.attr("TRANSFER_BACKENDS") = available_transfer_backends();
     m.attr("COMPONENT_MASK_FULL")  = COMPONENT_MASK_FULL;
     m.attr("COMPONENT_MASK_SWA")   = COMPONENT_MASK_SWA;
     m.attr("COMPONENT_MASK_MAMBA") = COMPONENT_MASK_MAMBA;
@@ -460,7 +453,6 @@ PYBIND11_MODULE(_data, m) {
              py::call_guard<py::gil_scoped_release>(),
              "XFER_OK, or XFER_EBUSY while the batch is still running.");
 
-#ifdef RADIXSHMEM_HAS_ETCD
     // ==================== data-plane registry (etcd) ====================
     py::class_<DataPlaneEntry>(m, "DataPlaneEntry")
         .def_readonly("pool_mask", &DataPlaneEntry::pool_mask)
@@ -517,5 +509,4 @@ PYBIND11_MODULE(_data, m) {
                  return py::make_tuple(ok, who, why);
              },
              py::arg("local"), "Returns (ok, offending node, reason).");
-#endif
 }

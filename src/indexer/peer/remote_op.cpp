@@ -4,7 +4,6 @@
 // RemotePeer: a remote-op session to a peer's local tree over one backend.
 #include "radix_client.h"          // RemotePeer decl + reply structs
 
-#ifndef RADIXSHMEM_NO_RDMA
 
 #include "bilateral_transport.h"    // IRemoteOpClientTransport
 #include "peer_breaker.hpp"
@@ -154,4 +153,3 @@ DedupReply RemotePeer::dedup_prefix(const uint64_t* hashes, int n, const DedupRe
 
 }  // namespace radixshmem
 
-#endif  // !RADIXSHMEM_NO_RDMA

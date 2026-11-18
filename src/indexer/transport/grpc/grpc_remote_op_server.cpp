@@ -4,7 +4,6 @@
 // Gated, bounded RemoteOpService RPCs: business results in replies, request failures in gRPC status codes.
 #include "grpc_remote_op.hpp"
 
-#ifdef RADIXSHMEM_HAS_GRPC
 
 #include "remote_op_service.hpp"
 #include "remote_ops.grpc.pb.h"
@@ -312,4 +311,3 @@ void GrpcRemoteOpServer::stop() {
 
 }  // namespace radixshmem
 
-#endif  // RADIXSHMEM_HAS_GRPC

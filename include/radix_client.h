@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "component_types.h"
 #include "health_check.h"
 #include "tree_dump.h"
@@ -24,7 +23,6 @@ struct RemoteHit;
 
 class LocalTreeConnector;
 class RadixServer;
-#ifndef RADIXSHMEM_NO_RDMA
 class PeerRegistry;
 class PeerIndexBackend;   // include/peer_index.h
 class RhtBackend;         // include/rht_backend.h
@@ -85,7 +83,6 @@ private:
     std::shared_ptr<PeerBreaker> breaker_;
 };
 
-#endif  // !RADIXSHMEM_NO_RDMA
 
 // Client config resolving the local shm from /shm/<node_name> and cluster
 // topology (peers/config) via etcd.
@@ -168,7 +165,6 @@ public:
     struct EvictedKey { uint64_t first_hash; uint32_t tree_node_id; };
     void remove_evicted_from_rht(const EvictedKey* entries, int count);
 
-#ifndef RADIXSHMEM_NO_RDMA
     // Remote ops are rank-first and stateless from the caller's view: the client
     // opens/reuses one cached session per rank internally. An illegal rank yields
     // BAD_TARGET / REMOTE_FAILED in the op result (never throws).
@@ -208,7 +204,6 @@ public:
     // blocks it freed.
     int dedup_move(int rank, const uint64_t* hashes, int n, int tail_cap, int branch_cap,
                    const int landing[NUM_COMPONENT_TYPES]);
-#endif
 
     // ==================== Stats / accessors ====================
 
@@ -259,7 +254,6 @@ private:
     void dec_ref(const uint64_t* hashes, int n, PinRecord pin);
     void dec_ref_remote(const uint64_t* hashes, int n, PinRecord pin);
 
-#ifndef RADIXSHMEM_NO_RDMA
     // ---- Cluster bring-up + teardown ----
     RadixClientConfig cfg_;            // set on the distributed ctors
     bool distributed_ = false;         // cluster machinery live
@@ -323,7 +317,6 @@ private:
     int64_t  peers_snapshot_rev_ = 0;
 
     std::unique_ptr<RhtBackend> rht_;
-#endif
 };
 
 } // namespace radixshmem

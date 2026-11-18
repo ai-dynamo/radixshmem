@@ -3,10 +3,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
-
-#ifdef RADIXSHMEM_HAS_GRPC
-
 #include "bilateral_transport.h"   // IRemoteOp{Client,Server}Transport
 #include "cluster_protocol.h"
 
@@ -82,4 +78,3 @@ private:
 
 }  // namespace radixshmem
 
-#endif  // RADIXSHMEM_HAS_GRPC

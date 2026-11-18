@@ -12,10 +12,9 @@
 #include "types.h"
 
 #include "cluster_protocol.h"
+#include "verbs_loader.hpp"
 
-#ifdef RADIXSHMEM_HAS_ETCD
 #include "etcd_client.hpp"   // src/registry: the Go-wrapper etcd client, bound as _core.EtcdKv
-#endif
 
 #include <array>
 #include <optional>
@@ -172,6 +171,10 @@ PYBIND11_MODULE(_core, m) {
     m.attr("COMPONENT_MASK_SWA") = COMPONENT_MASK_SWA;
     m.attr("COMPONENT_MASK_MAMBA") = COMPONENT_MASK_MAMBA;
     m.attr("INVALID_COMPONENT_SLOT") = INVALID_COMPONENT_SLOT;
+    m.attr("SHM_VERSION") = SHM_VERSION;
+    m.attr("CLUSTER_PROTOCOL_VERSION") = CLUSTER_PROTOCOL_VERSION;
+    m.def("rdma_error", &verbs::ibverbs_error,
+          "Why rdma-core cannot be loaded for the RDMA planes, or an empty string when it can.");
 
     // ==================== Config ====================
 
@@ -540,7 +543,6 @@ PYBIND11_MODULE(_core, m) {
             return d;
         });
 
-#ifdef RADIXSHMEM_HAS_ETCD
     // ==================== EtcdKv ====================
     // Plain key/value access to the cluster's etcd, sharing the process-global
     // connection with RadixServer / DataPlaneRegistry. Values are text (JSON,
@@ -592,7 +594,6 @@ PYBIND11_MODULE(_core, m) {
              "Stop renewing without revoking; the keys live on while another holder renews.")
         .def("revoke", [](etcd::Client& c, int64_t lease) { c.revoke(lease); },
              py::arg("lease"), py::call_guard<py::gil_scoped_release>());
-#endif
 
     // ==================== RadixClient ====================
 
@@ -718,7 +719,6 @@ PYBIND11_MODULE(_core, m) {
            "last_access in steady_clock ns, mamba), the concatenated block hashes, and header\n"
            "fields. A racing writer can make it slightly inconsistent (counted in `torn`).\n"
            "0 = no limit; `truncated` reports a limit reached.")
-#ifndef RADIXSHMEM_NO_RDMA
         // Remote ops are rank-first; the client caches one session per rank.
         .def("remote_allocate", [](RadixClient& c, int rank, int n,
                                    ComponentType component) {
@@ -830,12 +830,10 @@ PYBIND11_MODULE(_core, m) {
         }, py::arg("rank"), py::arg("hashes"), py::arg("tail_cap"), py::arg("branch_cap"),
            py::arg("landing"),
            "Dedup on `rank` that also moves what blocks the drop into `landing` (per pool) slots.")
-#endif
 
         .def_static("compute_hashes", &py_compute_hashes,
                      py::arg("token_ids"), py::arg("tokens_per_block"));
 
-#ifndef RADIXSHMEM_NO_RDMA
     // ==================== Remote-op control plane ====================
     // (RemoteStatus is registered unconditionally in the Enums section above.)
 
@@ -858,7 +856,6 @@ PYBIND11_MODULE(_core, m) {
     py::class_<DedupReply>(m, "DedupReply")
         .def_readonly("status", &DedupReply::status)
         .def_readonly("freed", &DedupReply::freed);
-#endif  // !RADIXSHMEM_NO_RDMA
 
     // ==================== Free functions ====================
 

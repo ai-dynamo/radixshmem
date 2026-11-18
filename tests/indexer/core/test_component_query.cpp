@@ -5,17 +5,14 @@
 // semantics, joint
 // common_hit, trust-model pin/release, the client facade, and the remote walk.
 
-#include "radixshmem_config.h"
 #include "radix_client.h"
 #include "local.h"
 #include "radix_tree.h"
 #include "test_utils.h"
 
-#ifndef RADIXSHMEM_NO_RDMA
 #include "fake_rdma_endpoint.hpp"
 #include "cluster_manifest.h"
 #include "rdma_remote_walker.h"
-#endif
 
 #include <algorithm>
 #include <cassert>
@@ -1078,68 +1075,6 @@ static void test_facade_bad_mask_and_crop_to_zero() {
     TEST_PASS();
 }
 
-#ifdef RADIXSHMEM_NO_RDMA
-static void test_nordma_client_boundaries() {
-    TEST_BEGIN("no RDMA: local access works and distributed entry points reject");
-    auto requires_rdma = [](auto&& action) {
-        bool rejected = false;
-        try {
-            action();
-        } catch (const std::runtime_error& error) {
-            rejected = std::string(error.what()).find("RDMA") != std::string::npos;
-        }
-        assert(rejected);
-    };
-
-    RadixClientConfig client_config;
-    requires_rdma([&] { RadixClient client(client_config); });
-    const std::string name = "/test_cq_nordma_" + std::to_string(::getpid());
-    for (int criterion = 0; criterion < 2; ++criterion) {
-        RadixServerConfig server_config;
-        server_config.name = name;
-        if (criterion == 0) server_config.world_size = 2;
-        if (criterion == 1) server_config.expected_min_nodes = 2;
-        requires_rdma([&] {
-            RadixServer server(server_config);
-            server.bootstrap();
-        });
-    }
-
-    auto tree = RadixShmemTree::create(name, cfg(4, 4, 32));
-    auto hashes = seq(4000, 4);
-    {
-        RadixClient client(name);
-        assert(!client.is_distributed() && client.world_size() == 1);
-        assert(insert_auto(client, hashes.data(), 4).error == InsertError::OK);
-    }
-    {
-        LocalTreeConnector borrowed(name);
-        requires_rdma([&] { RadixClient client(client_config, &borrowed); });
-        assert(borrowed.check_health() == 0);
-    }
-    auto* header = static_cast<ShmHeader*>(tree.shm_base());
-    header->is_distributed = 1;
-    header->my_rank = 3;
-    requires_rdma([&] { RadixClient client(name); });
-    {
-        RadixClient reader(name, true);
-        assert(!reader.is_distributed() && reader.rank() == 3);
-        auto result = reader.query(hashes.data(), 4, COMPONENT_MASK_FULL);
-        assert(result.status == RemoteStatus::OK && result.common_hit == 4);
-        bool rejected = false;
-        try {
-            std::vector<int32_t> slots;
-            reader.allocate_slots(1, slots);
-        } catch (const std::runtime_error&) {
-            rejected = true;
-        }
-        assert(rejected);
-    }
-    expect_healthy(tree);
-    tree.destroy();
-    TEST_PASS();
-}
-#endif
 
 static void test_client_component_insert() {
     TEST_BEGIN("facade: unified insert publishes every component end to end");
@@ -1180,7 +1115,6 @@ static void test_client_component_insert() {
     TEST_PASS();
 }
 
-#ifndef RADIXSHMEM_NO_RDMA
 
 static PeerEntry peer_entry_of(RadixShmemTree& t) {
     auto* hdr = reinterpret_cast<const ShmHeader*>(t.shm_base());
@@ -1761,7 +1695,6 @@ static void test_local_and_remote_refs_are_separate() {
     TEST_PASS();
 }
 
-#endif
 
 int main() {
     printf("test_component_query\n");
@@ -1789,10 +1722,6 @@ int main() {
     test_facade_shape_and_finalize();
     test_facade_bad_mask_and_crop_to_zero();
     test_client_component_insert();
-#ifdef RADIXSHMEM_NO_RDMA
-    test_nordma_client_boundaries();
-#endif
-#ifndef RADIXSHMEM_NO_RDMA
     test_remote_parity_and_abi_gate();
     test_remote_pin_incumbent_release();
     test_window_pin_matches_remote_walk();
@@ -1803,6 +1732,5 @@ int main() {
     test_remote_hint_chain_is_the_walk();
     test_remote_multinode_cut_and_release_guards();
     test_local_and_remote_refs_are_separate();
-#endif
     return tests_report();
 }

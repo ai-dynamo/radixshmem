@@ -5,7 +5,6 @@
 
 #include <stdexcept>
 
-#ifdef RADIXSHMEM_HAS_REDIS
 
 #include "peer_breaker.hpp"
 
@@ -1266,22 +1265,3 @@ std::string redis_rht_check(const RedisRhtConfig& cfg) {
 
 } // namespace radixshmem
 
-#else
-
-namespace radixshmem {
-
-std::unique_ptr<RhtBackend> make_redis_rht(const RedisRhtConfig&, int, PeerFaultCounters*) {
-    throw std::runtime_error("Redis RHT: radixshmem was built without hiredis");
-}
-
-bool redis_rht_clear(const RedisRhtConfig&) { return false; }
-
-bool redis_rht_drop_rank(const RedisRhtConfig&, int) { return false; }
-
-std::string redis_rht_check(const RedisRhtConfig&) {
-    return "radixshmem was built without hiredis";
-}
-
-} // namespace radixshmem
-
-#endif

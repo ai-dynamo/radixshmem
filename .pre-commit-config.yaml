@@ -14,9 +14,9 @@ repos:
         exclude: ^third_party/
       - id: uv-lock
         name: uv.lock up to date
-        entry: bash -c 'cd python && uv lock --check'
+        entry: uv lock --check
         language: system
-        files: ^python/(pyproject\.toml|uv\.lock)$
+        files: ^(pyproject\.toml|uv\.lock|python/radixshmem/_version\.py)$
         pass_filenames: false
       - id: dco-signoff
         name: DCO sign-off

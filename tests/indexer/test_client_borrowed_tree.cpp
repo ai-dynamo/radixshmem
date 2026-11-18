@@ -21,10 +21,6 @@ using namespace radixshmem;
 
 int main() {
     printf("=== test_client_borrowed_tree ===\n\n");
-#ifdef RADIXSHMEM_NO_RDMA
-    printf("  (skipped: built without RDMA)\n");
-    return 77;
-#else
     TEST_BEGIN("a borrowing client that fails to bootstrap leaves the tree to its owner");
     const char* name = "/test_client_borrowed_tree";
     shm_unlink(name);
@@ -53,5 +49,4 @@ int main() {
     t.destroy();
     TEST_PASS();
     return tests_report();
-#endif
 }

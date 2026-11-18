@@ -629,3 +629,8 @@ std::unique_ptr<ITransferBackend> create_nixl_backend(const TransferConfig& cfg)
 }
 
 } // namespace radixshmem
+
+extern "C" __attribute__((visibility("default"))) radixshmem::ITransferBackend*
+radixshmem_create_transfer_backend(const radixshmem::TransferConfig* cfg) {
+    return radixshmem::create_nixl_backend(*cfg).release();
+}

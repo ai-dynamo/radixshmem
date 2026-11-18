@@ -3,7 +3,6 @@
 
 #pragma once
 
-#include "radixshmem_config.h"   // feature macros (CMake-generated, build tree)
 #include "health_check.h"
 #include "dedup_writer.h"
 #include "types.h"
@@ -17,16 +16,13 @@
 #include <thread>
 #include <vector>
 
-#ifndef RADIXSHMEM_NO_RDMA
 #include "bilateral_transport.h"   // IRemoteOpServerTransport
 #include "cluster_manifest.h"      // CLUSTER_TRANSPORT_*, CLUSTER_RHT_*, CLUSTER_PEER_INDEX_*
-#endif
 
 namespace radixshmem {
 
 class RadixShmemTree;
 
-#ifndef RADIXSHMEM_NO_RDMA
 class LocalTreeConnector;
 class RadixClient;
 class RdmaHost;    // src/indexer/transport/rdma/rdma_host.hpp
@@ -35,7 +31,6 @@ class EtcdRegistry;
 struct PeerEntry;
 struct ShardMapMsg;
 class RemoteOpService;
-#endif
 
 struct RadixServerConfig {
     // POSIX shm name; identity-based, no rank suffix.
@@ -71,9 +66,7 @@ struct RadixServerConfig {
 };
 
 class RadixServer {
-#ifndef RADIXSHMEM_NO_RDMA
     friend class EtcdRegistry;
-#endif
 public:
     explicit RadixServer(const RadixServerConfig& cfg);
 
@@ -142,7 +135,6 @@ private:
     void stop_evictor();
     void evictor_loop();
 
-#ifndef RADIXSHMEM_NO_RDMA
     // ---- embedded eviction / remote-op service client ----
     std::unique_ptr<LocalTreeConnector>    svc_tree_;
     std::unique_ptr<RadixClient>   svc_client_;
@@ -150,9 +142,7 @@ private:
 
     // ---- cluster bring-up ----
     std::string bind_ip_;   // published as PeerEntry.host
-#ifdef RADIXSHMEM_HAS_ETCD
     std::unique_ptr<EtcdRegistry> registry_;   // holds the lease for the server's lifetime
-#endif
 
     // The RDMA side peers' one-sided QPs reach; only when a plane runs on RDMA.
     std::unique_ptr<RdmaHost>          rdma_;
@@ -231,7 +221,6 @@ private:
     // Start serving once svc_* exist; rc_stop stops serving, then drops the service.
     void     rc_spawn();
     void     rc_stop();
-#endif
 };
 
 } // namespace radixshmem

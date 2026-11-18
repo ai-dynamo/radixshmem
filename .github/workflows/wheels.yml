@@ -1,0 +1,133 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Wheels
+
+on:
+  pull_request:
+  workflow_dispatch:
+  # Releases: see RELEASING.md.
+  push:
+    tags: ["v*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches the package version
+        if: github.ref_type == 'tag'
+        run: |
+          version=$(sed -nE 's/^__version__ = "(.*)"$/\1/p' python/radixshmem/_version.py)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match _version.py ($version)"; exit 1
+          fi
+      # The builder image's layers live in the Actions cache; only a cold cache compiles gRPC.
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: packaging/manylinux
+          tags: radixshmem-manylinux:ci
+          load: true
+          build-args: JOBS=4
+          cache-from: type=gha,scope=radixshmem-manylinux
+          cache-to: type=gha,mode=max,scope=radixshmem-manylinux
+      # With the Go toolchain the wheel is built with; not on pull requests, where a new advisory would block every PR.
+      - name: Known vulnerabilities in the Go etcd client
+        if: github.event_name != 'pull_request'
+        run: >-
+          docker run --rm -v "$PWD/src/registry/etcd_go:/src:ro" radixshmem-manylinux:ci
+          sh -c 'cp -r /src /tmp/m && cd /tmp/m && go run golang.org/x/vuln/cmd/govulncheck@latest ./...'
+      # Pull requests build the cp312 wheel; tags and manual runs build all of them.
+      - uses: pypa/cibuildwheel@v4.3.5
+        env:
+          CIBW_MANYLINUX_X86_64_IMAGE: radixshmem-manylinux:ci
+        with:
+          only: ${{ github.event_name == 'pull_request' && 'cp312-manylinux_x86_64' || '' }}
+          output-dir: wheelhouse
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse/*.whl
+
+  test-clean-host:
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["ubuntu:22.04", "ubuntu:24.04", "rockylinux:9"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse
+      - run: sh packaging/test_clean_host.sh 3.12 wheelhouse
+      - if: github.event_name != 'pull_request'
+        run: |
+          sh packaging/test_clean_host.sh 3.10 wheelhouse
+          sh packaging/test_clean_host.sh 3.14 wheelhouse
+
+  publish-testpypi:
+    if: github.ref_type == 'tag'
+    needs: [build, test-clean-host]
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/radixshmem
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          packages-dir: wheelhouse/
+
+  # Release candidates stop at TestPyPI; a release waits for the pypi environment's approval.
+  publish-pypi:
+    if: github.ref_type == 'tag' && !contains(github.ref_name, 'rc')
+    needs: publish-testpypi
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi
+      url: https://pypi.org/p/radixshmem
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          packages-dir: wheelhouse/
+
+  github-release:
+    needs: publish-pypi
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels
+          path: wheelhouse
+      - run: >-
+          gh release create "$GITHUB_REF_NAME" wheelhouse/*.whl
+          --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

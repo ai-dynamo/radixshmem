@@ -469,8 +469,6 @@ class RadixServer:
             return
         if not (c.cluster.rpc_address or c.cluster.rpc_interface):
             raise ValueError("distributed mode requires cluster.rpc_address or cluster.rpc_interface")
-        if not hasattr(_core, "EtcdKv"):
-            raise RuntimeError("radixshmem was built without etcd; a cluster needs it")
         self._greg = _ServerRegistry(c.cluster.registry, c.cluster.cluster_id)
         if not c.index_only:
             self._backend = self._make_backend()
@@ -498,8 +496,8 @@ class RadixServer:
             device_filter=list(c.transfer_devices), publish=True))
         if backend is None:
             raise RuntimeError(
-                f"transfer backend {c.transfer_backend!r} unavailable (no RDMA "
-                f"device, or that backend not built — see ENABLE_MOONCAKE/ENABLE_NIXL)")
+                f"transfer backend {c.transfer_backend!r} unavailable (its plugin is missing or "
+                f"failed to load, or no RDMA device; see the [radixshmem] transfer line on stderr)")
         return backend
 
     def close(self) -> None:
