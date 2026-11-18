@@ -376,3 +376,24 @@ def test_copy_ranges(make_store):
     s.write_slot(2, b"x" * SLOT_BYTES)
     _core.copy_ranges(XferOp.WRITE, np.array([s.data_addr + s.slot_offset(2)], dtype=np.uint64), b, n)
     assert s.read_slot(0) == b"x" * SLOT_BYTES
+
+
+def test_check_batch():
+    from radixshmem import _core
+
+    def u64(*v):
+        return np.array(v, dtype=np.uint64)
+
+    regions = [(0x1000, 0x1000), (0x10000, 0x100)]
+    assert _core.check_batch(u64(0x1000, 0x10080), u64(0x5000, 0x5800), u64(0x800, 0x80), regions,
+                             0x5000, 0x1000) == (0x880, "")
+    for local, remote, length, why in [
+        (0x1000, 0x5000, 0, "zero length"),
+        (0, 0x5000, 8, "null address"),
+        (0x1c00, 0x5000, 0x800, "registered region"),     # runs past the first region's end
+        (0x1000, 0x5c00, 0x800, "escapes the segment"),
+        (0x1000, 0x4ff0, 0x10, "escapes the segment"),
+        (0x1000, 2**64 - 8, 0x10, "wraps"),
+    ]:
+        total, msg = _core.check_batch(u64(local), u64(remote), u64(length), regions, 0x5000, 0x1000)
+        assert total == 0 and why in msg, (local, remote, length, msg)

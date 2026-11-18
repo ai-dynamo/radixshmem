@@ -12,6 +12,7 @@ side are absolute, inside ``SegmentInfo.base`` .. ``base + length``.
 from __future__ import annotations
 
 import abc
+import os
 import time
 from typing import Optional, Tuple
 
@@ -74,16 +75,20 @@ class TransferBackend(abc.ABC):
         """XFER_OK, or XFER_EBUSY while the batch still runs (the handle stays valid)."""
 
     def wait(self, handle: int, timeout_ms: int) -> XferState:
-        deadline = None if timeout_ms < 0 else time.monotonic() + timeout_ms / 1000
-        spins = 0
+        # Spin for the first millisecond: any sleep, even sleep(0), costs the 50 us timer slack.
+        start = time.monotonic()
+        deadline = None if timeout_ms < 0 else start + timeout_ms / 1000
         while True:
             state, _ = self.poll(handle)
             if state != XferState.PENDING:
                 return state
-            if deadline is not None and time.monotonic() >= deadline:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
                 return XferState.TIMEOUT
-            spins += 1
-            time.sleep(0 if spins < 100 else 0.00005)
+            if now - start < 0.001:
+                os.sched_yield()
+            else:
+                time.sleep(0.00005)
 
     @abc.abstractmethod
     def close(self) -> None: ...

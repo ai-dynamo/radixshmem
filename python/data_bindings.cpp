@@ -542,6 +542,38 @@ void bind_data(py::module_& m) {
           "Slot ids: sequences of ints or integer arrays. Returns (local, remote, lengths, \"\") as uint64 arrays, runs "
           "fused, or (None, None, None, why).");
 
+    m.def("check_batch",
+          [](const U64Array& local, const U64Array& remote, const U64Array& lengths,
+             const std::vector<std::pair<uint64_t, uint64_t>>& regions, uint64_t seg_base,
+             uint64_t seg_len) -> py::tuple {
+              const py::ssize_t n = check_ranges(local, remote, lengths);
+              const uint64_t* l = local.data();
+              const uint64_t* r = remote.data();
+              const uint64_t* len = lengths.data();
+              uint64_t seg_end = 0, total = 0;
+              if (n == 0) return py::make_tuple(0, "empty batch");
+              if (__builtin_add_overflow(seg_base, seg_len, &seg_end)) return py::make_tuple(0, "segment wraps");
+              for (py::ssize_t i = 0; i < n; ++i) {
+                  uint64_t lend = 0, rend = 0;
+                  if (l[i] == 0 || len[i] == 0)
+                      return py::make_tuple(0, "a range has a null address or zero length");
+                  if (__builtin_add_overflow(l[i], len[i], &lend) || __builtin_add_overflow(r[i], len[i], &rend))
+                      return py::make_tuple(0, "a range wraps around the address space");
+                  bool inside = false;
+                  for (const auto& [addr, size] : regions)
+                      if (l[i] >= addr && lend - addr <= size) { inside = true; break; }
+                  if (!inside) return py::make_tuple(0, "a local range is not inside any registered region");
+                  if (r[i] < seg_base || rend > seg_end)
+                      return py::make_tuple(0, "a remote range escapes the segment");
+                  total += len[i];
+              }
+              return py::make_tuple(total, "");
+          },
+          py::arg("local"), py::arg("remote"), py::arg("lengths"), py::arg("regions"), py::arg("seg_base"),
+          py::arg("seg_len"),
+          "(total bytes, \"\") if every range is non-empty, inside one of the local regions ((addr, length) pairs) "
+          "and inside [seg_base, +seg_len); else (0, why).");
+
     m.def("copy_ranges",
           [](XferOp op, const U64Array& local, const U64Array& remote, const U64Array& lengths) {
               const py::ssize_t n = check_ranges(local, remote, lengths);

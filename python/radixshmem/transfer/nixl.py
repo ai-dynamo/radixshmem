@@ -75,6 +75,14 @@ def _merge(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return out
 
 
+def _descs(addrs: np.ndarray, lengths: np.ndarray) -> np.ndarray:
+    """NIXL's (addr, length, device id) rows."""
+    d = np.zeros((len(addrs), 3), dtype=np.uint64)
+    d[:, 0] = addrs
+    d[:, 1] = lengths
+    return d
+
+
 @dataclass
 class _Segment:
     name: str
@@ -269,15 +277,6 @@ class NixlBackend(TransferBackend):
 
     # ---------------------------------------------------------------- transfers
 
-    def _covers_local(self, local: np.ndarray, lengths: np.ndarray) -> bool:
-        with self._mu:
-            merged = list(self._merged)
-        ends = local + lengths
-        ok = np.zeros(len(local), dtype=bool)
-        for addr, length in merged:
-            ok |= (local >= addr) & (ends <= addr + length)
-        return bool(ok.all())
-
     def submit(self, op: XferOp, seg_id: int, local, remote, lengths) -> int:
         local, remote, lengths = (as_u64(local, "addresses"), as_u64(remote, "addresses"),
                                   as_u64(lengths, "lengths"))
@@ -289,29 +288,22 @@ class NixlBackend(TransferBackend):
             return INVALID_BATCH
         with self._mu:
             seg = self._segments.get(seg_id)
+            merged = self._merged
         if seg is None or self._agent is None:
             _warn(f"batch targets unknown segment {seg_id}")
             return INVALID_BATCH
-        if not lengths.all() or not local.all():
-            _warn("a range has a null address or zero length")
+        total, why = _core.check_batch(local, remote, lengths, merged, seg.info.base, seg.info.length)
+        if why:
+            _warn(f"{why} (segment {seg.name!r} [{seg.info.base:#x}, +{seg.info.length}))")
             return INVALID_BATCH
-        if not self._covers_local(local, lengths):
-            _warn("a local range is not inside any registered region")
-            return INVALID_BATCH
-        base, size = seg.info.base, seg.info.length
-        if (remote < base).any() or (remote + lengths > base + size).any() or (remote + lengths < remote).any():
-            _warn(f"a remote range escapes segment {seg.name!r} [{base:#x}, +{size})")
-            return INVALID_BATCH
-        total = int(lengths.sum())
 
         if seg.is_self:
             _core.copy_ranges(op, local, remote, lengths)
             return self._add_batch(_Batch(None, total, done=True))
 
-        zeros = np.zeros(n, dtype=np.uint64)
         try:
-            ldescs = self._agent.get_xfer_descs(np.column_stack((local, lengths, zeros)), "DRAM")
-            rdescs = self._agent.get_xfer_descs(np.column_stack((remote, lengths, zeros)), "DRAM")
+            ldescs = self._agent.get_xfer_descs(_descs(local, lengths), "DRAM")
+            rdescs = self._agent.get_xfer_descs(_descs(remote, lengths), "DRAM")
             handle = self._agent.initialize_xfer("READ" if op == XferOp.READ else "WRITE", ldescs, rdescs,
                                                  seg.name)
         except Exception as e:  # noqa: BLE001
