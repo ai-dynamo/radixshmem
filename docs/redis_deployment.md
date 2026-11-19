@@ -83,7 +83,9 @@ RADIXSHMEM_REDIS_PASSWORD=<pw>
 RADIXSHMEM_REDIS_TIMEOUT_MS=50
 ```
 
-Several radixshmem clusters can share one Redis Cluster as long as their `cluster_id`s differ.
+Several radixshmem clusters can share one Redis Cluster as long as their `cluster_id`s differ: a new radixshmem cluster deletes every key under its prefix, `rsh:<cluster_id>:`.
+
+Start the Redis Cluster first: rank 0 fails to start unless a node in `RADIXSHMEM_REDIS_ADDRS` reports `cluster_state:ok`. A master that restarts comes back empty, since persistence is off; the radix-servers notice its new `run_id` within a second and send their routes in its slots again.
 
 ## 5. Fault testing
 
