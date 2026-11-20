@@ -71,13 +71,14 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
             -DENABLE_MOONCAKE=OFF \
-            -DENABLE_NIXL=OFF \
             -DPython3_EXECUTABLE="$(command -v python)"
       - name: Build
         run: cmake --build build -j "$(nproc)"
       - name: Test
         run: ctest --test-dir build --output-on-failure
       - name: Wheel
+        env:
+          SKBUILD_CMAKE_DEFINE: ENABLE_MOONCAKE=OFF   # as configured above; wheels.yml builds the Mooncake wheels
         run: |
           pip wheel --no-deps -w dist .
           python -m venv /tmp/wheel-venv

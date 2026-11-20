@@ -1,26 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""radixshmem._data binding tests — the data plane from Python.
+"""radixshmem._data tests — the data plane from Python.
 
-The C++ suite (test_slot_store, test_slot_transfer_e2e) owns the functional
-coverage. These tests assert that the binding surface carries it faithfully:
    - geometry and lifetime come through as Python attributes,
    - slot views are windows onto the mapping, not copies,
-   - slot lists map to the right C++ parameters, and coalescing is observable
-     from Python (read/write's descriptor count) exactly as it is from C++,
-   - a real two-process transfer, driven entirely from Python, moves the same
-     bytes into the same slots as the C++ end-to-end test does.
+   - a real two-process transfer through SlotTransfer moves the right bytes into
+     the right slots, coalescing included, over each transfer backend,
+   - a transfer to the process's own segment is a local copy,
+   - release() of a batch in flight is XFER_EBUSY and keeps the handle,
+   - NIXL: opening a peer that starts late retries, a closed segment reopens.
 
-Everything past the store tests needs a transfer backend, and the only backend
-is Mooncake, so those tests fork: an ibverbs context does not survive fork(), so
-every engine is built inside a child and the parent never touches one. They SKIP
-when no Mooncake engine can come up on this host.
+Everything past the store tests needs a transfer backend, so those tests fork:
+an ibverbs context does not survive fork(), so every engine is built inside a
+child and the parent never touches one. A backend that cannot come up on this
+host (no Mooncake plugin, no NIXL package) is SKIPped.
 """
 
 import os
+import socket
 import struct
 import sys
+import time
+
+import numpy as np
 
 import radixshmem
 
@@ -41,12 +44,12 @@ FULL, SWA, MAMBA = (radixshmem.ComponentType.FULL, radixshmem.ComponentType.SWA,
                     radixshmem.ComponentType.MAMBA)
 
 
-def mc_cfg(publish, protocol, devices=()):
+def xfer_cfg(backend, publish, protocol, devices=()):
     # rpc_port=0: the engine binds what it can and we read the name back off
     # local_segment. Naming the segment ourselves would hand Mooncake a host it
     # cannot resolve.
     return radixshmem._data.TransferConfig(
-        backend="mooncake", metadata="P2PHANDSHAKE", ip_or_host="127.0.0.1",
+        backend=backend, metadata="P2PHANDSHAKE", ip_or_host="127.0.0.1",
         rpc_port=0, protocol=protocol, device_filter=list(devices),
         publish=publish)
 
@@ -295,6 +298,8 @@ def _read_str(fd):
 
 
 def _spawn(fn):
+    sys.stdout.flush()
+    sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
         code = 1
@@ -322,26 +327,26 @@ def _reap(pid, who):
     return False
 
 
-def _mooncake_available():
+def _available(backend):
     """Probing costs a fork, but building an engine in this process would poison
     every later fork, which is worse."""
-    if _mooncake_available.cached is None:
+    if backend not in _available.cached:
         pid = _spawn(lambda: 0 if radixshmem._data.create_transfer_backend(
-            mc_cfg(True, "rdma")) is not None else 1)
+            xfer_cfg(backend, True, "rdma")) is not None else 1)
         _, status = os.waitpid(pid, 0)
-        _mooncake_available.cached = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-    return _mooncake_available.cached
+        _available.cached[backend] = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+    return _available.cached[backend]
 
 
-_mooncake_available.cached = None
+_available.cached = {}
 
 
-def _publisher(shm, protocol, fds, devices=()):
+def _publisher(backend, shm, protocol, fds, devices=()):
     name_r, name_w, done_r, done_w = fds
     os.close(name_r)
     os.close(done_w)
     s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True, swa=SWA_POOL))
-    be = radixshmem._data.create_transfer_backend(mc_cfg(True, protocol, devices))
+    be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, True, protocol, devices))
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
@@ -368,12 +373,12 @@ def _publisher(shm, protocol, fds, devices=()):
     return 0
 
 
-def _initiator(shm, protocol, fds, devices=()):
+def _initiator(backend, shm, protocol, fds, devices=()):
     name_r, name_w, done_r, done_w = fds
     os.close(name_w)
     os.close(done_r)
     s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True, swa=SWA_POOL))
-    be = radixshmem._data.create_transfer_backend(mc_cfg(False, protocol, devices))
+    be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, False, protocol, devices))
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
@@ -467,7 +472,7 @@ def _initiator(shm, protocol, fds, devices=()):
     return 0
 
 
-def _run_e2e(protocol, tag, devices=()):
+def _run_e2e(protocol, tag, devices=(), backend="mooncake"):
     name_r, name_w = os.pipe()
     done_r, done_w = os.pipe()
     shm_a = "/py_ste_" + tag + "_a"
@@ -476,8 +481,8 @@ def _run_e2e(protocol, tag, devices=()):
     radixshmem._data.SlotStore.destroy(shm_b, "")
 
     fds = (name_r, name_w, done_r, done_w)
-    pa = _spawn(lambda: _publisher(shm_a, protocol, fds, devices))
-    pb = _spawn(lambda: _initiator(shm_b, protocol, fds, devices))
+    pa = _spawn(lambda: _publisher(backend, shm_a, protocol, fds, devices))
+    pb = _spawn(lambda: _initiator(backend, shm_b, protocol, fds, devices))
     for fd in fds:
         os.close(fd)
 
@@ -489,7 +494,7 @@ def _run_e2e(protocol, tag, devices=()):
 
 
 def test_e2e_rdma():
-    if not _mooncake_available():
+    if not _available("mooncake"):
         print("  SKIP: e2e_rdma (no Mooncake engine)")
         return
     assert _run_e2e("rdma", "rdma")
@@ -497,7 +502,7 @@ def test_e2e_rdma():
 
 
 def test_e2e_tcp():
-    if not _mooncake_available():
+    if not _available("mooncake"):
         print("  SKIP: e2e_tcp (no Mooncake engine)")
         return
     assert _run_e2e("tcp", "tcp")
@@ -508,7 +513,7 @@ def test_e2e_device_filter():
     """device_filter is how the data plane is kept off the management NIC.
     Pinning both endpoints to one named HCA is the deterministic case: they
     cannot end up on HCAs in different L3 planes, which never reach RTR."""
-    if not _mooncake_available():
+    if not _available("mooncake"):
         print("  SKIP: e2e_device_filter (no Mooncake engine)")
         return
     devs = rdma_devices()
@@ -520,6 +525,242 @@ def test_e2e_device_filter():
     # requirements, so a name that does not exist costs nothing.
     assert _run_e2e("rdma", "dev2", [devs[0], "mlx5_no_such_device"])
     print("  PASS: e2e_device_filter")
+
+
+def test_e2e_nixl():
+    if not _available("nixl"):
+        print("  SKIP: e2e_nixl (no NIXL package or UCX agent)")
+        return
+    assert _run_e2e("rdma", "nixl", backend="nixl")
+    print("  PASS: e2e_nixl")
+
+
+def _self_copy(backend):
+    shm = "/py_ste_self_" + backend
+    radixshmem._data.SlotStore.destroy(shm, "")
+    s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True))
+    try:
+        be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, True, "tcp"))
+        if be is None:
+            return 2
+        x = radixshmem._data.SlotTransfer(s, be)
+        if x.register_store("cpu:0") != radixshmem._data.XFER_OK:
+            return 3
+        if x.attach_peer(x.local_segment, SLOT_BYTES)[0] != radixshmem._data.XFER_OK:
+            return 4
+        for i in range(4):
+            fill(s, i, pattern(i))
+            fill(s, 10 + i, 0)
+        h, n = x.write(x.local_segment, [0, 1, 2, 3], [10, 11, 12, 13])
+        if h == radixshmem._data.INVALID_BATCH or n != 1:
+            return 5
+        if x.wait(h, 5000) != radixshmem._data.XferState.COMPLETED or x.release(h) != radixshmem._data.XFER_OK:
+            return 6
+        if not all(holds(s, 10 + i, pattern(i)) for i in range(4)):
+            return 7
+        h, _ = x.read(x.local_segment, [12], [20])
+        x.wait(h, 5000)
+        x.release(h)
+        if not holds(s, 20, pattern(2)) or x.detach_peer(x.local_segment) != radixshmem._data.XFER_OK:
+            return 8
+        # The closed segment takes no batch; reopened, it is the same memory again.
+        rc, seg = be.open_segment(be.local_segment)
+        if rc != radixshmem._data.XFER_OK or seg.base != s.data_addr:
+            return 9
+        be.close_segment(seg.id)
+        one = np.array([s.data_addr + s.slot_offset(30)], dtype=np.uint64)
+        size = np.array([SLOT_BYTES], dtype=np.uint64)
+        if be.submit(radixshmem._data.XferOp.READ, seg.id, one, np.array([seg.base], dtype=np.uint64), size) \
+                != radixshmem._data.INVALID_BATCH:
+            return 10
+        if x.attach_peer(x.local_segment, SLOT_BYTES)[0] != radixshmem._data.XFER_OK:
+            return 11
+        h, _ = x.read(x.local_segment, [1], [31])
+        if x.wait(h, 5000) != radixshmem._data.XferState.COMPLETED or x.release(h) != radixshmem._data.XFER_OK:
+            return 12
+        if not holds(s, 31, pattern(1)):
+            return 13
+        be.close()
+        be.close()   # idempotent
+        return 0
+    finally:
+        radixshmem._data.SlotStore.destroy(shm, "")
+
+
+def test_self_segment():
+    """Single-node multi-DP: a peer that is this process is a memcpy, on every backend."""
+    ran = []
+    for backend in ("mooncake", "nixl"):
+        if _available(backend):
+            assert _reap(_spawn(lambda: _self_copy(backend)), backend)
+            ran.append(backend)
+    print(f"  PASS: self_segment ({', '.join(ran) or 'no backend'})")
+
+
+BIG_SLOTS, BIG_SLOT_BYTES = 8, 2 << 20   # one 16 MiB read, in flight at release(); two stores fit a 64 MB /dev/shm
+
+
+def _big_store(shm):
+    radixshmem._data.SlotStore.destroy(shm, "")
+    s = radixshmem._data.SlotStore.create(store_cfg(shm, slots=BIG_SLOTS, slot_bytes=BIG_SLOT_BYTES,
+                                                    prefault=True))
+    return s
+
+
+def _release_publisher(backend, shm, fds):
+    name_r, name_w, done_r, done_w = fds
+    os.close(name_r)
+    os.close(done_w)
+    s = _big_store(shm)
+    be = radixshmem._data.create_transfer_backend(xfer_cfg(backend, True, "rdma"))
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != radixshmem._data.XFER_OK:
+        return 2
+    for i in range(BIG_SLOTS):
+        s.slot_view(i)[:] = bytes([pattern(i)]) * BIG_SLOT_BYTES
+    _write_str(name_w, be.local_segment)
+    ok = os.read(done_r, 1) == b"k"
+    be.close()
+    return 0 if ok else 3
+
+
+def _release_initiator(backend, shm, fds):
+    """release() on a batch in flight is XFER_EBUSY and keeps the handle; once done it frees it, after
+    which poll() is INVALID and release() ENOENT. Exits 0 if EBUSY was seen, 100 if the batch finished
+    before the first release()."""
+    d = radixshmem._data
+    name_r, name_w, done_r, done_w = fds
+    os.close(name_w)
+    os.close(done_r)
+    s = _big_store(shm)
+    be = d.create_transfer_backend(xfer_cfg(backend, False, "rdma"))
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != d.XFER_OK:
+        return 2
+    rc, seg = be.open_segment(_read_str(name_r))
+    if rc != d.XFER_OK:
+        return 4
+    n = BIG_SLOTS * BIG_SLOT_BYTES
+    u64 = lambda v: np.array([v], dtype=np.uint64)  # noqa: E731
+    h = be.submit(d.XferOp.READ, seg.id, u64(s.data_addr), u64(seg.base), u64(n))
+    if h == d.INVALID_BATCH:
+        return 5
+    busy = be.release(h) == d.XFER_EBUSY
+    if busy:
+        if be.poll(h)[0] not in (d.XferState.PENDING, d.XferState.COMPLETED):
+            return 6
+        if be.wait(h, 30000) != d.XferState.COMPLETED or be.release(h) != d.XFER_OK:
+            return 7
+    if be.poll(h)[0] != d.XferState.INVALID or be.release(h) != d.XFER_ENOENT:
+        return 8
+    for i in (0, BIG_SLOTS // 2, BIG_SLOTS - 1):
+        if s.read_slot(i)[:4096] != bytes([pattern(i)]) * 4096:
+            return 9
+    be.close_segment(seg.id)
+    os.write(done_w, b"k")
+    be.close()
+    return 0 if busy else 100
+
+
+def test_release_contract():
+    for backend in ("mooncake", "nixl"):
+        if not _available(backend):
+            print(f"  SKIP: release_contract ({backend} unavailable)")
+            continue
+        name_r, name_w = os.pipe()
+        done_r, done_w = os.pipe()
+        fds = (name_r, name_w, done_r, done_w)
+        a, b = f"/py_rel_{backend}_a", f"/py_rel_{backend}_b"
+        pa = _spawn(lambda: _release_publisher(backend, a, fds))
+        pb = _spawn(lambda: _release_initiator(backend, b, fds))
+        for fd in fds:
+            os.close(fd)
+        _, status = os.waitpid(pb, 0)
+        code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+        ok_a = _reap(pa, "publisher")
+        for name in (a, b):
+            radixshmem._data.SlotStore.destroy(name, "")
+        assert code in (0, 100) and ok_a, f"{backend}: initiator exited {code}"
+        print(f"  PASS: release_contract ({backend}, "
+              f"{'EBUSY seen' if code == 0 else 'no EBUSY: the batch finished before release'})")
+
+
+def _free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def _late_publisher(shm, port, done_r):
+    time.sleep(1.5)   # the initiator is already opening this segment
+    s = radixshmem._data.SlotStore.create(store_cfg(shm, prefault=True))
+    cfg = xfer_cfg("nixl", True, "rdma")
+    cfg.rpc_port = port
+    be = radixshmem._data.create_transfer_backend(cfg)
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != radixshmem._data.XFER_OK:
+        return 2
+    for i in range(SLOTS):
+        fill(s, i, pattern(i))
+    ok = os.read(done_r, 1) == b"k"
+    be.close()
+    return 0 if ok else 3
+
+
+def _late_initiator(shm, port, done_w):
+    d = radixshmem._data
+    s = d.SlotStore.create(store_cfg(shm, prefault=True))
+    be = d.create_transfer_backend(xfer_cfg("nixl", False, "rdma"))
+    if be is None or be.register_memory(s.data_addr, s.data_bytes) != d.XFER_OK:
+        return 2
+    u64 = lambda v: np.array([v], dtype=np.uint64)  # noqa: E731
+
+    def pull(seg, slot, code):
+        local = s.data_addr + s.slot_offset(slot)
+        h = be.submit(d.XferOp.READ, seg.id, u64(local), u64(seg.base + s.slot_offset(slot)), u64(SLOT_BYTES))
+        if h == d.INVALID_BATCH or be.wait(h, 30000) != d.XferState.COMPLETED or be.release(h) != d.XFER_OK:
+            return code
+        return 0 if holds(s, slot, pattern(slot)) else code + 1
+
+    peer = f"127.0.0.1:{port}"
+    t0 = time.monotonic()
+    rc, seg = be.open_segment(peer)   # nobody listens yet: the exchange is retried
+    if rc != d.XFER_OK or time.monotonic() - t0 < 1.0:
+        return 4
+    err = pull(seg, 5, 10)
+    if err:
+        return err
+    be.close_segment(seg.id)
+    h = be.submit(d.XferOp.READ, seg.id, u64(s.data_addr), u64(seg.base), u64(SLOT_BYTES))
+    if h != d.INVALID_BATCH:
+        return 20
+    rc, again = be.open_segment(peer)   # reopened: the metadata is fetched afresh
+    if rc != d.XFER_OK or again.base != seg.base or again.id == seg.id:
+        return 21
+    err = pull(again, 9, 30)
+    if err:
+        return err
+    os.write(done_w, b"k")
+    be.close()
+    return 0
+
+
+def test_nixl_late_peer_and_reopen():
+    if not _available("nixl"):
+        print("  SKIP: nixl_late_peer_and_reopen (no NIXL package or UCX agent)")
+        return
+    port = _free_port()
+    done_r, done_w = os.pipe()
+    a, b = "/py_late_a", "/py_late_b"
+    for name in (a, b):
+        radixshmem._data.SlotStore.destroy(name, "")
+    pb = _spawn(lambda: _late_initiator(b, port, done_w))
+    pa = _spawn(lambda: _late_publisher(a, port, done_r))
+    os.close(done_r)
+    os.close(done_w)
+    ok_b = _reap(pb, "initiator")
+    ok_a = _reap(pa, "publisher")
+    for name in (a, b):
+        radixshmem._data.SlotStore.destroy(name, "")
+    assert ok_a and ok_b
+    print("  PASS: nixl_late_peer_and_reopen")
 
 
 # ==================================================================
@@ -536,4 +777,8 @@ if __name__ == "__main__":
     test_e2e_rdma()
     test_e2e_tcp()
     test_e2e_device_filter()
+    test_e2e_nixl()
+    test_self_segment()
+    test_release_contract()
+    test_nixl_late_peer_and_reopen()
     print("\nAll tests passed.")

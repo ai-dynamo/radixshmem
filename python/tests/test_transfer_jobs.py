@@ -88,6 +88,19 @@ def test_a_transfer_is_in_flight_exactly_while_the_engine_keeps_it():
     assert srv._zombies == []
 
 
+def test_teardown_releases_zombies_and_unregisters_the_store():
+    S, EBUSY, OK = _data.XferState, _data.XFER_EBUSY, _data.XFER_OK
+    srv = RadixServer(ServerConfig(name="/py_tj_teardown"))
+    xfer, unregistered = FakeXfer([]), []
+    xfer.handles = {1: [S.PENDING, EBUSY], 2: [S.COMPLETED, OK]}
+    xfer.backend = SimpleNamespace(unregister_memory=lambda addr: unregistered.append(addr) or OK)
+    srv._xfer, srv._zombies = xfer, [1, 2]
+    srv._store = SimpleNamespace(data_addr=0x1000, name="/py_tj_teardown_store")
+    srv._teardown_regions()
+    assert unregistered == [0x1000]
+    assert srv._zombies == [1] and srv._xfer is None and srv._store is None
+
+
 def test_a_job_whose_deadline_passed_in_the_queue_is_not_issued():
     job = _Job([item(), item(XFER_READ)], time.monotonic() - 1)
     srv = run([job], [])

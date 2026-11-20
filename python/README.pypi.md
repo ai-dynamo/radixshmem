@@ -4,7 +4,7 @@ RadixShmem is a KV cache index built on a distributed radix tree. Each node keep
 shared memory, and any process on the node can attach to it and insert or look up KV cache blocks by prefix
 hash. Across nodes, a sharded Radix Hash Table (RHT) records which node holds each prefix, and a query
 continues the match on that peer's tree, so the KV cache is indexed globally across the cluster. Together with
-a transfer engine (Mooncake), RadixShmem also moves the blocks between nodes.
+a transfer engine (Mooncake, or NIXL), RadixShmem also moves the blocks between nodes.
 
 Source, documentation and issues: <https://github.com/ai-dynamo/radixshmem>.
 
@@ -14,7 +14,13 @@ Source, documentation and issues: <https://github.com/ai-dynamo/radixshmem>.
 pip install radixshmem
 ```
 
-Wheels are built for Linux x86_64 (glibc 2.28 or newer) and CPython 3.10 to 3.14.
+Wheels are built for Linux x86_64 (glibc 2.28 or newer) and CPython 3.10 to 3.14. They include the Mooncake
+transfer backend, the default. For the NIXL backend (`--transfer-backend nixl`), install the `nixl` extra, which
+brings `nixl-cu13` and torch (Python 3.13 or older):
+
+```bash
+pip install "radixshmem[nixl]"
+```
 
 What else the host needs depends on the setup:
 
@@ -24,6 +30,7 @@ What else the host needs depends on the setup:
 | Cluster, index only, Redis RHT + gRPC peer index (the default) | no | no |
 | `RADIXSHMEM_RHT_BACKEND=rdma` or `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` | yes | yes |
 | Cluster with a data plane (Mooncake) | yes, plus libnuma | with `--transfer-protocol rdma` (the default) |
+| Cluster with a data plane (NIXL) | as NIXL's UCX needs | for RDMA transports |
 
 rdma-core and libnuma come from the distribution: `apt-get install libibverbs1 ibverbs-providers libnuma1`
 on Debian and Ubuntu, `dnf install libibverbs numactl-libs` on RHEL and its rebuilds. A cluster also needs an
@@ -31,7 +38,7 @@ etcd for the bootstrap and, with the default RHT, a Redis Cluster
 ([deployment guide](https://github.com/ai-dynamo/radixshmem/blob/main/docs/redis_deployment.md)).
 
 `python -c "import radixshmem; print(radixshmem.build_info())"` shows the version, whether rdma-core can be
-loaded, and the transfer backends in the package.
+loaded, and the transfer backends available.
 
 ## Start a server
 

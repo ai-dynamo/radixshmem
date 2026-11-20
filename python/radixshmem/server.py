@@ -103,9 +103,9 @@ class ServerConfig:
     transfer_port: int = 0
     transfer_metadata: str = "P2PHANDSHAKE"
     # jobs
-    max_inflight: int = 256          # batches in flight at the engine
+    max_inflight: int = 1024         # batches in flight at the engine
     max_pending_jobs: int = 4096     # queued + running + uncollected jobs before Submit is refused
-    job_ttl_s: float = 60.0          # seconds an uncollected job is kept
+    job_ttl_s: float = 300.0         # seconds an uncollected job is kept
     transfer_log: str = ""           # one line per transfer with bytes > 0: "-" = stdout, a path appends, "" = off
     # index tuning
     max_nodes: int = 0               # radix node pool, 0 = auto
@@ -487,17 +487,14 @@ class RadixServer:
         from radixshmem import _data
 
         c = self.cfg
-        if c.transfer_backend == "nixl" and c.transfer_port <= 0:
-            raise ValueError("transfer_port must be set for the nixl transfer backend; "
-                             "it cannot pick a port")
         backend = _data.create_transfer_backend(_data.TransferConfig(
             backend=c.transfer_backend, metadata=c.transfer_metadata, ip_or_host=c.resolved_transfer_ip(),
             rpc_port=c.transfer_port, protocol=c.transfer_protocol,
             device_filter=list(c.transfer_devices), publish=True))
         if backend is None:
             raise RuntimeError(
-                f"transfer backend {c.transfer_backend!r} unavailable (its plugin is missing or "
-                f"failed to load, or no RDMA device; see the [radixshmem] transfer line on stderr)")
+                f"transfer backend {c.transfer_backend!r} unavailable (installed: {_data.TRANSFER_BACKENDS}; "
+                f"the reason is on stderr)")
         return backend
 
     def close(self) -> None:
@@ -532,6 +529,8 @@ class RadixServer:
                 pass
             self._greg.close()
         self._teardown_regions()
+        if self._backend is not None:
+            self._backend.close()
         self._backend = self._greg = None
         with self._cv:
             self._mode = MODE_CLOSED
@@ -620,7 +619,7 @@ class RadixServer:
         self._stop_writeback()
         self._stop_dedup_writes()
         with self._cv:
-            index, store, dreg = self._index, self._store, self._dreg
+            index, store, dreg, xfer = self._index, self._store, self._dreg, self._xfer
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
             self._peers = {}
         if dreg is not None and index is not None:
@@ -628,7 +627,15 @@ class RadixServer:
                 dreg.unpublish(index.node_name())
             except Exception:  # noqa: BLE001
                 pass
-        self._reap()
+        if xfer is not None:
+            from radixshmem import _data
+
+            self._zombies = [h for h in self._zombies if xfer.release(h) == _data.XFER_EBUSY]
+            if store is not None:
+                # The next store registers anew; a stale range would split the segment peers open.
+                rc = xfer.backend.unregister_memory(store.data_addr)
+                if rc != _data.XFER_OK:
+                    print(f"radixshmem: unregistering the old store failed rc={rc}", file=sys.stderr)
         if store is not None:
             from radixshmem import _data
 

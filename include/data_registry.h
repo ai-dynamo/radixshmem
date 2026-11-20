@@ -48,7 +48,7 @@ bool make_data_plane_entry(const StoreGeometry& layout, const std::string& segme
 bool make_data_plane_entry(uint64_t slot_bytes, uint64_t num_slots,
                            const std::string& segment, DataPlaneEntry& out);
 
-// Published layout, for SlotTransfer::attach_peer(peer, &layout).
+// Published layout, for SlotTransfer.attach_peer(peer, layout).
 StoreGeometry data_plane_layout(const DataPlaneEntry& e);
 
 // Reads and writes radix/<cluster_id>/data/. Shares the process-global etcd

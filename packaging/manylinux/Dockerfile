@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Wheel builder: manylinux_2_28 with the dependencies a radixshmem build needs, built once.
-# gRPC and hiredis are static in /opt/deps; Mooncake is built at the commit scripts/build_mooncake.sh pins,
+# gRPC and hiredis are static in /opt/deps; Mooncake is built at the commit CMakeLists.txt pins (MOONCAKE_COMMIT),
 # without its HTTP metadata server (radixshmem uses P2PHANDSHAKE), in /opt/mooncake.
 #
 #   docker build -t radixshmem-manylinux packaging/manylinux     (see packaging/README.md)

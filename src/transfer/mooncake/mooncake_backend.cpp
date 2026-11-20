@@ -437,13 +437,11 @@ BatchHandle MooncakeBackend::submit(const TransferDesc* descs, int n) {
 }
 
 XferState MooncakeBackend::poll(BatchHandle h, uint64_t* done_bytes) {
-    Batch b;
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        auto it = batches_.find(h);
-        if (it == batches_.end()) return XferState::INVALID;
-        b = it->second;
-    }
+    // Held through the status read: a release() of the same handle frees the batch.
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = batches_.find(h);
+    if (it == batches_.end()) return XferState::INVALID;
+    const Batch& b = it->second;
     if (b.is_local) {
         if (done_bytes) *done_bytes = b.bytes;
         return XferState::COMPLETED;

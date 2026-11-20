@@ -113,6 +113,8 @@ static py::array_t<uint64_t> py_compute_hashes(py::array_t<int64_t> token_ids,
     return arr;
 }
 
+void bind_data(py::module_& m);
+
 PYBIND11_MODULE(_core, m) {
     m.doc() = "radixshmem: shared-memory radix tree for KV cache prefix matching";
 
@@ -862,4 +864,6 @@ PYBIND11_MODULE(_core, m) {
     m.def("compute_hashes", &py_compute_hashes,
           py::arg("token_ids"), py::arg("tokens_per_block"),
           "Compute cumulative prefix hashes from token IDs.");
+
+    bind_data(m);
 }

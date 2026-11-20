@@ -1,25 +1,25 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-// radixshmem._data — Python bindings for the data plane (SlotStore + transfer
-// backend + SlotTransfer). A separate extension from radixshmem._core: the data
-// plane does not link the indexer.
+// Data-plane bindings (SlotStore, C++ transfer backends, slot planning), part of radixshmem._core.
 //
-// Lifetime: SlotTransfer borrows its store and backend; keep_alive pins both.
 // Slot payloads are memoryviews over the shared mapping (windows, not copies).
 
 #include <pybind11/pybind11.h>
+#include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
 #include "component_kind.h"
 #include "data_registry.h"
 #include "slot_geometry.h"
 #include "slot_store.h"
-#include "slot_transfer.h"
+#include "slot_plan.h"
 #include "transfer.h"
 
+#include <climits>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,15 +28,6 @@ namespace py = pybind11;
 using namespace radixshmem;
 
 namespace {
-
-void check_pair(const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
-    if (a.size() != b.size())
-        throw std::invalid_argument("slot lists must have the same length (got " +
-                                    std::to_string(a.size()) + " and " +
-                                    std::to_string(b.size()) + ")");
-    if (a.empty())
-        throw std::invalid_argument("slot lists must not be empty");
-}
 
 void check_kind(ComponentType c) {
     if (!component_type_valid(c))
@@ -70,6 +61,76 @@ void* slot_or_throw(SlotStore& s, ComponentType c, uint64_t slot_id) {
     return p;
 }
 
+// No forcecast: numpy's safe casting only, so a value that does not fit is a TypeError, not a wrapped address.
+using U64Array = py::array_t<uint64_t, py::array::c_style>;
+
+// Slot ids from a sequence of ints or a 1-d integer array, read exactly: anything else is a TypeError (numpy's
+// casts would truncate 1.7 to 1). Ids past int64 become -1, so plan_slots refuses them as out of range.
+std::vector<int64_t> slot_ids(py::handle h, const char* what) {
+    std::vector<int64_t> out;
+    if (py::isinstance<py::array>(h)) {
+        auto a = py::reinterpret_borrow<py::array>(h);
+        const char k = a.dtype().kind();
+        if ((k != 'i' && k != 'u') || a.ndim() != 1)
+            throw py::type_error(std::string(what) + " must be a 1-d integer array");
+        // uint64 ids past int64 wrap negative: out of range like any other.
+        auto v = py::array_t<int64_t, py::array::c_style | py::array::forcecast>::ensure(a);
+        if (!v) throw std::runtime_error(std::string("cannot read ") + what);
+        out.assign(v.data(), v.data() + v.size());
+        return out;
+    }
+    if (!PySequence_Check(h.ptr()) || PyUnicode_Check(h.ptr()) || PyBytes_Check(h.ptr()))
+        throw py::type_error(std::string(what) + " must be a sequence of integers or an integer array");
+    const Py_ssize_t n = PyObject_Size(h.ptr());
+    if (n < 0) throw py::error_already_set();
+    out.reserve((size_t)n);
+    for (py::handle item : h) {
+        PyObject* o = item.ptr();
+        int overflow = 0;
+        long long v;
+        if (PyLong_CheckExact(o)) {
+            v = PyLong_AsLongLongAndOverflow(o, &overflow);
+        } else {
+            if (PyBool_Check(o) || PyFloat_Check(o) || !PyIndex_Check(o))
+                throw py::type_error(std::string(what) + " must be integers");
+            py::object i = py::reinterpret_steal<py::object>(PyNumber_Index(o));
+            if (!i) throw py::error_already_set();
+            v = PyLong_AsLongLongAndOverflow(i.ptr(), &overflow);
+        }
+        if (v == -1 && PyErr_Occurred()) throw py::error_already_set();
+        out.push_back(overflow ? -1 : (int64_t)v);
+    }
+    return out;
+}
+
+py::ssize_t check_ranges(const U64Array& local, const U64Array& remote, const U64Array& lengths) {
+    if (local.ndim() != 1 || remote.ndim() != 1 || lengths.ndim() != 1 || local.shape(0) != remote.shape(0) ||
+        local.shape(0) != lengths.shape(0))
+        throw std::invalid_argument("local, remote and lengths must be 1-d and the same length");
+    return local.shape(0);
+}
+
+py::array_t<uint64_t> to_array(const std::vector<uint64_t>& v) {
+    py::array_t<uint64_t> a(static_cast<py::ssize_t>(v.size()));
+    std::memcpy(a.mutable_data(), v.data(), v.size() * sizeof(uint64_t));
+    return a;
+}
+
+// Calls take a reference before they release the GIL; close() drops ours, and the engine goes with the last one.
+struct NativeBackend {
+    std::mutex mu;
+    std::shared_ptr<ITransferBackend> be;
+    std::shared_ptr<ITransferBackend> get() {
+        std::lock_guard<std::mutex> lk(mu);
+        if (!be) throw std::runtime_error("transfer backend is closed");
+        return be;
+    }
+    std::shared_ptr<ITransferBackend> take() {
+        std::lock_guard<std::mutex> lk(mu);
+        return std::move(be);
+    }
+};
+
 std::string pool_repr(const PoolGeometry& g) {
     return "slots=" + std::to_string(g.num_slots) + " slot_bytes=" +
            std::to_string(g.slot_bytes) + " base=" + std::to_string(g.base);
@@ -77,9 +138,7 @@ std::string pool_repr(const PoolGeometry& g) {
 
 } // namespace
 
-PYBIND11_MODULE(_data, m) {
-    m.doc() = "radixshmem data plane: shared-memory slot pools and slot-granular transfers";
-
+void bind_data(py::module_& m) {
     // ==================== return codes / enums ====================
     m.attr("XFER_OK")        = XFER_OK;
     m.attr("XFER_EINVAL")    = XFER_EINVAL;
@@ -91,20 +150,6 @@ PYBIND11_MODULE(_data, m) {
     m.attr("PEER_SLOT_BYTES_UNCHECKED") = PEER_SLOT_BYTES_UNCHECKED;
     // Transfer backends whose plugin is installed (tests SKIP on a missing one).
     m.attr("TRANSFER_BACKENDS") = available_transfer_backends();
-    m.attr("COMPONENT_MASK_FULL")  = COMPONENT_MASK_FULL;
-    m.attr("COMPONENT_MASK_SWA")   = COMPONENT_MASK_SWA;
-    m.attr("COMPONENT_MASK_MAMBA") = COMPONENT_MASK_MAMBA;
-
-    // ComponentType is shared with _core: reuse its registration when _core is
-    // already loaded (pybind11 refuses to bind one C++ type twice).
-    if (py::detail::get_type_info(typeid(ComponentType)) == nullptr) {
-        py::enum_<ComponentType>(m, "ComponentType")
-            .value("FULL", ComponentType::FULL)
-            .value("SWA", ComponentType::SWA)
-            .value("MAMBA", ComponentType::MAMBA);
-    } else {
-        m.attr("ComponentType") = py::detail::get_type_handle(typeid(ComponentType), true);
-    }
 
     py::enum_<XferState>(m, "XferState")
         .value("PENDING", XferState::PENDING)
@@ -225,6 +270,7 @@ PYBIND11_MODULE(_data, m) {
         .def_property_readonly("num_slots", [](const SlotStore& s) { return s.num_slots(); })
         .def_property_readonly("slot_bytes", [](const SlotStore& s) { return s.slot_bytes(); })
         .def_property_readonly("data_bytes", &SlotStore::data_bytes)
+        .def_property_readonly("data_addr", [](const SlotStore& s) { return reinterpret_cast<uint64_t>(s.data_base()); })
         .def_property_readonly("valid", &SlotStore::valid)
         .def_property_readonly("is_owner", &SlotStore::is_owner)
         .def_property_readonly("is_hugepage", &SlotStore::is_hugepage)
@@ -296,7 +342,22 @@ PYBIND11_MODULE(_data, m) {
             return r + ">";
         });
 
-    // ==================== transfer backend ====================
+    // ==================== transfer backends implemented in C++ ====================
+    py::enum_<XferOp>(m, "XferOp")
+        .value("READ", XferOp::READ)
+        .value("WRITE", XferOp::WRITE);
+
+    py::class_<SegmentInfo>(m, "SegmentInfo")
+        .def(py::init([](int32_t id, uint64_t base, uint64_t length) { return SegmentInfo{id, base, length}; }),
+             py::arg("id"), py::arg("base"), py::arg("length"))
+        .def_readwrite("id", &SegmentInfo::id)
+        .def_readwrite("base", &SegmentInfo::base)
+        .def_readwrite("length", &SegmentInfo::length)
+        .def("__repr__", [](const SegmentInfo& i) {
+            return "<SegmentInfo id=" + std::to_string(i.id) + " base=" + std::to_string(i.base) +
+                   " length=" + std::to_string(i.length) + ">";
+        });
+
     py::class_<TransferConfig>(m, "TransferConfig")
         .def(py::init<>())
         .def(py::init([](const std::string& backend, const std::string& metadata,
@@ -331,127 +392,204 @@ PYBIND11_MODULE(_data, m) {
         .def_readwrite("device_filter", &TransferConfig::device_filter)
         .def_readwrite("publish", &TransferConfig::publish);
 
-    py::class_<ITransferBackend>(m, "TransferBackend")
-        .def_property_readonly("backend_name", &ITransferBackend::backend_name)
-        .def_property_readonly("local_segment", &ITransferBackend::local_segment)
-        .def("__repr__", [](const ITransferBackend& b) {
-            return std::string("<TransferBackend '") + b.backend_name() + "' segment='" +
-                   b.local_segment() + "'>";
-        });
-
-    // None when the backend name is unknown or was not compiled in.
-    m.def("create_transfer_backend",
-          [](const TransferConfig& cfg) { return create_transfer_backend(cfg); },
-          py::arg("config"),
-          py::call_guard<py::gil_scoped_release>(),
-          "Build a transfer backend, or None if it is unavailable.");
-
-    // ==================== slot-granular layer ====================
-    py::class_<SlotTransfer>(m, "SlotTransfer")
-        .def(py::init<SlotStore&, ITransferBackend&>(),
-             py::arg("store"), py::arg("backend"),
-             py::keep_alive<1, 2>(), py::keep_alive<1, 3>())
-        .def("register_store", &SlotTransfer::register_store,
-             py::arg("location") = "",
-             py::call_guard<py::gil_scoped_release>(),
-             "Hand the store's registerable range to the backend.")
-        .def("attach_peer",
-             [](SlotTransfer& t, const std::string& peer, py::object published) -> py::tuple {
-                 // int: FULL-only stride form -> (rc, PoolGeometry).
-                 if (py::isinstance<py::int_>(published)) {
-                     const uint64_t stride = published.cast<uint64_t>();
-                     SlotGeometry g;
-                     int rc;
-                     {
-                         py::gil_scoped_release nogil;
-                         rc = t.attach_peer(peer, stride, &g);
-                     }
-                     return py::make_tuple(rc, rc == XFER_OK ? py::cast(g) : py::none());
-                 }
-                 // StoreGeometry or None -> (rc, StoreGeometry).
-                 const StoreGeometry* layout = nullptr;
-                 StoreGeometry holder;
-                 if (!published.is_none()) {
-                     holder = published.cast<StoreGeometry>();
-                     layout = &holder;
-                 }
-                 StoreGeometry g;
+    // A plugin's ITransferBackend behind radixshmem.transfer.TransferBackend.
+    py::class_<NativeBackend>(m, "NativeTransferBackend")
+        .def_property_readonly("name", [](NativeBackend& b) { return std::string(b.get()->backend_name()); })
+        .def_property_readonly("local_segment", [](NativeBackend& b) { return b.get()->local_segment(); })
+        .def("register_memory",
+             [](NativeBackend& b, uint64_t addr, uint64_t length, const std::string& location) {
+                 auto be = b.get();
+                 py::gil_scoped_release nogil;
+                 return be->register_memory(reinterpret_cast<void*>(addr), length, location);
+             },
+             py::arg("addr"), py::arg("length"), py::arg("location") = "")
+        .def("unregister_memory",
+             [](NativeBackend& b, uint64_t addr) {
+                 auto be = b.get();
+                 py::gil_scoped_release nogil;
+                 return be->unregister_memory(reinterpret_cast<void*>(addr));
+             },
+             py::arg("addr"))
+        .def("open_segment",
+             [](NativeBackend& b, const std::string& name) -> py::tuple {
+                 auto be = b.get();
+                 SegmentInfo info;
                  int rc;
                  {
                      py::gil_scoped_release nogil;
-                     rc = t.attach_peer(peer, layout, &g);
+                     rc = be->open_segment(name, info);
                  }
-                 return py::make_tuple(rc, rc == XFER_OK ? py::cast(g) : py::none());
+                 return py::make_tuple(rc, rc == XFER_OK ? py::cast(info) : py::none());
              },
-             py::arg("peer"), py::arg("published"),
-             "Resolve a peer segment and check its geometry. `published` is the "
-             "peer's StoreGeometry from the registry, None to assume our layout, "
-             "or (FULL-only stores) the published stride / PEER_SLOT_BYTES_UNCHECKED. "
-             "Returns (rc, geometry or None).")
-        .def("detach_peer", &SlotTransfer::detach_peer, py::arg("peer"),
-             "Close the peer segment. XFER_EBUSY while any batch is unreleased.")
-        .def("peer_geometry",
-             [](const SlotTransfer& t, const std::string& peer) -> py::object {
-                 StoreGeometry g;
-                 if (!t.peer_geometry(peer, g)) return py::none();
-                 return py::cast(g);
+             py::arg("name"), "Returns (rc, SegmentInfo or None).")
+        .def("close_segment",
+             [](NativeBackend& b, int32_t id) {
+                 auto be = b.get();
+                 py::gil_scoped_release nogil;
+                 be->close_segment(id);
              },
-             py::arg("peer"), "Attached peer's StoreGeometry (absolute bases), or None.")
-        .def_property_readonly("local_segment", &SlotTransfer::local_segment)
-        .def("read",
-             [](SlotTransfer& t, const std::string& peer,
-                const std::vector<int32_t>& remote_slots,
-                const std::vector<int32_t>& local_slots, py::object k) {
-                 check_pair(remote_slots, local_slots);
-                 const ComponentType c = kind_of(k);
-                 BatchHandle h;
-                 int ndesc = 0;
-                 {
-                     py::gil_scoped_release nogil;
-                     h = t.read(peer, c, remote_slots.data(), local_slots.data(),
-                                (int)local_slots.size(), &ndesc);
-                 }
-                 return py::make_tuple(h, ndesc);
+             py::arg("seg_id"))
+        .def("submit",
+             [](NativeBackend& b, XferOp op, int32_t seg, const U64Array& local, const U64Array& remote,
+                const U64Array& lengths) {
+                 const py::ssize_t n = check_ranges(local, remote, lengths);
+                 const uint64_t* l = local.data();
+                 const uint64_t* r = remote.data();
+                 const uint64_t* len = lengths.data();
+                 auto be = b.get();
+                 py::gil_scoped_release nogil;
+                 std::vector<TransferDesc> descs((size_t)n);
+                 for (py::ssize_t i = 0; i < n; ++i)
+                     descs[i] = TransferDesc{op, reinterpret_cast<void*>(l[i]), seg, r[i], len[i]};
+                 return be->submit(descs.data(), (int)n);
              },
-             py::arg("peer"), py::arg("remote_slots"), py::arg("local_slots"),
-             KIND_ARG("kind"),
-             "local_slots[i] <- peer's remote_slots[i] in pool `kind`. Returns "
-             "(batch_handle, descriptors); handle is INVALID_BATCH on rejection.")
-        .def("write",
-             [](SlotTransfer& t, const std::string& peer,
-                const std::vector<int32_t>& local_slots,
-                const std::vector<int32_t>& remote_slots, py::object k) {
-                 check_pair(local_slots, remote_slots);
-                 const ComponentType c = kind_of(k);
-                 BatchHandle h;
-                 int ndesc = 0;
-                 {
-                     py::gil_scoped_release nogil;
-                     h = t.write(peer, c, local_slots.data(), remote_slots.data(),
-                                 (int)local_slots.size(), &ndesc);
-                 }
-                 return py::make_tuple(h, ndesc);
-             },
-             py::arg("peer"), py::arg("local_slots"), py::arg("remote_slots"),
-             KIND_ARG("kind"),
-             "peer's remote_slots[i] <- local_slots[i] in pool `kind`. Returns "
-             "(batch_handle, descriptors).")
+             py::arg("op"), py::arg("seg_id"), py::arg("local"), py::arg("remote"), py::arg("lengths"),
+             "Batch handle, INVALID_BATCH on rejection.")
         .def("poll",
-             [](SlotTransfer& t, BatchHandle h) {
+             [](NativeBackend& b, BatchHandle h) {
+                 auto be = b.get();
                  uint64_t done = 0;
                  XferState s;
                  {
                      py::gil_scoped_release nogil;
-                     s = t.poll(h, &done);
+                     s = be->poll(h, &done);
                  }
                  return py::make_tuple(s, done);
              },
              py::arg("handle"), "Returns (XferState, bytes_done).")
-        .def("wait", &SlotTransfer::wait, py::arg("handle"), py::arg("timeout_ms"),
-             py::call_guard<py::gil_scoped_release>())
-        .def("release", &SlotTransfer::release, py::arg("handle"),
-             py::call_guard<py::gil_scoped_release>(),
-             "XFER_OK, or XFER_EBUSY while the batch is still running.");
+        .def("wait",
+             [](NativeBackend& b, BatchHandle h, int timeout_ms) {
+                 auto be = b.get();
+                 py::gil_scoped_release nogil;
+                 return be->wait(h, timeout_ms);
+             },
+             py::arg("handle"), py::arg("timeout_ms"))
+        .def("release",
+             [](NativeBackend& b, BatchHandle h) {
+                 auto be = b.get();
+                 py::gil_scoped_release nogil;
+                 return be->release(h);
+             },
+             py::arg("handle"), "XFER_OK, or XFER_EBUSY while the batch is still running.")
+        .def("close",
+             [](NativeBackend& b) {
+                 auto be = b.take();
+                 py::gil_scoped_release nogil;
+                 be.reset();
+             })
+        .def("__repr__", [](NativeBackend& b) {
+            std::shared_ptr<ITransferBackend> be;
+            {
+                std::lock_guard<std::mutex> lk(b.mu);
+                be = b.be;
+            }
+            if (!be) return std::string("<NativeTransferBackend closed>");
+            return std::string("<NativeTransferBackend '") + be->backend_name() + "' segment='" +
+                   be->local_segment() + "'>";
+        });
+
+    m.def("create_native_backend",
+          [](const TransferConfig& cfg) -> std::unique_ptr<NativeBackend> {
+              std::unique_ptr<ITransferBackend> be;
+              {
+                  py::gil_scoped_release nogil;
+                  be = create_transfer_backend(cfg);
+              }
+              if (!be) return nullptr;
+              auto nb = std::unique_ptr<NativeBackend>(new NativeBackend());
+              nb->be = std::move(be);
+              return nb;
+          },
+          py::arg("config"), "The plugin backend named by config.backend, or None if it is unavailable.");
+
+    // ==================== slot planning ====================
+    m.def("resolve_peer_geometry",
+          [](const StoreGeometry& mine, py::object published, uint64_t seg_base, uint64_t seg_len) {
+              StoreGeometry holder, out;
+              const StoreGeometry* layout = nullptr;
+              if (!published.is_none()) {
+                  holder = published.cast<StoreGeometry>();
+                  layout = &holder;
+              }
+              std::string why;
+              const bool ok = resolve_peer_geometry(mine, layout, seg_base, seg_len, out, why);
+              return py::make_tuple(ok, ok ? py::cast(out) : py::none(), why);
+          },
+          py::arg("mine"), py::arg("published"), py::arg("seg_base"), py::arg("seg_len"),
+          "Returns (ok, the peer's StoreGeometry with absolute bases or None, why).");
+
+    m.def("plan_slots",
+          [](const SlotStore& store, const StoreGeometry& peer, py::object k, py::handle local_slots,
+             py::handle remote_slots) -> py::tuple {
+              const ComponentType c = kind_of(k);
+              const std::vector<int64_t> local = slot_ids(local_slots, "local slots");
+              const std::vector<int64_t> remote = slot_ids(remote_slots, "remote slots");
+              if (local.size() != remote.size())
+                  throw std::invalid_argument("slot lists must be the same length");
+              if (local.empty() || local.size() > (size_t)INT_MAX)
+                  throw std::invalid_argument("slot lists must not be empty or longer than INT_MAX");
+              SlotPlan plan;
+              std::string why;
+              bool ok;
+              {
+                  py::gil_scoped_release nogil;
+                  ok = plan_slots(store, peer, c, local.data(), remote.data(), (int)local.size(), plan, why);
+              }
+              if (!ok) return py::make_tuple(py::none(), py::none(), py::none(), why);
+              return py::make_tuple(to_array(plan.local), to_array(plan.remote), to_array(plan.length), "");
+          },
+          py::arg("store"), py::arg("peer"), py::arg("kind"), py::arg("local_slots"), py::arg("remote_slots"),
+          "Slot ids: sequences of ints or integer arrays. Returns (local, remote, lengths, \"\") as uint64 arrays, runs "
+          "fused, or (None, None, None, why).");
+
+    m.def("check_batch",
+          [](const U64Array& local, const U64Array& remote, const U64Array& lengths,
+             const std::vector<std::pair<uint64_t, uint64_t>>& regions, uint64_t seg_base,
+             uint64_t seg_len) -> py::tuple {
+              const py::ssize_t n = check_ranges(local, remote, lengths);
+              const uint64_t* l = local.data();
+              const uint64_t* r = remote.data();
+              const uint64_t* len = lengths.data();
+              uint64_t seg_end = 0, total = 0;
+              if (n == 0) return py::make_tuple(0, "empty batch");
+              if (__builtin_add_overflow(seg_base, seg_len, &seg_end)) return py::make_tuple(0, "segment wraps");
+              for (py::ssize_t i = 0; i < n; ++i) {
+                  uint64_t lend = 0, rend = 0;
+                  if (l[i] == 0 || len[i] == 0)
+                      return py::make_tuple(0, "a range has a null address or zero length");
+                  if (__builtin_add_overflow(l[i], len[i], &lend) || __builtin_add_overflow(r[i], len[i], &rend))
+                      return py::make_tuple(0, "a range wraps around the address space");
+                  bool inside = false;
+                  for (const auto& [addr, size] : regions)
+                      if (l[i] >= addr && lend - addr <= size) { inside = true; break; }
+                  if (!inside) return py::make_tuple(0, "a local range is not inside any registered region");
+                  if (r[i] < seg_base || rend > seg_end)
+                      return py::make_tuple(0, "a remote range escapes the segment");
+                  total += len[i];
+              }
+              return py::make_tuple(total, "");
+          },
+          py::arg("local"), py::arg("remote"), py::arg("lengths"), py::arg("regions"), py::arg("seg_base"),
+          py::arg("seg_len"),
+          "(total bytes, \"\") if every range is non-empty, inside one of the local regions ((addr, length) pairs) "
+          "and inside [seg_base, +seg_len); else (0, why).");
+
+    m.def("copy_ranges",
+          [](XferOp op, const U64Array& local, const U64Array& remote, const U64Array& lengths) {
+              const py::ssize_t n = check_ranges(local, remote, lengths);
+              const uint64_t* l = local.data();
+              const uint64_t* r = remote.data();
+              const uint64_t* len = lengths.data();
+              py::gil_scoped_release nogil;
+              for (py::ssize_t i = 0; i < n; ++i) {
+                  void* lp = reinterpret_cast<void*>(l[i]);
+                  void* rp = reinterpret_cast<void*>(r[i]);
+                  if (op == XferOp::READ) std::memcpy(lp, rp, len[i]);
+                  else                    std::memcpy(rp, lp, len[i]);
+              }
+          },
+          py::arg("op"), py::arg("local"), py::arg("remote"), py::arg("lengths"),
+          "memcpy each range: READ copies remote to local, WRITE local to remote.");
 
     // ==================== data-plane registry (etcd) ====================
     py::class_<DataPlaneEntry>(m, "DataPlaneEntry")
