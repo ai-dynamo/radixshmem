@@ -159,6 +159,25 @@ def test_index_only_takes_the_counts_from_the_client(cfg):
     assert not os.path.exists(f"/dev/shm{c.name}")
 
 
+def test_index_only_server_creates_the_ssd_files(cfg, tmp_path):
+    dirs = [str(tmp_path / "d0"), str(tmp_path / "d1")]
+    c = cfg(ssd_dirs=dirs, ssd_bytes=64 * 8192, ssd_file_bytes=16 * 8192)
+    srv = up(c, geometry())
+    try:
+        cl = client(c)
+        assert cl.info.ssd_bytes == 64 * 8192
+        g = cl.geometry
+        assert g["pools"]["full"] == {"slot_bytes": 8192, "num_slots": 64}
+        files = [p for d in g["ssd"]["full"]["files"] for p in d]
+        assert len(files) == 4 and all(os.path.getsize(p) == 16 * 8192 for p in files)
+        assert cl.mempool_total() == 64
+        cl.configure(geometry())                                     # a second client: same plan
+        cl.close()
+    finally:
+        srv.close()
+    assert all(os.path.exists(p) for p in files)                    # the files outlive the server
+
+
 def test_failed_configuration_returns_to_waiting_with_the_error(cfg):
     c = cfg(**data())
     srv = RadixServer(c).start()

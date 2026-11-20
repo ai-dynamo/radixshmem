@@ -111,3 +111,29 @@ def test_server_config_validation():
         cfg(data_bytes=1, mamba_ratio=1.0)
     assert cfg().index_only and not cfg(data_bytes=1).index_only
     assert cfg(data_bytes=1).resolved_data_name == "/geo_data" and cfg().resolved_data_name == ""
+
+
+def test_index_only_server_with_ssd_files_plans_counts_and_lays_out_files():
+    spec = Geometry(block_size=4, full_slot_bytes=1000, swa_slot_bytes=3000, swa_window_blocks=2).to_dict()
+    c = cfg(ssd_dirs=["/a", "/b"], ssd_bytes=100_000, ssd_swa_ratio=0.3, ssd_file_bytes=12_000)
+    g = G.plan(spec, c)
+    p, ssd = g["pools"], g["ssd"]
+    # SWA: 30 000 B -> 10 slots -> 5 per directory, 4 per file -> 1 file per directory, 8 slots
+    assert ssd["swa"]["blocks_per_file"] == 4 and p["swa"]["num_slots"] == 8
+    assert ssd["swa"]["files"] == [["/a/geo_swa_0_0.bin"], ["/b/geo_swa_1_0.bin"]]
+    # FULL: 70 000 B -> 70 slots -> 35 per directory, 12 per file -> 2 files, 48 slots
+    assert ssd["full"]["blocks_per_file"] == 12 and p["full"]["num_slots"] == 48
+    assert ssd["full"]["files"][1] == ["/b/geo_full_1_0.bin", "/b/geo_full_1_1.bin"]
+    assert p["full"]["slot_bytes"] == 1000 and p["swa"]["window_blocks"] == 2
+    assert G.plan(spec, c) == g                          # every client of the node gets the same plan
+    # counts a client brings for a server without SSD files are ignored
+    assert G.plan(Geometry(block_size=4, full_slot_bytes=1000, full_slots=8).to_dict(),
+                  cfg(ssd_dirs=["/a"], ssd_bytes=10_000))["pools"]["full"]["num_slots"] == 10
+    with pytest.raises(ValueError, match="slot_bytes > 0"):
+        G.plan(Geometry(block_size=4, full_slots=8).to_dict(), c)
+    with pytest.raises(ValueError, match="ssd_swa_ratio is 0"):
+        G.plan(spec, cfg(ssd_dirs=["/a"], ssd_bytes=100_000))
+    with pytest.raises(ValueError, match="go together"):
+        cfg(ssd_bytes=1 << 20)
+    with pytest.raises(ValueError, match="index-only"):
+        cfg(ssd_dirs=["/a"], ssd_bytes=1 << 20, data_bytes=1 << 20)

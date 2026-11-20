@@ -28,6 +28,13 @@ static py::array_t<int32_t> vec_to_npy_i32(const std::vector<int32_t>& v) {
     return arr;
 }
 
+static py::array_t<uint64_t> vec_to_npy_u64(const std::vector<uint64_t>& v) {
+    py::array_t<uint64_t> arr(static_cast<py::ssize_t>(v.size()));
+    if (!v.empty())
+        std::memcpy(arr.mutable_data(), v.data(), v.size() * sizeof(uint64_t));
+    return arr;
+}
+
 
 static py::tuple writeback_task_tuple(const WritebackTask& t) {
     const HeldEviction& h = t.h;
@@ -189,7 +196,8 @@ PYBIND11_MODULE(_core, m) {
                          const std::string& hugepage_path,
                          uint32_t component_mask, uint32_t swa_window_blocks,
                          uint64_t mamba_state_bytes, uint32_t swa_max_blocks,
-                         uint32_t mamba_max_slots) {
+                         uint32_t mamba_max_slots,
+                         uint32_t kvevent_ring_capacity) {
             ShmConfig c;
             c.max_nodes = max_nodes;
             c.max_blocks = max_blocks;
@@ -204,6 +212,7 @@ PYBIND11_MODULE(_core, m) {
             c.mamba_state_bytes = mamba_state_bytes;
             c.swa_max_blocks = swa_max_blocks;
             c.mamba_max_slots = mamba_max_slots;
+            c.kvevent_ring_capacity = kvevent_ring_capacity;
             return c;
         }),
         py::arg("max_nodes") = 0,
@@ -218,7 +227,8 @@ PYBIND11_MODULE(_core, m) {
         py::arg("swa_window_blocks") = 0,
         py::arg("mamba_state_bytes") = 0,
         py::arg("swa_max_blocks") = 0,
-        py::arg("mamba_max_slots") = 0)
+        py::arg("mamba_max_slots") = 0,
+        py::arg("kvevent_ring_capacity") = 0)
         .def_readwrite("max_nodes", &ShmConfig::max_nodes)
         .def_readwrite("max_blocks", &ShmConfig::max_blocks)
         .def_readwrite("block_size", &ShmConfig::block_size)
@@ -232,6 +242,7 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("mamba_state_bytes", &ShmConfig::mamba_state_bytes)
         .def_readwrite("swa_max_blocks", &ShmConfig::swa_max_blocks)
         .def_readwrite("mamba_max_slots", &ShmConfig::mamba_max_slots)
+        .def_readwrite("kvevent_ring_capacity", &ShmConfig::kvevent_ring_capacity)
         .def("effective_max_nodes", &ShmConfig::effective_max_nodes)
         .def("effective_register_chunk_size", &ShmConfig::effective_register_chunk_size,
              "register_chunk_tokens in blocks, what the tree is created with.")
@@ -250,7 +261,9 @@ PYBIND11_MODULE(_core, m) {
                    ", swa_window_blocks=" + std::to_string(c.swa_window_blocks) +
                    ", mamba_state_bytes=" + std::to_string(c.mamba_state_bytes) +
                    ", swa_max_blocks=" + std::to_string(c.swa_max_blocks) +
-                   ", mamba_max_slots=" + std::to_string(c.mamba_max_slots) + ")";
+                   ", mamba_max_slots=" + std::to_string(c.mamba_max_slots) +
+                   ", kvevent_ring_capacity=" +
+                       std::to_string(c.kvevent_ring_capacity) + ")";
         });
 
     py::class_<RadixServerConfig>(m, "RadixServerConfig")
@@ -706,6 +719,20 @@ PYBIND11_MODULE(_core, m) {
         .def_property_readonly("component_config", &RadixClient::component_config)
         .def("print_tree", &RadixClient::print_tree)
         .def("name", &RadixClient::name)
+        .def("kvevent_enabled", &RadixClient::kvevent_enabled)
+        .def("kvevent_drain", [](RadixClient& c, size_t max_hashes) {
+            RadixClient::KvEventBatch b;
+            {
+                py::gil_scoped_release nogil;
+                b = c.kvevent_drain(max_hashes);
+            }
+            py::list records;
+            for (const auto& rec : b.records)
+                records.append(py::make_tuple(rec.kind, vec_to_npy_u64(rec.hashes)));
+            return py::make_tuple(records, b.overflow);
+        }, py::arg("max_hashes") = 65536,
+           "Placement records since the last call: ([(kind, hashes)], overflow); "
+           "kind 0 removed, 1 stored, 2 cleared.")
         .def("check_health", [](const RadixClient& c) { return c.check_health(); },
              "Lock-free leak audit of the local tree; returns HealthFlag bits (0 == healthy).")
         .def("health_report", [](const RadixClient& c) {

@@ -6,6 +6,7 @@
 #include "data_pool.hpp"
 #include "child_table.hpp"
 #include "component_types.h"
+#include "kvevent.h"
 #include "mempool.hpp"
 #include "slot_lru.hpp"
 #include "node_pool.hpp"
@@ -75,8 +76,10 @@ struct ShmLayoutInfo {
     uint64_t mamba_mempool_size;
     uint64_t swa_lru_size;           // SlotLruEntry[swa_max_blocks]
     uint64_t mamba_lru_size;         // SlotLruEntry[mamba_max_slots]
+    uint64_t kvevent_ring_size;      // KV-event ring; 0 = disabled
     uint32_t ht_bucket_count;
     uint32_t ht_entry_capacity;
+    uint32_t kvevent_ring_capacity;  // entries; 0 = disabled
 };
 
 class RadixShmemTree {
@@ -195,6 +198,10 @@ public:
     // Optional eviction callback (RHT cleanup), fired AFTER the write lock drops.
     using EvictCallback = std::function<void(const std::vector<NodeHead>&)>;
     void set_evict_callback(EvictCallback cb) { evict_cb_ = std::move(cb); }
+
+    // KV-event ring of this region (STORED / REMOVED / CLEARED); a no-op writer without one.
+    KvEventRingWriter& kvevent_writer() { return kvevent_writer_; }
+    uint64_t kvevent_ring_offset() const;   // 0 without a ring
     // True iff node_id is live again with this first hash: the evicted id was
     // recycled (LIFO pool) for the same prefix before its RHT removal ran.
     bool node_head_matches(uint32_t node_id, uint64_t first_hash);
@@ -286,6 +293,9 @@ private:
     // Eviction-cleanup plumbing (RHT); pending buffer is thread_local.
     EvictCallback evict_cb_;
     static std::vector<NodeHead>& evicted_pending();
+    KvEventRingWriter kvevent_writer_;
+    // Hashes of the nodes detached under the lock, published as REMOVED by flush_evicted().
+    static std::vector<std::vector<uint64_t>>& evicted_blocks_pending();
     void flush_evicted();
 
     // ---- Shared memory accessors ----

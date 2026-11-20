@@ -27,6 +27,7 @@ writes them.
 from __future__ import annotations
 
 import fcntl
+import os
 import json
 import socket
 import struct
@@ -53,6 +54,7 @@ _CLUSTER_FIELDS = (
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
+_KV_EVENTS_RING = 65536  # KV-event ring entries x 14 hashes, 8 MiB of shm
 
 ROLES = ("prefill", "decode")
 
@@ -95,6 +97,12 @@ class ServerConfig:
     hugepage_path: str = ""          # hugetlbfs mount for both regions, "" = /dev/shm
     prefault: bool = True
     slot_align: int = 4096           # slot stride alignment unless the geometry brings its own
+    # Index-only only: SSD files this server creates for its clients' blocks.
+    # Slot s is block (s // D) // F of file (s // D) % F in directory s % D.
+    ssd_dirs: List[str] = field(default_factory=list)
+    ssd_bytes: int = 0               # total over ssd_dirs, 0 = the client owns its storage
+    ssd_swa_ratio: float = 0.0       # share of ssd_bytes for SWA slots
+    ssd_file_bytes: int = 0          # largest file, 0 = one file per directory and pool
     # transfer engine (distributed data mode)
     transfer_backend: str = "mooncake"  # "mooncake" | "nixl"
     transfer_protocol: str = "rdma"
@@ -114,6 +122,9 @@ class ServerConfig:
     data_pool_ratio: float = 4.0     # DataPool bytes = full_slots x ratio x (12 | 16 with SWA)
     evict_policy: str = "lru"
     writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
+    # ZMQ PUB endpoint of this node's placement stream (radixshmem.kv_events), e.g.
+    # "tcp://*:5600". Setting it also sizes the region's KV-event ring.
+    kv_events_endpoint: str = ""
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
@@ -134,6 +145,14 @@ class ServerConfig:
             raise ValueError("swa_ratio + mamba_ratio must stay below 1 to leave FULL slots")
         if self.index_only and (self.swa_ratio or self.mamba_ratio):
             raise ValueError("pool ratios need data_bytes > 0; without it the server is index only")
+        if self.ssd_bytes < 0 or self.ssd_file_bytes < 0:
+            raise ValueError("ssd_bytes and ssd_file_bytes must be >= 0")
+        if self.ssd_bytes and not self.index_only:
+            raise ValueError("SSD files need an index-only server (no data_bytes)")
+        if bool(self.ssd_bytes) != bool(self.ssd_dirs):
+            raise ValueError("ssd_bytes and ssd_dirs go together")
+        if not 0.0 <= float(self.ssd_swa_ratio) < 1.0:
+            raise ValueError("ssd_swa_ratio must be in [0, 1)")
         if self.slot_align <= 0 or self.slot_align & (self.slot_align - 1):
             raise ValueError("slot_align must be a power of two")
         if self.register_chunk_tokens <= 0:
@@ -176,6 +195,35 @@ class ServerConfig:
         if c.rpc_interface:
             return _nic_ip(c.rpc_interface)
         return c.rpc_address if c.rpc_address not in ("", "0.0.0.0") else "127.0.0.1"
+
+
+def _create_ssd_files(g: Dict[str, Any]) -> None:
+    """Create the SSD files the geometry lays out (sparse). Files of the right
+    size are kept: a fresh index never points into their old contents."""
+    want: Dict[str, int] = {}
+    for kind, layout in g["ssd"].items():
+        size = int(layout["blocks_per_file"]) * int(g["pools"][kind]["slot_bytes"])
+        for path in (p for files in layout["files"] for p in files):
+            want[path] = size
+    need: Dict[str, int] = {}
+    for path, size in want.items():
+        d = os.path.dirname(path)
+        os.makedirs(d, exist_ok=True)
+        have = os.path.getsize(path) if os.path.exists(path) else 0
+        need[d] = need.get(d, 0) + max(0, size - have)
+    for d, n in need.items():
+        st = os.statvfs(d)
+        if n > st.f_frsize * st.f_bavail:
+            raise RuntimeError(f"SSD directory {d} has {st.f_frsize * st.f_bavail} B free, "
+                               f"the files need {n} B more")
+    for path, size in want.items():
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        try:
+            if os.fstat(fd).st_size != size:
+                os.ftruncate(fd, size)
+                os.fsync(fd)
+        finally:
+            os.close(fd)
 
 
 def _nic_ip(ifname: str) -> str:
@@ -400,6 +448,7 @@ class RadixServer:
         self._cv = threading.Condition(threading.RLock())
         self._mode = MODE_STARTING
         self._index = self._iclient = self._store = self._backend = self._xfer = self._dreg = None
+        self._kv_events = None
         self._greg: Optional[_ServerRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
@@ -620,8 +669,11 @@ class RadixServer:
         self._stop_dedup_writes()
         with self._cv:
             index, store, dreg, xfer = self._index, self._store, self._dreg, self._xfer
+            publisher, self._kv_events = self._kv_events, None
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
             self._peers = {}
+        if publisher is not None:
+            publisher.close()
         if dreg is not None and index is not None:
             try:
                 dreg.unpublish(index.node_name())
@@ -685,7 +737,8 @@ class RadixServer:
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
                 mamba_ratio=float(c.mamba_ratio),
-                role=c.role)
+                role=c.role,
+                ssd_bytes=int(c.ssd_bytes))
 
     def _node_record(self) -> Dict[str, Any]:
         info = self.describe()
@@ -753,6 +806,7 @@ class RadixServer:
     def _configure_thread(self) -> None:
         try:
             self._bring_up()
+            self._start_kv_events()
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
@@ -852,7 +906,9 @@ class RadixServer:
     def _bring_up(self) -> None:
         c, g = self.cfg, self._geometry
         shm = _geometry.shm_config(g, background_evict_ratio=c.background_evict_ratio,
-                                   data_pool_ratio=c.data_pool_ratio)
+                                   data_pool_ratio=c.data_pool_ratio,
+                                   kvevent_ring_capacity=(
+                                       _KV_EVENTS_RING if c.kv_events_endpoint else 0))
         shm.evict_policy = {"lru": EvictPolicy.LRU}[c.evict_policy]
         shm.max_nodes = shm.effective_max_nodes()
         index = _core.RadixServer(self._core_config(shm, g))
@@ -869,10 +925,25 @@ class RadixServer:
             _geometry.check_attached(g, iclient, store)
         else:
             _geometry.check_attached(g, iclient, None)
+        if g.get("ssd"):
+            _create_ssd_files(g)
         with self._cv:
             self._index, self._iclient, self._store = index, iclient, store
         if store is not None and index.is_distributed():
             self._data_plane_up(index, store)
+
+    def _start_kv_events(self) -> None:
+        c, g, index = self.cfg, self._geometry, self._index
+        if not c.kv_events_endpoint:
+            return
+        from radixshmem.kv_events import KvEventPublisher
+
+        publisher = KvEventPublisher(
+            self._iclient, c.kv_events_endpoint, cluster_id=c.cluster.cluster_id,
+            node=max(index.rank(), 0), node_name=index.node_name() or c.cluster.node_name,
+            hash_scheme=_geometry.hash_scheme(g), block_size=int(g["block_size"]))
+        with self._cv:
+            self._kv_events = publisher
 
     def _data_plane_up(self, index, store) -> None:
         from radixshmem import _data

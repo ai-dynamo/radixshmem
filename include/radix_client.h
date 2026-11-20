@@ -8,8 +8,10 @@
 #include "tree_dump.h"
 #include "types.h"
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <cstdlib>
 #include <mutex>
@@ -23,6 +25,7 @@ struct RemoteHit;
 
 class LocalTreeConnector;
 class RadixServer;
+class KvEventRingReader;
 class PeerRegistry;
 class PeerIndexBackend;   // include/peer_index.h
 class RhtBackend;         // include/rht_backend.h
@@ -160,6 +163,20 @@ public:
     // without a local tree.
     PeerFaultCounters* peer_faults() const;
 
+    // ==================== KV-event ring ====================
+    // Readers of the region's placement ring (empty when it has none); each
+    // client keeps its own cursor and never blocks writers.
+    bool kvevent_enabled() const;
+    struct KvEventRecord {
+        uint32_t kind;                  // KvEventKind
+        std::vector<uint64_t> hashes;   // empty for cleared
+    };
+    struct KvEventBatch {
+        std::vector<KvEventRecord> records;
+        bool overflow = false;          // records were lost; the node's state is unknown
+    };
+    KvEventBatch kvevent_drain(size_t max_hashes = 65536);
+
     // Server-side eviction client: remove RHT entries for locally-evicted nodes
     // (only cells still matching this rank). Empty list ok; flushes at end.
     struct EvictedKey { uint64_t first_hash; uint32_t tree_node_id; };
@@ -249,6 +266,9 @@ private:
     std::mutex reset_mu_;
     void require_writable(const char* op) const;
 
+    std::unique_ptr<KvEventRingReader> kvevent_reader_;
+    KvEventRingReader* kvevent_reader();
+
     // Pin release, reachable only through a query(lock=true) finalize:
     // one PinRecord on the local tree / on peer pin.source_rank.
     void dec_ref(const uint64_t* hashes, int n, PinRecord pin);
@@ -278,6 +298,17 @@ private:
     std::shared_ptr<RemotePeer> peer_for(int rank);
     void drop_peer_session(int rank);
     RemoteStatus missing_peer_status(int rank) const;
+
+    // Landing slots of a dedup move that timed out or whose writer ran late:
+    // the source may still write them, so they are recycled only after a delay.
+    struct HeldLanding {
+        std::chrono::steady_clock::time_point until;
+        uint64_t generation = 0;   // a reset in between reinitialised the pools
+        std::vector<int32_t> slots[NUM_COMPONENT_TYPES];
+    };
+    std::mutex held_landing_mu_;
+    std::deque<HeldLanding> held_landing_;
+    void recycle_held_landing();
 
     // Step one, RHT probe from the deepest position not past the incumbent, with
     // the chunk-gap early-stop; returns best peer rank (-1 = none) plus its hints.
