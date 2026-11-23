@@ -286,7 +286,8 @@ PYBIND11_MODULE(_core, m) {
         .def_readwrite("writeback_max_held_ratio", &RadixServerConfig::writeback_max_held_ratio);
 
     // Resolve network settings in place; return a summary or raise on invalid or ambiguous choices.
-    m.def("resolve_cluster_net", &resolve_cluster_net, py::arg("cfg"));
+    m.def("resolve_cluster_net", &resolve_cluster_net, py::arg("cfg"),
+          py::call_guard<py::gil_scoped_release>());
 
     // ==================== Result types ====================
 

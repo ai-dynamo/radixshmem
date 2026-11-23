@@ -61,7 +61,8 @@ radix-server --name /my_kv_cache --data-bytes 1024G
 A cluster coordinates through etcd. By default the RHT lives in a Redis Cluster
 ([`docs/redis_deployment.md`](docs/redis_deployment.md)) and queries continue on peers over gRPC, so the index
 uses no RDMA; `RADIXSHMEM_RHT_BACKEND=rdma` and `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` move them to one-sided
-RDMA. `--transfer-dev` selects the NICs of the data plane.
+RDMA. `--transfer-dev` selects the NICs of the data plane, which runs on RDMA and does not fall back to TCP;
+a host without a usable RDMA device needs `--transfer-protocol tcp`.
 
 The address peers reach a node at is `--rpc-interface`, else `--rpc-address`, else the source IP of the route
 to the registry. An index plane on RDMA discovers a usable local device, port and GID; `RADIXSHMEM_INDEX_DEV`,

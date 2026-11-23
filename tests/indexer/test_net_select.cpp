@@ -26,6 +26,8 @@ struct FakeProbe final : NetProbe {
     bool route_ok = false;
     std::string route_src;
     int route_calls = 0;
+    std::map<std::string, std::string> routes;
+    std::vector<std::string> route_hosts;
     std::map<std::string, std::pair<std::string, std::string>> gid_types;   // "dev:port:idx" -> type, netdev
 
     std::vector<std::string> interface_addresses(const std::string& n) override {
@@ -34,8 +36,15 @@ struct FakeProbe final : NetProbe {
     }
     bool device_accessible(const std::string& d) override { return !inaccessible.count(d); }
     bool device_dc_capable(const std::string& d) override { return !no_dc.count(d); }
-    bool route_to(const std::string&, std::string& src) override {
+    bool route_to(const std::string& host, std::string& src) override {
         route_calls++;
+        route_hosts.push_back(host);
+        if (!routes.empty()) {
+            const auto found = routes.find(host);
+            if (found == routes.end()) return false;
+            src = found->second;
+            return true;
+        }
         if (!route_ok) return false;
         src = route_src;
         return true;
@@ -234,7 +243,7 @@ void test_single_and_ambiguous() {
     s = select_net(dual, in, &p);
     assert(s.index.gid_index == 5 && s.index.reason == "control-address hint" && s.control_ip == "192.168.7.23");
     in = NetSelectionInput{};
-    in.registry_host = "192.168.7.1";
+    in.registry_uri = "192.168.7.1";
     p.route_ok = true;
     p.route_src = "192.168.7.23";
     s = select_net(dual, in, &p);
@@ -279,7 +288,7 @@ void test_hints() {
     // A control interface without RDMA GIDs (management NIC) does not exclude; the route hint settles it.
     in = NetSelectionInput{};
     in.rpc_interface = "eno1";
-    in.registry_host = "10.6.131.1";
+    in.registry_uri = "10.6.131.1";
     p.addrs["eno1"] = {"10.1.1.5"};
     p.route_ok = true;
     p.route_src = "172.18.0.23";
@@ -291,7 +300,7 @@ void test_hints() {
 
     // A loopback, failed or management-net route is no hint: still ambiguous; a single candidate needs none.
     in = NetSelectionInput{};
-    in.registry_host = "127.0.0.1";
+    in.registry_uri = "127.0.0.1";
     for (const auto& [ok, src] : {std::pair{true, "127.0.0.1"}, std::pair{false, ""}, std::pair{true, "10.1.1.5"}}) {
         p.route_ok = ok;
         p.route_src = src;
@@ -315,7 +324,7 @@ void test_hints() {
     // 0.0.0.0 is published as given and never used as an index hint: the route settles it, without a note.
     in = NetSelectionInput{};
     in.rpc_address = "0.0.0.0";
-    in.registry_host = "10.6.131.1";
+    in.registry_uri = "10.6.131.1";
     p.route_ok = true;
     p.route_src = "172.18.0.23";
     s = select_net(devs, in, &p);
@@ -381,7 +390,7 @@ void test_gid_tiers() {
     std::vector<NetDevice> ibd = {ib("mlx5_ib0")};
     s = select_net(ibd, in, &p);
     assert(s.index.device == "mlx5_ib0" && s.index.gid_index == 0 && s.control_ip.empty() && !s.notes.empty());
-    in.registry_host = "10.0.0.1";
+    in.registry_uri = "10.0.0.1";
     p.route_ok = true;
     p.route_src = "10.0.0.7";
     s = select_net(ibd, in, &p);
@@ -541,7 +550,7 @@ void test_control_without_rdma() {
     probe.addrs["eth0"] = {"192.0.2.2"};
     NetSelectionInput input;
     input.need_rdma = false;
-    input.registry_host = "etcd.local";
+    input.registry_uri = "etcd.local";
     input.index_dev = "missing_device";
     input.index_port = 999;
     auto selected = select_net({}, input, &probe);
@@ -608,11 +617,59 @@ void test_index_environment() {
     printf("ok index_environment\n");
 }
 
+void test_registry_route_fallback() {
+    const std::vector<NetDevice> devices = {eth("mlx5_0", "192.0.2.1", "eth0"),
+                                          eth("mlx5_1", "192.0.2.2", "eth1")};
+    for (const auto& uri : {"etcd://bad.local:2379,good.local:2379",
+                           "bad.local:2379;etcd://good.local:2379"}) {
+        for (bool need_rdma : {false, true}) {
+            FakeProbe probe;
+            probe.routes = {{"good.local", "192.0.2.2"}};
+            NetSelectionInput input;
+            input.need_rdma = need_rdma;
+            input.registry_uri = uri;
+            auto selected = select_net(devices, input, &probe);
+            assert(selected.control_ip == "192.0.2.2" && selected.control_source == "registry route");
+            if (need_rdma) {
+                assert(selected.index.device == "mlx5_1" && selected.index.reason == "registry-route hint");
+                assert((probe.route_hosts == std::vector<std::string>{"bad.local", "good.local", "bad.local", "good.local"}));
+            } else {
+                assert(selected.index.device.empty());
+                assert((probe.route_hosts == std::vector<std::string>{"bad.local", "good.local"}));
+            }
+
+            probe.routes["bad.local"] = "127.0.0.1";
+            assert(select_net(devices, input, &probe).control_ip == "192.0.2.2");
+            probe.routes["bad.local"] = "192.0.2.1";
+            probe.route_hosts.clear();
+            selected = select_net(devices, input, &probe);
+            assert(selected.control_ip == "192.0.2.1");
+            assert(probe.route_hosts == std::vector<std::string>(need_rdma ? 2 : 1, "bad.local"));
+            if (need_rdma) assert(selected.index.device == "mlx5_0");
+
+            probe.routes.clear();
+            if (need_rdma) {
+                assert(has(throws_with(devices, input, &probe), "cannot choose the index device"));
+            } else {
+                assert(select_net(devices, input, &probe).control_ip.empty());
+            }
+
+            probe.route_hosts.clear();
+            input.rpc_address = "192.0.2.2";
+            assert(select_net(devices, input, &probe).control_ip == "192.0.2.2");
+            assert(probe.route_hosts.empty());
+        }
+    }
+    printf("ok registry_route_fallback\n");
+}
+
 void test_registry_host() {
     assert(registry_host_of("etcd://10.6.131.1:2379") == "10.6.131.1");
     assert(registry_host_of("etcd://etcd.local:2379/x") == "etcd.local");
     assert(registry_host_of("10.0.0.1:2379") == "10.0.0.1");
     assert(registry_host_of("etcd://[::1]:2379") == "::1");
+    assert(registry_host_of("etcd://10.6.131.24:2479,10.6.131.25:2479") == "10.6.131.24");
+    assert(registry_host_of("10.6.131.24:2479;etcd.b:2479") == "10.6.131.24");
     assert(registry_host_of("") == "");
     printf("ok registry_host\n");
 }
@@ -629,6 +686,7 @@ int main() {
     test_control_without_rdma();
     test_index_environment();
     test_registry_host();
+    test_registry_route_fallback();
     printf("test_net_select: all passed\n");
     return 0;
 }

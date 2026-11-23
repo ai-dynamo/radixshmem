@@ -63,7 +63,7 @@ struct NetSelectionInput {
     int         gid_idx = -1;     // -1 = choose; >= 0 is a constraint even when index_dev is empty
     std::string rpc_interface;    // control-plane NIC (explicit)
     std::string rpc_address;      // control-plane IPv4 (explicit); "0.0.0.0" is kept as given
-    std::string registry_host;    // host part of the registry uri, route hint only
+    std::string registry_uri;
     bool        need_dc = false;  // DC transport in use: only dc_capable devices qualify
     bool        need_rdma = true;
 
@@ -103,6 +103,6 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
 // Discovery + selection with the system probe.
 NetSelection resolve_net(const NetSelectionInput& in, const std::string& sys_root = "/sys");
 
-std::string registry_host_of(const std::string& uri);  // "etcd://h:p" -> "h"
+std::string registry_host_of(const std::string& uri);  // "etcd://h:p,h2:p" -> "h"
 
 }  // namespace radixshmem

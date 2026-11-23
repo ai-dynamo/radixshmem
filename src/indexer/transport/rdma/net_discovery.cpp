@@ -52,6 +52,20 @@ std::vector<std::string> list_dir(const std::string& path) {
 
 bool is_loopback(const std::string& ip) { return ip.rfind("127.", 0) == 0 || ip == "::1"; }
 
+bool registry_route(NetProbe* probe, const std::string& uri, std::string& host, std::string& src) {
+    if (!probe) return false;
+    size_t begin = 0;
+    while (begin < uri.size()) {
+        const auto end = uri.find_first_of(",;", begin);
+        host = registry_host_of(uri.substr(begin, end == std::string::npos ? end : end - begin));
+        src.clear();
+        if (!host.empty() && probe->route_to(host, src) && !src.empty() && !is_loopback(src)) return true;
+        if (end == std::string::npos) break;
+        begin = end + 1;
+    }
+    return false;
+}
+
 class SystemNetProbe final : public NetProbe {
 public:
     explicit SystemNetProbe(std::string sys_root) : sys_root_(std::move(sys_root)) {}
@@ -245,7 +259,7 @@ const GidEntry* NetDevice::gid(int index) const {
 }
 
 std::string registry_host_of(const std::string& uri) {
-    std::string s = uri;
+    std::string s = uri.substr(0, uri.find_first_of(",;"));   // the first endpoint of an etcd list
     const auto scheme = s.find("://");
     if (scheme != std::string::npos) s = s.substr(scheme + 3);
     const auto slash = s.find('/');
@@ -428,15 +442,15 @@ static NetSelection select_index(const std::vector<NetDevice>& devices, const Ne
             else cur = n;
             if (cur.size() == 1 && !n.empty()) reason = "control-address hint";
         }
-        if (cur.size() > 1 && probe && !in.registry_host.empty()) {
-            std::string src;
-            if (probe->route_to(in.registry_host, src) && !is_loopback(src)) {
+        if (cur.size() > 1 && probe && !in.registry_uri.empty()) {
+            std::string host, src;
+            if (registry_route(probe, in.registry_uri, host, src)) {
                 auto n = on_address(cur, src);
-                if (n.empty()) sel.notes.push_back("route to registry " + in.registry_host + " (" + src + ") is on no RDMA GID");
+                if (n.empty()) sel.notes.push_back("route to registry " + host + " (" + src + ") is on no RDMA GID");
                 else cur = n;
                 if (cur.size() == 1 && !n.empty()) reason = "registry-route hint";
             } else {
-                sel.notes.push_back("route to registry " + in.registry_host + " gives no usable hint");
+                sel.notes.push_back("route to registry " + in.registry_uri + " gives no usable hint");
             }
         }
         if (cur.size() != 1)
@@ -488,8 +502,8 @@ NetSelection select_net(const std::vector<NetDevice>& devices, const NetSelectio
         sel.control_ip = in.rpc_address;
         sel.control_source = "rpc_address";
     } else {
-        std::string src;
-        if (probe && !in.registry_host.empty() && probe->route_to(in.registry_host, src) && !is_loopback(src)) {
+        std::string host, src;
+        if (registry_route(probe, in.registry_uri, host, src)) {
             sel.control_ip = src;
             sel.control_source = "registry route";
         } else {

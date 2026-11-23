@@ -29,7 +29,7 @@ class RdmaTransportClient {
                         const std::string& registry = "") {
         auto input = index_net_env();
         input.need_dc = need_dc;
-        input.registry_host = registry_host_of(registry);
+        input.registry_uri = registry;
         if (self) {
             input.inherit_index(std::string(self->index_dev, strnlen(self->index_dev, sizeof(self->index_dev))),
                                 self->index_port, self->gid_index);

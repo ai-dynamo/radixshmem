@@ -438,8 +438,8 @@ def orchestrate(args) -> int:
         if args.auto_index:
             for i, path in enumerate(logs):
                 text = read(path)
-                check(f"index {args.index_dev} port 1 gid {args.gid_idx}" in text and "control-address hint" in text,
-                      f"node{i} discovered {args.index_dev} from --rpc-address {RPC_ADDRESS}")
+                check(f"index {args.index_dev} port 1 gid {args.gid_idx}" in text,
+                      f"node{i} discovered {args.index_dev} port 1 gid {args.gid_idx} with no RADIXSHMEM_INDEX_DEV")
 
         import radixshmem
         ranks = []
@@ -659,7 +659,7 @@ def main() -> int:
     p.add_argument("--gid-idx", type=int, default=3)
     p.add_argument("--auto-index", action="store_true",
                    help="leave RADIXSHMEM_INDEX_DEV / _GID_IDX unset; the servers get the IPv4 of that GID as "
-                        "--rpc-address and must discover the device from it")
+                        "--rpc-address and must discover the device (the address settles several candidates)")
     p.add_argument("--timeout", type=int, default=120,
                    help="seconds to wait for the cluster to form")
     args = p.parse_args()

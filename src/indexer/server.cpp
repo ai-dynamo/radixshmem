@@ -374,7 +374,7 @@ void RadixServer::setup_rdma(PeerEntry& e) {
     hc.net = index_net_env();
     hc.net.rpc_interface = cfg_.rpc_interface;
     hc.net.rpc_address = cfg_.rpc_address;
-    hc.net.registry_host = registry_host_of(cfg_.registry);
+    hc.net.registry_uri = cfg_.registry;
     hc.net.need_dc = hc.dc;
     rdma_ = std::make_unique<RdmaHost>(hc);
     if (walks) rdma_->expose_tree(tree_->shm_base(), tree_->shm_size());
@@ -542,7 +542,7 @@ std::string resolve_cluster_net(RadixServerConfig& cfg) {
     in.need_rdma     = false;
     in.rpc_interface = cfg.rpc_interface;
     in.rpc_address   = cfg.rpc_address;
-    in.registry_host = registry_host_of(cfg.registry);
+    in.registry_uri = cfg.registry;
     const NetSelection sel = resolve_net(in);
     if (sel.control_ip.empty())
         throw std::runtime_error("net: no IPv4 control address to publish; set rpc_address or rpc_interface");

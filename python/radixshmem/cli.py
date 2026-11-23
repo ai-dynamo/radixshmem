@@ -110,7 +110,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="do not touch every slot page at creation")
     g.add_argument("--transfer-backend", default=None, choices=["mooncake", "nixl"],
                    help="(default: mooncake)")
-    g.add_argument("--transfer-protocol", default=None, choices=["rdma", "tcp"], help="(default: rdma)")
+    g.add_argument("--transfer-protocol", default=None, choices=["rdma", "tcp"],
+                   help="rdma needs an RDMA device the engine can use and does not fall back to tcp (default: rdma)")
     g.add_argument("--transfer-dev", action="append", default=None,
                    help="HCA allowlist of the transfer engine, repeatable or comma-separated (default: all)")
     g.add_argument("--transfer-ip", default=None, help="data-plane IP (default: the rpc address)")

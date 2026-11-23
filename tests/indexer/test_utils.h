@@ -122,10 +122,10 @@ inline int reap_servers(std::vector<pid_t>& pids) {
     return unhealthy;
 }
 
-// The test host's bonded HCA for the planes that run on RDMA, unless
-// RADIXSHMEM_INDEX_DEV names another; spawned servers and clients inherit it.
+// mlx5_bond_0 GID 3 for the RDMA planes unless RADIXSHMEM_INDEX_DEV / _GID_IDX are set; children inherit it.
 inline void default_index_dev() {
     setenv("RADIXSHMEM_INDEX_DEV", "mlx5_bond_0", 0);
+    setenv("RADIXSHMEM_INDEX_GID_IDX", "3", 0);
 }
 
 inline int32_t remote_src(const radixshmem::ComponentQueryResult& r) {

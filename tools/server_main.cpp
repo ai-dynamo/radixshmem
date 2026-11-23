@@ -40,11 +40,12 @@ static void print_usage(const char* prog) {
     printf("\nDistributed options (expected-min-nodes > 1 enables distributed mode;\n");
     printf("the RHT is configured with RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with\n");
     printf("RADIXSHMEM_PEER_INDEX_BACKEND=grpc|rdma and RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=xrc|dc,\n");
-    printf("and the RDMA device of either with RADIXSHMEM_INDEX_DEV / RADIXSHMEM_INDEX_GID_IDX,\n");
+    printf("and the RDMA device of either with RADIXSHMEM_INDEX_DEV / _PORT / _GID_IDX, discovered when unset,\n");
     printf("see docs/api.md):\n");
     printf("  --expected-min-nodes <int> Nodes to wait for before the cluster forms\n");
-    printf("  --rpc-address <ip>       Bootstrap IP peers connect to (required; 0.0.0.0 for single node)\n");
-    printf("  --rpc-interface <nic>    NIC name to resolve the bootstrap IP from; wins over --rpc-address\n");
+    printf("  --rpc-address <ip>       Control IP published to peers (default: source IP of the route to\n"
+           "                           the registry; 0.0.0.0 needs --node-name)\n");
+    printf("  --rpc-interface <nic>    NIC to take the control IP from; wins over --rpc-address\n");
     printf("  --rpc-port <int>         gRPC port peers reach: remote ops, peer queries,\n"
            "                           RDMA connection setup (default: 0 = OS-assigned)\n");
     printf("  --settle-ms <int>        Membership stability window in ms (default: 500)\n");
