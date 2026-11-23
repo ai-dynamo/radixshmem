@@ -84,42 +84,14 @@ The client API, server options and environment variables are in [`docs/api.md`](
 
 ## Index on RDMA
 
-The RHT and the peer index can run on one-sided RDMA instead of Redis and gRPC. Set either variable, or both,
-in the environment of every `radix-server`; a plane left at its default keeps using Redis or gRPC, and clients
-need no settings:
-
-- `RADIXSHMEM_RHT_BACKEND=rdma`: the RHT lives in shards on the nodes, one per node by default, so no Redis
-  Cluster is needed.
-- `RADIXSHMEM_PEER_INDEX_BACKEND=rdma`: a query reads a peer's tree with one-sided RDMA instead of asking the
-  peer over gRPC.
+The index uses no RDMA by default. To run it on RDMA (no Redis needed), set on every `radix-server`:
 
 ```bash
-# Same command on every node except --rpc-address; no Redis
 export RADIXSHMEM_RHT_BACKEND=rdma
 export RADIXSHMEM_PEER_INDEX_BACKEND=rdma
-radix-server --name /my_kv_cache --data-bytes 1024G \
-    --expected-min-nodes 4 --registry etcd://10.0.0.1:2379 \
-    --rpc-address 10.0.0.10 \
-    --transfer-dev mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7
 ```
 
-Each server picks the RDMA device, port and GID of the index and logs the choice, e.g.
-`[RdmaHost] net: control 10.0.0.10 (rpc_address) | index mlx5_bond_0 port 1 gid 3 (...)`; the clients on its
-node use the same ones. A host with one usable device needs nothing more. With several, the server takes the
-one that carries the control address (`--rpc-interface`, `--rpc-address` or the route to the registry); if none
-does, startup fails and lists the candidates. Then set `RADIXSHMEM_INDEX_DEV` to the device, and
-`RADIXSHMEM_INDEX_GID_IDX` as well when its port has several IPv4 addresses (Calico VXLAN, VLAN interfaces,
-secondary IPs). The index device is independent of the data plane's `--transfer-dev`.
-
-- The QPs use XRC; `RADIXSHMEM_RHT_TRANSPORT=dc` and `RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT=dc` switch to DC,
-  which needs mlx5 NICs.
-- Rank 0's values apply to the whole cluster, and a node with other values cannot join a running cluster. To
-  switch a cluster between Redis + gRPC and RDMA, stop every node and start again after `--lease-ttl` (30 s by
-  default), or under a new `--cluster-id`.
-- The hosts need rdma-core (libibverbs, and libmlx5 for DC). In a container, the device's
-  `/dev/infiniband/uverbs*` must be mapped in.
-
-The other variables of the index on RDMA are in [`docs/api.md`](docs/api.md).
+The RDMA device and the other settings are in [`docs/api.md`](docs/api.md).
 
 ## Transfer backends
 
