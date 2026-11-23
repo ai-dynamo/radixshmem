@@ -18,12 +18,13 @@ inline bool cluster_without_rdma() {
     return (!rht || strcasecmp(rht, "redis") == 0) && (!peer || strcasecmp(peer, "grpc") == 0);
 }
 
-// Sets RADIXSHMEM_INDEX_DEV (default `def`) for the planes on RDMA and returns it;
-// exits 77 if a plane needs it and it is absent. Call at top of main(), before forking.
+// Sets RADIXSHMEM_INDEX_DEV (default `def`) and RADIXSHMEM_INDEX_GID_IDX (default 3) for the planes on RDMA
+// and returns the device; exits 77 if a plane needs it and it is absent. Call at top of main(), before forking.
 inline std::string resolve_index_dev_or_skip(const char* def) {
     const char* env = ::getenv("RADIXSHMEM_INDEX_DEV");
     std::string want = env ? env : def;
     setenv("RADIXSHMEM_INDEX_DEV", want.c_str(), 1);
+    setenv("RADIXSHMEM_INDEX_GID_IDX", "3", 0);
     if (cluster_without_rdma()) return want;
     int n = 0;
     ibv_device** list = ibv_get_device_list(&n);
