@@ -71,6 +71,10 @@ class NodeInfo:
     swa_ratio: float = 0.0
     mamba_ratio: float = 0.0
     role: str = "prefill"           # PD disaggregation role: "prefill" | "decode"
+    # Changes whenever the index starts over (a new region, a reconfiguration or a
+    # reset), so a client keeping data outside the server can tell whether the
+    # slots the index names still hold what it wrote; "" before the index is up.
+    index_id: str = ""
 
 
 @dataclass

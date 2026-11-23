@@ -30,6 +30,7 @@ import json
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -388,6 +389,7 @@ def _kind_name(kind: int) -> str:
 class RadixServer:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
+        self._index_uuid = ""
         self._wb_handler = self._make_writeback_handler()
         self._wb: Optional[_Worker] = None
         self._wb_closed = False
@@ -693,7 +695,8 @@ class RadixServer:
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
                 mamba_ratio=float(c.mamba_ratio),
-                role=c.role)
+                role=c.role,
+                index_id=f"{self._index_uuid}.{idx.reset_generation()}" if idx else "")
 
     def _node_record(self) -> Dict[str, Any]:
         info = self.describe()
@@ -869,6 +872,7 @@ class RadixServer:
         index = _core.RadixServer(self._core_config(shm, g))
         if not index.bootstrap():
             raise RuntimeError("index bootstrap failed")
+        index_uuid = uuid.uuid4().hex
         iclient = _core.RadixClient(index)
         g["index_name"] = index.shm_name()      # a cluster node's name carries "_<node_name>"
         store = None
@@ -882,6 +886,7 @@ class RadixServer:
             _geometry.check_attached(g, iclient, None)
         with self._cv:
             self._index, self._iclient, self._store = index, iclient, store
+            self._index_uuid = index_uuid
         if store is not None and index.is_distributed():
             self._data_plane_up(index, store)
 
