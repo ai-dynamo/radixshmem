@@ -70,6 +70,7 @@ set(_radixshmem_sources
     src/indexer/rht/redis_rht.cpp
     # RDMA transport plane: verbs primitives split by connection model.
     src/indexer/transport/rdma/context.cpp
+    src/indexer/transport/rdma/net_discovery.cpp
     src/indexer/transport/rdma/rc_endpoint.cpp
     src/indexer/transport/rdma/xrc.cpp
     src/indexer/transport/rdma/dc_oneside.cpp
@@ -395,6 +396,12 @@ foreach(_t ${_core_unit_tests})
     add_dependencies(${_t} radix_server)
     add_test(NAME ${_t} COMMAND ${_t})
 endforeach()
+
+# Device discovery parser + index-plane selection rules over fake sysfs / probe doubles (no hardware).
+add_executable(test_net_select tests/indexer/test_net_select.cpp)
+target_link_libraries(test_net_select PRIVATE radixshmem)
+radixshmem_enable_asserts(test_net_select)
+add_test(NAME test_net_select COMMAND test_net_select)
 
 # XRC shared-state cross-process primitive test (no radixshmem needed).
 add_executable(test_xrc_state tests/indexer/test_xrc_state.cpp)
@@ -744,6 +751,8 @@ if(BUILD_PYTHON_MODULES)
             endif()
         endforeach()
         add_test(NAME py_test_cluster COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py)
+        # No RADIXSHMEM_INDEX_DEV: the servers discover the index device from the control address.
+        add_test(NAME py_test_cluster_auto_index COMMAND ${Python3_EXECUTABLE} tests/test_cluster.py --auto-index)
         add_test(NAME py_test_p2p_pull COMMAND ${Python3_EXECUTABLE} tests/test_p2p_pull.py)
         add_test(NAME py_test_dedup_move COMMAND ${Python3_EXECUTABLE} tests/test_dedup_move.py)
         add_test(NAME py_test_writeback_pull COMMAND ${Python3_EXECUTABLE} tests/test_writeback_pull.py)
@@ -764,7 +773,7 @@ if(BUILD_PYTHON_MODULES)
                          --flush-after-insert)
         foreach(_t py_test_geometry py_test_server_rpc py_test_radixshmem py_test_geometry_registry
                    py_test_writeback py_test_monitor py_test_transfer_jobs py_test_slot_transfer
-                   py_test_cluster py_test_p2p_pull
+                   py_test_cluster py_test_cluster_auto_index py_test_p2p_pull
                    py_test_dedup_move
                    py_test_writeback_pull
                    py_test_push py_agentic_stress_1node py_agentic_stress_2node py_agentic_stress_3node_threads)

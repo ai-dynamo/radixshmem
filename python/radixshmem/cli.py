@@ -110,7 +110,8 @@ def parse_args(argv=None) -> argparse.Namespace:
                    help="do not touch every slot page at creation")
     g.add_argument("--transfer-backend", default=None, choices=["mooncake", "nixl"],
                    help="(default: mooncake)")
-    g.add_argument("--transfer-protocol", default=None, choices=["rdma", "tcp"], help="(default: rdma)")
+    g.add_argument("--transfer-protocol", default=None, choices=["rdma", "tcp"],
+                   help="rdma needs an RDMA device the engine can use and does not fall back to tcp (default: rdma)")
     g.add_argument("--transfer-dev", action="append", default=None,
                    help="HCA allowlist of the transfer engine, repeatable or comma-separated (default: all)")
     g.add_argument("--transfer-ip", default=None, help="data-plane IP (default: the rpc address)")
@@ -150,14 +151,15 @@ def parse_args(argv=None) -> argparse.Namespace:
     g = p.add_argument_group("distributed (--expected-min-nodes > 1; the RHT is configured with "
                              "RADIXSHMEM_RHT_* and RADIXSHMEM_REDIS_*, the peer index with "
                              "RADIXSHMEM_PEER_INDEX_*, the RDMA device of either with "
-                             "RADIXSHMEM_INDEX_DEV / _GID_IDX, see docs/api.md)")
+                             "RADIXSHMEM_INDEX_DEV / _PORT / _GID_IDX, see docs/api.md)")
     g.add_argument("--expected-min-nodes", type=int, default=0)
     g.add_argument("--settle-ms", type=int, default=500)
     g.add_argument("--registry", default="etcd://127.0.0.1:2379")
     g.add_argument("--cluster-id", default="default")
     g.add_argument("--node-name", default="")
-    g.add_argument("--rpc-address", default="", help="bootstrap IP peers dial; 0.0.0.0 on one host")
-    g.add_argument("--rpc-interface", default="", help="NIC to resolve the bootstrap IP from")
+    g.add_argument("--rpc-address", default="",
+                   help="control IP peers dial (default: source IP of the registry route); 0.0.0.0 on one host")
+    g.add_argument("--rpc-interface", default="", help="NIC to resolve the control IP from (wins over --rpc-address)")
     g.add_argument("--rpc-port", type=int, default=0,
                    help="port of the gRPC endpoint peers reach: remote ops, peer queries, "
                         "RDMA connection setup (default: 0 = OS-assigned)")

@@ -8,6 +8,7 @@
 
 #include "cluster_manifest.h"   // PeerEntry
 #include "rdma_transport.hpp"
+#include "net_discovery.hpp"
 
 #include <cstddef>
 #include <cstdlib>
@@ -22,20 +23,22 @@ class RdmaTransportClient {
   public:
     static constexpr size_t BUF_SIZE = 1 << 20;
 
-    // Open the device, size the CQ for `world_size` peers, and register a
-    // scratch buffer of `buf_size` bytes (0 = none). QoS is adopted before any
-    // QP connect. The device and GID index: RADIXSHMEM_INDEX_DEV / _GID_IDX, else
-    // what `self` (this node's /peers entry, null for an observer) published,
-    // else the first device and GID index 3.
+    // Environment constraints override the local server's settings; observers use discovery.
     RdmaTransportClient(const PeerEntry* self, int sl, int tc, int world_size,
-                        size_t buf_size = BUF_SIZE) {
-        IndexDevice d = index_device_env();
-        const bool published = self && self->index_dev[0] != '\0';
-        if (d.dev.empty() && published)
-            d.dev.assign(self->index_dev, strnlen(self->index_dev, sizeof(self->index_dev)));
-        if (d.gid_idx < 0) d.gid_idx = published ? self->gid_index : 3;
-        ctx_ = std::make_unique<RdmaContext>(d.dev.empty() ? nullptr : d.dev.c_str(), 1,
-                                             d.gid_idx);
+                        size_t buf_size = BUF_SIZE, bool need_dc = false,
+                        const std::string& registry = "") {
+        auto input = index_net_env();
+        input.need_dc = need_dc;
+        input.registry_uri = registry;
+        if (self) {
+            input.inherit_index(std::string(self->index_dev, strnlen(self->index_dev, sizeof(self->index_dev))),
+                                self->index_port, self->gid_index);
+            input.rpc_address.assign(self->host, strnlen(self->host, sizeof(self->host)));
+        }
+        const auto selected = resolve_net(input);
+        fprintf(stderr, "[RdmaTransportClient] net: %s\n", selected.summary().c_str());
+        ctx_ = std::make_unique<RdmaContext>(selected.index.device.c_str(), selected.index.port,
+                                            selected.index.gid_index);
         ctx_->set_qos(sl, tc);
         int cq_depth = std::max(256, world_size * 128);
         cq_ = ibv_create_cq(ctx_->ctx(), cq_depth, nullptr, nullptr, 0);

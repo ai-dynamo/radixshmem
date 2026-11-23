@@ -61,7 +61,11 @@ radix-server --name /my_kv_cache --data-bytes 1024G
 A cluster coordinates through etcd. By default the RHT lives in a Redis Cluster
 ([`docs/redis_deployment.md`](docs/redis_deployment.md)) and queries continue on peers over gRPC, so the index
 uses no RDMA; `RADIXSHMEM_RHT_BACKEND=rdma` and `RADIXSHMEM_PEER_INDEX_BACKEND=rdma` move them to one-sided
-RDMA. `--transfer-dev` selects the NICs of the data plane.
+RDMA ([Index on RDMA](#index-on-rdma)). `--transfer-dev` selects the NICs of the data plane, which runs on RDMA
+and does not fall back to TCP; a host without a usable RDMA device needs `--transfer-protocol tcp`.
+
+The address peers reach a node at is `--rpc-interface`, else `--rpc-address`, else the source IP of the route
+to the registry.
 
 ```bash
 # Same command on every node except --rpc-address
@@ -77,6 +81,17 @@ disaggregation, decode nodes add `--decode`; prefill nodes then write the KV the
 back to a decode node instead of dropping it.
 
 The client API, server options and environment variables are in [`docs/api.md`](docs/api.md).
+
+## Index on RDMA
+
+The index uses no RDMA by default. To run it on RDMA (no Redis needed), set on every `radix-server`:
+
+```bash
+export RADIXSHMEM_RHT_BACKEND=rdma
+export RADIXSHMEM_PEER_INDEX_BACKEND=rdma
+```
+
+The RDMA device and the other settings are in [`docs/api.md`](docs/api.md).
 
 ## Transfer backends
 

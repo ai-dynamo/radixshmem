@@ -350,7 +350,7 @@ def _publisher(backend, shm, protocol, fds, devices=()):
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
-    if x.register_store("cpu:0") != radixshmem._data.XFER_OK:
+    if x.register_store() != radixshmem._data.XFER_OK:
         return 3
 
     for i in range(SLOTS):
@@ -382,7 +382,7 @@ def _initiator(backend, shm, protocol, fds, devices=()):
     if be is None:
         return 2
     x = radixshmem._data.SlotTransfer(s, be)
-    if x.register_store("cpu:0") != radixshmem._data.XFER_OK:
+    if x.register_store() != radixshmem._data.XFER_OK:
         return 3
 
     peer = _read_str(name_r)
@@ -521,9 +521,10 @@ def test_e2e_device_filter():
         print("  SKIP: e2e_device_filter (no RDMA device in sysfs)")
         return
     assert _run_e2e("rdma", "dev1", [devs[0]])
-    # An allowlist, intersected with what the host has -- not a list of
-    # requirements, so a name that does not exist costs nothing.
+    # Missing allowlist entries do not prevent transfers through the remaining device.
     assert _run_e2e("rdma", "dev2", [devs[0], "mlx5_no_such_device"])
+    # No usable allowed device must fail rather than fall back to TCP.
+    assert not _run_e2e("rdma", "dev_none", ["mlx5_no_such_device"])
     print("  PASS: e2e_device_filter")
 
 

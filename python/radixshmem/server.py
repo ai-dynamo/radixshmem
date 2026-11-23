@@ -26,10 +26,7 @@ writes them.
 
 from __future__ import annotations
 
-import fcntl
 import json
-import socket
-import struct
 import sys
 import threading
 import time
@@ -62,15 +59,15 @@ class ClusterConfig:
     """etcd rendezvous of the index (see _core.RadixServerConfig). Distributed
     when expected_min_nodes > 1; the RHT is configured with RADIXSHMEM_RHT_* and
     RADIXSHMEM_REDIS_*, the peer index with RADIXSHMEM_PEER_INDEX_*, and the RDMA
-    device of either with RADIXSHMEM_INDEX_DEV / _GID_IDX (docs/api.md)."""
+    device of either with RADIXSHMEM_INDEX_DEV / _PORT / _GID_IDX (docs/api.md)."""
 
     expected_min_nodes: int = 0
     settle_ms: int = 500
     registry: str = "etcd://127.0.0.1:2379"
     cluster_id: str = "default"
     node_name: str = ""
-    rpc_address: str = ""
-    rpc_interface: str = ""
+    rpc_address: str = ""             # control IP from rpc_interface, else the registry route
+    rpc_interface: str = ""           # wins over rpc_address
     rpc_port: int = 0                 # gRPC endpoint peers reach, 0 = OS-assigned
     bootstrap_timeout_sec: int = 60
     lease_ttl_sec: int = 30           # etcd lease TTL of the node and of the cluster keys
@@ -170,21 +167,16 @@ class ServerConfig:
         return self.endpoint or rpc.endpoint_for(self.name)
 
     def resolved_transfer_ip(self) -> str:
+        """Use transfer_ip or the resolved control address, mapping only 0.0.0.0 to loopback."""
         if self.transfer_ip:
             return self.transfer_ip
-        c = self.cluster
-        if c.rpc_interface:
-            return _nic_ip(c.rpc_interface)
-        return c.rpc_address if c.rpc_address not in ("", "0.0.0.0") else "127.0.0.1"
-
-
-def _nic_ip(ifname: str) -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        packed = fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", ifname[:15].encode()))
-    finally:
-        s.close()
-    return socket.inet_ntoa(packed[20:24])
+        a = self.cluster.rpc_address
+        if a == "0.0.0.0":
+            return "127.0.0.1"
+        if not a:
+            raise ValueError("no control address to publish for the transfer engine; "
+                             "set transfer_ip or cluster.rpc_address / rpc_interface")
+        return a
 
 
 class _ServerRegistry:
@@ -467,11 +459,21 @@ class RadixServer:
             from radixshmem import _data  # noqa: F401 - data mode needs the SlotStore extension
         if not c.distributed:
             return
-        if not (c.cluster.rpc_address or c.cluster.rpc_interface):
-            raise ValueError("distributed mode requires cluster.rpc_address or cluster.rpc_interface")
+        self._resolve_net()
         self._greg = _ServerRegistry(c.cluster.registry, c.cluster.cluster_id)
         if not c.index_only:
             self._backend = self._make_backend()
+
+    def _resolve_net(self) -> None:
+        """Normalize cluster settings before publishing or dialing any address."""
+        cl = self.cfg.cluster
+        cc = _core.RadixServerConfig()
+        for k in _CLUSTER_FIELDS:
+            setattr(cc, k, getattr(cl, k))
+        summary = _core.resolve_cluster_net(cc)
+        for k in _CLUSTER_FIELDS:
+            setattr(cl, k, getattr(cc, k))
+        print(f"[radixshmem] net: {summary}", file=sys.stderr, flush=True)
 
     def _start_monitor(self) -> None:
         c = self.cfg
@@ -479,8 +481,6 @@ class RadixServer:
             return
         from radixshmem.monitor import MonitorProcess
         host = c.cluster.rpc_address if c.cluster.rpc_address not in ("", "0.0.0.0") else ""
-        if c.cluster.rpc_interface:
-            host = _nic_ip(c.cluster.rpc_interface)
         self.monitor = MonitorProcess(c, host)   # a child process: no share of this one's GIL
 
     def _make_backend(self):
@@ -744,11 +744,11 @@ class RadixServer:
 
     def _node_key(self) -> str:
         """This node's name under nodes/: the configured node_name, else the
-        one the index derives from its bind IP (node<ip>)."""
+        one the index derives from its published IP (node<ip>)."""
         c = self.cfg.cluster
         if c.node_name:
             return c.node_name
-        return "node" + (_nic_ip(c.rpc_interface) if c.rpc_interface else c.rpc_address)
+        return "node" + c.rpc_address
 
     def _configure_thread(self) -> None:
         try:
@@ -879,7 +879,7 @@ class RadixServer:
 
         c = self.cfg
         xfer = _data.SlotTransfer(store, self._backend)
-        rc = xfer.register_store("cpu:0")
+        rc = xfer.register_store()   # the backend places the pool on its own NUMA node
         if rc != _data.XFER_OK:
             raise RuntimeError(f"register_store failed rc={rc}")
         dreg = _data.DataPlaneRegistry(c.cluster.registry, c.cluster.cluster_id)

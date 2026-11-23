@@ -10,6 +10,7 @@
 #include "bilateral_transport.h"   // XrcConnInfo
 #include "cluster_manifest.h"      // PeerEntry
 #include "rdma_transport.hpp"
+#include "net_discovery.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -19,9 +20,8 @@
 
 namespace radixshmem {
 
-// The device and GID index come from RADIXSHMEM_INDEX_DEV / _GID_IDX (default:
-// the first device, GID index 3).
 struct RdmaHostConfig {
+    NetSelectionInput net;
     int         sl = 5;         // the cluster's QoS
     int         tc = 160;
     bool        dc = false;     // also a DC target

@@ -60,9 +60,9 @@ The layout of one tree, fixed when the server creates it; processes that attach 
 | `world_size` | `int` | `1` | Output: the cluster's node count after `bootstrap()`. On input, > 1 selects cluster mode. |
 | `registry` | `std::string` | `"etcd://127.0.0.1:2379"` | etcd endpoint. |
 | `cluster_id` | `std::string` | `"default"` | etcd key namespace, `radix/<cluster_id>/`. With the Redis RHT it may not contain `{` or `}`. |
-| `node_name` | `std::string` | `""` | The node's identity in etcd; empty = `node<bind IP>`. |
-| `rpc_address` | `std::string` | `""` | IPv4 address published to peers; `"0.0.0.0"` for tests on one host. |
-| `rpc_interface` | `std::string` | `""` | NIC whose IPv4 address to publish; takes precedence over `rpc_address`. |
+| `node_name` | `std::string` | `""` | The node's identity in etcd; empty = `node<control IP>`. |
+| `rpc_address` | `std::string` | `""` | IPv4 address published to peers; `"0.0.0.0"` for tests on one host (then `node_name` is required). Empty: the address of `rpc_interface`, else the source address of the route to the registry; `bootstrap()` writes the result back. |
+| `rpc_interface` | `std::string` | `""` | NIC whose IPv4 address to publish; takes precedence over `rpc_address`. In cluster mode, if the NIC has several IPv4 addresses, `rpc_address` must select one of them. It also narrows an RDMA index device to the GIDs of that NIC. See the single-node behavior below. |
 | `rpc_port` | `uint16_t` | `0` | Port of the gRPC endpoint peers reach (remote operations, the grpc peer index, RDMA connection setup); `0` = chosen by the OS. A single-node server starts no endpoint. |
 | `expected_min_nodes` | `int` | `0` | `bootstrap()` waits until this many nodes (with the RDMA RHT, at least `RADIXSHMEM_RHT_SHARDS`) have registered and stayed unchanged for `settle_ms`. > 1 selects cluster mode. |
 | `settle_ms` | `int` | `500` | See `expected_min_nodes`. |
@@ -72,7 +72,13 @@ The layout of one tree, fixed when the server creates it; processes that attach 
 | `writeback_enabled` | `bool` | `false` | Background eviction holds evicted slots for write-back; see [write-back queue](#write-back-queue). |
 | `writeback_max_held_ratio` | `float` | `0.05` | Background eviction pauses while unfinished write-backs hold this share of a pool. |
 
-Cluster mode is `expected_min_nodes > 1 || world_size > 1`. It needs `rpc_address` or `rpc_interface`; without them `bootstrap()` throws `std::runtime_error`. `RADIXSHMEM_REGISTRY`, `RADIXSHMEM_CLUSTER_ID` and `RADIXSHMEM_NODE_NAME` override `registry`, `cluster_id` and `node_name`.
+Cluster mode is `expected_min_nodes > 1 || world_size > 1`. `resolve_cluster_net()` (in Python, `_core.resolve_cluster_net`) settles the control address first: `rpc_interface`, then `rpc_address`, then the route to the registry; it throws `std::runtime_error` when none gives an IPv4 address, or when `0.0.0.0` is published without `node_name`. RDMA device discovery runs afterwards, only for an RDMA RHT or peer index, and throws with the candidate list when the choice is ambiguous. `RADIXSHMEM_REGISTRY`, `RADIXSHMEM_CLUSTER_ID` and `RADIXSHMEM_NODE_NAME` override `registry`, `cluster_id` and `node_name`.
+
+**Multiple IPv4 addresses:** in cluster mode, `rpc_interface` with several IPv4 addresses is an error unless `rpc_address` matches one of them. Single-node bootstrap retains `resolve_publish_ip()`: it takes the first IPv4 returned by `getifaddrs()` for the interface and ignores `rpc_address` when both are set. That result only supplies the default node identity in this bootstrap path; no cluster endpoint is started. For a stable single-node identity, set `node_name`; to select a specific address instead, leave `rpc_interface` empty and set `rpc_address`. The registry-route fallback and resolved-address write-back described above apply to cluster mode only.
+
+**Registry route hints:** for a comma- or semicolon-separated endpoint list, discovery tries hosts in order and uses the first route with a non-loopback IPv4 source address. DNS or route lookup failure advances to the next endpoint. This applies to both control-address fallback and RDMA index hints; it does not check etcd service health or prove RDMA reachability.
+
+**Upgrade note — node names:** in cluster mode, `RADIXSHMEM_NODE_NAME` now overrides the node name before shm creation, so it affects both the registry identity and the `<name>_<node_name>` shm name. Previously, this environment override changed only the registry identity. Check client configurations that attach by an explicit shm name and cleanup scripts that use the old name when upgrading.
 
 ### 1.3 `RadixClientConfig`
 
@@ -91,6 +97,8 @@ C++ only. `RadixClient(const RadixClientConfig&)` finds its node's shm through e
 
 Missing `/config`, an unknown `node_name`, a membership timeout or a failed connection throw `std::runtime_error`.
 
+**Upgrade note — RDMA observers:** an observer (`no_local_tree = true`, rank `-1`) has no local server's device, port or GID to inherit. It uses local discovery and the registry-route hint instead of the previous first-device / GID 3 fallback. If several devices or GIDs remain, set `RADIXSHMEM_INDEX_DEV` and, when needed, `RADIXSHMEM_INDEX_PORT` / `RADIXSHMEM_INDEX_GID_IDX`. This applies only to an RDMA RHT or peer index; the default Redis + gRPC index needs no RDMA configuration.
+
 ### 1.4 Environment variables
 
 The RHT (radix hash table) maps a prefix to the nodes that hold it; a query that finds more on another node continues there through the peer index. Rank 0's values of the RHT, peer index and RDMA QoS variables (`RADIXSHMEM_RHT_*`, `RADIXSHMEM_REDIS_ADDRS`, `RADIXSHMEM_REDIS_TIMEOUT_MS`, `RADIXSHMEM_PEER_INDEX_BACKEND`, `RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT`, `RADIXSHMEM_RDMA_SL`, `RADIXSHMEM_RDMA_TC`) apply to the whole cluster: other servers' values are ignored with a warning, and clients need none. A node that joins a running cluster with a different RHT or peer index setting is refused. With the defaults, the Redis RHT and the grpc peer index, the index uses no RDMA device.
@@ -108,8 +116,9 @@ The RHT (radix hash table) maps a prefix to the nodes that hold it; a query that
 | `RADIXSHMEM_PEER_INDEX_BACKEND` | `grpc` | `grpc`: the peer matches the hashes in one RPC. `rdma`: the caller reads the peer's tree with one-sided RDMA. |
 | `RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT` | `xrc` | rdma peer index: `xrc` or `dc`. |
 | `RADIXSHMEM_PEER_INDEX_TIMEOUT_MS` | `500` | grpc peer index: deadline of one query or release; read by each client process. |
-| `RADIXSHMEM_INDEX_DEV` | first device | RDMA device of the planes that run on RDMA. A client without it uses the device its server published. |
-| `RADIXSHMEM_INDEX_GID_IDX` | `3` | GID index on that device (3 = RoCE v2 over IPv4). |
+| `RADIXSHMEM_INDEX_DEV` | auto | RDMA device of the planes that run on RDMA; read only when the cluster selects an RDMA RHT or peer index. A server discovers an accessible ACTIVE port and publishes device, port and GID in `/peers`; a client without the variables inherits them. Several usable devices without a hint fail with the candidate list; `rpc_interface`, `rpc_address` and the route to the registry narrow the choice. A port with several IPv4 addresses (Calico VXLAN, VLAN interfaces, secondary IPs) has a GID for each, so naming the device is not enough there: set `RADIXSHMEM_INDEX_GID_IDX`, or make the control address one of them. |
+| `RADIXSHMEM_INDEX_PORT` | auto | Port of that device (1–255). |
+| `RADIXSHMEM_INDEX_GID_IDX` | auto | GID index (0–255). Without it, per port: RoCE v2 IPv4, then RoCE v2 global IPv6, RoCE v1 IPv4, RoCE v1 global IPv6; InfiniBand takes an IB GID. Link-local and unknown-type GIDs need an explicit index. |
 | `RADIXSHMEM_RDMA_SL`, `RADIXSHMEM_RDMA_TC` | `5`, `160` | Service level and traffic class of the index's RDMA traffic. |
 | `RADIXSHMEM_LAZY_CONNECT` | `0` | `1`: connect to a peer over RDMA on first use instead of at startup. |
 | `RADIXSHMEM_REMOTE_OP_TIMEOUT_MS` | `5000` | Client deadline of one remote operation. |
@@ -130,7 +139,7 @@ RadixServer(const std::string& name, const ShmConfig& cfg = ShmConfig{});
 bool bootstrap();
 ```
 
-The first constructor only stores `cfg`. `bootstrap()` creates the shm, starts background eviction and, in cluster mode, registers the node in etcd, waits for the other nodes (`expected_min_nodes`), takes a rank and starts the endpoint peers reach. It blocks until the node is ready and returns `false` on failure (etcd unreachable, membership timeout, RDMA failure); the server is then unusable. The second constructor creates a single-node server and bootstraps it. All nodes and clients of a cluster must run the same version.
+The first constructor only stores `cfg`. `bootstrap()` creates the shm, starts background eviction and, in cluster mode, registers the node in etcd, waits for the other nodes (`expected_min_nodes`), takes a rank and starts the endpoint peers reach. It blocks until the node is ready and returns `false` on failure (etcd unreachable, membership timeout, RDMA failure); the server is then unusable. An unresolvable control address or an ambiguous RDMA device choice throws `std::runtime_error` instead. The second constructor creates a single-node server and bootstraps it. All nodes and clients of a cluster must run the same version.
 
 The destructor stops background eviction, leaves the cluster and unlinks the shm; attached processes keep their mapping until they detach.
 

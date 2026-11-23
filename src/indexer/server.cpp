@@ -12,6 +12,7 @@
 #include "local.h"
 #include "radix_tree.h"
 #include "net_util.hpp"
+#include "net_discovery.hpp"
 
 #include "radix_client.h"
 #include "cluster_manifest.h"
@@ -177,7 +178,7 @@ void RadixServer::fill_local_entry(PeerEntry& e) const {
     e.rank = cfg_.rank;
     e.rht_shard_id = -1;   // overwritten by setup_local_rht_shard on holders
 
-    const char* host = bind_ip_.empty() ? "127.0.0.1" : bind_ip_.c_str();
+    const char* host = publish_ip_.empty() ? "127.0.0.1" : publish_ip_.c_str();
     std::strncpy(e.host, host, sizeof(e.host) - 1);
     e.shm_size = (uint64_t)tree_->shm_size();
 
@@ -370,6 +371,11 @@ void RadixServer::setup_rdma(PeerEntry& e) {
                  (walks && peer_index_transport_ == CLUSTER_TRANSPORT_DC);
     hc.dc_access_key = dc_access_key_;
     hc.rank    = cfg_.rank;
+    hc.net = index_net_env();
+    hc.net.rpc_interface = cfg_.rpc_interface;
+    hc.net.rpc_address = cfg_.rpc_address;
+    hc.net.registry_uri = cfg_.registry;
+    hc.net.need_dc = hc.dc;
     rdma_ = std::make_unique<RdmaHost>(hc);
     if (walks) rdma_->expose_tree(tree_->shm_base(), tree_->shm_size());
     rdma_->publish_to(e);
@@ -525,6 +531,29 @@ RadixServer::~RadixServer() {
     if (tree_) { tree_->destroy(); tree_.reset(); }
 }
 
+std::string resolve_cluster_net(RadixServerConfig& cfg) {
+    if (const char* value = ::getenv("RADIXSHMEM_REGISTRY"))
+        cfg.registry = value;
+    if (const char* value = ::getenv("RADIXSHMEM_CLUSTER_ID"))
+        cfg.cluster_id = value;
+    if (const char* value = ::getenv("RADIXSHMEM_NODE_NAME"))
+        cfg.node_name = value;
+    NetSelectionInput in;
+    in.need_rdma     = false;
+    in.rpc_interface = cfg.rpc_interface;
+    in.rpc_address   = cfg.rpc_address;
+    in.registry_uri = cfg.registry;
+    const NetSelection sel = resolve_net(in);
+    if (sel.control_ip.empty())
+        throw std::runtime_error("net: no IPv4 control address to publish; set rpc_address or rpc_interface");
+    // Every unnamed server on the host would become node0.0.0.0 and share its shm name.
+    if (sel.control_ip == "0.0.0.0" && cfg.node_name.empty())
+        throw std::runtime_error("net: publishing 0.0.0.0 needs a node_name (or RADIXSHMEM_NODE_NAME): "
+                                 "the identity derived from the address is the same for every node on the host");
+    cfg.rpc_address = sel.control_ip;
+    return sel.summary();
+}
+
 bool RadixServer::bootstrap() {
     const bool distributed = want_cluster(cfg_);
     const float held_ratio = cfg_.writeback_max_held_ratio;
@@ -539,18 +568,20 @@ bool RadixServer::bootstrap() {
     shm.register_chunk_tokens = cfg_.register_chunk_tokens;
     shm.max_nodes = shm.effective_max_nodes();
 
-    // Bootstrap IP peers connect to: interface (wins) or explicit address.
-    // Required in distributed mode; the resolved IP also seeds node_name.
-    std::string bind_ip = resolve_bind_ip(cfg_.rpc_address, cfg_.rpc_interface);
-    if (distributed && bind_ip.empty())
-        throw std::runtime_error(
-            "RadixServer: distributed mode requires --rpc-address <ip> or "
-            "--rpc-interface <nic> (use 0.0.0.0 for a single-node test)");
+    // Resolve network settings before publishing or dialing any cluster address.
+    std::string publish_ip;
+    if (distributed) {
+        const std::string net = resolve_cluster_net(cfg_);
+        fprintf(stderr, "[RadixServer] net: %s\n", net.c_str());
+        publish_ip = cfg_.rpc_address;
+    } else {
+        publish_ip = resolve_publish_ip(cfg_.rpc_address, cfg_.rpc_interface);
+    }
 
-    // Node identity: explicit node_name, else derived from the bind IP (node<ip>).
+    // Node identity: explicit node_name, else derived from the published IP (node<ip>).
     std::string node_name = cfg_.node_name;
     if (node_name.empty())
-        node_name = "node" + bind_ip;
+        node_name = "node" + publish_ip;
     cfg_.node_name = node_name;
 
     // Shm name is identity-based; multiple nodes on one host disambiguate by identity.
@@ -566,15 +597,7 @@ bool RadixServer::bootstrap() {
     start_evictor();
 
     if (distributed) {
-        bind_ip_ = bind_ip;   // published as PeerEntry.host
-
-        // Deployment-level env overrides.
-        if (const char* r = ::getenv("RADIXSHMEM_REGISTRY"))
-            cfg_.registry = r;
-        if (const char* c = ::getenv("RADIXSHMEM_CLUSTER_ID"))
-            cfg_.cluster_id = c;
-        if (const char* n = ::getenv("RADIXSHMEM_NODE_NAME"))
-            cfg_.node_name = n;
+        publish_ip_ = publish_ip;   // published as PeerEntry.host
 
         if (!cluster_bootstrap()) {
             rc_stop();

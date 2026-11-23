@@ -363,10 +363,13 @@ static void test_device_filter() {
 
     assert(run_loopback("rdma", "dev1", {devs[0]}));
 
-    // A list, and one entry that does not exist: the filter is an allowlist
-    // intersected with what the host has, not a list of requirements, so the
-    // real device survives and the transfers still land.
-    assert(run_loopback("rdma", "dev2", {devs[0], "mlx5_no_such_device"}));
+    // Missing allowlist entries do not prevent transfers through the remaining device.
+    assert(run_loopback("rdma", "dev_partial", {devs[0], "mlx5_no_such_device"}));
+
+    // No usable allowed device must fail rather than fall back to TCP.
+    assert(child_succeeds([&] {
+        assert(!create_transfer_backend(mc_cfg(true, "rdma", 0, {"mlx5_no_such_device"})));
+    }));
 
     TEST_PASS();
 }

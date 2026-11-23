@@ -15,6 +15,7 @@ Clients are re-exec'd, never fork()'d: the etcd Go wrapper starts its runtime
 at library load and a bare-forked child deadlocks on the first cgo call.
 
 Exit code 0 = pass.
+Redis + gRPC needs no RDMA device; RDMA index backends require the selected index device (exit 77 when missing).
 """
 
 import argparse
@@ -228,6 +229,22 @@ def start_etcd(workdir: str):
     raise RuntimeError("etcd did not come up")
 
 
+RPC_ADDRESS = "0.0.0.0"   # --auto-index replaces it with the IPv4 of the index device's GID
+
+
+def gid_ipv4(dev, gid_idx):
+    """IPv4 of a RoCE GID as sysfs prints it (::ffff:a.b.c.d), '' when absent."""
+    try:
+        with open(f"/sys/class/infiniband/{dev}/ports/1/gids/{gid_idx}") as f:
+            gid = f.read().strip()
+    except OSError:
+        return ""
+    if not gid.startswith("0000:0000:0000:0000:0000:ffff:"):
+        return ""
+    hi, lo = gid.split(":")[6:8]
+    return ".".join(str(int(x, 16)) for x in (hi[:2], hi[2:], lo[:2], lo[2:]))
+
+
 def server_cmd(i, n, registry, cluster_id, workdir, decode=None):
     cmd = [
         sys.executable, "-m", "radixshmem.cli",
@@ -236,7 +253,7 @@ def server_cmd(i, n, registry, cluster_id, workdir, decode=None):
         "--registry", registry,
         "--cluster-id", cluster_id,
         "--expected-min-nodes", str(n),
-        "--rpc-address", "0.0.0.0",
+        "--rpc-address", RPC_ADDRESS,
         # several servers on one host: the default socket is per name, not per node
         "--endpoint", endpoint(workdir, i),
         "--lease-ttl", str(LEASE_TTL),
@@ -371,12 +388,33 @@ def check(cond, msg):
     print(f"  ok  {msg}")
 
 
+def prerequisite_error(index_dev, transfer_devices=None):
+    import radixshmem
+
+    if not shutil.which("etcd") or not hasattr(radixshmem._core, "EtcdKv"):
+        return "needs etcd and radixshmem built with etcd"
+    index_rdma = (os.environ.get("RADIXSHMEM_RHT_BACKEND", "redis") == "rdma" or
+                  os.environ.get("RADIXSHMEM_PEER_INDEX_BACKEND", "grpc").lower() == "rdma")
+    if not index_rdma and transfer_devices is None:
+        return ""
+    devices = {os.path.basename(path) for path in glob.glob("/sys/class/infiniband/*")}
+    if index_rdma and (index_dev not in devices if index_dev else not devices):
+        return f"needs RDMA index device {index_dev!r}" if index_dev else "needs an RDMA index device"
+    if transfer_devices is not None:
+        if "mooncake" not in getattr(getattr(radixshmem, "_data", None), "TRANSFER_BACKENDS", ()):
+            return "needs radixshmem built with Mooncake"
+        allowed = {device.strip() for value in transfer_devices for device in value.split(",") if device.strip()}
+        if not (devices & allowed if allowed else devices):
+            return f"needs an RDMA transfer device from {sorted(allowed) or 'all local devices'}"
+    return ""
+
+
 def orchestrate(args) -> int:
     import radixshmem
 
-    if (not shutil.which("etcd") or not os.path.isdir(f"/sys/class/infiniband/{args.index_dev}")
-            or not hasattr(radixshmem._core, "EtcdKv")):
-        print(f"SKIP: needs etcd, RDMA device {args.index_dev!r} and radixshmem built with etcd")
+    missing = prerequisite_error(args.index_dev)
+    if missing:
+        print(f"SKIP: {missing}")
         return 77
     workdir = tempfile.mkdtemp(prefix="radixshmem-cluster-")
     cluster_id = f"pytest{os.getpid()}"
@@ -397,6 +435,11 @@ def orchestrate(args) -> int:
                   f"node{i} lists every node's role before any geometry")
         configure_all(args.nodes, workdir)
         wait_banner(servers, logs, "Cluster ready", args.timeout)
+        if args.auto_index:
+            for i, path in enumerate(logs):
+                text = read(path)
+                check(f"index {args.index_dev} port 1 gid {args.gid_idx}" in text,
+                      f"node{i} discovered {args.index_dev} port 1 gid {args.gid_idx} with no RADIXSHMEM_INDEX_DEV")
 
         import radixshmem
         ranks = []
@@ -614,15 +657,27 @@ def main() -> int:
     p.add_argument("--rht-transport", default="xrc", choices=["xrc", "dc"])
     p.add_argument("--peer-index-rdma-transport", default="xrc", choices=["xrc", "dc"])
     p.add_argument("--gid-idx", type=int, default=3)
+    p.add_argument("--auto-index", action="store_true",
+                   help="leave RADIXSHMEM_INDEX_DEV / _GID_IDX unset; the servers get the IPv4 of that GID as "
+                        "--rpc-address and must discover the device (the address settles several candidates)")
     p.add_argument("--timeout", type=int, default=120,
                    help="seconds to wait for the cluster to form")
     args = p.parse_args()
     # The RDMA RHT's and the rdma peer index's transports; the servers inherit them.
     os.environ["RADIXSHMEM_RHT_TRANSPORT"] = args.rht_transport
     os.environ["RADIXSHMEM_PEER_INDEX_RDMA_TRANSPORT"] = args.peer_index_rdma_transport
-    # The device of the planes that run on RDMA; the servers inherit it.
-    os.environ["RADIXSHMEM_INDEX_DEV"] = args.index_dev
-    os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(args.gid_idx)
+    if args.auto_index:
+        global RPC_ADDRESS
+        RPC_ADDRESS = gid_ipv4(args.index_dev, args.gid_idx)
+        if not RPC_ADDRESS:
+            print(f"SKIP: {args.index_dev} gid {args.gid_idx} carries no IPv4")
+            return 77
+        for name in ("RADIXSHMEM_INDEX_DEV", "RADIXSHMEM_INDEX_PORT", "RADIXSHMEM_INDEX_GID_IDX"):
+            os.environ.pop(name, None)
+    else:
+        # The device of the planes that run on RDMA; the servers inherit it.
+        os.environ["RADIXSHMEM_INDEX_DEV"] = args.index_dev
+        os.environ["RADIXSHMEM_INDEX_GID_IDX"] = str(args.gid_idx)
     return orchestrate(args)
 
 

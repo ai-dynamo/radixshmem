@@ -12,19 +12,6 @@
 
 namespace radixshmem {
 
-IndexDevice index_device_env() {
-    IndexDevice d;
-    if (const char* v = ::getenv("RADIXSHMEM_INDEX_DEV")) d.dev = v;
-    if (const char* v = ::getenv("RADIXSHMEM_INDEX_GID_IDX")) {
-        char* end = nullptr;
-        const long g = std::strtol(v, &end, 10);
-        if (end == v || *end != '\0' || g < 0 || g > 255)
-            throw std::runtime_error(std::string("invalid RADIXSHMEM_INDEX_GID_IDX=") + v);
-        d.gid_idx = (int)g;
-    }
-    return d;
-}
-
 RdmaContext::RdmaContext(const char* dev_name, int port, int gid_idx)
     : port_(port), gid_idx_(gid_idx) {
     verbs::require_ibverbs();
@@ -32,25 +19,24 @@ RdmaContext::RdmaContext(const char* dev_name, int port, int gid_idx)
     if (const char* s = ::getenv("RADIXSHMEM_RDMA_SL")) sl_ = atoi(s);
     if (const char* t = ::getenv("RADIXSHMEM_RDMA_TC")) tc_ = atoi(t);
 
+    if (!dev_name || !*dev_name || gid_idx_ < 0)
+        throw std::runtime_error("RdmaContext requires a resolved RDMA device and GID index");
+
     int num_devices = 0;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
     if (!dev_list || num_devices == 0)
         throw std::runtime_error("No RDMA devices found");
 
     ibv_device* dev = nullptr;
-    if (dev_name) {
-        for (int i = 0; i < num_devices; i++) {
-            if (strcmp(ibv_get_device_name(dev_list[i]), dev_name) == 0) {
-                dev = dev_list[i];
-                break;
-            }
+    for (int i = 0; i < num_devices; i++) {
+        if (strcmp(ibv_get_device_name(dev_list[i]), dev_name) == 0) {
+            dev = dev_list[i];
+            break;
         }
-        if (!dev) {
-            ibv_free_device_list(dev_list);
-            throw std::runtime_error(std::string("RDMA device not found: ") + dev_name);
-        }
-    } else {
-        dev = dev_list[0];
+    }
+    if (!dev) {
+        ibv_free_device_list(dev_list);
+        throw std::runtime_error(std::string("RDMA device not found: ") + dev_name);
     }
 
     ctx_ = ibv_open_device(dev);
