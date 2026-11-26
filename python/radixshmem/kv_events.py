@@ -15,12 +15,16 @@ Wire (ZMQ PUB, multipart): ``[topic, seq, payload]``
        "incarnation": str, "hash_scheme": str, "block_size": int,
        "events": [["stored" | "removed", [hash, ...]] | ["cleared", []], ...]}
 
-  ``node`` is the node's cluster rank (0 standalone), ``incarnation`` changes
-  every time the publisher starts, hashes are signed 64-bit (the same bits the
-  clients inserted). A batch with no events is a heartbeat.
+  ``node`` is the node's cluster rank (0 standalone), ``incarnation`` is the
+  uuid of the node's ``NodeInfo.index_id`` (new whenever the server brings an
+  index up), hashes are signed 64-bit (the same bits the clients inserted). A
+  batch with no events is a heartbeat.
 
 A consumer drops what it knows about a node on a seq gap, a new incarnation or
-``cleared`` (also sent when the ring lost records), then relearns from later events.
+``cleared`` (sent on a reset, and when the ring lost records), then relearns from
+later events. There is no snapshot: blocks stored before that and still held are
+not announced again until they are evicted and stored anew. Only FULL blocks are
+reported; a node may have dropped the SWA or Mamba state of a block it still holds.
 """
 
 from __future__ import annotations
@@ -28,7 +32,6 @@ from __future__ import annotations
 import logging
 import struct
 import threading
-import uuid
 from typing import Any, List
 
 import numpy as np
@@ -40,6 +43,27 @@ _KIND_NAMES = {KVEVENT_REMOVED: "removed", KVEVENT_STORED: "stored", KVEVENT_CLE
 WIRE_VERSION = 1
 # Hashes per published batch; the remainder goes out on the next tick.
 MAX_HASHES_PER_BATCH = 65536
+# Batches queued per subscriber (one batch is at most ~600 KiB). A subscriber that
+# falls further behind loses batches and sees a seq gap, instead of the server
+# buffering for it without bound.
+SEND_HWM = 256
+
+
+def open_socket(endpoint: str):
+    """The bound PUB socket for ``endpoint``; called when the server starts, so a
+    missing pyzmq/msgpack or a taken port fails there."""
+    import msgpack  # noqa: F401
+    import zmq
+
+    sock = zmq.Context.instance().socket(zmq.PUB)
+    sock.setsockopt(zmq.SNDHWM, SEND_HWM)
+    sock.setsockopt(zmq.LINGER, 0)
+    try:
+        sock.bind(endpoint)
+    except Exception:
+        sock.close(0)
+        raise
+    return sock
 
 
 def records_to_events(records, overflow: bool) -> List[List[Any]]:
@@ -57,13 +81,13 @@ def records_to_events(records, overflow: bool) -> List[List[Any]]:
 
 class KvEventPublisher:
     """Drains ``client``'s KV-event ring every ``interval_s`` and publishes
-    each non-empty drain as one batch; idle ticks send a heartbeat every
-    ``heartbeat_s`` so a new subscriber learns the incarnation and seq."""
+    each non-empty drain as one batch on ``sock`` (from :func:`open_socket`,
+    not closed here); idle ticks send a heartbeat every ``heartbeat_s`` so a
+    new subscriber learns the incarnation and seq."""
 
-    def __init__(self, client, endpoint: str, *, cluster_id: str, node: int, node_name: str,
-                 hash_scheme: str, block_size: int,
+    def __init__(self, client, sock, *, incarnation: str, cluster_id: str, node: int,
+                 node_name: str, hash_scheme: str, block_size: int,
                  interval_s: float = 0.01, heartbeat_s: float = 1.0):
-        import msgpack  # noqa: F401 - fail at start-up, not on the first batch
         import zmq
 
         if not client.kvevent_enabled():
@@ -71,15 +95,11 @@ class KvEventPublisher:
                              "--kv-events-endpoint")
         self._client = client
         self._header = {"v": WIRE_VERSION, "cluster_id": cluster_id, "node": int(node),
-                        "node_name": node_name, "incarnation": uuid.uuid4().hex,
+                        "node_name": node_name, "incarnation": incarnation,
                         "hash_scheme": hash_scheme, "block_size": int(block_size)}
         self._interval_s = interval_s
         self._heartbeat_s = heartbeat_s
-        self._ctx = zmq.Context.instance()
-        self._sock = self._ctx.socket(zmq.PUB)
-        self._sock.setsockopt(zmq.SNDHWM, 100000)
-        self._sock.setsockopt(zmq.LINGER, 0)
-        self._sock.bind(endpoint)
+        self._sock = sock
         self.endpoint = self._sock.getsockopt_string(zmq.LAST_ENDPOINT)
         self._seq = 0
         self._stop = threading.Event()
@@ -129,8 +149,7 @@ class KvEventPublisher:
     def close(self) -> None:
         self._stop.set()
         self._thread.join(2)
-        self._sock.close(0)
 
 
-__all__ = ["KvEventPublisher", "records_to_events", "KVEVENT_REMOVED", "KVEVENT_STORED",
+__all__ = ["KvEventPublisher", "open_socket", "records_to_events", "KVEVENT_REMOVED", "KVEVENT_STORED",
            "KVEVENT_CLEARED", "WIRE_VERSION"]

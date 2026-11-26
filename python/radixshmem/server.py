@@ -399,6 +399,7 @@ class RadixServer:
         self._mode = MODE_STARTING
         self._index = self._iclient = self._store = self._backend = self._xfer = self._dreg = None
         self._kv_events = None
+        self._kv_sock = None
         self._greg: Optional[_ServerRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
@@ -443,6 +444,9 @@ class RadixServer:
         except BaseException:
             self._rpc.stop(grace=0).wait()
             self._rpc = None
+            if self._kv_sock is not None:
+                self._kv_sock.close(0)
+                self._kv_sock = None
             if self._greg is not None:
                 self._greg.close()
                 self._greg = None
@@ -462,6 +466,10 @@ class RadixServer:
 
     def _preflight(self) -> None:
         c = self.cfg
+        if c.kv_events_endpoint and self._kv_sock is None:
+            from radixshmem.kv_events import open_socket
+
+            self._kv_sock = open_socket(c.kv_events_endpoint)
         if not c.index_only:
             from radixshmem import _data  # noqa: F401 - data mode needs the SlotStore extension
         if not c.distributed:
@@ -536,6 +544,9 @@ class RadixServer:
                 pass
             self._greg.close()
         self._teardown_regions()
+        if self._kv_sock is not None:
+            self._kv_sock.close(0)
+            self._kv_sock = None
         if self._backend is not None:
             self._backend.close()
         self._backend = self._greg = None
@@ -897,7 +908,7 @@ class RadixServer:
         from radixshmem.kv_events import KvEventPublisher
 
         publisher = KvEventPublisher(
-            self._iclient, c.kv_events_endpoint, cluster_id=c.cluster.cluster_id,
+            self._iclient, self._kv_sock, incarnation=self._index_uuid, cluster_id=c.cluster.cluster_id,
             node=max(index.rank(), 0), node_name=index.node_name() or c.cluster.node_name,
             hash_scheme=_geometry.hash_scheme(g), block_size=int(g["block_size"]))
         with self._cv:

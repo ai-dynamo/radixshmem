@@ -79,7 +79,7 @@ def test_insert_evict_reset_reach_the_subscriber_in_order(node):
     events, msg = _events(sub, 1)
     assert events == [["stored", signed(a)]]
     assert msg["v"] == 1 and msg["hash_scheme"] == "test-scheme-v1" and msg["block_size"] == BLOCK
-    assert msg["node"] == 0 and msg["incarnation"] == srv._kv_events.incarnation
+    assert msg["node"] == 0 and msg["incarnation"] == cl.status().index_id.split(".")[0]
 
     # The pool holds 16 slots: b fits, then 8 more slots evict a (the LRU path).
     assert cl.insert(b, cl.allocate_slots(8)).error == OK
@@ -130,3 +130,17 @@ def test_hash_scheme_is_part_of_the_geometry(tmp_path):
         a.close()
     finally:
         srv.close()
+
+
+def test_a_taken_endpoint_fails_at_start(tmp_path):
+    taken = zmq.Context.instance().socket(zmq.PUB)
+    taken.bind("tcp://127.0.0.1:*")
+    try:
+        tag = uuid.uuid4().hex[:8]
+        cfg = ServerConfig(name=f"/py_kvev_{tag}", endpoint=f"unix://{tmp_path}/{tag}.sock",
+                           data_bytes=16 * 8192, slot_align=64, prefault=False,
+                           kv_events_endpoint=taken.getsockopt_string(zmq.LAST_ENDPOINT))
+        with pytest.raises(zmq.ZMQError):
+            RadixServer(cfg).start()
+    finally:
+        taken.close(0)
