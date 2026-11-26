@@ -74,6 +74,3 @@ repair-wheel-command = [
     "auditwheel repair --exclude libibverbs.so.1 --exclude libmlx5.so.1 --exclude libnuma.so.1 --exclude 'libnl-*' -w {dest_dir} {wheel}",
     "python {project}/packaging/check_wheel.py {dest_dir}",
 ]
-
-[tool.uv]
-managed = true

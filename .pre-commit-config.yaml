@@ -12,12 +12,6 @@ repos:
         language: script
         files: (\.(c|cc|cpp|h|hpp|cu|cuh|py|sh|go|toml|ya?ml|in)|CMakeLists\.txt)$
         exclude: ^third_party/
-      - id: uv-lock
-        name: uv.lock up to date
-        entry: uv lock --check
-        language: system
-        files: ^(pyproject\.toml|uv\.lock|python/radixshmem/_version\.py)$
-        pass_filenames: false
       - id: dco-signoff
         name: DCO sign-off
         entry: tools/check_signoff.sh

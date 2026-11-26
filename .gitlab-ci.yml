@@ -14,7 +14,7 @@ variables:
 compliance:
   image: python:3.12
   before_script:
-    - pip install -q pre-commit uv
+    - pip install -q pre-commit
   script:
     - pre-commit run --all-files --show-diff-on-failure
     - |
