@@ -294,8 +294,7 @@ private:
     EvictCallback evict_cb_;
     static std::vector<NodeHead>& evicted_pending();
     KvEventRingWriter kvevent_writer_;
-    // Hashes of the nodes detached under the lock, published as REMOVED by flush_evicted().
-    static std::vector<std::vector<uint64_t>>& evicted_blocks_pending();
+    // Runs the RHT cleanup for the nodes detached under the lock.
     void flush_evicted();
 
     // ---- Shared memory accessors ----

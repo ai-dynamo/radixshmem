@@ -215,8 +215,9 @@ void RadixShmemTree::reset(std::vector<NodeHead>* left, uint64_t since) {
 
     alloc_root();
 
-    write_unlock();
+    // Inside the lock, so the ring orders events as the tree changed.
     kvevent_writer_.publish(KVEVENT_CLEARED, nullptr, 0);
+    write_unlock();
 }
 
 ShmLayoutInfo RadixShmemTree::compute_layout(const ShmConfig& config) {
@@ -1084,10 +1085,9 @@ int RadixShmemTree::detach_node(uint32_t node_id, std::vector<int32_t>& out, boo
     // Record (first_hash, node_id) for distributed RHT cleanup (flushed after unlock).
     if (evict_cb_)
         evicted_pending().push_back({head_hash, node_id, (uint32_t)n});
-    if (kvevent_writer_.enabled()) {
-        const uint64_t* hashes = data_.get_hashes(node->data_offset);
-        evicted_blocks_pending().emplace_back(hashes, hashes + n);
-    }
+    // One REMOVED record per node, so a reader never sees half of a node; under
+    // the write lock, so the ring orders it with every other change of the tree.
+    kvevent_writer_.publish(KVEVENT_REMOVED, data_.get_hashes(node->data_offset), (uint32_t)n);
 
     int32_t* slots = data_.get_slots(node->data_offset, n);
     for (int i = 0; i < n; i++)
@@ -1832,11 +1832,12 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
     if (result.error == InsertError::OK)
         header()->insert_success.fetch_add(1, std::memory_order_relaxed);
 
-    write_unlock();
-    flush_evicted();
-    // After this insert's own evictions, so no block is seen stored and then removed.
+    // After this insert's own evictions and before unlocking, so the ring orders
+    // events as the tree changed.
     if (inserted > 0)
         kvevent_writer_.publish(KVEVENT_STORED, hashes + insert_start, (uint32_t)inserted);
+    write_unlock();
+    flush_evicted();
     return finish();
 }
 
@@ -1941,11 +1942,6 @@ std::vector<NodeHead>& RadixShmemTree::evicted_pending() {
     return buf;
 }
 
-std::vector<std::vector<uint64_t>>& RadixShmemTree::evicted_blocks_pending() {
-    static thread_local std::vector<std::vector<uint64_t>> buf;
-    return buf;
-}
-
 void RadixShmemTree::flush_evicted() {
     // Call after the write lock is dropped. The buffer is thread_local, so the
     // foreground and evictor threads each drain their own.
@@ -1953,11 +1949,6 @@ void RadixShmemTree::flush_evicted() {
     if (evict_cb_ && !batch.empty())
         evict_cb_(batch);
     batch.clear();
-    // One REMOVED record per node, so a reader never sees half of a node.
-    auto& blocks = evicted_blocks_pending();
-    for (const auto& b : blocks)
-        kvevent_writer_.publish(KVEVENT_REMOVED, b.data(), (uint32_t)b.size());
-    blocks.clear();
 }
 
 int RadixShmemTree::try_evict_batch(int target_blocks,
