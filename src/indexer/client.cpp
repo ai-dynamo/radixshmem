@@ -963,17 +963,14 @@ constexpr auto DEDUP_LANDING_HOLD = std::chrono::seconds(30);
 void RadixClient::recycle_held_landing() {
     std::lock_guard<std::mutex> g(held_landing_mu_);
     RadixShmemTree& tree = local_->tree();
-    ShmHeader* hdr = static_cast<ShmHeader*>(tree.shm_base());
     const auto now = std::chrono::steady_clock::now();
     while (!held_landing_.empty() && held_landing_.front().until <= now) {
         HeldLanding& h = held_landing_.front();
-        if (h.generation == hdr->reset_generation.load(std::memory_order_relaxed))
-            for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
-                if (h.slots[k].empty()) continue;
-                tree.recycle_slots(h.slots[k].data(), (int)h.slots[k].size(), (ComponentType)k);
-                hdr->held_slots[k].fetch_sub((uint32_t)h.slots[k].size(),
-                                             std::memory_order_relaxed);
-            }
+        // A reset since dropped them with the pool (and held_slots with it).
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            if (!h.slots[k].empty())
+                tree.recycle_slots_if(h.generation, h.slots[k].data(), (int)h.slots[k].size(),
+                                      (ComponentType)k, true);
         held_landing_.pop_front();
     }
 }
@@ -990,6 +987,9 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
         (void)tree.dec_ref(hashes, n, std::move(held.pin));
         return 0;
     }
+    // The landing slots belong to this generation of the pool; after a reset
+    // they are back in the new pool and may have a new owner.
+    const uint64_t gen = tree.reset_generation();
     DedupRequest req;
     req.rank = peer_reg_->my_rank();
     req.tail_cap = tail_cap;
@@ -998,6 +998,11 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
         if (landing[k] > 0)
             (void)tree.allocate_slots(landing[k], req.landing[k], (ComponentType)k, false);
     DedupReply rep = remote_dedup_prefix(rank, hashes, n, req);
+    if (tree.reset_generation() != gen) {
+        // Reset during the move: nothing to adopt, nothing of ours to return.
+        (void)tree.dec_ref(hashes, n, std::move(held.pin));
+        return 0;
+    }
     std::vector<int32_t> unused[NUM_COMPONENT_TYPES];
     std::vector<uint64_t> path;
     for (const MovedPath& m : rep.moved) {
@@ -1011,7 +1016,8 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
     for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
         unused[k].insert(unused[k].end(), rep.unused[k].begin(), rep.unused[k].end());
         if (!unused[k].empty())
-            tree.recycle_slots(unused[k].data(), (int)unused[k].size(), (ComponentType)k);
+            tree.recycle_slots_if(gen, unused[k].data(), (int)unused[k].size(),
+                                  (ComponentType)k, false);
         // Neither adopted nor returned: a timeout or a late writer on the source.
         std::unordered_set<int32_t> seen(rep.unused[k].begin(), rep.unused[k].end());
         for (const MovedPath& m : rep.moved) {
@@ -1024,13 +1030,13 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
         holding |= !hold.slots[k].empty();
     }
     if (holding) {
-        ShmHeader* hdr = static_cast<ShmHeader*>(tree.shm_base());
         std::lock_guard<std::mutex> g(held_landing_mu_);
         hold.until = std::chrono::steady_clock::now() + DEDUP_LANDING_HOLD;
-        hold.generation = hdr->reset_generation.load(std::memory_order_relaxed);
+        hold.generation = gen;
         for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
-            hdr->held_slots[k].fetch_add((uint32_t)hold.slots[k].size(),
-                                         std::memory_order_relaxed);
+            if (!hold.slots[k].empty() &&
+                !tree.hold_slots_if(gen, (uint32_t)hold.slots[k].size(), (ComponentType)k))
+                hold.slots[k].clear();   // a reset just dropped them with the pool
         held_landing_.push_back(std::move(hold));
     }
     (void)tree.dec_ref(hashes, n, std::move(held.pin));

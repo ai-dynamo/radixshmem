@@ -188,6 +188,13 @@ public:
     // Return allocated slot IDs to the component's pool; safe on never-inserted slots.
     void recycle_slots(const int32_t* slots, int num,
                        ComponentType component = ComponentType::FULL);
+    // Same, but only while reset_generation() is still `generation` (checked under
+    // the write lock: after a reset the slots are back in the new pool and may have
+    // a new owner). `held`: the slots were counted in held_slots; uncount them.
+    void recycle_slots_if(uint64_t generation, const int32_t* slots, int num,
+                          ComponentType component, bool held);
+    // Count `num` slots in held_slots while reset_generation() is still `generation`.
+    bool hold_slots_if(uint64_t generation, uint32_t num, ComponentType component);
 
     void set_background_evict_ratio(float ratio) { background_evict_ratio_ = ratio; }
     float background_evict_ratio() const { return background_evict_ratio_; }

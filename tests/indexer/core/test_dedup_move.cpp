@@ -524,6 +524,34 @@ static void test_landing_pools() {
     TEST_PASS();
 }
 
+static void test_landing_hold_and_reset() {
+    TEST_BEGIN("held landing slots: recycled in their generation, never after a reset");
+    auto t = fresh("/tdm_hold");
+    std::vector<int32_t> s;
+    assert(t.allocate_slots(256, s, ComponentType::FULL, false) == 256);
+    const uint64_t gen = t.reset_generation();
+    assert(t.hold_slots_if(gen, 8, ComponentType::FULL));
+    assert(t.held_slots(ComponentType::FULL) == 8);
+    t.recycle_slots_if(gen, s.data(), 8, ComponentType::FULL, true);
+    assert(t.held_slots(ComponentType::FULL) == 0);
+    std::vector<int32_t> again;
+    assert(t.allocate_slots(8, again, ComponentType::FULL, false) == 8);   // the 8 came back
+
+    // A reset returns every slot; the new pool hands them to a new owner, and a
+    // hold or recycle of the old generation must leave that owner alone.
+    t.reset();
+    std::vector<int32_t> owner;
+    assert(t.allocate_slots(256, owner, ComponentType::FULL, false) == 256);
+    assert(!t.hold_slots_if(gen, 8, ComponentType::FULL));
+    assert(t.held_slots(ComponentType::FULL) == 0);
+    t.recycle_slots_if(gen, s.data(), 8, ComponentType::FULL, true);
+    std::vector<int32_t> none;
+    assert(t.allocate_slots(1, none, ComponentType::FULL, false) == 0);   // still all owned
+    assert(t.held_slots(ComponentType::FULL) == 0);
+    t.destroy();
+    TEST_PASS();
+}
+
 static void test_write_queue() {
     TEST_BEGIN("DedupWriteQueue: inactive, unclaimed, claimed but unfinished, finished, switched off");
     DedupWriteQueue q;
@@ -570,6 +598,7 @@ int main() {
     test_adopt_edges();
     test_slot_lru_by_ts();
     test_landing_pools();
+    test_landing_hold_and_reset();
     test_write_queue();
     return 0;
 }

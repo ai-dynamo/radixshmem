@@ -2083,6 +2083,33 @@ void RadixShmemTree::recycle_slots(const int32_t* slots, int num,
     write_unlock();
 }
 
+void RadixShmemTree::recycle_slots_if(uint64_t generation, const int32_t* slots, int num,
+                                      ComponentType component, bool held) {
+    set_write_op("recycle");
+    Mempool* pool = try_component_pool(component);
+    if (pool == nullptr || !pool->enabled() || num <= 0 || slots == nullptr)
+        return;
+    write_lock();
+    ShmHeader* hdr = header();
+    if (hdr->reset_generation.load(std::memory_order_relaxed) == generation) {
+        pool->recycle(slots, num);
+        if (held)
+            hdr->held_slots[(int)component].fetch_sub((uint32_t)num, std::memory_order_relaxed);
+    }
+    write_unlock();
+}
+
+bool RadixShmemTree::hold_slots_if(uint64_t generation, uint32_t num, ComponentType component) {
+    set_write_op("hold");
+    write_lock();
+    ShmHeader* hdr = header();
+    const bool same = hdr->reset_generation.load(std::memory_order_relaxed) == generation;
+    if (same)
+        hdr->held_slots[(int)component].fetch_add(num, std::memory_order_relaxed);
+    write_unlock();
+    return same;
+}
+
 // ==================== Stats & debug ====================
 
 uint32_t RadixShmemTree::total_radix_nodes() const {
