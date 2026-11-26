@@ -27,6 +27,7 @@ The Python package runs one server process per node, which holds the index, the 
   - [5.3 Write-back](#53-write-back)
   - [5.4 Transfer backends](#54-transfer-backends)
   - [5.5 `radixshmem._core`](#55-radixshmem_core)
+  - [5.6 KV-event stream](#56-kv-event-stream)
 
 ## 1. Configuration
 
@@ -49,6 +50,7 @@ The layout of one tree, fixed when the server creates it; processes that attach 
 | `mamba_state_bytes` | `uint64_t` | `0` | Bytes of one Mamba checkpoint, equal to the SlotStore's Mamba slot size. |
 | `swa_max_blocks` | `uint32_t` | `0` | SWA slot pool capacity. |
 | `mamba_max_slots` | `uint32_t` | `0` | Mamba slot pool capacity. |
+| `kvevent_ring_capacity` | `uint32_t` | `0` | KV-event ring entries (rounded up to a power of two, at least 64; 128 bytes each); `0` = no ring. See [5.6](#56-kv-event-stream). |
 
 ### 1.2 `RadixServerConfig`
 
@@ -590,9 +592,9 @@ Writes the path `hashes` from local slots to node `rank` and publishes it there.
 
 A job that gives up while its transfer is in flight leaves the destination slots allocated, local for a pull and on the target for a push, since the data may still land; `check_health` reports them as leaked.
 
-`Geometry(block_size, full_slot_bytes=0, swa_slot_bytes=0, swa_window_blocks=0, mamba_slot_bytes=0, full_slots=0, swa_slots=0, mamba_slots=0, slot_align=0, register_chunk_tokens=0)` is the client's slot shape. A data-mode server takes the byte sizes and sizes the pools from `data_bytes`; an index-only server takes the counts. A pool exists when its bytes or its count is > 0; `slot_align` and `register_chunk_tokens` `0` mean the server's default. `radixshmem.check_pools_aligned(index, store)` checks that the index pools match the SlotStore pools.
+`Geometry(block_size, full_slot_bytes=0, swa_slot_bytes=0, swa_window_blocks=0, mamba_slot_bytes=0, full_slots=0, swa_slots=0, mamba_slots=0, slot_align=0, register_chunk_tokens=0, hash_scheme="")` is the client's slot shape. A data-mode server takes the byte sizes and sizes the pools from `data_bytes`; an index-only server takes the counts. A pool exists when its bytes or its count is > 0; `slot_align` and `register_chunk_tokens` `0` mean the server's default. `hash_scheme` names how the client derives block hashes (`""` = `xxh64-v1`, `compute_hashes`); a client or cluster node with another scheme is refused like any geometry mismatch. `radixshmem.check_pools_aligned(index, store)` checks that the index pools match the SlotStore pools.
 
-`NodeInfo` fields: `mode`, `data_plane`, `index_name`, `data_name`, `hugepage_path`, `geometry`, `rank`, `world_size`, `node_name`, `segment`, `data_bytes`, `last_error`, `swa_ratio`, `mamba_ratio`, `role`.
+`NodeInfo` fields: `mode`, `data_plane`, `index_name`, `data_name`, `hugepage_path`, `geometry`, `rank`, `world_size`, `node_name`, `segment`, `data_bytes`, `last_error`, `swa_ratio`, `mamba_ratio`, `role`, `index_id`. `index_id` is `"<uuid>.<reset generation>"` (`""` before the index is up): the uuid is drawn each time the server brings an index up and the generation counts resets, so it changes whenever the index starts over. A client that keeps data outside the server (the storage an index-only server's slots name) compares it with the id it recorded to tell whether the index still describes that data. It is read over RPC: a process attached to the old region of a restarted server must ask the server and compare.
 
 Exceptions, all `RuntimeError`: `ServerNotReady` (with `mode` and `last_error`), `GeometryMismatch`, `DataPlaneUnavailable`, `ServerBusy` (the server's job table is full).
 
@@ -642,5 +644,25 @@ The C++ classes, with these differences:
 - `check_health()` and `health_report()` on both classes; `HealthFlag` is an arithmetic enum (`int(HealthFlag.FULL_SLOT_LEAK)`). `peer_fault_counts()` returns a dict, `dump_tree(max_nodes=0, max_blocks=0)` a dict of numpy arrays.
 - `RadixServer` adds `pop_writeback`, `complete_writeback`, `drop_writeback`, `set_writeback_active`, `writeback_stats` and `reset_generation` for the write-back queue.
 - `compute_hashes(token_ids, tokens_per_block)`, also as `radixshmem.compute_hashes`.
+- `kvevent_enabled()` and `kvevent_drain(max_hashes)` on `RadixClient` read the region's KV-event ring ([5.6](#56-kv-event-stream)); `kvevent_drain` returns `(records, overflow)`, records as `(kind, uint64 hashes)`. One reader per process; the server's publisher is the intended one.
 - `EtcdKv(registry)`: `put`, `create` (put if absent), `get`, `get_prefix`, `count`, `delete`, `grant_lease`, `keep_alive`, `keep_alive_stop`, `revoke`.
 - Calls release the GIL while they run in C++.
+
+### 5.6 KV-event stream
+
+`radix-server --kv-events-endpoint tcp://*:PORT` (`ServerConfig.kv_events_endpoint`; needs `pip install radixshmem[kv-events]`, i.e. pyzmq and msgpack) gives the region a KV-event ring and publishes the node's placement on a ZMQ PUB socket, bound when the server starts. Every process that changes the tree writes to the ring under the tree's write lock, so the ring orders events as the tree changed: `stored` after an insert (the new blocks only), `removed` for every node detached (eviction, write-back, the source of a dedup move), `cleared` on a reset.
+
+Each message is `[topic, seq, payload]`: `topic` is `b""`, `seq` an 8-byte big-endian batch number (+1 per batch from 0), `payload` a msgpack map:
+
+```
+{"v": 1, "cluster_id": str, "node": int, "node_name": str, "incarnation": str,
+ "hash_scheme": str, "block_size": int,
+ "events": [["stored" | "removed", [hash, ...]] | ["cleared", []], ...]}
+```
+
+`node` is the cluster rank (0 standalone); `incarnation` is the uuid of `NodeInfo.index_id`; hashes are signed 64-bit, the bits the clients inserted. The server drains the ring every 10 ms; a batch with no events, sent each idle second, is a heartbeat. When the ring lost entries (the publisher fell a lap behind) the batch leads with `cleared` and carries only what followed the loss. Each subscriber may queue 256 batches; one that falls further behind loses batches.
+
+A consumer drops what it knows about a node on a seq gap, a new `incarnation` or `cleared`, then relearns from later events. Limits:
+
+- No snapshot: blocks stored before a consumer joined or reset its view, and still held, are not announced again until they are evicted and stored anew.
+- Only FULL blocks: a node can drop the SWA or Mamba state of a block it still reports.
