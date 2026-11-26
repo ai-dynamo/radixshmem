@@ -1,6 +1,7 @@
 #include "kvevent.h"
 #include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdio>
 #include <thread>
 #include <unordered_set>
@@ -45,17 +46,56 @@ int main() {
         printf("ok: round-trip 100 hashes across %u-entry ring\n", 64u);
     }
 
-    // 2) seek_to_head skips history
+    // 2) a new reader starts at the oldest entry; seek_to_head skips history
     {
         auto buf = make_region(64);
         KvEventRingWriter w(buf.data());
         std::vector<uint64_t> in{1,2,3};
         w.publish(KVEVENT_REMOVED, in.data(), 3);
-        KvEventRingReader r(buf.data());   // ctor seeks to head
+        KvEventRingReader early(buf.data());
+        assert(removed(early.drain()) == in);
+        KvEventRingReader r(buf.data());
+        r.seek_to_head();
         assert(removed(r.drain()).empty());
         w.publish(KVEVENT_REMOVED, in.data(), 3);
         assert(removed(r.drain()).size() == 3);
-        printf("ok: late attach skips history\n");
+        printf("ok: new reader reads history, seek_to_head skips it\n");
+    }
+
+    // 2b) an entry lost in the middle of a drain drops what came before it too:
+    //     the consumer clears first, so `stored x` must not survive a lost `removed x`
+    {
+        auto buf = make_region(64);
+        KvEventRingWriter w(buf.data());
+        KvEventRingReader r(buf.data());
+        uint64_t x = 7, y = 8;
+        w.publish(KVEVENT_STORED, &x, 1);
+        w.publish(KVEVENT_REMOVED, &x, 1);
+        w.publish(KVEVENT_STORED, &y, 1);
+        auto* entries = reinterpret_cast<KvEventEntry*>(
+            static_cast<KvEventRingHeader*>((void*)buf.data()) + 1);
+        entries[1].seq.store(2 + 64, std::memory_order_release);   // overwritten by the next lap
+        auto out = r.drain();
+        assert(out.overflow && out.records.size() == 1);
+        assert(out.records[0].kind == KVEVENT_STORED && out.records[0].hashes == std::vector<uint64_t>{y});
+        printf("ok: mid-drain loss keeps only what follows it\n");
+    }
+
+    // 2c) a writer that died between reserving and writing an entry stalls the
+    //     reader for about a second, then the entry counts as lost
+    {
+        auto buf = make_region(64);
+        KvEventRingWriter w(buf.data());
+        KvEventRingReader r(buf.data());
+        static_cast<KvEventRingHeader*>((void*)buf.data())->head.fetch_add(1);   // reserved, never written
+        uint64_t y = 9;
+        w.publish(KVEVENT_STORED, &y, 1);
+        auto a = r.drain();   // first sighting at this position starts the clock
+        assert(!a.overflow && a.records.empty());
+        std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+        auto b = r.drain();
+        assert(b.overflow && b.records.size() == 1 && b.records[0].hashes == std::vector<uint64_t>{y});
+        printf("ok: an entry never written is skipped after a second\n");
     }
 
     // 3) overflow: producer laps the consumer
@@ -144,6 +184,7 @@ int main() {
         std::vector<uint64_t> in{7,8,9};
         w.publish(KVEVENT_REMOVED, in.data(), 3);
         KvEventRingReader r(buf.data());
+        r.seek_to_head();
         w.publish(KVEVENT_REMOVED, in.data(), 3);
         assert(removed(r.drain()).size() == 3);
         KvEventRingWriter::init(buf.data(), 64);   // restart: head resets to 0

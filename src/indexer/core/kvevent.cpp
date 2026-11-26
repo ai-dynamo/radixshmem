@@ -1,6 +1,7 @@
 #include "kvevent.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 
 namespace radixshmem {
@@ -51,7 +52,9 @@ void KvEventRingWriter::publish(KvEventKind kind, const uint64_t* hashes, uint32
             std::min<uint32_t>(KVEVENT_HASHES_PER_ENTRY, count - written);
         KvEventEntry* e = &entries_[slot & mask];
 
-        e->seq.store(0, std::memory_order_release);
+        // Seqlock: seq 0 is visible before any of the new data.
+        e->seq.store(0, std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_release);
         e->num_hashes = chunk;
         e->kind = kind;
         if (chunk > 0) std::memcpy(e->hashes, hashes + written, (size_t)chunk * sizeof(uint64_t));
@@ -68,7 +71,9 @@ KvEventRingReader::KvEventRingReader(void* base) {
     if (hdr->capacity == 0) return;
     hdr_ = hdr;
     entries_ = reinterpret_cast<KvEventEntry*>(hdr + 1);
-    cursor_ = hdr->head.load(std::memory_order_acquire);
+    // From the oldest entry still in the ring: the first drain also returns what
+    // was written before this reader existed (or reports the loss).
+    cursor_ = 0;
 }
 
 void KvEventRingReader::seek_to_head() {
@@ -103,12 +108,20 @@ KvEventRingReader::DrainResult KvEventRingReader::drain(size_t max_hashes) {
 
         uint64_t seq = e->seq.load(std::memory_order_acquire);
         if (seq > want) {
-            out.overflow = true;
-            cursor_ += 1;
+            lost(out, total);
             continue;
         }
         if (seq != want) {
-            // Reserved but not written yet: pick it up next time.
+            // Reserved but not written yet: pick it up next time, unless its writer
+            // died between reserving and writing it.
+            const auto now = std::chrono::steady_clock::now();
+            if (stuck_cursor_ != cursor_) {
+                stuck_cursor_ = cursor_;
+                stuck_since_ = now;
+            } else if (now - stuck_since_ > std::chrono::seconds(1)) {
+                lost(out, total);
+                continue;
+            }
             break;
         }
 
@@ -118,9 +131,9 @@ KvEventRingReader::DrainResult KvEventRingReader::drain(size_t max_hashes) {
         std::memcpy(copied, e->hashes, (size_t)n * sizeof(uint64_t));
 
         // Overwritten while copying.
-        if (e->seq.load(std::memory_order_acquire) != want) {
-            out.overflow = true;
-            cursor_ += 1;
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (e->seq.load(std::memory_order_relaxed) != want) {
+            lost(out, total);
             continue;
         }
         cursor_ += 1;
@@ -136,6 +149,15 @@ KvEventRingReader::DrainResult KvEventRingReader::drain(size_t max_hashes) {
         total += n;
     }
     return out;
+}
+
+void KvEventRingReader::lost(DrainResult& out, size_t& total) {
+    // The lost entry follows what this drain collected so far; the consumer
+    // clears its view first, so drop those too and resume after the loss.
+    out.overflow = true;
+    out.records.clear();
+    total = 0;
+    cursor_ += 1;
 }
 
 }  // namespace radixshmem

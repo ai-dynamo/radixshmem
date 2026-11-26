@@ -10,6 +10,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -88,9 +89,13 @@ public:
     DrainResult drain(size_t max_hashes = 65536);
 
 private:
+    void lost(DrainResult& out, size_t& total);
+
     KvEventRingHeader* hdr_ = nullptr;
     KvEventEntry* entries_ = nullptr;
     uint64_t cursor_ = 0;
+    uint64_t stuck_cursor_ = UINT64_MAX;
+    std::chrono::steady_clock::time_point stuck_since_;
 };
 
 }  // namespace radixshmem
