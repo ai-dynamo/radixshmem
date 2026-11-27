@@ -70,9 +70,10 @@ RadixShmemTree::RadixShmemTree(RadixShmemTree&& o) noexcept
       mamba_lru_(o.mamba_lru_), background_evict_ratio_(o.background_evict_ratio_),
       evict_policy_(o.evict_policy_), cs_(o.cs_), has_swa_(o.has_swa_),
       has_mamba_(o.has_mamba_), has_aux_(o.has_aux_),
-      evict_cb_(std::move(o.evict_cb_)) {
+      evict_cb_(std::move(o.evict_cb_)), kvevent_writer_(o.kvevent_writer_) {
     o.base_ = nullptr;
     o.fd_ = -1;
+    o.kvevent_writer_ = KvEventRingWriter();
 }
 
 RadixShmemTree& RadixShmemTree::operator=(RadixShmemTree&& o) noexcept {
@@ -99,8 +100,10 @@ RadixShmemTree& RadixShmemTree::operator=(RadixShmemTree&& o) noexcept {
         has_mamba_ = o.has_mamba_;
         has_aux_ = o.has_aux_;
         evict_cb_ = std::move(o.evict_cb_);
+        kvevent_writer_ = o.kvevent_writer_;
         o.base_ = nullptr;
         o.fd_ = -1;
+        o.kvevent_writer_ = KvEventRingWriter();
     }
     return *this;
 }
@@ -160,6 +163,14 @@ void RadixShmemTree::init_pools() {
         mamba_lru_ = SlotLru(reinterpret_cast<SlotLruEntry*>(
                                  (char*)base_ + hdr->mamba_lru_offset),
                              hdr->mamba_mempool_total_blocks, &hdr->mamba_list);
+
+    if (hdr->kvevent_ring_offset != 0)
+        kvevent_writer_ = KvEventRingWriter((char*)base_ + hdr->kvevent_ring_offset);
+}
+
+uint64_t RadixShmemTree::kvevent_ring_offset() const {
+    if (base_ == nullptr) return 0;
+    return header()->kvevent_ring_offset;
 }
 
 void RadixShmemTree::alloc_root() {
@@ -204,6 +215,8 @@ void RadixShmemTree::reset(std::vector<NodeHead>* left, uint64_t since) {
 
     alloc_root();
 
+    // Inside the lock, so the ring orders events as the tree changed.
+    kvevent_writer_.publish(KVEVENT_CLEARED, nullptr, 0);
     write_unlock();
 }
 
@@ -238,12 +251,17 @@ ShmLayoutInfo RadixShmemTree::compute_layout(const ShmConfig& config) {
     info.swa_lru_size = SlotLru::region_bytes(config.swa_max_blocks);
     info.mamba_lru_size = SlotLru::region_bytes(config.mamba_max_slots);
 
+    info.kvevent_ring_capacity =
+        kvevent_ring_normalize_capacity(config.kvevent_ring_capacity);
+    info.kvevent_ring_size = kvevent_ring_bytes(info.kvevent_ring_capacity);
+
     info.total_size = info.header_size + info.node_pool_size
                     + info.component_state_size
                     + info.data_pool_size + info.ht_size
                     + info.mempool_size
                     + info.swa_mempool_size + info.mamba_mempool_size
-                    + info.swa_lru_size + info.mamba_lru_size;
+                    + info.swa_lru_size + info.mamba_lru_size
+                    + info.kvevent_ring_size;
     return info;
 }
 
@@ -376,6 +394,15 @@ RadixShmemTree RadixShmemTree::create(const std::string& name,
         pool_cursor += l.bytes;
         if (l.count > 0)
             SlotLru::init_region((char*)tree.base_ + *l.offset, l.count);
+    }
+
+    // KV-event ring: last region, offset 0 when absent.
+    hdr->kvevent_ring_capacity = layout.kvevent_ring_capacity;
+    hdr->kvevent_ring_offset = layout.kvevent_ring_size ? pool_cursor : 0;
+    if (layout.kvevent_ring_size) {
+        KvEventRingWriter::init((char*)tree.base_ + hdr->kvevent_ring_offset,
+                                layout.kvevent_ring_capacity);
+        pool_cursor += layout.kvevent_ring_size;
     }
 
     hdr->component_config.abi_version          = COMPONENT_ABI_VERSION;
@@ -1058,6 +1085,9 @@ int RadixShmemTree::detach_node(uint32_t node_id, std::vector<int32_t>& out, boo
     // Record (first_hash, node_id) for distributed RHT cleanup (flushed after unlock).
     if (evict_cb_)
         evicted_pending().push_back({head_hash, node_id, (uint32_t)n});
+    // One REMOVED record per node, so a reader never sees half of a node; under
+    // the write lock, so the ring orders it with every other change of the tree.
+    kvevent_writer_.publish(KVEVENT_REMOVED, data_.get_hashes(node->data_offset), (uint32_t)n);
 
     int32_t* slots = data_.get_slots(node->data_offset, n);
     for (int i = 0; i < n; i++)
@@ -1802,6 +1832,10 @@ InsertResult RadixShmemTree::insert_impl(const uint64_t* hashes, int n,
     if (result.error == InsertError::OK)
         header()->insert_success.fetch_add(1, std::memory_order_relaxed);
 
+    // After this insert's own evictions and before unlocking, so the ring orders
+    // events as the tree changed.
+    if (inserted > 0)
+        kvevent_writer_.publish(KVEVENT_STORED, hashes + insert_start, (uint32_t)inserted);
     write_unlock();
     flush_evicted();
     return finish();
@@ -2047,6 +2081,33 @@ void RadixShmemTree::recycle_slots(const int32_t* slots, int num,
     write_lock();
     pool->recycle(slots, num);   // idempotent: double-recycle is a no-op
     write_unlock();
+}
+
+void RadixShmemTree::recycle_slots_if(uint64_t generation, const int32_t* slots, int num,
+                                      ComponentType component, bool held) {
+    set_write_op("recycle");
+    Mempool* pool = try_component_pool(component);
+    if (pool == nullptr || !pool->enabled() || num <= 0 || slots == nullptr)
+        return;
+    write_lock();
+    ShmHeader* hdr = header();
+    if (hdr->reset_generation.load(std::memory_order_relaxed) == generation) {
+        pool->recycle(slots, num);
+        if (held)
+            hdr->held_slots[(int)component].fetch_sub((uint32_t)num, std::memory_order_relaxed);
+    }
+    write_unlock();
+}
+
+bool RadixShmemTree::hold_slots_if(uint64_t generation, uint32_t num, ComponentType component) {
+    set_write_op("hold");
+    write_lock();
+    ShmHeader* hdr = header();
+    const bool same = hdr->reset_generation.load(std::memory_order_relaxed) == generation;
+    if (same)
+        hdr->held_slots[(int)component].fetch_add(num, std::memory_order_relaxed);
+    write_unlock();
+    return same;
 }
 
 // ==================== Stats & debug ====================

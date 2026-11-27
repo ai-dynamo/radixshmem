@@ -5,6 +5,7 @@
 #include "radix_server.h"       // RadixClient(RadixServer&) ctor
 
 #include "local.h"
+#include "kvevent.h"
 #include "cluster_protocol.h"
 #include "cluster_manifest.h"
 #include "bilateral_transport.h"
@@ -954,10 +955,31 @@ DedupReply RadixClient::remote_dedup_prefix(int rank, const uint64_t* hashes, in
     return p->dedup_prefix(hashes, n, req);
 }
 
+namespace {
+// Well past the source's write timeout plus its grace (3 s + 1 s).
+constexpr auto DEDUP_LANDING_HOLD = std::chrono::seconds(30);
+}  // namespace
+
+void RadixClient::recycle_held_landing() {
+    std::lock_guard<std::mutex> g(held_landing_mu_);
+    RadixShmemTree& tree = local_->tree();
+    const auto now = std::chrono::steady_clock::now();
+    while (!held_landing_.empty() && held_landing_.front().until <= now) {
+        HeldLanding& h = held_landing_.front();
+        // A reset since dropped them with the pool (and held_slots with it).
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            if (!h.slots[k].empty())
+                tree.recycle_slots_if(h.generation, h.slots[k].data(), (int)h.slots[k].size(),
+                                      (ComponentType)k, true);
+        held_landing_.pop_front();
+    }
+}
+
 int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_cap,
                             int branch_cap, const int landing[NUM_COMPONENT_TYPES]) {
     if (n <= 0 || !local_ || !distributed_) return 0;
     RadixShmemTree& tree = local_->tree();
+    recycle_held_landing();
     // Our copy must outlive the source's: hold it until what moves has landed.
     TreeComponentQueryResult held =
         tree.query_components(hashes, n, COMPONENT_MASK_FULL, true, false);
@@ -965,6 +987,9 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
         (void)tree.dec_ref(hashes, n, std::move(held.pin));
         return 0;
     }
+    // The landing slots belong to this generation of the pool; after a reset
+    // they are back in the new pool and may have a new owner.
+    const uint64_t gen = tree.reset_generation();
     DedupRequest req;
     req.rank = peer_reg_->my_rank();
     req.tail_cap = tail_cap;
@@ -973,6 +998,11 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
         if (landing[k] > 0)
             (void)tree.allocate_slots(landing[k], req.landing[k], (ComponentType)k, false);
     DedupReply rep = remote_dedup_prefix(rank, hashes, n, req);
+    if (tree.reset_generation() != gen) {
+        // Reset during the move: nothing to adopt, nothing of ours to return.
+        (void)tree.dec_ref(hashes, n, std::move(held.pin));
+        return 0;
+    }
     std::vector<int32_t> unused[NUM_COMPONENT_TYPES];
     std::vector<uint64_t> path;
     for (const MovedPath& m : rep.moved) {
@@ -981,10 +1011,33 @@ int RadixClient::dedup_move(int rank, const uint64_t* hashes, int n, int tail_ca
         InsertResult r = tree.adopt(path.data(), (int)path.size(), m, unused);
         publish_chain(path.data(), (int)path.size(), r, m.full_from);
     }
+    HeldLanding hold;
+    bool holding = false;
     for (int k = 0; k < NUM_COMPONENT_TYPES; k++) {
         unused[k].insert(unused[k].end(), rep.unused[k].begin(), rep.unused[k].end());
         if (!unused[k].empty())
-            tree.recycle_slots(unused[k].data(), (int)unused[k].size(), (ComponentType)k);
+            tree.recycle_slots_if(gen, unused[k].data(), (int)unused[k].size(),
+                                  (ComponentType)k, false);
+        // Neither adopted nor returned: a timeout or a late writer on the source.
+        std::unordered_set<int32_t> seen(rep.unused[k].begin(), rep.unused[k].end());
+        for (const MovedPath& m : rep.moved) {
+            if (k == (int)ComponentType::FULL) seen.insert(m.full.begin(), m.full.end());
+            for (const MovedCell& c : m.cells)
+                if ((int)c.component == k) seen.insert(c.slot);
+        }
+        for (int32_t s : req.landing[k])
+            if (!seen.count(s)) hold.slots[k].push_back(s);
+        holding |= !hold.slots[k].empty();
+    }
+    if (holding) {
+        std::lock_guard<std::mutex> g(held_landing_mu_);
+        hold.until = std::chrono::steady_clock::now() + DEDUP_LANDING_HOLD;
+        hold.generation = gen;
+        for (int k = 0; k < NUM_COMPONENT_TYPES; k++)
+            if (!hold.slots[k].empty() &&
+                !tree.hold_slots_if(gen, (uint32_t)hold.slots[k].size(), (ComponentType)k))
+                hold.slots[k].clear();   // a reset just dropped them with the pool
+        held_landing_.push_back(std::move(hold));
     }
     (void)tree.dec_ref(hashes, n, std::move(held.pin));
     return rep.status == RemoteStatus::OK ? rep.freed : 0;
@@ -1048,6 +1101,35 @@ TreeDump RadixClient::dump_tree(uint32_t max_nodes, uint64_t max_blocks) const {
 const std::string& RadixClient::name() const {
     static const std::string kNone;
     return local_ ? local_->name() : kNone;
+}
+
+// ==================== KV-event ring ====================
+
+KvEventRingReader* RadixClient::kvevent_reader() {
+    if (kvevent_reader_) return kvevent_reader_.get();
+    if (!local_) return nullptr;
+    auto& tree = local_->tree();
+    const uint64_t off = tree.kvevent_ring_offset();
+    if (off == 0) return nullptr;
+    kvevent_reader_ = std::make_unique<KvEventRingReader>(
+        (char*)tree.shm_base() + off);
+    return kvevent_reader_.get();
+}
+
+bool RadixClient::kvevent_enabled() const {
+    return const_cast<RadixClient*>(this)->kvevent_reader() != nullptr;
+}
+
+RadixClient::KvEventBatch RadixClient::kvevent_drain(size_t max_hashes) {
+    KvEventBatch out;
+    auto* r = kvevent_reader();
+    if (r == nullptr) return out;
+    auto res = r->drain(max_hashes);
+    out.records.reserve(res.records.size());
+    for (auto& rec : res.records)
+        out.records.push_back({static_cast<uint32_t>(rec.kind), std::move(rec.hashes)});
+    out.overflow = res.overflow;
+    return out;
 }
 
 } // namespace radixshmem

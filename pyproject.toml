@@ -27,6 +27,8 @@ classifiers = [
 dependencies = ["numpy", "grpcio>=1.60"]
 
 [project.optional-dependencies]
+# radix-server --kv-events-endpoint
+kv-events = ["pyzmq", "msgpack"]
 # The nixl transfer backend; NIXL publishes no Python 3.14 wheels yet.
 nixl = ['nixl-cu13>=1.4.1,<2; python_version < "3.14"']
 

@@ -71,6 +71,19 @@ class NodeInfo:
     swa_ratio: float = 0.0
     mamba_ratio: float = 0.0
     role: str = "prefill"           # PD disaggregation role: "prefill" | "decode"
+    # Changes whenever the index starts over (a new region, a reconfiguration or a
+    # reset), so a client keeping data outside the server can tell whether the
+    # slots the index names still hold what it wrote; "" before the index is up.
+    index_id: str = ""
+
+
+_NODE_INFO_FIELDS = frozenset(NodeInfo.__dataclass_fields__)
+
+
+def _node_info(reply: Dict[str, Any]) -> NodeInfo:
+    # A newer server may report fields this client does not know; the region
+    # version check, not this parse, decides whether the two can work together.
+    return NodeInfo(**{k: v for k, v in reply.items() if k in _NODE_INFO_FIELDS})
 
 
 @dataclass
@@ -192,14 +205,14 @@ class _Rpc:
         self._stub = rpc.Stub(endpoint)
 
     def describe(self) -> NodeInfo:
-        return NodeInfo(**self._stub.call("Describe", timeout=30))
+        return _node_info(self._stub.call("Describe", timeout=30))
 
     def wait_ready(self, timeout_s) -> NodeInfo:
-        return NodeInfo(**self._stub.call("WaitReady", {"timeout_ms": int(timeout_s * 1000)},
+        return _node_info(self._stub.call("WaitReady", {"timeout_ms": int(timeout_s * 1000)},
                                           timeout=timeout_s + 5))
 
     def configure(self, spec: Dict[str, Any]) -> NodeInfo:
-        return NodeInfo(**self._stub.call("Configure", {"geometry": spec}, timeout=30))
+        return _node_info(self._stub.call("Configure", {"geometry": spec}, timeout=30))
 
     def nodes(self) -> List[Dict[str, Any]]:
         return self._stub.call("Nodes", timeout=30)["nodes"]

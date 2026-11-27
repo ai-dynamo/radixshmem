@@ -159,6 +159,32 @@ def test_index_only_takes_the_counts_from_the_client(cfg):
     assert not os.path.exists(f"/dev/shm{c.name}")
 
 
+def test_index_id_changes_when_the_index_starts_over(cfg):
+    c = cfg()
+    srv = RadixServer(c).start()
+    try:
+        assert srv.describe().index_id == ""
+        cl = client(c, geometry(full_slots=16))
+        first = cl.status().index_id
+        assert first and cl.status().index_id == first
+        h = hashes(2)
+        assert cl.insert(h, cl.allocate_slots(2)).error == OK
+        assert cl.status().index_id == first            # inserts keep it
+        cl.reset()
+        after_reset = cl.status().index_id
+        assert after_reset != first and after_reset.split(".")[0] == first.split(".")[0]
+        cl.close()
+    finally:
+        srv.close()
+    srv = up(c, geometry(full_slots=16))                 # a new region
+    try:
+        cl = client(c)
+        assert cl.status().index_id.split(".")[0] != first.split(".")[0]
+        cl.close()
+    finally:
+        srv.close()
+
+
 def test_failed_configuration_returns_to_waiting_with_the_error(cfg):
     c = cfg(**data())
     srv = RadixServer(c).start()

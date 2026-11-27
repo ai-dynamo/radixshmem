@@ -30,6 +30,7 @@ import json
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
@@ -50,6 +51,7 @@ _CLUSTER_FIELDS = (
 
 _POLL_S = 0.5        # how often a waiting cluster node looks for a published geometry
 _LEASE_TTL_S = 10    # etcd lease of the geometry and node keys; kept alive while the server runs
+_KV_EVENTS_RING = 65536  # KV-event ring entries x 14 hashes, 8 MiB of shm
 
 ROLES = ("prefill", "decode")
 
@@ -111,6 +113,9 @@ class ServerConfig:
     data_pool_ratio: float = 4.0     # DataPool bytes = full_slots x ratio x (12 | 16 with SWA)
     evict_policy: str = "lru"
     writeback_max_held_ratio: float = 0.05  # background eviction pauses at this in-flight share
+    # ZMQ PUB endpoint of this node's placement stream (radixshmem.kv_events), e.g.
+    # "tcp://*:5600". Setting it also sizes the region's KV-event ring.
+    kv_events_endpoint: str = ""
     # service
     endpoint: str = ""               # gRPC; "" = unix:///dev/shm/<name>.sock
     role: str = "prefill"            # PD disaggregation role: "prefill" | "decode"
@@ -384,6 +389,7 @@ def _kind_name(kind: int) -> str:
 class RadixServer:
     def __init__(self, cfg: ServerConfig):
         self.cfg = cfg
+        self._index_uuid = ""
         self._wb_handler = self._make_writeback_handler()
         self._wb: Optional[_Worker] = None
         self._wb_closed = False
@@ -392,6 +398,8 @@ class RadixServer:
         self._cv = threading.Condition(threading.RLock())
         self._mode = MODE_STARTING
         self._index = self._iclient = self._store = self._backend = self._xfer = self._dreg = None
+        self._kv_events = None
+        self._kv_sock = None
         self._greg: Optional[_ServerRegistry] = None
         self._rejected: Optional[Dict[str, Any]] = None   # cluster geometry this node could not take
         self._peers: Dict[int, str] = {}
@@ -436,6 +444,9 @@ class RadixServer:
         except BaseException:
             self._rpc.stop(grace=0).wait()
             self._rpc = None
+            if self._kv_sock is not None:
+                self._kv_sock.close(0)
+                self._kv_sock = None
             if self._greg is not None:
                 self._greg.close()
                 self._greg = None
@@ -455,6 +466,10 @@ class RadixServer:
 
     def _preflight(self) -> None:
         c = self.cfg
+        if c.kv_events_endpoint and self._kv_sock is None:
+            from radixshmem.kv_events import open_socket
+
+            self._kv_sock = open_socket(c.kv_events_endpoint)
         if not c.index_only:
             from radixshmem import _data  # noqa: F401 - data mode needs the SlotStore extension
         if not c.distributed:
@@ -529,6 +544,9 @@ class RadixServer:
                 pass
             self._greg.close()
         self._teardown_regions()
+        if self._kv_sock is not None:
+            self._kv_sock.close(0)
+            self._kv_sock = None
         if self._backend is not None:
             self._backend.close()
         self._backend = self._greg = None
@@ -620,8 +638,11 @@ class RadixServer:
         self._stop_dedup_writes()
         with self._cv:
             index, store, dreg, xfer = self._index, self._store, self._dreg, self._xfer
+            publisher, self._kv_events = self._kv_events, None
             self._index = self._iclient = self._store = self._xfer = self._dreg = None
             self._peers = {}
+        if publisher is not None:
+            publisher.close()
         if dreg is not None and index is not None:
             try:
                 dreg.unpublish(index.node_name())
@@ -685,7 +706,8 @@ class RadixServer:
                 last_error=self.last_error,
                 swa_ratio=float(c.swa_ratio),
                 mamba_ratio=float(c.mamba_ratio),
-                role=c.role)
+                role=c.role,
+                index_id=f"{self._index_uuid}.{idx.reset_generation()}" if idx else "")
 
     def _node_record(self) -> Dict[str, Any]:
         info = self.describe()
@@ -753,6 +775,7 @@ class RadixServer:
     def _configure_thread(self) -> None:
         try:
             self._bring_up()
+            self._start_kv_events()
             with self._cv:
                 self._mode = MODE_READY
                 self._cv.notify_all()
@@ -852,12 +875,15 @@ class RadixServer:
     def _bring_up(self) -> None:
         c, g = self.cfg, self._geometry
         shm = _geometry.shm_config(g, background_evict_ratio=c.background_evict_ratio,
-                                   data_pool_ratio=c.data_pool_ratio)
+                                   data_pool_ratio=c.data_pool_ratio,
+                                   kvevent_ring_capacity=(
+                                       _KV_EVENTS_RING if c.kv_events_endpoint else 0))
         shm.evict_policy = {"lru": EvictPolicy.LRU}[c.evict_policy]
         shm.max_nodes = shm.effective_max_nodes()
         index = _core.RadixServer(self._core_config(shm, g))
         if not index.bootstrap():
             raise RuntimeError("index bootstrap failed")
+        index_uuid = uuid.uuid4().hex
         iclient = _core.RadixClient(index)
         g["index_name"] = index.shm_name()      # a cluster node's name carries "_<node_name>"
         store = None
@@ -871,8 +897,22 @@ class RadixServer:
             _geometry.check_attached(g, iclient, None)
         with self._cv:
             self._index, self._iclient, self._store = index, iclient, store
+            self._index_uuid = index_uuid
         if store is not None and index.is_distributed():
             self._data_plane_up(index, store)
+
+    def _start_kv_events(self) -> None:
+        c, g, index = self.cfg, self._geometry, self._index
+        if not c.kv_events_endpoint:
+            return
+        from radixshmem.kv_events import KvEventPublisher
+
+        publisher = KvEventPublisher(
+            self._iclient, self._kv_sock, incarnation=self._index_uuid, cluster_id=c.cluster.cluster_id,
+            node=max(index.rank(), 0), node_name=index.node_name() or c.cluster.node_name,
+            hash_scheme=_geometry.hash_scheme(g), block_size=int(g["block_size"]))
+        with self._cv:
+            self._kv_events = publisher
 
     def _data_plane_up(self, index, store) -> None:
         from radixshmem import _data
